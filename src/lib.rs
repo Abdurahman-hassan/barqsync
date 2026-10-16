@@ -1,17 +1,21 @@
 //! fastrsync: a parallel, rsync-compatible file synchronizer.
 
+pub mod checksum;
+pub mod chmod;
 pub mod cli;
 pub mod delta;
 pub mod diff;
 pub mod entry;
 pub mod filter;
 pub mod fsops;
+pub mod ids;
 pub mod local;
 pub mod output;
 pub mod paths;
 pub mod progress;
 pub mod proto;
 pub mod remote;
+pub mod select;
 
 use cli::Options;
 use paths::{Location, parse_location};
@@ -37,6 +41,10 @@ pub fn run(opts: Options) -> i32 {
     let paths = &opts.paths;
     if paths.len() < 2 {
         eprintln!("fastrsync: need at least one SRC and a DEST (listing mode is not supported)");
+        return exit::SYNTAX;
+    }
+    if opts.files_from.is_some() && paths.len() != 2 {
+        eprintln!("fastrsync: --files-from takes exactly one SRC and a DEST");
         return exit::SYNTAX;
     }
     let (sources, dest) = paths.split_at(paths.len() - 1);

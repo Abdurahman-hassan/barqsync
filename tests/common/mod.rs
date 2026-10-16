@@ -396,6 +396,56 @@ pub fn both_remote(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Optio
     Some((r, f))
 }
 
+/// A [`fake_ssh`] that cuts the remote command's output after `CUT_BYTES` bytes (a
+/// dropped connection in the middle of a transfer). Copies with an unbuffered loop,
+/// tolerating the non-blocking pipe rsync hands its remote shell.
+pub fn cut_ssh(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("cut-ssh");
+    fs::write(
+        &p,
+        r#"#!/bin/sh
+shift
+fifo=$(mktemp -u "${TMPDIR:-/tmp}/cut.XXXXXX")
+mkfifo "$fifo"
+exec 3<&0
+/bin/sh -c "exec $*" <&3 >"$fifo" &
+pid=$!
+exec 3<&-
+perl -MErrno=EAGAIN -e '
+  $n = shift;
+  while ($n > 0 && ($r = sysread(STDIN, $buf, $n < 65536 ? $n : 65536)) > 0) {
+    $n -= $r;
+    for ($o = 0; $o < $r;) {
+      $w = syswrite(STDOUT, $buf, $r - $o, $o);
+      if (defined $w) { $o += $w } elsif ($! == EAGAIN) { select(undef, undef, undef, 0.01) } else { exit 1 }
+    }
+  }' "${CUT_BYTES:-5000000}" <"$fifo"
+kill -9 $pid 2>/dev/null
+rm -f "$fifo"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// [`both_remote`] through a given remote-shell stand-in.
+pub fn both_remote_via(cwd: &Path, shim: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
+    let rsync_bin = reference_rsync()?;
+    let shim = shim.to_str().unwrap();
+    let sub = |d: &str| -> Vec<String> {
+        args.iter().map(|a| a.replace("{dst}", d).replace("{host}", "fakehost:")).collect()
+    };
+    let mut ra = vec!["-e".to_string(), shim.to_string(), format!("--rsync-path={}", rsync_bin.display())];
+    ra.extend(sub(dst_r));
+    let mut fa = vec!["-e".to_string(), shim.to_string(), format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync"))];
+    fa.extend(sub(dst_f));
+    let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let f = fastrsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>());
+    Some((r, f))
+}
+
 /// fastrsync alone as a remote transfer via [`fake_ssh`] (`{host}` = `fakehost:`).
 pub fn fastrsync_remote(cwd: &Path, args: &[&str]) -> RunOut {
     let shim = fake_ssh(cwd);

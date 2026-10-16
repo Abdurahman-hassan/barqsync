@@ -8,16 +8,20 @@
 use super::{Stop, WORKER_STACK, recv};
 use crate::cli::Options;
 use crate::delta::{self, Op, Params};
-use crate::entry::{DirEnt, Kind};
+use crate::checksum::{self, Sum};
+use crate::entry::{DirEnt, Kind, Meta};
+use crate::ids;
+use crate::local::flags::{adjust_listing, adjust_mode, remove_source};
+use crate::select::{self, Descend, Sel};
 use crate::exit;
 use crate::filter::Filter;
 use crate::fsops;
 use crate::output::{Output, StatsSnapshot, path_msg};
 use crate::paths::{join_rel, split_source, wants_contents};
-use crate::proto::{self, Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, file_id};
+use crate::proto::{self, Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
 use rayon::Scope;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -40,6 +44,10 @@ struct Sender<'a> {
     scan_done: AtomicBool,
     done_sent: AtomicBool,
     errors: AtomicU64,
+    /// Ids already named to the receiver (no `--numeric-ids`).
+    ids: Mutex<ids::Sent>,
+    /// Each root's base directory (`--remove-source-files` paths are relative to it).
+    bases: Vec<PathBuf>,
 }
 
 /// A source argument resolved on disk.
@@ -47,6 +55,8 @@ struct SrcRoot {
     info: RootInfo,
     /// The `src/` directory itself, or the directory holding the named items.
     base: PathBuf,
+    /// `-R`/`--files-from`: the selected paths below `base`.
+    sel: Option<&'static Sel>,
 }
 
 impl Sender<'_> {
@@ -61,36 +71,85 @@ impl Sender<'_> {
 
     /// Register a listing and send it. Registered first, so a quick `Need` finds it.
     fn send_listing(&self, root: u16, rel: Vec<u8>, path: PathBuf, entries: Vec<DirEnt>) {
+        let sums = if self.opts.checksum { self.checksums(&path, &entries) } else { Vec::new() };
         let dir = self.next_dir.fetch_add(1, SeqCst);
         self.listings.lock().unwrap().insert(dir, (path, entries.clone()));
-        self.send(Msg::DirBatch { root, dir, rel, entries });
+        self.name_ids(entries.iter().map(|e| &e.meta));
+        self.send(Msg::DirBatch { root, dir, rel, entries, sums });
     }
 
-    fn walk_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, path: PathBuf, root_dev: u64) {
+    /// `-c`: checksums of the listing's regular files, hashed in parallel.
+    fn checksums(&self, dir: &Path, entries: &[DirEnt]) -> Vec<Option<Sum>> {
+        let files: Vec<PathBuf> =
+            entries.iter().filter(|e| e.meta.kind == Kind::File).map(|e| dir.join(&e.name)).collect();
+        let mut sums = checksum::sums(files).into_iter();
+        entries
+            .iter()
+            .map(|e| if e.meta.kind == Kind::File { sums.next().and_then(Result::ok) } else { None })
+            .collect()
+    }
+
+    /// Without `--numeric-ids`, name each uid/gid before the first listing that uses it.
+    /// The names are queued under the lock, so no listing using an id can overtake them.
+    fn name_ids<'m>(&self, metas: impl Iterator<Item = &'m Meta>) {
+        if self.opts.numeric_ids || !(self.opts.owner || self.opts.group) {
+            return;
+        }
+        let mut sent = self.ids.lock().unwrap();
+        let (users, groups) = sent.new_names(metas, self.opts.owner, self.opts.group);
+        if !users.is_empty() || !groups.is_empty() {
+            self.send(Msg::IdNames { users, groups });
+        }
+    }
+
+    fn walk_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, path: PathBuf, root_dev: u64, sel: Option<&'static Sel>) {
         if fsops::interrupted() {
             return;
         }
-        let ents = match fsops::read_dir_meta(&path) {
-            Ok(v) => v,
-            Err(e) => return self.err(path_msg("opendir \"", &path, format!("\" failed: {e}"))),
+        let ents = match sel {
+            Some(sel) if !sel.contents => self.read_selected(&path, sel),
+            _ => match fsops::read_dir_meta(&path) {
+                Ok(v) => adjust_listing(self.opts, &path, v, &mut |m| self.err(m)),
+                Err(e) => return self.err(path_msg("opendir \"", &path, format!("\" failed: {e}"))),
+            },
         };
         let ents: Vec<DirEnt> = ents
             .into_iter()
             .filter(|e| !self.filter.is_excluded(&join_rel(&rel, &e.name), e.meta.kind == Kind::Dir))
             .collect();
-        let subdirs: Vec<(Vec<u8>, PathBuf)> = ents
+        let subdirs: Vec<(Vec<u8>, PathBuf, Option<&'static Sel>)> = ents
             .iter()
-            .filter(|e| self.descend_into(e, root_dev))
-            .map(|e| (join_rel(&rel, &e.name), path.join(&e.name)))
+            .filter_map(|e| {
+                let sub = self.descend_into(sel, e, root_dev)?;
+                Some((join_rel(&rel, &e.name), path.join(&e.name), sub))
+            })
             .collect();
         self.send_listing(root, rel, path, ents);
-        for (crel, cpath) in subdirs {
-            s.spawn(move |s| self.walk_dir(s, root, crel, cpath, root_dev));
+        for (crel, cpath, sub) in subdirs {
+            s.spawn(move |s| self.walk_dir(s, root, crel, cpath, root_dev, sub));
         }
     }
 
-    fn descend_into(&self, e: &DirEnt, root_dev: u64) -> bool {
-        e.meta.kind == Kind::Dir && self.opts.recursive && !(self.opts.one_file_system && e.meta.dev != root_dev)
+    /// The selected entries of `dir`, with missing names reported as errors.
+    fn read_selected(&self, dir: &Path, sel: &Sel) -> Vec<DirEnt> {
+        let (ents, errs) = select::read_selected(dir, sel);
+        for (p, e) in errs {
+            self.err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
+        }
+        adjust_listing(self.opts, dir, ents, &mut |m| self.err(m))
+    }
+
+    /// Whether the listing of subdirectory `e` is sent (and with which selection). The
+    /// receiver makes the same decision with [`select::descend`].
+    fn descend_into(&self, sel: Option<&'static Sel>, e: &DirEnt, root_dev: u64) -> Option<Option<&'static Sel>> {
+        if e.meta.kind != Kind::Dir || (self.opts.one_file_system && e.meta.dev != root_dev) {
+            return None;
+        }
+        match select::descend(sel, e.name.as_bytes(), self.opts.recursive) {
+            Descend::No => None,
+            Descend::All => Some(None),
+            Descend::Some(s) => Some(Some(s)),
+        }
     }
 
     fn walk_roots<'s>(&'s self, s: &Scope<'s>, roots: &'s [SrcRoot]) {
@@ -98,18 +157,34 @@ impl Sender<'_> {
             let r = r as u16;
             if root.info.contents {
                 let dev = root.info.meta.map(|m| m.dev).unwrap_or(0);
-                s.spawn(move |s| self.walk_dir(s, r, Vec::new(), root.base.clone(), dev));
+                let sel = root.sel.and_then(|sel| sel.at_root(self.opts.recursive));
+                s.spawn(move |s| self.walk_dir(s, r, Vec::new(), root.base.clone(), dev, sel));
             } else {
                 // The named items form a virtual top-level listing.
                 for item in &root.info.items {
-                    if self.descend_into(item, item.meta.dev) {
+                    if let Some(sub) = self.descend_into(root.sel, item, item.meta.dev) {
                         let rel = item.name.as_bytes().to_vec();
                         let path = root.base.join(&item.name);
                         let dev = item.meta.dev;
-                        s.spawn(move |s| self.walk_dir(s, r, rel, path, dev));
+                        s.spawn(move |s| self.walk_dir(s, r, rel, path, dev, sub));
                     }
                 }
                 self.send_listing(r, Vec::new(), root.base.clone(), root.info.items.clone());
+            }
+        }
+    }
+
+    /// `--remove-source-files`: the receiver has these entries now.
+    fn remove_synced(&self, root: u16, files: SyncedFiles) {
+        let Some(base) = self.bases.get(root as usize) else {
+            return self.err(format!("protocol error: unknown root {root}"));
+        };
+        for (rel, size, mtime) in files {
+            let path = base.join(OsStr::from_bytes(&rel));
+            match remove_source(self.opts, &path, size, mtime) {
+                Ok(()) if self.out.verbose() >= 2 => self.out.info([&b"sender removed "[..], &rel].concat()),
+                Ok(()) => {}
+                Err(m) => self.err(m),
             }
         }
     }
@@ -272,9 +347,52 @@ impl Sender<'_> {
     }
 }
 
+/// `-R`/`--files-from` roots: each base directory with its selected paths.
+fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, out: &Output, errors: &AtomicU64) -> Vec<SrcRoot> {
+    let sel_roots = match &opts.files_from {
+        Some(list) => select::from_list(&sources[0], list),
+        None => select::from_relative_args(sources),
+    };
+    let mut err = |m: Vec<u8>| {
+        errors.fetch_add(1, SeqCst);
+        out.error(m);
+    };
+    let mut roots = Vec::new();
+    for r in sel_roots {
+        let sel = select::leak(r.sel);
+        let info = if r.with_root {
+            match fsops::stat(&r.base) {
+                Ok(mut m) => {
+                    adjust_mode(opts, &mut m);
+                    RootInfo { contents: true, meta: Some(m), items: Vec::new(), sel: Some(sel.clone()) }
+                }
+                Err(e) => {
+                    err(path_msg("link_stat \"", &r.base, format!("\" failed: {e}")));
+                    continue;
+                }
+            }
+        } else {
+            let (ents, errs) = select::read_selected(&r.base, sel);
+            for (p, e) in errs {
+                err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
+            }
+            let items = adjust_listing(opts, &r.base, ents, &mut err)
+                .into_iter()
+                .filter(|e| !filter.is_excluded(e.name.as_bytes(), e.meta.kind == Kind::Dir))
+                .collect();
+            RootInfo { contents: false, meta: None, items, sel: Some(sel.clone()) }
+        };
+        roots.push(SrcRoot { info, base: r.base, sel: Some(sel) });
+    }
+    roots
+}
+
 /// Resolve SRC arguments the way rsync does: `src/` sends the directory's contents,
 /// `src` sends the directory (or file) itself under its name.
-fn resolve_roots(sources: &[OsString], filter: &Filter, out: &Output, errors: &AtomicU64) -> Vec<SrcRoot> {
+fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, out: &Output, errors: &AtomicU64) -> Vec<SrcRoot> {
+    if opts.relative {
+        return resolve_select_roots(opts, sources, filter, out, errors);
+    }
     let mut roots = Vec::new();
     for s in sources {
         let sp = PathBuf::from(s);
@@ -292,12 +410,19 @@ fn resolve_roots(sources: &[OsString], filter: &Filter, out: &Output, errors: &A
                     continue;
                 }
                 let link = if meta.kind == Kind::Symlink { fsops::read_link_bytes(&sp).ok() } else { None };
-                let item = DirEnt { name, meta, link };
-                roots.push(SrcRoot { info: RootInfo { contents: false, meta: None, items: vec![item] }, base: parent });
+                let mut err = |m: Vec<u8>| {
+                    errors.fetch_add(1, SeqCst);
+                    out.error(m);
+                };
+                let items = adjust_listing(opts, &parent, vec![DirEnt { name, meta, link }], &mut err);
+                let info = RootInfo { contents: false, meta: None, items, sel: None };
+                roots.push(SrcRoot { info, base: parent, sel: None });
             }
             _ => match fsops::stat(&sp) {
-                Ok(m) if m.kind == Kind::Dir => {
-                    roots.push(SrcRoot { info: RootInfo { contents: true, meta: Some(m), items: Vec::new() }, base: sp })
+                Ok(mut m) if m.kind == Kind::Dir => {
+                    adjust_mode(opts, &mut m);
+                    let info = RootInfo { contents: true, meta: Some(m), items: Vec::new(), sel: None };
+                    roots.push(SrcRoot { info, base: sp, sel: None })
                 }
                 Ok(_) => {
                     errors.fetch_add(1, SeqCst);
@@ -325,7 +450,13 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
         }
     };
     let errors = AtomicU64::new(0);
-    let roots = resolve_roots(sources, &filter, out, &errors);
+    if opts.files_from.is_some() && sources.len() != 1 {
+        let msg = "--files-from takes exactly one source directory".to_string();
+        out.error(&msg);
+        let _ = conn.msg(Msg::Fatal { msg });
+        return (exit::SYNTAX, None);
+    }
+    let roots = resolve_roots(opts, sources, &filter, out, &errors);
     let sender = Sender {
         out_frames: conn.out.clone(),
         opts,
@@ -338,7 +469,10 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
         scan_done: AtomicBool::new(false),
         done_sent: AtomicBool::new(false),
         errors,
+        ids: Mutex::new(ids::Sent::default()),
+        bases: roots.iter().map(|r| r.base.clone()).collect(),
     };
+    sender.name_ids(roots.iter().flat_map(|r| r.info.meta.iter().chain(r.info.items.iter().map(|e| &e.meta))));
     sender.send(Msg::Roots(roots.iter().map(|r| r.info.clone()).collect()));
 
     let pool = match rayon::ThreadPoolBuilder::new()
@@ -366,6 +500,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
             loop {
                 match recv(conn) {
                     Ok(Frame::Msg(Msg::Need { dir, files })) => s.spawn(move |s| sender.serve(s, dir, files)),
+                    Ok(Frame::Msg(Msg::Synced { root, files })) => s.spawn(move |_| sender.remove_synced(root, files)),
                     Ok(Frame::Msg(Msg::ReceiverDone { stats })) => break Ok(stats),
                     Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
                     Ok(Frame::Msg(Msg::Fatal { msg })) => {
