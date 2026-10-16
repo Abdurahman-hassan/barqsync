@@ -218,7 +218,8 @@ impl Output {
         };
         if c.new {
             f[2..].fill(b'+');
-        } else if !c.anything() {
+        } else if !c.any_attr() {
+            // rsync: no attribute changed, so the columns are blank (`hf`, `cd`, `>f`).
             f[2..].fill(b' ');
         } else {
             let set = |on: bool, ch: u8| if on { ch } else { b'.' };

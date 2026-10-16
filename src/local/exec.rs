@@ -13,12 +13,14 @@
 use super::Root;
 use crate::cli::Options;
 use crate::delta::{self, apply::apply};
-use crate::diff::{AttrDiff, DiffRules, FileAction, file_action};
+use crate::diff::{AttrDiff, DiffRules, FileAction, file_action_sum};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::filter::Filter;
 use crate::fsops::{self, Copied};
 use crate::output::{Change, Link, Output, Stats, path_msg};
 use crate::paths::join_rel;
+use crate::checksum::{self, Sum};
+use crate::select::{self, Descend, Sel};
 use rayon::Scope;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -42,6 +44,13 @@ pub struct Engine<'a> {
     pub(crate) umask: u32,
     /// Set when this engine is the receiving end of a remote transfer.
     pub(crate) remote: Option<crate::remote::receiver::RemoteState>,
+    /// The destination directory transfer roots write into (alt-dest and backup paths
+    /// are relative to it).
+    pub(crate) dest_root: PathBuf,
+    /// `--link-dest` / `--compare-dest` directories that exist.
+    pub(crate) alt_dirs: Vec<PathBuf>,
+    /// `--backup-dir`, resolved against `dest_root`.
+    pub(crate) backup_root: Option<PathBuf>,
 }
 
 pub(crate) struct DirJob {
@@ -58,6 +67,8 @@ pub(crate) struct DirJob {
     src_meta: Meta,
     /// Destination directory metadata before we touched it (`None` when new).
     pre: Option<Meta>,
+    /// `-R`/`--files-from`: only these entries are transferred (`None`: all of them).
+    pub(crate) sel: Option<&'static Sel>,
 }
 
 pub(crate) struct Ctx<'p> {
@@ -70,6 +81,9 @@ pub(crate) struct Ctx<'p> {
     depth: usize,
     dst_is_new: bool,
     root_dev: Option<u64>,
+    sel: Option<&'static Sel>,
+    /// Listing id on the wire (remote: finds the sender's `-c` checksums).
+    wire_dir: u32,
 }
 
 pub(crate) struct FileJob {
@@ -80,6 +94,21 @@ pub(crate) struct FileJob {
     pub(crate) rel: Vec<u8>,
     pub(crate) meta: Meta,
     pub(crate) dst_meta: Option<Meta>,
+    pub(crate) root: u16,
+    /// Delta basis other than the destination file: a `--partial-dir` file or an
+    /// alt-dest file.
+    pub(crate) basis: Option<PathBuf>,
+    /// The alt-dest file the new file is itemized against (no destination file).
+    pub(crate) alt: Option<Meta>,
+    /// `--partial-dir` file to remove once the file is written.
+    pub(crate) partial: Option<PathBuf>,
+}
+
+impl FileJob {
+    /// The file a delta is computed against.
+    pub(crate) fn basis_path(&self) -> &Path {
+        self.basis.as_deref().unwrap_or(&self.dst_path)
+    }
 }
 
 /// Source entries of one directory, each with its index in the source listing and an
@@ -95,6 +124,7 @@ struct HardGroup {
 }
 
 struct Follower {
+    root: u16,
     src_path: PathBuf,
     dst_path: PathBuf,
     rel: Vec<u8>,
@@ -104,6 +134,9 @@ struct Follower {
 struct DirFixup {
     depth: usize,
     path: PathBuf,
+    /// `-K`: `path` is a symlink standing in for the directory; like rsync, its own
+    /// time is set and the mode is left alone.
+    link: bool,
     mode: Option<u32>,
     mtime: Option<(i64, u32)>,
     uid: Option<u32>,
@@ -130,6 +163,7 @@ impl<'a> Engine<'a> {
             ignore_times: opts.ignore_times,
             ignore_existing: opts.ignore_existing,
             modify_window: opts.modify_window,
+            checksum: opts.checksum,
         };
         Engine {
             opts,
@@ -141,6 +175,9 @@ impl<'a> Engine<'a> {
             hardlinks: Mutex::new(HashMap::new()),
             umask: fsops::current_umask(),
             remote: None,
+            dest_root: PathBuf::from("."),
+            alt_dirs: Vec::new(),
+            backup_root: None,
         }
     }
 
@@ -169,11 +206,31 @@ impl<'a> Engine<'a> {
     /// Report a directory: new (`cd+++++++++`), or what differs. Plain `-v` shows it
     /// only when new or its time differs.
     fn report_dir(&self, rel: &[u8], src: &Meta, pre: Option<&Meta>) {
+        if pre.is_none()
+            && let Some(alt) = self.alt_dir_meta(rel)
+        {
+            // A new directory with an alt-dest counterpart is itemized against it.
+            let significant = self.dir_times() && !self.rules.same_mtime(src, &alt);
+            let change = Change { local: true, time: significant, ..self.attr_change(src, &alt, false) };
+            if change.any_attr() || self.opts.itemize >= 2 || significant {
+                self.out.item(rel, Kind::Dir, Link::None, change, significant);
+            }
+            return;
+        }
         let (change, significant) = match pre {
             None => (Change::new_local(), true),
-            Some(p) => (self.attr_change(src, p, false), self.opts.times && !self.rules.same_mtime(src, p)),
+            Some(p) => {
+                let differs = self.dir_times() && !self.rules.same_mtime(src, p);
+                (Change { time: differs, ..self.attr_change(src, p, false) }, differs)
+            }
         };
         self.out.item(rel, Kind::Dir, Link::None, change, significant);
+    }
+
+    /// Directory mtimes are preserved: `-t`, unless `-O` (which `-b` without
+    /// `--backup-dir` forces on, as in rsync).
+    fn dir_times(&self) -> bool {
+        self.opts.times && !self.opts.omit_dir_times
     }
 
     /// Permissions for a newly written file or directory.
@@ -191,15 +248,18 @@ impl<'a> Engine<'a> {
         match root {
             Root::Contents { src, dst } => {
                 let src_meta = match fsops::stat(src) {
-                    Ok(m) => m,
+                    Ok(mut m) => {
+                        super::flags::adjust_mode(self.opts, &mut m);
+                        m
+                    }
                     Err(e) => return self.err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
                 };
                 let job = self.root_job(src.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh);
                 s.spawn(move |s| self.process_dir(s, job));
             }
             Root::Items { src_dir, dst_dir, items } => {
-                let mut entries = Vec::with_capacity(items.len());
-                for (i, (sname, dname)) in items.iter().enumerate() {
+                let mut ents = Vec::with_capacity(items.len());
+                for (sname, _) in items {
                     let sp = src_dir.join(sname);
                     let meta = match fsops::lstat(&sp) {
                         Ok(m) => m,
@@ -209,11 +269,47 @@ impl<'a> Engine<'a> {
                         }
                     };
                     let link = if meta.kind == Kind::Symlink { fsops::read_link_bytes(&sp).ok() } else { None };
-                    entries.push((i as u32, DirEnt { name: sname.clone(), meta, link }, Some(dname.clone())));
+                    ents.push(DirEnt { name: sname.clone(), meta, link });
                 }
-                self.run_items(s, src_dir, dst_dir, 0, 0, entries, !dest_exists || dest_fresh);
+                let ents = self.adjust_listing(src_dir, ents);
+                let entries = ents
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let dname = items.iter().find(|(n, _)| *n == e.name).map(|(_, d)| d.clone());
+                        (i as u32, e, dname)
+                    })
+                    .collect();
+                self.run_items(s, src_dir, dst_dir, 0, 0, entries, !dest_exists || dest_fresh, None);
+            }
+            Root::Select { base, dst, sel, with_root } => {
+                if *with_root {
+                    let src_meta = match fsops::stat(base) {
+                        Ok(mut m) => {
+                            super::flags::adjust_mode(self.opts, &mut m);
+                            m
+                        }
+                        Err(e) => return self.err(path_msg("link_stat \"", base, format!("\" failed: {e}"))),
+                    };
+                    let mut job = self.root_job(base.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh);
+                    job.sel = sel.at_root(self.opts.recursive);
+                    s.spawn(move |s| self.process_dir(s, job));
+                } else {
+                    let ents = self.read_selected(base, sel);
+                    let entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
+                    self.run_items(s, base, dst, 0, 0, entries, !dest_exists || dest_fresh, Some(sel));
+                }
             }
         }
+    }
+
+    /// The selected entries of `dir`, with missing names reported as errors.
+    fn read_selected(&self, dir: &Path, sel: &Sel) -> Vec<DirEnt> {
+        let (ents, errs) = select::read_selected(dir, sel);
+        for (p, e) in errs {
+            self.err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
+        }
+        self.adjust_listing(dir, ents)
     }
 
     /// The job for a `src/` root: `dst` itself gets the source directory's attributes
@@ -233,6 +329,7 @@ impl<'a> Engine<'a> {
             root_dev: Some(src_meta.dev),
             src_meta,
             pre,
+            sel: None,
         }
     }
 
@@ -249,6 +346,7 @@ impl<'a> Engine<'a> {
         wire_dir: u32,
         entries: Entries,
         dst_is_new: bool,
+        sel: Option<&'static Sel>,
     ) {
         let entries: Entries = entries
             .into_iter()
@@ -272,6 +370,8 @@ impl<'a> Engine<'a> {
             depth: 0,
             dst_is_new,
             root_dev: None,
+            sel,
+            wire_dir,
         };
         let (_, files) = self.process_entries(s, &ctx, entries, &dst_map);
         self.transfer(wire_dir, files);
@@ -298,12 +398,15 @@ impl<'a> Engine<'a> {
         if fsops::interrupted() {
             return;
         }
-        let src_ents = match fsops::read_dir_meta(&job.src) {
-            Ok(v) => v,
-            Err(e) => {
-                self.err(path_msg("opendir \"", &job.src, format!("\" failed: {e}")));
-                return self.push_fixup(&job, false);
-            }
+        let src_ents = match job.sel {
+            Some(sel) if !sel.contents => self.read_selected(&job.src, sel),
+            _ => match fsops::read_dir_meta(&job.src) {
+                Ok(v) => self.adjust_listing(&job.src, v),
+                Err(e) => {
+                    self.err(path_msg("opendir \"", &job.src, format!("\" failed: {e}")));
+                    return self.push_fixup(&job, false);
+                }
+            },
         };
         let entries = src_ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
         self.process_listing(s, job, entries);
@@ -337,7 +440,7 @@ impl<'a> Engine<'a> {
         };
 
         let mut changed = false;
-        if self.opts.delete && !job.dst_is_new {
+        if self.opts.delete && !job.dst_is_new && select::may_delete(job.sel) {
             changed |= self.delete_extraneous(job, &entries, &dst_map);
         }
         let dst_handle = if job.dst_is_new { None } else { fsops::DirHandle::open(&job.dst).ok() };
@@ -350,6 +453,8 @@ impl<'a> Engine<'a> {
             depth: job.depth,
             dst_is_new: job.dst_is_new,
             root_dev: job.root_dev,
+            sel: job.sel,
+            wire_dir: job.wire_dir,
         };
         let (c, files) = self.process_entries(s, &ctx, entries, &dst_map);
         self.push_fixup(job, changed || c);
@@ -363,7 +468,7 @@ impl<'a> Engine<'a> {
             .filter(|(n, _)| !src_names.contains(n.as_os_str()))
             .filter(|(n, k)| {
                 self.opts.delete_excluded
-                    || !self.filter.is_excluded(&join_rel(&job.rel, n), **k == Kind::Dir)
+                    || (!self.filter.is_excluded(&join_rel(&job.rel, n), **k == Kind::Dir) && !self.is_protected_backup(n))
             })
             .map(|(n, k)| (n, *k))
             .collect();
@@ -401,7 +506,7 @@ impl<'a> Engine<'a> {
                 self.out.deleting(rel, false);
             }
             if !self.dry()
-                && let Err(e) = fs::remove_file(path)
+                && let Err(e) = self.remove_or_backup(path)
             {
                 return self.err(path_msg("delete_file: unlink \"", path, format!("\" failed: {e}")));
             }
@@ -434,13 +539,15 @@ impl<'a> Engine<'a> {
         }
         let src = &job.src_meta;
         let is_new = job.pre.is_none();
+        let link = self.opts.keep_dirlinks && !is_new && fsops::lstat(&job.dst).is_ok_and(|m| m.kind == Kind::Symlink);
         let mode = match &job.pre {
+            _ if link => None,
             None => Some(self.new_mode(src)),
             Some(p) if self.opts.perms && p.mode != src.mode => Some(src.mode),
             _ => None,
         };
-        let mtime = (self.opts.times
-            && (is_new || changed || job.pre.is_some_and(|p| !self.rules.same_mtime(src, &p))))
+        let mtime = (self.dir_times()
+            && (is_new || changed || link || job.pre.is_some_and(|p| !self.rules.same_mtime(src, &p))))
         .then_some((src.mtime, src.mtime_ns));
         let uid = self.rules.wanted_uid(src).filter(|&u| job.pre.is_none_or(|p| p.uid != u));
         let gid = self.rules.wanted_gid(src).filter(|&g| job.pre.is_none_or(|p| p.gid != g));
@@ -448,6 +555,7 @@ impl<'a> Engine<'a> {
             self.fixups.lock().unwrap().push(DirFixup {
                 depth: job.depth,
                 path: job.dst.clone(),
+                link,
                 mode,
                 mtime,
                 uid,
@@ -458,7 +566,7 @@ impl<'a> Engine<'a> {
 
     /// `-H`: true if this name leads its hard-link group (and is transferred normally);
     /// otherwise it is queued to be linked to the leader at the end.
-    fn claim_leader(&self, meta: &Meta, src_path: &Path, dst_path: &Path, rel: &[u8]) -> bool {
+    fn claim_leader(&self, root: u16, meta: &Meta, src_path: &Path, dst_path: &Path, rel: &[u8]) -> bool {
         let mut groups = self.hardlinks.lock().unwrap();
         match groups.entry((meta.dev, meta.ino)) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -467,6 +575,7 @@ impl<'a> Engine<'a> {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 o.get_mut().followers.push(Follower {
+                    root,
                     src_path: src_path.to_path_buf(),
                     dst_path: dst_path.to_path_buf(),
                     rel: rel.to_vec(),
@@ -495,13 +604,25 @@ impl<'a> Engine<'a> {
                     && (l.dev, l.ino) == (d.dev, d.ino)
                 {
                     self.out.item(&f.rel, Kind::File, Link::Hard(&g.leader_rel), Change::default(), false);
+                    self.source_done(f.root, &f.src_path, &f.rel, &f.meta);
                     continue;
                 }
                 if leader.is_none() && !self.dry() {
                     // The leader wasn't written (an error, already reported): send this name on its own.
                     if self.remote.is_none() {
                         let dst_meta = dst.filter(|d| d.kind == Kind::File);
-                        let job = FileJob { idx: 0, src_path: f.src_path, dst_path: f.dst_path, rel: f.rel, meta: f.meta, dst_meta };
+                        let job = FileJob {
+                            idx: 0,
+                            src_path: f.src_path,
+                            dst_path: f.dst_path,
+                            rel: f.rel,
+                            meta: f.meta,
+                            dst_meta,
+                            root: f.root,
+                            basis: None,
+                            alt: None,
+                            partial: None,
+                        };
                         self.transfer_file(&job);
                     } else {
                         self.err([&b"hard link target missing for "[..], &f.rel].concat());
@@ -529,8 +650,9 @@ impl<'a> Engine<'a> {
                 let (dir, name) = split_dst(&f.dst_path);
                 let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&g.leader_dst, tmp))
                     .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, &f.dst_path)));
-                if let Err(e) = r {
-                    self.err(path_msg("link \"", &f.dst_path, format!("\" failed: {e}")));
+                match r {
+                    Ok(()) => self.source_done(f.root, &f.src_path, &f.rel, &f.meta),
+                    Err(e) => self.err(path_msg("link \"", &f.dst_path, format!("\" failed: {e}"))),
                 }
             }
         }
@@ -551,8 +673,9 @@ impl<'a> Engine<'a> {
                 {
                     self.err(path_msg("chmod \"", &f.path, format!("\" failed: {e}")));
                 }
+                let set = if f.link { fsops::set_symlink_mtime } else { fsops::set_mtime };
                 if let Some((s, ns)) = f.mtime
-                    && let Err(e) = fsops::set_mtime(&f.path, s, ns)
+                    && let Err(e) = set(&f.path, s, ns)
                 {
                     self.err(path_msg("failed to set times on \"", &f.path, format!("\": {e}")));
                 }
@@ -575,6 +698,7 @@ impl<'a> Engine<'a> {
     ) -> (bool, Vec<FileJob>) {
         let mut changed = false;
         let mut files: Vec<FileJob> = Vec::new();
+        let same_sums = if self.opts.checksum { self.checksum_matches(ctx, &entries, dst_map) } else { HashSet::new() };
         for (idx, e, dname_override) in entries {
             if fsops::interrupted() {
                 break;
@@ -584,12 +708,19 @@ impl<'a> Engine<'a> {
             let src_path = ctx.src.join(&e.name);
             let dst_path = ctx.dst.join(dname);
             let dst_kind = if ctx.dst_is_new { None } else { dst_map.get(dname).copied() };
+            if self.opts.existing && dst_kind.is_none() && !(e.meta.kind == Kind::Dir && !self.opts.recursive && !self.opts.dirs) {
+                // --existing: nothing new is created, not even directories.
+                continue;
+            }
             match e.meta.kind {
                 Kind::Dir => changed |= self.handle_dir(s, ctx, e.meta, rel, src_path, dst_path, dst_kind),
                 Kind::File => {
                     Stats::add(&self.stats.files, 1);
                     Stats::add(&self.stats.total_size, e.meta.size);
-                    if self.opts.hard_links && e.meta.nlink > 1 && !self.claim_leader(&e.meta, &src_path, &dst_path, &rel) {
+                    if self.size_filtered(&e.meta, &rel) {
+                        continue;
+                    }
+                    if self.opts.hard_links && e.meta.nlink > 1 && !self.claim_leader(ctx.root, &e.meta, &src_path, &dst_path, &rel) {
                         // Linked at the end, which modifies this directory.
                         changed = true;
                         continue;
@@ -612,19 +743,55 @@ impl<'a> Engine<'a> {
                         },
                         None => {}
                     }
-                    match file_action(&e.meta, dst_meta.as_ref(), &self.rules) {
-                        FileAction::Skip => self.out.item(&rel, Kind::File, Link::None, Change::default(), false),
+                    let action = file_action_sum(&e.meta, dst_meta.as_ref(), &self.rules, same_sums.contains(&idx));
+                    let mut alt = None;
+                    if !self.alt_dirs.is_empty()
+                        && action == FileAction::Transfer
+                        && dst_meta.is_none_or(|d| d.kind == Kind::File)
+                    {
+                        let mut src_sum = || self.src_sum(ctx.wire_dir, idx, &src_path);
+                        match self.try_alt_file(ctx.root, &e.meta, &rel, &src_path, &dst_path, dst_meta.as_ref(), &mut src_sum) {
+                            super::flags::AltFile::Done => {
+                                changed = true;
+                                continue;
+                            }
+                            super::flags::AltFile::Basis(p, m) => alt = Some((p, m)),
+                            super::flags::AltFile::None => {}
+                        }
+                    }
+                    match action {
+                        FileAction::Skip => {
+                            self.out.item(&rel, Kind::File, Link::None, Change::default(), false);
+                            self.source_done(ctx.root, &src_path, &rel, &e.meta);
+                        }
                         FileAction::Attrs(a) => {
                             if let Some(d) = &dst_meta {
                                 self.out.item(&rel, Kind::File, Link::None, self.attr_change(&e.meta, d, false), false);
                             }
-                            if !self.dry() {
-                                self.fix_attrs(&dst_path, &e.meta, a);
+                            if !self.dry() && self.fix_attrs(&dst_path, &e.meta, a) {
+                                self.source_done(ctx.root, &src_path, &rel, &e.meta);
                             }
                         }
                         FileAction::Transfer => {
                             changed = true;
-                            files.push(FileJob { idx, src_path, dst_path, rel, meta: e.meta, dst_meta });
+                            let (basis, alt) = match alt {
+                                Some((p, m)) if dst_meta.is_none() => (Some(p), Some(m)),
+                                _ => (None, None),
+                            };
+                            let mut job = FileJob {
+                                idx,
+                                src_path,
+                                dst_path,
+                                rel,
+                                meta: e.meta,
+                                dst_meta,
+                                root: ctx.root,
+                                basis,
+                                alt,
+                                partial: None,
+                            };
+                            self.find_partial(&mut job);
+                            files.push(job);
                         }
                     }
                 }
@@ -634,7 +801,7 @@ impl<'a> Engine<'a> {
                         self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
-                    changed |= self.handle_symlink(&e, &rel, &src_path, &dst_path, dst_kind);
+                    changed |= self.handle_symlink(ctx.root, &e, &rel, &src_path, &dst_path, dst_kind);
                 }
                 kind => {
                     Stats::add(&self.stats.specials, 1);
@@ -647,11 +814,59 @@ impl<'a> Engine<'a> {
                         self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
-                    changed |= self.handle_special(&e.meta, &rel, &dst_path, dst_kind);
+                    changed |= self.handle_special(ctx.root, &e.meta, &rel, &src_path, &dst_path, dst_kind);
                 }
             }
         }
         (changed && !self.dry(), files)
+    }
+
+    /// The source file's `-c` checksum: sent by the remote sender, or computed here.
+    fn src_sum(&self, wire_dir: u32, idx: u32, src_path: &Path) -> Option<Sum> {
+        match &self.remote {
+            Some(r) => r.src_sum(wire_dir, idx),
+            None => checksum::file_sum(src_path).ok(),
+        }
+    }
+
+    /// `-c`: which files of this listing have a same-size destination file with the
+    /// same checksum. All needed files are hashed in parallel.
+    fn checksum_matches(&self, ctx: &Ctx, entries: &Entries, dst_map: &HashMap<OsString, Kind>) -> HashSet<u32> {
+        if ctx.dst_is_new {
+            return HashSet::new();
+        }
+        let mut cands = Vec::new();
+        for (idx, e, dname) in entries {
+            let dname = dname.as_deref().unwrap_or(&e.name);
+            if e.meta.kind != Kind::File || dst_map.get(dname) != Some(&Kind::File) {
+                continue;
+            }
+            let dst_path = ctx.dst.join(dname);
+            if ctx.lstat_dst(dname, &dst_path).is_ok_and(|d| d.kind == Kind::File && d.size == e.meta.size) {
+                cands.push((*idx, ctx.src.join(&e.name), dst_path));
+            }
+        }
+        if cands.is_empty() {
+            return HashSet::new();
+        }
+        let local = self.remote.is_none();
+        let mut paths = Vec::with_capacity(cands.len() * 2);
+        for (_, src, dst) in &cands {
+            paths.push(dst.clone());
+            if local {
+                paths.push(src.clone());
+            }
+        }
+        let mut sums = checksum::sums(paths).into_iter();
+        let mut same = HashSet::new();
+        for (idx, _, _) in &cands {
+            let dst = sums.next().and_then(Result::ok);
+            let src = if local { sums.next().and_then(Result::ok) } else { self.src_sum(ctx.wire_dir, *idx, Path::new("")) };
+            if dst.is_some() && dst == src {
+                same.insert(*idx);
+            }
+        }
+        same
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -666,13 +881,21 @@ impl<'a> Engine<'a> {
         dst_kind: Option<Kind>,
     ) -> bool {
         Stats::add(&self.stats.dirs, 1);
-        if !self.opts.recursive {
+        let descend = select::descend(ctx.sel, rel.rsplit(|&b| b == b'/').next().unwrap_or(&rel), self.opts.recursive);
+        if descend == Descend::No && !self.opts.dirs {
             self.out.info([b"skipping directory ", quoted(&rel)].concat());
             return false;
         }
+        // -K: a symlink to a directory on the receiver stands in for the directory.
+        let kept_link = if self.opts.keep_dirlinks && dst_kind == Some(Kind::Symlink) {
+            fsops::stat(&dst_path).ok().filter(|m| m.kind == Kind::Dir)
+        } else {
+            None
+        };
         let mut changed = false;
         let mut pre = None;
         match dst_kind {
+            _ if kept_link.is_some() => pre = kept_link,
             Some(Kind::Dir) => match ctx.lstat_dst(dst_path.file_name().unwrap_or_default(), &dst_path) {
                 Ok(m) if m.kind == Kind::Dir => pre = Some(m),
                 Ok(_) => {}
@@ -684,7 +907,7 @@ impl<'a> Engine<'a> {
             },
             Some(_) => {
                 if !self.dry()
-                    && let Err(e) = fs::remove_file(&dst_path)
+                    && let Err(e) = self.remove_or_backup(&dst_path)
                 {
                     self.err(path_msg("unlink \"", &dst_path, format!("\" failed: {e}")));
                     return false;
@@ -718,8 +941,15 @@ impl<'a> Engine<'a> {
             root_dev: Some(root_dev),
             src_meta: meta,
             pre,
+            sel: match descend {
+                Descend::Some(sel) => Some(sel),
+                _ => None,
+            },
         };
-        if let Some(r) = &self.remote {
+        if descend == Descend::No {
+            // -d: the directory itself, without its contents.
+            self.push_fixup(&job, false);
+        } else if let Some(r) = &self.remote {
             // The sender applies -x itself; the listing arrives as its own batch.
             r.expect_dir(s, self, job);
         } else if self.opts.one_file_system && meta.dev != root_dev {
@@ -730,7 +960,7 @@ impl<'a> Engine<'a> {
         changed
     }
 
-    fn handle_symlink(&self, e: &DirEnt, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>) -> bool {
+    fn handle_symlink(&self, root: u16, e: &DirEnt, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>) -> bool {
         let meta = &e.meta;
         let Some(target) = e.link.as_deref().map(|t| PathBuf::from(OsStr::from_bytes(t))) else {
             self.err(path_msg("readlink \"", src_path, "\" failed"));
@@ -755,10 +985,15 @@ impl<'a> Engine<'a> {
                             let _ = fsops::set_symlink_mtime(dst_path, meta.mtime, meta.mtime_ns);
                         }
                     }
+                    self.source_done(root, src_path, rel, meta);
                     return false;
                 }
             }
             Some(Kind::Dir) if !self.remove_conflicting_dir(dst_path, rel) => return false,
+            None if self.alt_symlink(rel, target.as_os_str().as_bytes(), dst_path) => {
+                self.source_done(root, src_path, rel, meta);
+                return true;
+            }
             _ => {}
         }
         let change = match dst_kind {
@@ -776,6 +1011,9 @@ impl<'a> Engine<'a> {
         if self.dry() {
             return true;
         }
+        if dst_kind.is_some_and(|k| k != Kind::Dir) {
+            self.backup_existing(dst_path, false);
+        }
         let (dir, name) = split_dst(dst_path);
         let res = fsops::with_temp(dir, name, |tmp| std::os::unix::fs::symlink(&target, tmp)).and_then(|(tmp, ())| {
             let r = (|| {
@@ -787,13 +1025,14 @@ impl<'a> Engine<'a> {
             })();
             finish_temp(&tmp, r)
         });
-        if let Err(e) = res {
-            self.err(path_msg("symlink \"", dst_path, format!("\" failed: {e}")));
+        match res {
+            Err(e) => self.err(path_msg("symlink \"", dst_path, format!("\" failed: {e}"))),
+            Ok(()) => self.source_done(root, src_path, rel, meta),
         }
         true
     }
 
-    fn handle_special(&self, meta: &Meta, rel: &[u8], dst_path: &Path, dst_kind: Option<Kind>) -> bool {
+    fn handle_special(&self, root: u16, meta: &Meta, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>) -> bool {
         match dst_kind {
             Some(k) if k == meta.kind => {
                 if let Ok(d) = fsops::lstat(dst_path)
@@ -801,8 +1040,8 @@ impl<'a> Engine<'a> {
                 {
                     self.out.item(rel, meta.kind, Link::None, self.attr_change(meta, &d, false), false);
                     let a = self.rules.attrs_differ(meta, &d);
-                    if a.any() && !self.dry() {
-                        self.fix_attrs(dst_path, meta, a);
+                    if !a.any() || self.dry() || self.fix_attrs(dst_path, meta, a) {
+                        self.source_done(root, src_path, rel, meta);
                     }
                     return false;
                 }
@@ -829,13 +1068,17 @@ impl<'a> Engine<'a> {
                 finish_temp(&tmp, r)
             },
         );
+        if res.is_ok() {
+            self.source_done(root, src_path, rel, meta);
+        }
         if let Err(e) = res {
             self.err(path_msg("mknod \"", dst_path, format!("\" failed: {e}")));
         }
         true
     }
 
-    fn fix_attrs(&self, path: &Path, src: &Meta, a: AttrDiff) {
+    /// Returns whether the attributes were set.
+    fn fix_attrs(&self, path: &Path, src: &Meta, a: AttrDiff) -> bool {
         let r = (|| {
             if a.owner {
                 fsops::lchown(path, self.rules.wanted_uid(src), self.rules.wanted_gid(src))?;
@@ -850,7 +1093,9 @@ impl<'a> Engine<'a> {
         })();
         if let Err(e) = r {
             self.err(path_msg("failed to set attributes on \"", path, format!("\": {e}")));
+            return false;
         }
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -859,11 +1104,15 @@ impl<'a> Engine<'a> {
 
     /// Report a file that is about to be (re)written: the item line and the counters.
     pub(crate) fn note_transfer(&self, job: &FileJob) {
-        let change = match job.dst_meta {
-            Some(d) if d.kind == Kind::File => {
-                Change { transfer: true, size: d.size != job.meta.size, ..self.attr_change(&job.meta, &d, true) }
-            }
-            _ => Change { new: true, transfer: true, ..Change::default() },
+        // With -c, rsync marks a rewritten file's checksum as changed (`>fc`).
+        let change = match job.dst_meta.filter(|d| d.kind == Kind::File).or(job.alt) {
+            Some(d) => Change {
+                transfer: true,
+                value: self.opts.checksum,
+                size: d.size != job.meta.size,
+                ..self.attr_change(&job.meta, &d, true)
+            },
+            None => Change { new: true, transfer: true, ..Change::default() },
         };
         self.out.item(&job.rel, Kind::File, Link::None, change, true);
         crate::progress::planned(job.meta.size);
@@ -893,13 +1142,16 @@ impl<'a> Engine<'a> {
             crate::progress::done(job.meta.size);
             return;
         }
+        self.backup_existing_file(job);
         let r = self.write_file(job);
         crate::progress::done(job.meta.size);
-        if let Err(e) = r
-            && !fsops::interrupted()
-        {
-            let to = path_msg("\" -> \"", &job.dst_path, format!("\" failed: {e}"));
-            self.err(path_msg("copy \"", &job.src_path, to));
+        match r {
+            Ok(()) => self.file_written(job),
+            Err(e) if !fsops::interrupted() => {
+                let to = path_msg("\" -> \"", &job.dst_path, format!("\" failed: {e}"));
+                self.err(path_msg("copy \"", &job.src_path, to));
+            }
+            Err(_) => {}
         }
     }
 
@@ -938,19 +1190,26 @@ impl<'a> Engine<'a> {
             // The mtime is set last, so an interrupted copy never passes the quick check;
             // on Ctrl-C the partial file is removed like a temp file.
             fsops::register_temp(&job.dst_path);
-            let r = fsops::copy_new(&job.src_path, &job.dst_path, src.size, allow_fast, mode)
+            let r = self
+                .copy_new(&job.src_path, &job.dst_path, src.size, allow_fast, mode)
                 .and_then(|copied| self.apply_new_file_attrs(&job.dst_path, copied, mode, uid, gid, mtime))
                 .and_then(|()| fsops::check_interrupt());
-            return finish_temp(&job.dst_path, r);
+            return self.finish_or_keep(&job.dst_path, job, r);
         }
         let (dir, name) = split_dst(&job.dst_path);
-        let (tmp, copied) =
-            fsops::with_temp(dir, name, |tmp| fsops::copy_new(&job.src_path, tmp, src.size, allow_fast, mode))?;
+        let (tmp, copied) = fsops::with_temp(dir, name, |tmp| {
+            // An interrupted copy is kept with --partial before the temp is discarded.
+            self.copy_new(&job.src_path, tmp, src.size, allow_fast, mode).inspect_err(|_| {
+                if fsops::interrupted() {
+                    self.keep_partial(tmp, &job.dst_path);
+                }
+            })
+        })?;
         let r = self
             .apply_new_file_attrs(&tmp, copied, mode, uid, gid, mtime)
             .and_then(|()| fsops::check_interrupt())
             .and_then(|()| fs::rename(&tmp, &job.dst_path));
-        finish_temp(&tmp, r)
+        self.finish_or_keep(&tmp, job, r)
     }
 
     /// Delta transfer is opt-in locally (`--no-whole-file`), like rsync, and needs an
@@ -958,7 +1217,7 @@ impl<'a> Engine<'a> {
     fn delta_candidate(&self, job: &FileJob) -> bool {
         self.opts.whole_file == Some(false)
             && job.meta.size >= delta::MIN_DELTA_SIZE
-            && job.dst_meta.is_some_and(|d| d.kind == Kind::File && d.size > 0)
+            && (job.basis.is_some() || job.dst_meta.is_some_and(|d| d.kind == Kind::File && d.size > 0))
     }
 
     /// Update `job.dst_path` from the old destination file plus the changed ranges of
@@ -970,7 +1229,7 @@ impl<'a> Engine<'a> {
     /// the changed ranges are written straight into the destination.
     fn write_delta(&self, job: &FileJob, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<bool> {
         let new = fs::File::open(&job.src_path)?;
-        let basis = fs::File::open(&job.dst_path)?;
+        let basis = fs::File::open(job.basis_path())?;
         let basis_size = basis.metadata()?.len();
         let d = delta::local_delta(&new, job.meta.size, &basis, basis_size, &delta::Params::DEFAULT)?;
         if d.matched_bytes() == 0 {
@@ -980,7 +1239,7 @@ impl<'a> Engine<'a> {
         Stats::add(&self.stats.literal_bytes, d.literal_bytes());
         Stats::add(&self.stats.matched_bytes, d.matched_bytes());
 
-        if self.opts.inplace && d.is_in_place() {
+        if self.opts.inplace && d.is_in_place() && job.basis.is_none() {
             let out = fs::OpenOptions::new().write(true).open(&job.dst_path)?;
             apply(&d, &basis, &new, &out, true)?;
             self.finish_delta_file(&out, &job.meta, mode, uid, gid)?;

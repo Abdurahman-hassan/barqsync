@@ -18,6 +18,8 @@ pub struct DiffRules {
     pub ignore_times: bool,
     pub ignore_existing: bool,
     pub modify_window: i64,
+    /// `-c`: same-size files are compared by checksum instead of mtime.
+    pub checksum: bool,
 }
 
 impl DiffRules {
@@ -73,6 +75,12 @@ pub enum FileAction {
 /// The rsync "quick check" for a regular file. `dst` is `None` when nothing
 /// exists at the destination path; a non-file destination always means Transfer.
 pub fn file_action(src: &Meta, dst: Option<&Meta>, r: &DiffRules) -> FileAction {
+    file_action_sum(src, dst, r, false)
+}
+
+/// [`file_action`] with `-c`: `same_sum` says whether the checksums of `src` and `dst`
+/// match (only consulted when the sizes do).
+pub fn file_action_sum(src: &Meta, dst: Option<&Meta>, r: &DiffRules, same_sum: bool) -> FileAction {
     let Some(dst) = dst else { return FileAction::Transfer };
     if dst.kind != Kind::File {
         return FileAction::Transfer;
@@ -83,7 +91,9 @@ pub fn file_action(src: &Meta, dst: Option<&Meta>, r: &DiffRules) -> FileAction 
     if r.update && dst.mtime > src.mtime && !r.same_mtime(src, dst) {
         return FileAction::Skip;
     }
-    let data_same = if r.ignore_times {
+    let data_same = if r.checksum {
+        src.size == dst.size && same_sum
+    } else if r.ignore_times {
         false
     } else if r.size_only {
         src.size == dst.size
@@ -114,6 +124,7 @@ mod tests {
             ignore_times: false,
             ignore_existing: false,
             modify_window: 0,
+            checksum: false,
         }
     }
 
@@ -167,6 +178,16 @@ mod tests {
         r.update = true;
         let s = file(10, 100, 0, 0o644);
         assert_eq!(file_action(&s, Some(&file(99, 200, 0, 0o644)), &r), FileAction::Skip);
+    }
+
+    #[test]
+    fn checksum_decides_for_same_size_files() {
+        let mut r = rules();
+        r.checksum = true;
+        let s = file(10, 100, 0, 0o644);
+        assert_eq!(file_action_sum(&s, Some(&file(10, 100, 0, 0o644)), &r, false), FileAction::Transfer);
+        assert_eq!(file_action_sum(&s, Some(&file(10, 200, 0, 0o644)), &r, true), FileAction::Attrs(AttrDiff { mtime: true, ..AttrDiff::default() }));
+        assert_eq!(file_action_sum(&s, Some(&file(11, 100, 0, 0o644)), &r, true), FileAction::Transfer);
     }
 
     #[test]

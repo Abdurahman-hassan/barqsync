@@ -23,7 +23,10 @@
 //! ssh pipe. All frames of one file use the same stream, so they stay in order; each
 //! stream ends with `StreamEnd`, and the receiver waits for every one before finishing.
 
+use crate::checksum::Sum;
 use crate::cli::Options;
+use crate::ids::Names;
+use crate::select::Sel;
 use crate::delta::{BlockSig, ChunkSig, Op};
 use crate::entry::{DirEnt, Meta};
 use crate::output::StatsSnapshot;
@@ -34,7 +37,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"FASTRSYN";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -61,6 +64,9 @@ pub struct RootInfo {
     pub contents: bool,
     pub meta: Option<Meta>,
     pub items: Vec<DirEnt>,
+    /// `-R`/`--files-from`: the selected paths of this root. Both sides use it to
+    /// decide which directories are descended into and pruned.
+    pub sel: Option<Sel>,
 }
 
 /// The receiver's basis-file signature, chosen by the receiver: aligned blocks when the
@@ -81,6 +87,9 @@ pub struct StreamOffer {
     /// Shared secret the client presents inside TLS on every stream.
     pub token: [u8; 32],
 }
+
+/// `--remove-source-files`: `(rel, size, mtime)` of entries the receiver now has.
+pub type SyncedFiles = Vec<(Vec<u8>, u64, i64)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeedReq {
@@ -108,7 +117,10 @@ pub enum Msg {
 
     // sender → receiver
     Roots(Vec<RootInfo>),
-    DirBatch { root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt> },
+    /// `-c`: `sums[i]` is the checksum of regular file `entries[i]` (empty otherwise).
+    DirBatch { root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt>, sums: Vec<Option<Sum>> },
+    /// User and group names for ids in the listings that follow (no `--numeric-ids`).
+    IdNames { users: Names, groups: Names },
     ScanDone { dirs: u32 },
     FileBegin { id: u64, size: u64 },
     /// Start a delta-encoded file: `copies` come from the receiver's basis, the
@@ -122,6 +134,9 @@ pub enum Msg {
     // receiver → sender
     /// The answer to one `DirBatch`: which of its files the receiver wants.
     Need { dir: u32, files: Vec<NeedReq> },
+    /// `--remove-source-files`: these entries are on the receiver now. `(rel, size, mtime)`
+    /// relative to the root; the sender removes them unless they changed meanwhile.
+    Synced { root: u16, files: SyncedFiles },
     ReceiverDone { stats: StatsSnapshot },
 }
 
