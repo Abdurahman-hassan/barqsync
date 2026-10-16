@@ -7,7 +7,7 @@
 
 use super::{Stop, WORKER_STACK, recv};
 use crate::cli::Options;
-use crate::delta::{self, Op, Params};
+use crate::delta::{self, Op, Params, ReadAt, ReadOnce};
 use crate::entry::{DirEnt, Kind};
 use crate::exit;
 use crate::filter::Filter;
@@ -21,7 +21,6 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
@@ -215,7 +214,7 @@ impl Sender<'_> {
         }
     }
 
-    fn send_range(&self, f: &File, id: u64, off: u64, len: u64) -> io::Result<()> {
+    fn send_range(&self, f: &dyn ReadAt, id: u64, off: u64, len: u64) -> io::Result<()> {
         let mut pos = 0;
         while pos < len {
             fsops::check_interrupt()?;
@@ -236,7 +235,7 @@ impl Sender<'_> {
     fn send_whole_file(&self, id: u64, f: &File) -> io::Result<()> {
         let size = f.metadata()?.len();
         self.send(Msg::FileBegin { id, size });
-        self.send_range(f, id, 0, size)?;
+        self.send_range(&ReadOnce::new(f, size), id, 0, size)?;
         self.send(Msg::FileEnd { id, ok: true });
         Ok(())
     }
@@ -244,13 +243,14 @@ impl Sender<'_> {
     /// Diff the source file against the receiver's basis signature and send only the
     /// ranges it doesn't have.
     fn send_delta(&self, id: u64, path: &Path, sig: Sig) -> io::Result<()> {
-        let f = File::open(path)?;
-        let size = f.metadata()?.len();
+        let file = File::open(path)?;
+        let size = file.metadata()?.len();
+        let f = ReadOnce::new(&file, size);
         let d = match sig {
             Sig::Blocks(basis) => {
                 let bs = basis.block_size as usize;
                 if bs == 0 {
-                    return self.send_whole_file(id, &f);
+                    return self.send_whole_file(id, &file);
                 }
                 let p = Params { block_size: bs, segment: (Params::DEFAULT.segment / bs).max(1) * bs, ..Params::DEFAULT };
                 delta::diff_blocks(&delta::block_signature(&f, size, &p)?, &basis)
@@ -258,7 +258,7 @@ impl Sender<'_> {
             Sig::Chunks(basis) => delta::diff_chunks(&delta::chunk_signature(&f, size, &Params::DEFAULT)?, &basis),
         };
         if d.matched_bytes() == 0 {
-            return self.send_whole_file(id, &f);
+            return self.send_whole_file(id, &file);
         }
         let copies: Vec<Op> = d.ops.iter().copied().filter(|o| matches!(o, Op::Copy { .. })).collect();
         self.send(Msg::DeltaBegin { id, size, copies });

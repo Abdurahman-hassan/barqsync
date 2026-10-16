@@ -8,11 +8,11 @@
 
 use super::{MAX_PACKS_IN_FLIGHT, Stop, WORKER_STACK, recv};
 use crate::cli::Options;
-use crate::delta::{self, Delta, Op, ReadAt, apply::apply};
+use crate::delta::{self, Delta, Op, ReadAt, ReadOnce, apply::apply};
 use crate::entry::{DirEnt, Kind};
 use crate::exit;
 use crate::filter::Filter;
-use crate::fsops::{self, Copied};
+use crate::fsops::{self, Copied, cache};
 use crate::local::exec::{DirJob, Engine, FileJob, finish_temp, split_dst};
 use crate::output::{Output, Stats, StatsSnapshot, path_msg};
 use crate::paths::{split_source, wants_contents};
@@ -51,6 +51,8 @@ struct Incoming {
     delta: bool,
     size: u64,
     job: FileJob,
+    /// Page-cache hints for the incoming data.
+    hint: cache::Writer,
 }
 
 pub struct RemoteState {
@@ -252,7 +254,8 @@ impl RemoteState {
         let job = self.take_job(id)?;
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
-        let inc = Incoming { file, path, rename, registered, created, delta: false, size, job };
+        let hint = cache::Writer::new(&file, size);
+        let inc = Incoming { file, path, rename, registered, created, delta: false, size, job, hint };
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
     }
@@ -289,21 +292,27 @@ impl RemoteState {
                 }
             }
         };
-        if let Err(e) = apply(&d, &basis, &NoLiteral, &file, has_basis) {
+        let basis_size = job.dst_meta.map_or(0, |m| m.size);
+        if let Err(e) = apply(&d, &ReadOnce::new(&basis, basis_size), &NoLiteral, &file, has_basis) {
             if registered {
                 fsops::drop_temp(&path);
             }
             return Err(e);
         }
-        let inc = Incoming { file, path, rename, registered, created: false, delta: true, size, job };
+        let hint = cache::Writer::new(&file, size);
+        let inc = Incoming { file, path, rename, registered, created: false, delta: true, size, job, hint };
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
     }
 
     fn data(&self, id: u64, off: u64, bytes: &[u8]) -> io::Result<()> {
-        let incoming = self.incoming.lock().unwrap();
-        match incoming.get(&id) {
-            Some(inc) => inc.file.write_all_at(bytes, off),
+        let mut incoming = self.incoming.lock().unwrap();
+        match incoming.get_mut(&id) {
+            Some(inc) => {
+                inc.file.write_all_at(bytes, off)?;
+                inc.hint.written_to(&inc.file, off + bytes.len() as u64);
+                Ok(())
+            }
             // The file failed to open on our side; its error was already reported.
             None => Ok(()),
         }
@@ -381,7 +390,8 @@ impl RemoteState {
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let size = bytes.len() as u64;
         let write = file.write_all_at(bytes, 0);
-        let inc = Incoming { file, path: path.clone(), rename, registered, created, delta: false, size, job };
+        let hint = cache::Writer::new(&file, size);
+        let inc = Incoming { file, path: path.clone(), rename, registered, created, delta: false, size, job, hint };
         let r = write.and_then(|()| self.finish(eng, inc));
         if registered { finish_temp(&path, r) } else { r }
     }
@@ -405,6 +415,7 @@ fn basis_signature(job: &FileJob) -> Option<Sig> {
         return None;
     }
     let f = File::open(&job.dst_path).ok()?;
+    let f = ReadOnce::new(&f, d.size);
     let p = delta::Params::DEFAULT;
     if job.meta.size == d.size {
         delta::block_signature(&f, d.size, &p).ok().map(Sig::Blocks)

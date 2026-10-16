@@ -105,6 +105,12 @@ pub struct Cli {
     /// Never use copy-on-write clones / reflinks (benchmarking aid)
     #[arg(long = "no-clone", hide = true)]
     no_clone: bool,
+    /// Keep big files (8 MiB+) out of the page cache (default)
+    #[arg(long = "drop-cache")]
+    drop_cache: bool,
+    /// Let big files fill the page cache like small ones
+    #[arg(long = "no-drop-cache", overrides_with = "drop_cache")]
+    no_drop_cache: bool,
 
     /// Delete extraneous files from destination dirs
     #[arg(long)]
@@ -196,6 +202,8 @@ pub struct Options {
     pub inplace: bool,
     pub fsync: bool,
     pub no_clone: bool,
+    /// Page-cache hints for big files (see `fsops::cache`).
+    pub drop_cache: bool,
 
     pub delete: bool,
     pub delete_excluded: bool,
@@ -265,6 +273,7 @@ impl Options {
             inplace: c.inplace,
             fsync: c.fsync,
             no_clone: c.no_clone,
+            drop_cache: c.drop_cache || !c.no_drop_cache,
             delete: c.delete || c.delete_excluded,
             delete_excluded: c.delete_excluded,
             filter_rules,

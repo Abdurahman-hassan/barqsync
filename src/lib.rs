@@ -34,6 +34,7 @@ pub fn run(opts: Options) -> i32 {
     if opts.server {
         return remote::server::run();
     }
+    fsops::cache::set_enabled(opts.drop_cache);
     let paths = &opts.paths;
     if paths.len() < 2 {
         eprintln!("fastrsync: need at least one SRC and a DEST (listing mode is not supported)");

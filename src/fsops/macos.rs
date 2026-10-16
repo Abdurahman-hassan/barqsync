@@ -20,7 +20,7 @@ pub fn copy_new(src: &File, tmp: &Path, size: u64, mode: u32) -> io::Result<Copi
         return Ok(Copied::Clone);
     }
     let dst = create_new(tmp, mode)?;
-    copy_buffered(src, &dst)?;
+    copy_buffered(src, &dst, size)?;
     Ok(Copied::Written(dst))
 }
 

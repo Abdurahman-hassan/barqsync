@@ -1,7 +1,7 @@
 //! Produce the new file from a [`Delta`]: patch a clone of the basis, or rebuild it.
 
 use super::{Delta, Op, ReadAt, with_range};
-use crate::fsops::check_interrupt;
+use crate::fsops::{cache, check_interrupt};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io;
@@ -34,7 +34,7 @@ pub fn apply(delta: &Delta, basis: &dyn ReadAt, literal: &dyn ReadAt, out: &File
             with_range(src, src_off, op.len() as usize, |buf| out.write_all_at(buf, op.off()))?
         })?;
     } else {
-        rebuild_in_order(&pieces, basis, literal, out)?;
+        rebuild_in_order(&pieces, basis, literal, out, delta.size)?;
     }
     out.set_len(delta.size)
 }
@@ -45,7 +45,8 @@ const BATCH: usize = 8;
 /// Write every piece of a new file in ascending order while reading the next batch
 /// in parallel. Sequential writes keep the file contiguous: scattered parallel
 /// writes into a sparse file degrade badly once the disk's write cache fills.
-fn rebuild_in_order(pieces: &[Op], basis: &dyn ReadAt, literal: &dyn ReadAt, out: &File) -> io::Result<()> {
+fn rebuild_in_order(pieces: &[Op], basis: &dyn ReadAt, literal: &dyn ReadAt, out: &File, size: u64) -> io::Result<()> {
+    let mut hint = cache::Writer::new(out, size);
     let read_batch = |batch: &[Op]| -> io::Result<Vec<Vec<u8>>> {
         batch
             .par_iter()
@@ -58,9 +59,10 @@ fn rebuild_in_order(pieces: &[Op], basis: &dyn ReadAt, literal: &dyn ReadAt, out
             })
             .collect()
     };
-    let write_batch = |batch: &[Op], bufs: Vec<Vec<u8>>| -> io::Result<()> {
+    let write_batch = |batch: &[Op], bufs: Vec<Vec<u8>>, hint: &mut cache::Writer| -> io::Result<()> {
         for (op, buf) in batch.iter().zip(bufs) {
             out.write_all_at(&buf, op.off())?;
+            hint.written_to(out, op.off() + op.len());
         }
         Ok(())
     };
@@ -72,7 +74,7 @@ fn rebuild_in_order(pieces: &[Op], basis: &dyn ReadAt, literal: &dyn ReadAt, out
     while let Some((batch, bufs)) = current {
         let next = batches.next();
         let (written, read) = rayon::join(
-            || write_batch(batch, bufs),
+            || write_batch(batch, bufs, &mut hint),
             || next.map(|n| read_batch(n).map(|bufs| (n, bufs))).transpose(),
         );
         written?;

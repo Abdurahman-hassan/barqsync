@@ -1,6 +1,7 @@
 //! Filesystem primitives: directory reading, metadata, temp files, copying and attributes.
 //! Platform-specific fast paths live in `macos.rs` / `linux.rs`.
 
+pub mod cache;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -363,7 +364,7 @@ pub fn copy_new(src: &Path, tmp: &Path, size: u64, allow_fast: bool, mode: u32) 
     let src_file = File::open(src)?;
     if !allow_fast {
         let dst = create_new(tmp, mode)?;
-        copy_buffered(&src_file, &dst)?;
+        copy_buffered(&src_file, &dst, size)?;
         return Ok(Copied::Written(dst));
     }
     platform::copy_new(&src_file, tmp, size, mode)
@@ -381,7 +382,11 @@ pub(crate) fn create_new(path: &Path, mode: u32) -> io::Result<File> {
 }
 
 /// Portable fallback: read/write through a reusable 1 MiB per-thread buffer.
-pub(crate) fn copy_buffered(mut src: &File, mut dst: &File) -> io::Result<u64> {
+/// `size` is the expected length; big files go through [`copy_uncached`] instead.
+pub(crate) fn copy_buffered(mut src: &File, mut dst: &File, size: u64) -> io::Result<u64> {
+    if cache::wanted(size) {
+        return copy_uncached(src, dst, size);
+    }
     BUF.with(|b| {
         let mut buf = b.borrow_mut();
         if buf.len() < (1 << 20) {
@@ -402,11 +407,50 @@ pub(crate) fn copy_buffered(mut src: &File, mut dst: &File) -> io::Result<u64> {
     })
 }
 
-/// Overwrite an existing file in place (for `--inplace`).
-pub fn copy_into_existing(src: &Path, dst: &Path) -> io::Result<()> {
+/// Copy a big file with page-cache hints. Uncached I/O on macOS is synchronous (no
+/// read-ahead, no write-behind), so the next chunk is read while the current one is
+/// written. Buffers this large come page-aligned from the allocator, which uncached
+/// I/O needs to bypass the cache.
+fn copy_uncached(src: &File, dst: &File, size: u64) -> io::Result<u64> {
+    const CHUNK: usize = 8 << 20;
+    let mut reader = cache::Reader::new(src, size);
+    let mut writer = cache::Writer::new(dst, size);
+    let (mut cur, mut next) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);
+    let mut n = read_full(src, &mut cur)?;
+    let (mut read, mut written) = (n as u64, 0u64);
+    while n > 0 {
+        check_interrupt()?;
+        reader.read_to(src, read);
+        let (w, r) = rayon::join(|| { let mut d = dst; d.write_all(&cur[..n]) }, || read_full(src, &mut next));
+        w?;
+        written += n as u64;
+        writer.written_to(dst, written);
+        n = r?;
+        read += n as u64;
+        std::mem::swap(&mut cur, &mut next);
+    }
+    Ok(written)
+}
+
+/// Fill `buf` from `f` unless the file ends first; returns the bytes read.
+fn read_full(mut f: &File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(k) => filled += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+/// Overwrite an existing file in place with `src`, expected to be `size` bytes (for `--inplace`).
+pub fn copy_into_existing(src: &Path, dst: &Path, size: u64) -> io::Result<()> {
     let s = File::open(src)?;
     let d = fs::OpenOptions::new().write(true).truncate(true).open(dst)?;
-    copy_buffered(&s, &d)?;
+    copy_buffered(&s, &d, size)?;
     Ok(())
 }
 

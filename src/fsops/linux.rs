@@ -1,7 +1,7 @@
 //! Linux: `copy_file_range` keeps data in the kernel and reflinks automatically on
 //! btrfs/XFS; falls back to a buffered copy where the kernel refuses (old kernels, some FUSE/NFS).
 
-use super::{Copied, copy_buffered, create_new};
+use super::{Copied, cache, copy_buffered, create_new};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -26,8 +26,11 @@ pub fn clone_into_new(src: &File, tmp: &Path) -> io::Result<bool> {
     }
 }
 
-pub fn copy_new(src: &File, tmp: &Path, _size: u64, mode: u32) -> io::Result<Copied> {
+pub fn copy_new(src: &File, tmp: &Path, size: u64, mode: u32) -> io::Result<Copied> {
     let dst = create_new(tmp, mode)?;
+    // Without a reflink the kernel copies through the page cache like a buffered copy.
+    let mut reader = cache::Reader::new(src, size);
+    let mut writer = cache::Writer::new(&dst, size);
     let mut copied: u64 = 0;
     loop {
         super::check_interrupt()?;
@@ -46,6 +49,8 @@ pub fn copy_new(src: &File, tmp: &Path, _size: u64, mode: u32) -> io::Result<Cop
         }
         if n > 0 {
             copied += n as u64;
+            reader.read_to(src, copied);
+            writer.written_to(&dst, copied);
             continue;
         }
         let err = io::Error::last_os_error();
@@ -54,7 +59,7 @@ pub fn copy_new(src: &File, tmp: &Path, _size: u64, mode: u32) -> io::Result<Cop
             Some(libc::EXDEV | libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM)
                 if copied == 0 =>
             {
-                copy_buffered(src, &dst)?;
+                copy_buffered(src, &dst, size)?;
                 return Ok(Copied::Written(dst));
             }
             _ => return Err(err),

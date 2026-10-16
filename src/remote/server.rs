@@ -25,6 +25,7 @@ pub fn run() -> i32 {
         }
     };
     conn.set_compress(opts.compress);
+    crate::fsops::cache::set_enabled(opts.drop_cache);
     if conn.msg(Msg::HelloAck { version: VERSION }).is_err() {
         return exit::PROTOCOL;
     }

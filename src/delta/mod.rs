@@ -18,6 +18,7 @@
 
 pub mod apply;
 
+use crate::fsops::cache;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -65,6 +66,29 @@ pub trait ReadAt: Sync {
 impl ReadAt for File {
     fn read_exact_at(&self, buf: &mut [u8], off: u64) -> io::Result<()> {
         FileExt::read_exact_at(self, buf, off)
+    }
+}
+
+/// A file that is read once (hashed, then maybe read again for the rebuild), with
+/// page-cache hints when it is big: see [`crate::fsops::cache`].
+pub struct ReadOnce<'a> {
+    file: &'a File,
+    hinted: bool,
+}
+
+impl<'a> ReadOnce<'a> {
+    pub fn new(file: &'a File, size: u64) -> ReadOnce<'a> {
+        ReadOnce { file, hinted: cache::read_once(file, size) }
+    }
+}
+
+impl ReadAt for ReadOnce<'_> {
+    fn read_exact_at(&self, buf: &mut [u8], off: u64) -> io::Result<()> {
+        FileExt::read_exact_at(self.file, buf, off)?;
+        if self.hinted {
+            cache::drop_read(self.file, off, buf.len() as u64);
+        }
+        Ok(())
     }
 }
 
@@ -291,7 +315,7 @@ pub fn diff_chunks(new: &ChunkSig, basis: &ChunkSig) -> Delta {
 /// Compute a delta when both files are local: hash both concurrently with aligned
 /// blocks, and fall back to content-defined chunking when fewer than half of the
 /// bytes matched.
-pub fn local_delta(new: &File, new_size: u64, basis: &File, basis_size: u64, p: &Params) -> io::Result<Delta> {
+pub fn local_delta(new: &dyn ReadAt, new_size: u64, basis: &dyn ReadAt, basis_size: u64, p: &Params) -> io::Result<Delta> {
     let (ns, bs) = rayon::join(|| block_signature(new, new_size, p), || block_signature(basis, basis_size, p));
     let aligned = diff_blocks(&ns?, &bs?);
     if aligned.matched_bytes() * 2 >= new_size {

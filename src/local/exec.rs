@@ -918,7 +918,7 @@ impl<'a> Engine<'a> {
         }
 
         if self.opts.inplace && job.dst_meta.is_some_and(|d| d.kind == Kind::File) {
-            fsops::copy_into_existing(&job.src_path, &job.dst_path)?;
+            fsops::copy_into_existing(&job.src_path, &job.dst_path, src.size)?;
             fsops::lchown(&job.dst_path, uid, gid)?;
             fsops::chmod(&job.dst_path, mode)?;
             if self.opts.times {
@@ -972,7 +972,8 @@ impl<'a> Engine<'a> {
         let new = fs::File::open(&job.src_path)?;
         let basis = fs::File::open(&job.dst_path)?;
         let basis_size = basis.metadata()?.len();
-        let d = delta::local_delta(&new, job.meta.size, &basis, basis_size, &delta::Params::DEFAULT)?;
+        let (new_r, basis_r) = (delta::ReadOnce::new(&new, job.meta.size), delta::ReadOnce::new(&basis, basis_size));
+        let d = delta::local_delta(&new_r, job.meta.size, &basis_r, basis_size, &delta::Params::DEFAULT)?;
         if d.matched_bytes() == 0 {
             return Ok(false);
         }
@@ -982,7 +983,7 @@ impl<'a> Engine<'a> {
 
         if self.opts.inplace && d.is_in_place() {
             let out = fs::OpenOptions::new().write(true).open(&job.dst_path)?;
-            apply(&d, &basis, &new, &out, true)?;
+            apply(&d, &basis_r, &new_r, &out, true)?;
             self.finish_delta_file(&out, &job.meta, mode, uid, gid)?;
             return Ok(true);
         }
@@ -1000,7 +1001,7 @@ impl<'a> Engine<'a> {
         }
         let r = (|| {
             let out = fs::OpenOptions::new().write(true).open(&tmp)?;
-            apply(&d, &basis, &new, &out, cloned)?;
+            apply(&d, &basis_r, &new_r, &out, cloned)?;
             self.finish_delta_file(&out, &job.meta, mode, uid, gid)?;
             drop(out);
             fsops::check_interrupt()?;
