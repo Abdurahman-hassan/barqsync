@@ -28,8 +28,9 @@ fi
 [[ -x "$FR" ]] || { echo "build first: cargo build --release" >&2; exit 1; }
 
 if [[ "$COLD" == "--cold" ]]; then
-  if [[ $(uname) == Darwin ]]; then CACHE=" && sync && sudo purge"; else CACHE=" && sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null"; fi
-  sudo -v
+  SUDO=sudo; [[ $(id -u) == 0 ]] && SUDO=
+  if [[ $(uname) == Darwin ]]; then CACHE=" && sync && $SUDO purge"; else CACHE=" && sync && echo 3 | $SUDO tee /proc/sys/vm/drop_caches >/dev/null"; fi
+  [[ -n "$SUDO" ]] && sudo -v
 else
   CACHE=""
 fi
@@ -40,6 +41,9 @@ echo "machine:   $(uname -sm), $(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl
 echo
 
 tag=$(date +%Y%m%d-%H%M%S)${COLD:+-cold}
+# The fastest stock copy on each OS: APFS clones on macOS, reflinks where Linux supports them.
+if [[ $(uname) == Darwin ]]; then CP_FAST="cp -ac"; CP_FAST_NAME="cp -ac (clone)"
+else CP_FAST="cp -a --reflink=auto"; CP_FAST_NAME="cp -a --reflink=auto"; fi
 
 if [[ "$WHICH" == A || "$WHICH" == all ]]; then
   [[ -d "$DIR/A_src" ]] || { echo "missing $DIR/A_src (run bench/gen.py $DIR A)" >&2; exit 1; }
@@ -50,6 +54,8 @@ if [[ "$WHICH" == A || "$WHICH" == all ]]; then
     -n "fastrsync -a" "'$FR' -a '$DIR/A_src/' '$DIR/A_dst/'" \
     -n "rsync -a --inplace" "'$RSYNC' -a --inplace '$DIR/A_src/' '$DIR/A_dst/'" \
     -n "fastrsync -a --inplace" "'$FR' -a --inplace '$DIR/A_src/' '$DIR/A_dst/'" \
+    -n "cp -a" "cp -a '$DIR/A_src/' '$DIR/A_dst/'" \
+    -n "$CP_FAST_NAME" "$CP_FAST '$DIR/A_src/' '$DIR/A_dst/'" \
     --export-markdown "$OUT/A-$tag.md"
 fi
 

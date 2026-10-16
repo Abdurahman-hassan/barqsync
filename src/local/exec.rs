@@ -1039,9 +1039,10 @@ impl<'a> Engine<'a> {
         match copied {
             Copied::Written(f) => {
                 fsops::fchown(&f, uid, gid)?;
-                // open() already applied `mode & !umask`; only fix up what it couldn't set
-                // (bits masked by the umask, setuid/setgid/sticky, or bits cleared by chown).
-                if mode & !self.umask & 0o777 != mode || uid.is_some() || gid.is_some() {
+                // open() already applied `mode & !umask`; only fix up what it couldn't set:
+                // bits masked by the umask, and setuid/setgid/sticky (which also covers the
+                // bits chown clears).
+                if mode & !self.umask & 0o777 != mode {
                     fsops::fchmod(&f, mode)?;
                 }
                 if let Some((s, ns)) = mtime {
