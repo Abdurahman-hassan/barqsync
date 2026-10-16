@@ -1,7 +1,7 @@
 //! Client side of a remote transfer: start `fastrsync --server` through the remote
 //! shell, send it the role, paths and options, then run the opposite role locally.
 
-use super::{Stop, receiver, recv, sender};
+use super::{Stop, receiver, recv, sender, streams};
 use crate::cli::Options;
 use crate::exit;
 use crate::output::{Output, Stats};
@@ -86,7 +86,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         out.error("remote shell has no stdin/stdout");
         return exit::IPC;
     };
-    let conn = Conn::start(stdout, stdin, opts.compress);
+    let mut conn = Conn::start(stdout, stdin, opts.compress);
     let mut server_opts = opts.clone();
     server_opts.paths = server_paths;
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };
@@ -116,6 +116,12 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
             );
             return if status == Some(255) { exit::RSH } else { exit::PROTOCOL };
         }
+    }
+
+    if let Err(e) = streams::setup_client(&mut conn, opts.streams, !server_is_sender, &out) {
+        out.error(format!("setting up parallel streams failed: {e}"));
+        let _ = child.kill();
+        return exit::PROTOCOL;
     }
 
     let (code, stats) = if server_is_sender {

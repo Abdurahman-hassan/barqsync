@@ -17,8 +17,8 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M2 | local sync engine: dirs, files, symlinks, specials, perms/times/owner, `--delete`, temp+rename, Ctrl-C cleanup | done |
 | M3 | delta engine: aligned blocks, FastCDC fallback, clone+patch, BLAKE3-verified matches | done |
 | M4 | remote over SSH (`host:path`): push and pull, small-file packing, delta over the wire, `-z`, `-e`, `--remote-path` | done |
-| M5 | parallel TCP data streams (`--streams N`) | next |
-| M6 | `-H`, `--progress`, `-i`, `getattrlistbulk`/`statx` fast paths | planned |
+| M5 | parallel TLS data streams (`--streams N`), pinned ephemeral certificate, token auth, ssh fallback | done |
+| M6 | `-H`, `--progress`, `-i`, `getattrlistbulk`/`statx` fast paths | next |
 
 The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
@@ -79,6 +79,27 @@ sender, and both sides run the same code:
 - **No pipe deadlocks.** Each side has a dedicated reader and writer thread.
 - **Output.** Errors and `-v` lines produced on the server are forwarded to the client and
   escaped there for the client's terminal.
+
+### Parallel data streams (`--streams N`)
+
+A single ssh channel often can't fill a fast or long-distance link: one TCP flow, one
+encryption thread, ssh's own window. With `--streams N`, file data moves to N extra TLS 1.3
+connections and control messages stay on ssh:
+
+1. **Offer.** Over the already authenticated ssh connection, the server listens on the address
+   the client reached it at (`SSH_CONNECTION`). It sends that address, the BLAKE3 fingerprint
+   of a freshly generated self-signed certificate, and a random 32-byte token.
+2. **Connect.** The client opens N TLS connections that accept only that exact certificate
+   and presents the token on each, inside TLS. Nothing on these connections is trusted
+   without both checks.
+3. **Use.** Every frame of a file goes over the same stream, so it stays in order. Small-file
+   packs spread across streams. Each stream ends with an end-of-stream marker, and the
+   receiver finishes only after all of them and the sender's final ssh message.
+4. **Fall back.** If no stream can be opened within 5 s (a firewall, NAT, a non-routable
+   server address), both sides carry on over the ssh pipe; `-v` says so.
+
+`-vv` reports how many streams are in use. Encryption and `-z` compression then run on one
+thread per stream instead of in a single ssh process.
 
 ## Delta transfer
 
@@ -170,6 +191,12 @@ same comparison over real ssh.
 | --- | ---: | ---: | ---: |
 | fresh copy, 200k × 4 KiB files | 45.3 s | 16.9 s | 2.7× |
 | 500k files, 3 changed | 15.2 s | 3.1 s | 4.9× |
+| fresh copy, `--streams 4` (TLS over loopback) | 43.9 s | 17.2 s | 2.6× |
+
+On one machine `--streams` neither helps nor hurts: the pipe isn't the bottleneck, APFS
+metadata is. Its benefit is meant for real links where a single ssh channel is the limit
+(high latency, or more bandwidth than one ssh encryption thread delivers). That hasn't been
+measured yet; `REMOTE=user@host bench/run.sh DIR D` does it.
 
 Benchmark B: a 10 GiB image with 50 scattered 1 MiB overwrites, destination reset to the old
 version before every run. rsync and fastrsync runs were interleaved because big sequential

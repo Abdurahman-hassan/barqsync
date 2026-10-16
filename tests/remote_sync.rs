@@ -228,3 +228,62 @@ fn bad_remote_path_fails_cleanly() {
     assert_ne!(r.code, 0);
     assert!(r.stderr.contains("connection unexpectedly closed"), "{}", r.stderr);
 }
+
+/// fastrsync through the fake ssh with extra environment (inherited by the server).
+fn remote_with_env(cwd: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> RunOut {
+    let shim = fake_ssh(cwd);
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_fastrsync"));
+    cmd.arg("-e")
+        .arg(&shim)
+        .arg(format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync")))
+        .args(args.iter().map(|a| a.replace("{host}", "fakehost:")))
+        .env_remove("SSH_CONNECTION");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    run(&mut cmd, cwd)
+}
+
+#[test]
+fn parallel_tls_streams_push_and_pull() {
+    for extra in [&[][..], &["-z"]] {
+        for pull in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            delta_fixture(tmp.path());
+            let t = Tree::new(tmp.path().join("src"));
+            for i in 0..300 {
+                t.file(&format!("many/f{i:03}"), noise(1000 + i * 13, i as u64));
+            }
+            t.settle_mtimes();
+            let mut args = vec!["-avv", "--stats", "--streams", "4"];
+            args.extend_from_slice(extra);
+            if pull {
+                args.extend_from_slice(&["{host}src/", "dst"]);
+            } else {
+                args.extend_from_slice(&["src/", "{host}dst"]);
+            }
+            let f = remote_with_env(tmp.path(), &args, &[]);
+            assert_eq!(f.code, 0, "{extra:?} pull={pull}\n{}\n{}", f.stdout, f.stderr);
+            assert!(f.stdout.contains("using 4 parallel TLS data streams"), "{}", f.stdout);
+            let mut want = snapshot(&tmp.path().join("src"), true);
+            let got = snapshot(&tmp.path().join("dst"), true);
+            want.get_mut(b".".as_slice()).unwrap().mtime = got[b".".as_slice()].mtime;
+            assert_same_tree(&want, &got);
+            assert!(stat_bytes(&f.stdout, "Matched data: ") > 9 << 20, "delta over streams: {}", f.stdout);
+        }
+    }
+}
+
+#[test]
+fn parallel_streams_fall_back_to_ssh() {
+    let tmp = tempfile::tempdir().unwrap();
+    rich_tree(&tmp.path().join("src"));
+    let f = remote_with_env(
+        tmp.path(),
+        &["-av", "--streams", "3", "src/", "{host}dst"],
+        &[("FASTRSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")],
+    );
+    assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
+    assert!(f.stdout.contains("using the ssh connection"), "{}", f.stdout);
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
+}

@@ -248,7 +248,7 @@ fn is_item_line(l: &[u8]) -> bool {
     !(l.is_empty() || SUMMARY.iter().any(|p| l.starts_with(p)) || l.windows(9).any(|w| w == b"(DRY RUN)"))
 }
 
-fn run(cmd: &mut Command, cwd: &Path) -> RunOut {
+pub fn run(cmd: &mut Command, cwd: &Path) -> RunOut {
     let o = cmd.current_dir(cwd).output().expect("spawn");
     RunOut {
         code: o.status.code().unwrap_or(-1),

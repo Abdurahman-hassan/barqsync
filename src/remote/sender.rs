@@ -121,6 +121,11 @@ impl Sender<'_> {
             && self.pending_files.load(SeqCst) == 0
             && !self.done_sent.swap(true, SeqCst)
         {
+            // Data streams first: the receiver finishes once it has seen every
+            // stream's end as well as SenderDone (which travels on the ssh connection).
+            if let Err(e) = self.out_frames.end_data_streams() {
+                self.err(format!("closing data streams failed: {e}"));
+            }
             self.send(Msg::SenderDone { errors: self.errors.load(SeqCst) });
         }
     }

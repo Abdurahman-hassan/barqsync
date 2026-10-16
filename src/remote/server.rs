@@ -2,7 +2,7 @@
 //! needs (role, paths, options) arrives in the `Hello` frame on stdin; stdout carries
 //! only protocol frames, so all output is forwarded to the client as `Log` frames.
 
-use super::{receiver, sender};
+use super::{receiver, sender, streams};
 use crate::exit;
 use crate::output::Output;
 use crate::proto::{Conn, Frame, MAGIC, Msg, VERSION};
@@ -26,6 +26,12 @@ pub fn run() -> i32 {
     };
     conn.set_compress(opts.compress);
     if conn.msg(Msg::HelloAck { version: VERSION }).is_err() {
+        return exit::PROTOCOL;
+    }
+    if let Err(e) = streams::setup_server(&mut conn, opts.streams, server_is_sender) {
+        eprintln!("fastrsync --server: setting up parallel streams failed: {e}");
+        let _ = conn.msg(Msg::Fatal { msg: format!("parallel stream setup failed: {e}") });
+        let _ = conn.finish();
         return exit::PROTOCOL;
     }
     let fwd = conn.out.clone();

@@ -515,6 +515,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
 
     let engine = &engine;
     let remote = engine.remote.as_ref().unwrap();
+    let streams = conn.data_streams_in();
     let (sender_errors, failure) = pool.install(|| {
         rayon::scope(|s| {
             {
@@ -523,7 +524,14 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
                     map.insert((r, Vec::new()), slot);
                 }
             }
+            let mut streams_ended = 0;
+            let mut sender_done: Option<u64> = None;
             loop {
+                if let Some(errors) = sender_done
+                    && streams_ended == streams
+                {
+                    break (errors, None);
+                }
                 let frame = match recv(conn) {
                     Ok(f) => f,
                     Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
@@ -557,7 +565,14 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
                             remote.on_scan_done();
                             Ok(())
                         }
-                        Msg::SenderDone { errors } => break (errors, None),
+                        Msg::SenderDone { errors } => {
+                            sender_done = Some(errors);
+                            Ok(())
+                        }
+                        Msg::StreamEnd => {
+                            streams_ended += 1;
+                            Ok(())
+                        }
                         Msg::Log { stderr, escape, text } => {
                             out.print_forwarded(stderr, escape, &text);
                             Ok(())

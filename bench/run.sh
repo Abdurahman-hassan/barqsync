@@ -106,6 +106,7 @@ if [[ "$WHICH" == D || "$WHICH" == all ]]; then
     --prepare "$CLEAN$CACHE" \
     -n "rsync -a (remote)" "'$RSYNC' -a $RSH_R $RPATH_R '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
     -n "fastrsync -a (remote)" "'$FR' -a $RSH_F $RPATH_F '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
+    -n "fastrsync -a --streams 4 (remote)" "'$FR' -a --streams 4 $RSH_F $RPATH_F '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
     --export-markdown "$OUT/D1-$tag.md"
   echo "== D2: remote push, near no-op of C ($HOST)"
   eval "$CLEAN"
@@ -115,6 +116,7 @@ if [[ "$WHICH" == D || "$WHICH" == all ]]; then
     --prepare "$MUT$CACHE" \
     -n "rsync -a (remote)" "'$RSYNC' -a $RSH_R $RPATH_R '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
     -n "fastrsync -a (remote)" "'$FR' -a $RSH_F $RPATH_F '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
+    -n "fastrsync -a --streams 4 (remote)" "'$FR' -a --streams 4 $RSH_F $RPATH_F '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
     --export-markdown "$OUT/D2-$tag.md"
   eval "$CLEAN"
 fi

@@ -17,6 +17,11 @@
 //!
 //! Each side runs a dedicated reader thread and writer thread, so neither side can
 //! deadlock waiting for the other to drain the pipe.
+//!
+//! With `--streams N`, file data (`FileBegin`/`DeltaBegin`/`Data`/`FileEnd`,
+//! `SmallPack`) moves to N extra TLS connections while control messages stay on the
+//! ssh pipe. All frames of one file use the same stream, so they stay in order; each
+//! stream ends with `StreamEnd`, and the receiver waits for every one before finishing.
 
 use crate::cli::Options;
 use crate::delta::{BlockSig, ChunkSig, Op};
@@ -25,6 +30,7 @@ use crate::output::StatsSnapshot;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufWriter, Read, Write};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"FASTRSYN";
@@ -65,6 +71,17 @@ pub enum Sig {
     Chunks(ChunkSig),
 }
 
+/// Server → client: where to open parallel data streams and how to authenticate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOffer {
+    /// `ip:port` the server listens on (the server end of the ssh connection).
+    pub addr: String,
+    /// BLAKE3 of the server's ephemeral certificate; the client accepts nothing else.
+    pub fingerprint: [u8; 32],
+    /// Shared secret the client presents inside TLS on every stream.
+    pub token: [u8; 32],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeedReq {
     pub idx: u32,
@@ -76,6 +93,13 @@ pub enum Msg {
     /// Client → server, first frame. `opts.paths` holds the server-side paths.
     Hello { magic: [u8; 8], version: u32, server_is_sender: bool, opts: Box<Options> },
     HelloAck { version: u32 },
+    /// Parallel data streams (`--streams`): the server's offer, or why there is none.
+    StreamOffer(StreamOffer),
+    StreamUnavailable { reason: String },
+    /// Client → server: how many streams it established (0 = stay on the ssh pipe).
+    StreamsReady { count: u16 },
+    /// Last frame on a data stream.
+    StreamEnd,
     /// The peer is giving up; the message says why.
     Fatal { msg: String },
     /// Output produced on the server, printed by the client. `escape`: the text may
@@ -194,18 +218,46 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
 }
 
 /// Cloneable handle for sending frames. Frames are encoded (and compressed) on the
-/// calling thread, so many tasks can compress in parallel; the writer thread only writes.
+/// calling thread, so many tasks can compress in parallel; writer threads only write.
 #[derive(Clone)]
 pub struct FrameSender {
     tx: Sender<Vec<u8>>,
+    /// Parallel data streams, when attached: file data goes here instead of `tx`.
+    data: Option<Arc<Vec<Sender<Vec<u8>>>>>,
     compress: bool,
+}
+
+/// Which data stream a frame belongs on (`None`: control, stays on the main stream).
+/// Keyed by file id so every frame of one file travels the same, ordered, stream.
+fn data_key(f: &Frame) -> Option<u64> {
+    let id = match f {
+        Frame::Data { id, .. } => *id,
+        Frame::Msg(Msg::FileBegin { id, .. } | Msg::DeltaBegin { id, .. } | Msg::FileEnd { id, .. }) => *id,
+        Frame::Msg(Msg::SmallPack { files, .. }) => files.first()?.0,
+        _ => return None,
+    };
+    // Mix the bits: ids are `dir << 32 | index`, so low bits alone spread poorly.
+    Some(id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32)
 }
 
 impl FrameSender {
     /// Encode and queue a frame. Fails when the connection is gone.
     pub fn send(&self, frame: Frame) -> io::Result<()> {
         let buf = encode(&frame, self.compress)?;
-        self.tx.send(buf).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+        let tx = match (&self.data, data_key(&frame)) {
+            (Some(streams), Some(key)) if !streams.is_empty() => &streams[(key % streams.len() as u64) as usize],
+            _ => &self.tx,
+        };
+        tx.send(buf).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+    }
+
+    /// Close every data stream with `StreamEnd`, after all file data has been queued.
+    pub fn end_data_streams(&self) -> io::Result<()> {
+        for tx in self.data.iter().flat_map(|d| d.iter()) {
+            let buf = encode(&Frame::Msg(Msg::StreamEnd), false)?;
+            tx.send(buf).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "data stream closed"))?;
+        }
+        Ok(())
     }
 
     pub fn msg(&self, m: Msg) -> io::Result<()> {
@@ -218,7 +270,44 @@ impl FrameSender {
 pub struct Conn {
     pub out: FrameSender,
     pub rx: Receiver<io::Result<Frame>>,
+    /// A spare sender for attaching data-stream readers. Shared with the main reader
+    /// thread, which clears it when the main stream ends, so a spare never keeps the
+    /// channel open after the peer is gone. [`Conn::seal`] clears it too.
+    rtx: Arc<std::sync::Mutex<Option<Sender<io::Result<Frame>>>>>,
     writer: Option<JoinHandle<io::Result<()>>>,
+    data_writers: Vec<JoinHandle<io::Result<()>>>,
+    data_in: usize,
+}
+
+/// Clears the spare sender when the main reader thread exits, however it exits.
+struct ClearOnDrop(Arc<std::sync::Mutex<Option<Sender<io::Result<Frame>>>>>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.0.lock() {
+            g.take();
+        }
+    }
+}
+
+fn spawn_writer(name: String, writer: impl Write + Send + 'static, wrx: Receiver<Vec<u8>>) -> JoinHandle<io::Result<()>> {
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            let mut w = BufWriter::with_capacity(256 << 10, writer);
+            // An empty buffer is the close request from `Conn::finish`.
+            while let Ok(buf) = wrx.recv() {
+                if buf.is_empty() {
+                    break;
+                }
+                w.write_all(&buf)?;
+                if wrx.is_empty() {
+                    w.flush()?;
+                }
+            }
+            w.flush()
+        })
+        .expect("spawn writer thread")
 }
 
 impl Conn {
@@ -226,26 +315,13 @@ impl Conn {
         // Frames are up to ~4 MiB, so these bound memory to a few tens of MiB per side.
         let (tx, wrx) = bounded::<Vec<u8>>(16);
         let (rtx, rx) = bounded::<io::Result<Frame>>(16);
-        let writer = std::thread::Builder::new()
-            .name("fastrsync-writer".into())
-            .spawn(move || {
-                let mut w = BufWriter::with_capacity(256 << 10, writer);
-                // An empty buffer is the close request from `Conn::finish`.
-                while let Ok(buf) = wrx.recv() {
-                    if buf.is_empty() {
-                        break;
-                    }
-                    w.write_all(&buf)?;
-                    if wrx.is_empty() {
-                        w.flush()?;
-                    }
-                }
-                w.flush()
-            })
-            .expect("spawn writer thread");
+        let writer = spawn_writer("fastrsync-writer".into(), writer, wrx);
+        let spare = Arc::new(std::sync::Mutex::new(Some(rtx.clone())));
+        let spare2 = spare.clone();
         std::thread::Builder::new()
             .name("fastrsync-reader".into())
             .spawn(move || {
+                let _clear = ClearOnDrop(spare2);
                 let mut r = io::BufReader::with_capacity(256 << 10, reader);
                 loop {
                     match read_frame(&mut r) {
@@ -263,7 +339,70 @@ impl Conn {
                 }
             })
             .expect("spawn reader thread");
-        Conn { out: FrameSender { tx, compress }, rx, writer: Some(writer) }
+        Conn {
+            out: FrameSender { tx, data: None, compress },
+            rx,
+            rtx: spare,
+            writer: Some(writer),
+            data_writers: Vec::new(),
+            data_in: 0,
+        }
+    }
+
+    /// Send file data over these streams from now on (the sending side).
+    pub fn attach_data_out(&mut self, streams: Vec<Box<dyn Write + Send>>) {
+        let mut senders = Vec::with_capacity(streams.len());
+        for (i, s) in streams.into_iter().enumerate() {
+            // Shallow queues: N streams × depth × ~4 MiB frames is the memory bound.
+            let (tx, wrx) = bounded::<Vec<u8>>(4);
+            self.data_writers.push(spawn_writer(format!("fastrsync-data-{i}"), s, wrx));
+            senders.push(tx);
+        }
+        self.out.data = Some(Arc::new(senders));
+    }
+
+    /// Also receive frames from these streams (the receiving side). Each ends with `StreamEnd`.
+    pub fn attach_data_in(&mut self, streams: Vec<Box<dyn Read + Send>>) {
+        let Some(rtx) = self.rtx.lock().unwrap().clone() else { return };
+        for (i, s) in streams.into_iter().enumerate() {
+            let rtx = rtx.clone();
+            self.data_in += 1;
+            std::thread::Builder::new()
+                .name(format!("fastrsync-data-{i}"))
+                .spawn(move || {
+                    let mut r = io::BufReader::with_capacity(256 << 10, s);
+                    loop {
+                        let f = match read_frame(&mut r) {
+                            Ok(Some(f)) => f,
+                            Ok(None) => {
+                                let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "data stream closed early");
+                                let _ = rtx.send(Err(eof));
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = rtx.send(Err(e));
+                                return;
+                            }
+                        };
+                        let end = matches!(f, Frame::Msg(Msg::StreamEnd));
+                        if rtx.send(Ok(f)).is_err() || end {
+                            return;
+                        }
+                    }
+                })
+                .expect("spawn data reader thread");
+        }
+    }
+
+    /// Number of attached incoming data streams.
+    pub fn data_streams_in(&self) -> usize {
+        self.data_in
+    }
+
+    /// No more streams will be attached: from now on the peer closing the main stream
+    /// is seen as a disconnect.
+    pub fn seal(&mut self) {
+        self.rtx.lock().unwrap().take();
     }
 
     /// Turn compression on or off for frames sent from now on (before handing out clones).
@@ -290,6 +429,12 @@ impl Conn {
     /// Flush everything queued and close our side of the stream. Clones of the sender
     /// may still exist (e.g. in a forwarding `Output`), so closing is an explicit request.
     pub fn finish(mut self) -> io::Result<()> {
+        for tx in self.out.data.iter().flat_map(|d| d.iter()) {
+            let _ = tx.send(Vec::new());
+        }
+        for h in self.data_writers.drain(..) {
+            let _ = h.join();
+        }
         let _ = self.out.tx.send(Vec::new());
         match self.writer.take() {
             Some(h) => h.join().unwrap_or_else(|_| Err(io::Error::other("writer thread panicked"))),

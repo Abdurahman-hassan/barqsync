@@ -7,6 +7,7 @@ pub mod client;
 pub mod receiver;
 pub mod sender;
 pub mod server;
+pub mod streams;
 
 use crate::fsops;
 use crate::proto::{Conn, Frame};
