@@ -16,11 +16,11 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M1 | CLI, filters, parallel scan, quick-check diff, `-n -v` | done |
 | M2 | local sync engine: dirs, files, symlinks, specials, perms/times/owner, `--delete`, temp+rename, Ctrl-C cleanup | done |
 | M3 | delta engine: aligned blocks, FastCDC fallback, clone+patch, BLAKE3-verified matches | done |
-| M4 | remote over SSH (`host:path`) | next |
-| M5 | parallel TCP data streams (`--streams N`) | planned |
+| M4 | remote over SSH (`host:path`): push and pull, small-file packing, delta over the wire, `-z`, `-e`, `--remote-path` | done |
+| M5 | parallel TCP data streams (`--streams N`) | next |
 | M6 | `-H`, `--progress`, `-i`, `getattrlistbulk`/`statx` fast paths | planned |
 
-Remote paths (`host:path`) are rejected for now.
+The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
 ## Build
 
@@ -48,6 +48,37 @@ Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 20 interrupted, 23 partial
 
 Known differences: on APFS, clones also carry extended attributes (rsync needs `-X` for those).
 Hard links (`-H`) are not preserved yet.
+
+## Remote transfers
+
+```bash
+fastrsync -avz src/ user@host:/backup/src/        # push
+fastrsync -av user@host:/data/ ./data/            # pull
+fastrsync -av -e "ssh -p 2222" --remote-path=/opt/bin/fastrsync src/ host:dst/
+```
+
+Like rsync, the client starts `fastrsync --server` on the other machine through the remote
+shell (`ssh` by default, `-e` or `FASTRSYNC_RSH` to change it, `--remote-path` when the binary
+isn't on the remote `PATH`). fastrsync has to be installed on both ends. Either side can be the
+sender, and both sides run the same code:
+
+- **Pipelined listings.** The sender scans in parallel and streams one listing per directory
+  as soon as it is read. The receiver diffs each listing against its own directory as it
+  arrives, so the transfer starts before the scan ends.
+- **One round trip per directory, not per file.** For each listing the receiver answers with
+  one request naming the files it needs. For files it already has an older copy of, the
+  request carries a basis signature: aligned blocks when the size is unchanged, FastCDC
+  chunks otherwise.
+- **Small files are packed.** Files up to 128 KiB travel many-per-frame in ~4 MiB packs and
+  are written by the receiver's thread pool.
+- **Deltas over the wire.** Changed files come back as copy ranges plus only the missing
+  bytes. The receiver clones its old file and patches it where it can. Delta is the default
+  remotely, as in rsync; `-W` sends whole files.
+- **Compression.** `-z` zstd-compresses each frame on the thread that produced it, so
+  compression runs in parallel.
+- **No pipe deadlocks.** Each side has a dedicated reader and writer thread.
+- **Output.** Errors and `-v` lines produced on the server are forwarded to the client and
+  escaped there for the client's terminal.
 
 ## Delta transfer
 
@@ -86,9 +117,12 @@ src/diff.rs         quick check (size + mtime, --modify-window, -u, --size-only,
 src/fsops/          readdir + fstatat, temp names, clone/copy, utimensat, mknod
 src/local/          planner (SRC... DEST → roots) and the parallel per-directory engine
 src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild)
+src/proto/          wire frames (postcard + raw data, optional zstd), reader/writer threads
+src/remote/         client (spawns the server over ssh), server, sender and receiver roles
 src/output.rs       rsync-style item lines and stats
 tests/local_sync.rs end-to-end tests, most of them differential against rsync 3.x
 tests/delta_sync.rs --no-whole-file end to end (clone+patch, --inplace, rebuild) vs rsync
+tests/remote_sync.rs push/pull through a fake ssh, differential against rsync over the same shim
 bench/              dataset generator + hyperfine runner
 ```
 
@@ -128,6 +162,15 @@ clones, e.g. for copies to another volume.
 | A with `--inplace` (both tools) | 29.6 s | 11.6 s | 2.6× |
 | C: 500k files, 3 changed, `-a` | 12.2 s | 3.4 s | 3.6× |
 
+Benchmark D: remote push through a local fake-ssh shim (`bench/run.sh DIR D`). That measures
+the protocol and parallelism over a pipe, not a network; set `REMOTE=user@host` to run the
+same comparison over real ssh.
+
+| D: remote push (pipe) | rsync | fastrsync | speedup |
+| --- | ---: | ---: | ---: |
+| fresh copy, 200k × 4 KiB files | 45.3 s | 16.9 s | 2.7× |
+| 500k files, 3 changed | 15.2 s | 3.1 s | 4.9× |
+
 Benchmark B: a 10 GiB image with 50 scattered 1 MiB overwrites, destination reset to the old
 version before every run. rsync and fastrsync runs were interleaved because big sequential
 writes on this machine slow down as the SSD's write cache fills, which biases back-to-back
@@ -144,7 +187,7 @@ is simply cloned. When the destination can't be cloned, writing a whole new 10 G
 bound for both tools, so the delta engine's win comes from clone + patch (or `--inplace`), not
 from hashing.
 
-Peak memory is higher than rsync's (~130 MiB vs 9 MiB on A) because whole directory listings
+Peak memory is higher than rsync's (~130 MiB vs 9 MiB on A locally, ~230 MiB for a remote push) because whole directory listings
 and per-thread 1 MiB copy buffers are held at once; bounding that is on the list.
 
 ### What the measurements showed
@@ -160,5 +203,9 @@ and per-thread 1 MiB copy buffers are held at once; bounding that is on the list
 - **Rebuilding big files must write in order.** Scattered parallel 4 MiB writes into a sparse
   10 GiB file fell to 45–85 s once the SSD's write cache filled. Reading in parallel and writing
   sequentially keeps it at rsync's speed or better.
+- **Remote transfers need backpressure in both directions.** Without a cap on queued
+  small-file packs, the receiver buffered 834 MiB. Blocking sends inside nested parallel loops
+  also overflowed a 2 MiB worker stack on 5000 directories. Now packs are bounded, the
+  sender's serve path has no nested parallel loops, and workers get 32 MiB stacks.
 - **No-op syncs are bound by `lstat`.** They scale to ~20 threads; the next step is
   `getattrlistbulk` (macOS) and `statx` (Linux) bulk metadata reads.

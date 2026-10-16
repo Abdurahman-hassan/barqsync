@@ -90,6 +90,30 @@ impl DirHandle {
         })?;
         Ok(meta_from_stat(&st))
     }
+
+    pub fn readlink(&self, name: &OsStr) -> io::Result<Vec<u8>> {
+        let c = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let n = unsafe {
+                libc::readlinkat(self.fd.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+            };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if (n as usize) < buf.len() {
+                buf.truncate(n as usize);
+                return Ok(buf);
+            }
+            buf.resize(buf.len() * 4, 0);
+        }
+    }
+}
+
+/// Symlink target of `path` as raw bytes.
+pub fn read_link_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    Ok(fs::read_link(path)?.into_os_string().into_vec())
 }
 
 pub fn lstat(path: &Path) -> io::Result<Meta> {
@@ -107,11 +131,20 @@ pub fn read_dir_meta(dir: &Path) -> io::Result<Vec<DirEnt>> {
         fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
     let handle = DirHandle::open(dir)?;
     let stat_one = |name: OsString| -> Option<io::Result<DirEnt>> {
-        match handle.lstat(&name) {
-            Ok(meta) => Some(Ok(DirEnt { name, meta })),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => Some(Err(e)),
-        }
+        let meta = match handle.lstat(&name) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        let link = match meta.kind {
+            Kind::Symlink => match handle.readlink(&name) {
+                Ok(t) => Some(t),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+                Err(e) => return Some(Err(e)),
+            },
+            _ => None,
+        };
+        Some(Ok(DirEnt { name, meta, link }))
     };
     let res: io::Result<Vec<DirEnt>> = if names.len() > PARALLEL_STAT_THRESHOLD {
         names.into_par_iter().filter_map(stat_one).collect()

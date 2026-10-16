@@ -1,10 +1,11 @@
-//! File metadata model shared by the scanner, the diff engine and (later) the wire protocol.
+//! File metadata model shared by the scanner, the diff engine and the wire protocol.
 
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{FileType, Metadata};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     File,
     Dir,
@@ -40,7 +41,7 @@ impl Kind {
 }
 
 /// The subset of `lstat` results that sync decisions depend on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
     pub kind: Kind,
     pub size: u64,
@@ -73,8 +74,11 @@ impl Meta {
 }
 
 /// One directory child: its name and `lstat` metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEnt {
     pub name: OsString,
     pub meta: Meta,
+    /// Symlink target, read at scan time so a listing is self-contained (it may be
+    /// applied on another machine).
+    pub link: Option<Vec<u8>>,
 }

@@ -6,30 +6,6 @@ mod common;
 
 use common::*;
 use std::fs;
-use std::path::Path;
-
-fn rich_tree(root: &Path) -> Tree {
-    let t = Tree::new(root);
-    t.file("a.txt", "alpha\n")
-        .file("empty", "")
-        .file(".hidden", "dot")
-        .file("with space.txt", "spaces")
-        .file("ünïcødé/файл.txt", "unicode")
-        .file("sub/b.txt", "bravo")
-        .file("sub/deep/er/c.txt", "charlie")
-        .file("big.bin", vec![7u8; 3 * 1024 * 1024 + 17])
-        .dir("emptydir")
-        .dir("sub/emptyinner")
-        .symlink("link", "a.txt")
-        .symlink("sub/dangling", "../nowhere")
-        .symlink("dirlink", "sub")
-        .fifo("pipe")
-        .chmod("a.txt", 0o600)
-        .chmod("sub/b.txt", 0o755)
-        .chmod("sub/deep", 0o750)
-        .settle_mtimes();
-    t
-}
 
 #[test]
 fn fresh_copy_matches_rsync() {

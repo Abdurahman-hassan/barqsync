@@ -2,14 +2,14 @@
 # Benchmark fastrsync against rsync with hyperfine.
 #
 #   bench/gen.py  BENCH_DIR A B C      # create datasets first
-#   bench/run.sh  BENCH_DIR [A|B|C|all] [--cold]
+#   bench/run.sh  BENCH_DIR [A|B|C|D|all] [--cold]
 #
 # --cold drops the OS page cache before every run (macOS: `sudo purge`,
 # Linux: drop_caches) so disk I/O is measured, not RAM; it needs sudo.
 # Env: RSYNC=/path/to/rsync  FASTRSYNC=/path/to/fastrsync  RUNS=5
 set -euo pipefail
 
-DIR=${1:?usage: bench/run.sh BENCH_DIR [A|B|C|all] [--cold]}
+DIR=${1:?usage: bench/run.sh BENCH_DIR [A|B|C|D|all] [--cold]}
 WHICH=${2:-all}
 COLD=${3:-}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -81,6 +81,42 @@ if [[ "$WHICH" == C || "$WHICH" == all ]]; then
     -n "rsync -a" "'$RSYNC' -a '$DIR/C_src/' '$DIR/C_dst/'" \
     -n "fastrsync -a" "'$FR' -a '$DIR/C_src/' '$DIR/C_dst/'" \
     --export-markdown "$OUT/C-$tag.md"
+fi
+
+if [[ "$WHICH" == D || "$WHICH" == all ]]; then
+  # Remote transfers. With REMOTE=user@host (fastrsync and rsync installed there, both
+  # on PATH or given via REMOTE_FASTRSYNC / REMOTE_RSYNC) this goes over real ssh;
+  # otherwise through a local fake-ssh shim, which measures the protocol and the
+  # parallelism over a pipe but not a network.
+  [[ -d "$DIR/A_src" && -d "$DIR/C_src" ]] || { echo "missing A_src/C_src (run bench/gen.py $DIR A C)" >&2; exit 1; }
+  if [[ -n "${REMOTE:-}" ]]; then
+    HOST=$REMOTE; RDIR=${REMOTE_DIR:-/tmp/fastrsync-bench-remote}
+    RSH_R="-e ssh"; RSH_F="-e ssh"
+    RPATH_R=${REMOTE_RSYNC:+--rsync-path=$REMOTE_RSYNC}; RPATH_F=${REMOTE_FASTRSYNC:+--remote-path=$REMOTE_FASTRSYNC}
+    CLEAN="ssh $HOST rm -rf '$RDIR/D_dst'"
+  else
+    HOST=fakehost; RDIR=$DIR
+    printf '#!/bin/sh\nshift\nexec /bin/sh -c "$*"\n' > "$DIR/fake-ssh"; chmod +x "$DIR/fake-ssh"
+    RSH_R="-e $DIR/fake-ssh"; RSH_F="-e $DIR/fake-ssh"
+    RPATH_R="--rsync-path=$RSYNC"; RPATH_F="--remote-path=$FR"
+    CLEAN="rm -rf '$DIR/D_dst'"
+  fi
+  echo "== D1: remote push, fresh copy of A ($HOST)"
+  hyperfine --runs "$RUNS" --warmup 1 \
+    --prepare "$CLEAN$CACHE" \
+    -n "rsync -a (remote)" "'$RSYNC' -a $RSH_R $RPATH_R '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
+    -n "fastrsync -a (remote)" "'$FR' -a $RSH_F $RPATH_F '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
+    --export-markdown "$OUT/D1-$tag.md"
+  echo "== D2: remote push, near no-op of C ($HOST)"
+  eval "$CLEAN"
+  "$FR" -a $RSH_F $RPATH_F "$DIR/C_src/" "$HOST:$RDIR/D_dst/"
+  MUT="printf x >> '$DIR/C_src/dir_00001/file_00001.bin'; printf x >> '$DIR/C_src/dir_02500/file_00050.bin'; printf x >> '$DIR/C_src/dir_04999/file_00099.bin'"
+  hyperfine --runs "$RUNS" --warmup 1 \
+    --prepare "$MUT$CACHE" \
+    -n "rsync -a (remote)" "'$RSYNC' -a $RSH_R $RPATH_R '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
+    -n "fastrsync -a (remote)" "'$FR' -a $RSH_F $RPATH_F '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
+    --export-markdown "$OUT/D2-$tag.md"
+  eval "$CLEAN"
 fi
 
 echo

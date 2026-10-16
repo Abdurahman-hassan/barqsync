@@ -9,6 +9,8 @@ pub mod fsops;
 pub mod local;
 pub mod output;
 pub mod paths;
+pub mod proto;
+pub mod remote;
 
 use cli::Options;
 use paths::{Location, parse_location};
@@ -17,16 +19,19 @@ use paths::{Location, parse_location};
 pub mod exit {
     pub const OK: i32 = 0;
     pub const SYNTAX: i32 = 1;
+    pub const INCOMPATIBLE: i32 = 2;
     pub const FILE_IO: i32 = 11;
+    pub const PROTOCOL: i32 = 12;
     pub const IPC: i32 = 14;
     pub const SIGNAL: i32 = 20;
     pub const PARTIAL: i32 = 23;
+    /// The remote shell failed (e.g. ssh could not connect).
+    pub const RSH: i32 = 255;
 }
 
 pub fn run(opts: Options) -> i32 {
     if opts.server {
-        eprintln!("fastrsync: --server is not implemented yet");
-        return exit::SYNTAX;
+        return remote::server::run();
     }
     let paths = &opts.paths;
     if paths.len() < 2 {
@@ -37,8 +42,7 @@ pub fn run(opts: Options) -> i32 {
     let dest = &dest[0];
     let any_remote = paths.iter().any(|p| matches!(parse_location(p), Location::Remote { .. }));
     if any_remote {
-        eprintln!("fastrsync: remote transfers (host:path) are not implemented yet");
-        return exit::SYNTAX;
+        return remote::client::run(&opts, sources, dest);
     }
     local::run(&opts, sources, dest)
 }

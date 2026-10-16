@@ -1,10 +1,14 @@
-//! The local sync engine: one rayon task per directory, files copied in parallel.
+//! The sync engine (receiving side): one rayon task per directory.
 //!
-//! Each directory task reads its source directory, compares it with the matching
-//! destination directory, deletes extraneous entries (`--delete`), creates
-//! subdirectories and spawns tasks for them, then copies its own files in parallel.
+//! Each directory task takes the source directory's listing, compares it with the
+//! matching destination directory, deletes extraneous entries (`--delete`), creates
+//! subdirectories and descends into them, then has its changed files written.
 //! Directory attributes are applied after everything else, deepest first, so a
 //! read-only source directory stays writable while it is being filled.
+//!
+//! Locally the listing comes from `readdir` and files are copied in parallel. As a
+//! remote receiver (see `remote::receiver`), listings arrive as `DirBatch` frames,
+//! subdirectories wait for their batch, and changed files are requested from the sender.
 
 use super::Root;
 use crate::cli::Options;
@@ -33,13 +37,18 @@ pub struct Engine<'a> {
     pub out: &'a Output,
     pub stats: Stats,
     fixups: Mutex<Vec<DirFixup>>,
-    umask: u32,
+    pub(crate) umask: u32,
+    /// Set when this engine is the receiving end of a remote transfer.
+    pub(crate) remote: Option<crate::remote::receiver::RemoteState>,
 }
 
-struct DirJob {
-    src: PathBuf,
-    dst: PathBuf,
-    rel: Vec<u8>,
+pub(crate) struct DirJob {
+    pub(crate) src: PathBuf,
+    pub(crate) dst: PathBuf,
+    pub(crate) rel: Vec<u8>,
+    /// Transfer root this directory belongs to, and its id on the wire (remote only).
+    pub(crate) root: u16,
+    pub(crate) wire_dir: u32,
     depth: usize,
     /// The destination directory was just created (or would be, in a dry run): it is empty.
     dst_is_new: bool,
@@ -49,24 +58,31 @@ struct DirJob {
     pre: Option<Meta>,
 }
 
-struct Ctx<'p> {
+pub(crate) struct Ctx<'p> {
     src: &'p Path,
     dst: &'p Path,
     /// Open handle on `dst` for `fstatat` (cheaper than resolving full paths).
     dst_handle: Option<&'p fsops::DirHandle>,
     rel: &'p [u8],
+    root: u16,
     depth: usize,
     dst_is_new: bool,
     root_dev: Option<u64>,
 }
 
-struct FileJob {
-    src_path: PathBuf,
-    dst_path: PathBuf,
-    rel: Vec<u8>,
-    meta: Meta,
-    dst_meta: Option<Meta>,
+pub(crate) struct FileJob {
+    /// Index in the source listing (remote: identifies the file on the wire).
+    pub(crate) idx: u32,
+    pub(crate) src_path: PathBuf,
+    pub(crate) dst_path: PathBuf,
+    pub(crate) rel: Vec<u8>,
+    pub(crate) meta: Meta,
+    pub(crate) dst_meta: Option<Meta>,
 }
+
+/// Source entries of one directory, each with its index in the source listing and an
+/// optional destination-name override (a single file copied to a new name).
+pub(crate) type Entries = Vec<(u32, DirEnt, Option<OsString>)>;
 
 struct DirFixup {
     depth: usize,
@@ -106,20 +122,21 @@ impl<'a> Engine<'a> {
             stats: Stats::default(),
             fixups: Mutex::new(Vec::new()),
             umask: fsops::current_umask(),
+            remote: None,
         }
     }
 
-    fn err(&self, msg: impl AsRef<[u8]>) {
+    pub(crate) fn err(&self, msg: impl AsRef<[u8]>) {
         Stats::add(&self.stats.errors, 1);
         self.out.error(msg);
     }
 
-    fn dry(&self) -> bool {
+    pub(crate) fn dry(&self) -> bool {
         self.opts.dry_run
     }
 
     /// Permissions for a newly written file or directory.
-    fn new_mode(&self, src: &Meta) -> u32 {
+    pub(crate) fn new_mode(&self, src: &Meta) -> u32 {
         if self.opts.perms { src.mode } else { src.mode & 0o777 & !self.umask }
     }
 
@@ -136,31 +153,12 @@ impl<'a> Engine<'a> {
                     Ok(m) => m,
                     Err(e) => return self.err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
                 };
-                Stats::add(&self.stats.dirs, 1);
-                let pre = if dest_exists && !dest_fresh {
-                    fsops::lstat(dst).ok().filter(|m| m.kind == Kind::Dir)
-                } else {
-                    None
-                };
-                if pre.is_none() || pre.is_some_and(|p| self.opts.times && !self.rules.same_mtime(&src_meta, &p)) {
-                    self.out.item(b"", Kind::Dir, None);
-                }
-                let job = DirJob {
-                    src: src.clone(),
-                    dst: dst.clone(),
-                    rel: Vec::new(),
-                    depth: 0,
-                    dst_is_new: pre.is_none(),
-                    root_dev: Some(src_meta.dev),
-                    src_meta,
-                    pre,
-                };
+                let job = self.root_job(src.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh);
                 s.spawn(move |s| self.process_dir(s, job));
             }
             Root::Items { src_dir, dst_dir, items } => {
                 let mut entries = Vec::with_capacity(items.len());
-                let mut dst_map = HashMap::new();
-                for (sname, dname) in items {
+                for (i, (sname, dname)) in items.iter().enumerate() {
                     let sp = src_dir.join(sname);
                     let meta = match fsops::lstat(&sp) {
                         Ok(m) => m,
@@ -169,25 +167,87 @@ impl<'a> Engine<'a> {
                             continue;
                         }
                     };
-                    if self.filter.is_excluded(sname.as_bytes(), meta.kind == Kind::Dir) {
-                        continue;
-                    }
-                    if dest_exists && !dest_fresh && let Ok(dm) = fsops::lstat(&dst_dir.join(dname)) {
-                        dst_map.insert(dname.clone(), dm.kind);
-                    }
-                    entries.push((DirEnt { name: sname.clone(), meta }, Some(dname.clone())));
+                    let link = if meta.kind == Kind::Symlink { fsops::read_link_bytes(&sp).ok() } else { None };
+                    entries.push((i as u32, DirEnt { name: sname.clone(), meta, link }, Some(dname.clone())));
                 }
-                let ctx = Ctx {
-                    src: src_dir,
-                    dst: dst_dir,
-                    dst_handle: None,
-                    rel: b"",
-                    depth: 0,
-                    dst_is_new: !dest_exists || dest_fresh,
-                    root_dev: None,
-                };
-                self.process_entries(s, &ctx, entries, &dst_map);
+                self.run_items(s, src_dir, dst_dir, 0, 0, entries, !dest_exists || dest_fresh);
             }
+        }
+    }
+
+    /// The job for a `src/` root: `dst` itself gets the source directory's attributes
+    /// (shown as `./`). `check_dst`: `dst` may already exist (it wasn't just created).
+    pub(crate) fn root_job(&self, src: PathBuf, dst: PathBuf, src_meta: Meta, root: u16, check_dst: bool) -> DirJob {
+        Stats::add(&self.stats.dirs, 1);
+        let pre = if check_dst { fsops::lstat(&dst).ok().filter(|m| m.kind == Kind::Dir) } else { None };
+        if pre.is_none() || pre.is_some_and(|p| self.opts.times && !self.rules.same_mtime(&src_meta, &p)) {
+            self.out.item(b"", Kind::Dir, None);
+        }
+        DirJob {
+            src,
+            dst,
+            rel: Vec::new(),
+            root,
+            wire_dir: 0,
+            depth: 0,
+            dst_is_new: pre.is_none(),
+            root_dev: Some(src_meta.dev),
+            src_meta,
+            pre,
+        }
+    }
+
+    /// Named top-level entries (`src` without a trailing slash, or single files) synced
+    /// into `dst_dir`. Unlike a directory, `dst_dir` itself is neither pruned nor
+    /// given the source's attributes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_items<'s>(
+        &'s self,
+        s: &Scope<'s>,
+        src_dir: &Path,
+        dst_dir: &Path,
+        root: u16,
+        wire_dir: u32,
+        entries: Entries,
+        dst_is_new: bool,
+    ) {
+        let entries: Entries = entries
+            .into_iter()
+            .filter(|(_, e, _)| !self.filter.is_excluded(e.name.as_bytes(), e.meta.kind == Kind::Dir))
+            .collect();
+        let mut dst_map = HashMap::new();
+        if !dst_is_new {
+            for (_, e, dname) in &entries {
+                let dname = dname.as_ref().unwrap_or(&e.name);
+                if let Ok(dm) = fsops::lstat(&dst_dir.join(dname)) {
+                    dst_map.insert(dname.clone(), dm.kind);
+                }
+            }
+        }
+        let ctx = Ctx {
+            src: src_dir,
+            dst: dst_dir,
+            dst_handle: None,
+            rel: b"",
+            root,
+            depth: 0,
+            dst_is_new,
+            root_dev: None,
+        };
+        let (_, files) = self.process_entries(s, &ctx, entries, &dst_map);
+        self.transfer(wire_dir, files);
+    }
+
+    /// Have changed files written: copied locally, or requested from the remote sender.
+    /// Remotely this must run exactly once per listing, even with no files.
+    fn transfer(&self, wire_dir: u32, files: Vec<FileJob>) {
+        if let Some(r) = &self.remote {
+            return r.request(self, wire_dir, files);
+        }
+        match files.len() {
+            0 => {}
+            1 => self.transfer_file(&files[0]),
+            _ => files.par_iter().for_each(|j| self.transfer_file(j)),
         }
     }
 
@@ -206,12 +266,23 @@ impl<'a> Engine<'a> {
                 return self.push_fixup(&job, false);
             }
         };
-        let src_ents: Vec<DirEnt> = if self.filter.is_empty() {
-            src_ents
+        let entries = src_ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
+        self.process_listing(s, job, entries);
+    }
+
+    /// Sync one directory given its source listing.
+    pub(crate) fn process_listing<'s>(&'s self, s: &Scope<'s>, job: DirJob, entries: Entries) {
+        let files = self.diff_listing(s, &job, entries);
+        self.transfer(job.wire_dir, files);
+    }
+
+    fn diff_listing<'s>(&'s self, s: &Scope<'s>, job: &DirJob, entries: Entries) -> Vec<FileJob> {
+        let entries: Entries = if self.filter.is_empty() {
+            entries
         } else {
-            src_ents
+            entries
                 .into_iter()
-                .filter(|e| !self.filter.is_excluded(&join_rel(&job.rel, &e.name), e.meta.kind == Kind::Dir))
+                .filter(|(_, e, _)| !self.filter.is_excluded(&join_rel(&job.rel, &e.name), e.meta.kind == Kind::Dir))
                 .collect()
         };
         let dst_map = if job.dst_is_new {
@@ -221,14 +292,14 @@ impl<'a> Engine<'a> {
                 Ok(m) => m,
                 Err(e) => {
                     self.err(path_msg("opendir \"", &job.dst, format!("\" failed: {e}")));
-                    return;
+                    return Vec::new();
                 }
             }
         };
 
         let mut changed = false;
         if self.opts.delete && !job.dst_is_new {
-            changed |= self.delete_extraneous(&job, &src_ents, &dst_map);
+            changed |= self.delete_extraneous(job, &entries, &dst_map);
         }
         let dst_handle = if job.dst_is_new { None } else { fsops::DirHandle::open(&job.dst).ok() };
         let ctx = Ctx {
@@ -236,17 +307,18 @@ impl<'a> Engine<'a> {
             dst: &job.dst,
             dst_handle: dst_handle.as_ref(),
             rel: &job.rel,
+            root: job.root,
             depth: job.depth,
             dst_is_new: job.dst_is_new,
             root_dev: job.root_dev,
         };
-        let entries = src_ents.into_iter().map(|e| (e, None)).collect();
-        changed |= self.process_entries(s, &ctx, entries, &dst_map);
-        self.push_fixup(&job, changed);
+        let (c, files) = self.process_entries(s, &ctx, entries, &dst_map);
+        self.push_fixup(job, changed || c);
+        files
     }
 
-    fn delete_extraneous(&self, job: &DirJob, src_ents: &[DirEnt], dst_map: &HashMap<OsString, Kind>) -> bool {
-        let src_names: HashSet<&OsStr> = src_ents.iter().map(|e| e.name.as_os_str()).collect();
+    fn delete_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>) -> bool {
+        let src_names: HashSet<&OsStr> = entries.iter().map(|(_, e, _)| e.name.as_os_str()).collect();
         let mut extra: Vec<(&OsString, Kind)> = dst_map
             .iter()
             .filter(|(n, _)| !src_names.contains(n.as_os_str()))
@@ -373,19 +445,18 @@ impl<'a> Engine<'a> {
     // Entries
     // -----------------------------------------------------------------------
 
-    /// Handle the children of one directory. `entries` pairs each source entry with an
-    /// optional destination-name override (used when a single file is copied to a new name).
-    /// Returns whether the destination directory itself was modified.
+    /// Handle the children of one directory. Returns whether the destination directory
+    /// itself was modified, and the files whose data must be written.
     fn process_entries<'s>(
         &'s self,
         s: &Scope<'s>,
         ctx: &Ctx,
-        entries: Vec<(DirEnt, Option<OsString>)>,
+        entries: Entries,
         dst_map: &HashMap<OsString, Kind>,
-    ) -> bool {
+    ) -> (bool, Vec<FileJob>) {
         let mut changed = false;
         let mut files: Vec<FileJob> = Vec::new();
-        for (e, dname_override) in entries {
+        for (idx, e, dname_override) in entries {
             if fsops::interrupted() {
                 break;
             }
@@ -426,7 +497,7 @@ impl<'a> Engine<'a> {
                         }
                         FileAction::Transfer => {
                             changed = true;
-                            files.push(FileJob { src_path, dst_path, rel, meta: e.meta, dst_meta });
+                            files.push(FileJob { idx, src_path, dst_path, rel, meta: e.meta, dst_meta });
                         }
                     }
                 }
@@ -436,7 +507,7 @@ impl<'a> Engine<'a> {
                         self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
-                    changed |= self.handle_symlink(&e.meta, &rel, &src_path, &dst_path, dst_kind);
+                    changed |= self.handle_symlink(&e, &rel, &src_path, &dst_path, dst_kind);
                 }
                 kind => {
                     Stats::add(&self.stats.specials, 1);
@@ -453,12 +524,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        match files.len() {
-            0 => {}
-            1 => self.transfer_file(&files[0]),
-            _ => files.par_iter().for_each(|j| self.transfer_file(j)),
-        }
-        changed && !self.dry()
+        (changed && !self.dry(), files)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -520,13 +586,18 @@ impl<'a> Engine<'a> {
             src: src_path,
             dst: dst_path,
             rel,
+            root: ctx.root,
+            wire_dir: 0,
             depth: ctx.depth + 1,
             dst_is_new: is_new,
             root_dev: Some(root_dev),
             src_meta: meta,
             pre,
         };
-        if self.opts.one_file_system && meta.dev != root_dev {
+        if let Some(r) = &self.remote {
+            // The sender applies -x itself; the listing arrives as its own batch.
+            r.expect_dir(s, self, job);
+        } else if self.opts.one_file_system && meta.dev != root_dev {
             self.push_fixup(&job, false);
         } else {
             s.spawn(move |s| self.process_dir(s, job));
@@ -534,13 +605,11 @@ impl<'a> Engine<'a> {
         changed
     }
 
-    fn handle_symlink(&self, meta: &Meta, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>) -> bool {
-        let target = match fs::read_link(src_path) {
-            Ok(t) => t,
-            Err(e) => {
-                self.err(path_msg("readlink \"", src_path, format!("\" failed: {e}")));
-                return false;
-            }
+    fn handle_symlink(&self, e: &DirEnt, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>) -> bool {
+        let meta = &e.meta;
+        let Some(target) = e.link.as_deref().map(|t| PathBuf::from(OsStr::from_bytes(t))) else {
+            self.err(path_msg("readlink \"", src_path, "\" failed"));
+            return false;
         };
         match dst_kind {
             Some(Kind::Symlink) => {
@@ -657,16 +726,31 @@ impl<'a> Engine<'a> {
     // File data
     // -----------------------------------------------------------------------
 
-    fn transfer_file(&self, job: &FileJob) {
-        if fsops::interrupted() {
-            return;
-        }
+    /// Report a file that is about to be (re)written: the item line and the counters.
+    pub(crate) fn note_transfer(&self, job: &FileJob) {
         self.out.item(&job.rel, Kind::File, None);
         Stats::add(&self.stats.transferred, 1);
         Stats::add(&self.stats.transferred_bytes, job.meta.size);
         if job.dst_meta.is_none() {
             Stats::add(&self.stats.created, 1);
         }
+    }
+
+    /// Mode, owner and group the written file must end up with.
+    pub(crate) fn target_attrs(&self, job: &FileJob) -> (u32, Option<u32>, Option<u32>) {
+        let src = &job.meta;
+        let mode = match (&job.dst_meta, self.opts.perms) {
+            (Some(d), false) if d.kind == Kind::File => d.mode,
+            _ => self.new_mode(src),
+        };
+        (mode, self.rules.wanted_uid(src), self.rules.wanted_gid(src))
+    }
+
+    fn transfer_file(&self, job: &FileJob) {
+        if fsops::interrupted() {
+            return;
+        }
+        self.note_transfer(job);
         if self.dry() {
             return;
         }
@@ -680,12 +764,7 @@ impl<'a> Engine<'a> {
 
     fn write_file(&self, job: &FileJob) -> io::Result<()> {
         let src = &job.meta;
-        let mode = match (&job.dst_meta, self.opts.perms) {
-            (Some(d), false) if d.kind == Kind::File => d.mode,
-            _ => self.new_mode(src),
-        };
-        let uid = self.rules.wanted_uid(src);
-        let gid = self.rules.wanted_gid(src);
+        let (mode, uid, gid) = self.target_attrs(job);
 
         if self.delta_candidate(job) {
             match self.write_delta(job, mode, uid, gid) {
@@ -791,7 +870,7 @@ impl<'a> Engine<'a> {
 
     /// Attributes for a delta-built file. It may be a clone of the old file, which
     /// carries the old mode and mtime, so both are always set.
-    fn finish_delta_file(&self, f: &fs::File, src: &Meta, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    pub(crate) fn finish_delta_file(&self, f: &fs::File, src: &Meta, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
         fsops::fchown(f, uid, gid)?;
         fsops::fchmod(f, mode)?;
         if self.opts.times {
@@ -807,7 +886,7 @@ impl<'a> Engine<'a> {
 
     /// Set owner, mode and mtime on a freshly written file, by descriptor when we
     /// still hold one (one metadata update each, no path lookups).
-    fn apply_new_file_attrs(
+    pub(crate) fn apply_new_file_attrs(
         &self,
         path: &Path,
         copied: Copied,
@@ -859,13 +938,13 @@ impl Ctx<'_> {
     }
 }
 
-fn split_dst(path: &Path) -> (&Path, &OsStr) {
+pub(crate) fn split_dst(path: &Path) -> (&Path, &OsStr) {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     (dir, path.file_name().unwrap_or(OsStr::new("")))
 }
 
 /// Unregister a temp file that was renamed into place, or delete it on failure.
-fn finish_temp(tmp: &Path, r: io::Result<()>) -> io::Result<()> {
+pub(crate) fn finish_temp(tmp: &Path, r: io::Result<()>) -> io::Result<()> {
     match r {
         Ok(()) => {
             fsops::unregister_temp(tmp);

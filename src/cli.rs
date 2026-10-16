@@ -3,6 +3,7 @@
 use crate::filter::{RuleSpec, read_rules_file};
 use anyhow::Result;
 use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -154,11 +155,11 @@ pub struct Cli {
     sender: bool,
 
     /// SRC... DEST
-    #[arg(value_name = "PATH", required = true, num_args = 1..)]
+    #[arg(value_name = "PATH", required_unless_present = "server", num_args = 1..)]
     paths: Vec<OsString>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
     pub recursive: bool,
     pub links: bool,

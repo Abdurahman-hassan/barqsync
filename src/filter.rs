@@ -11,7 +11,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuleSpec {
     pub include: bool,
     pub pattern: String,

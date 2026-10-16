@@ -19,6 +19,7 @@
 pub mod apply;
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
@@ -104,7 +105,7 @@ fn segments(size: u64, segment: usize) -> Vec<(u64, usize)> {
 // ---------------------------------------------------------------------------
 
 /// One step of rebuilding the new file; ops are ordered by `off` and cover `0..size`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Op {
     /// `new[off..off+len] == basis[basis_off..basis_off+len]`.
     Copy { off: u64, basis_off: u64, len: u64 },
@@ -189,7 +190,7 @@ impl Delta {
 // Aligned blocks
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockSig {
     pub block_size: u32,
     pub size: u64,
@@ -227,14 +228,14 @@ pub fn diff_blocks(new: &BlockSig, basis: &BlockSig) -> Delta {
 // Content-defined chunks
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkEntry {
     pub off: u64,
     pub len: u32,
     pub hash: Hash128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkSig {
     pub size: u64,
     pub chunks: Vec<ChunkEntry>,

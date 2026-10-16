@@ -12,11 +12,16 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+/// Where a server sends its output instead of its own stdout/stderr:
+/// `(stderr, escape, text)`, printed by the client (see [`Output::print_forwarded`]).
+pub type Forward = Box<dyn Fn(bool, bool, &[u8]) + Send + Sync>;
+
 pub struct Output {
     out: Mutex<BufWriter<Stdout>>,
     verbose: u8,
     format: Option<String>,
     charset: Charset,
+    forward: Option<Forward>,
 }
 
 impl Output {
@@ -28,6 +33,30 @@ impl Output {
             verbose,
             format,
             charset: Charset::for_output(eight_bit),
+            forward: None,
+        }
+    }
+
+    /// Output for a server process: nothing is written locally, every line goes to
+    /// `forward` unescaped, so the client escapes it for its own terminal and charset.
+    pub fn forwarding(verbose: u8, out_format: Option<String>, eight_bit: bool, forward: Forward) -> Output {
+        Output { forward: Some(forward), ..Output::new(verbose, out_format, eight_bit) }
+    }
+
+    /// Print a line a server forwarded.
+    pub fn print_forwarded(&self, stderr: bool, escape_it: bool, text: &[u8]) {
+        let mut line = Vec::with_capacity(text.len() + 1);
+        if escape_it {
+            escape(text, self.charset, &mut line);
+        } else {
+            line.extend_from_slice(text);
+        }
+        line.push(b'\n');
+        if stderr {
+            self.flush();
+            let _ = std::io::stderr().lock().write_all(&line);
+        } else {
+            let _ = self.out.lock().unwrap().write_all(&line);
         }
     }
 
@@ -36,6 +65,9 @@ impl Output {
     }
 
     fn line(&self, bytes: &[u8]) {
+        if let Some(f) = &self.forward {
+            return f(false, false, bytes);
+        }
         let mut out = self.out.lock().unwrap();
         let _ = out.write_all(bytes);
         let _ = out.write_all(b"\n");
@@ -44,6 +76,9 @@ impl Output {
     /// Write a line that may contain names. Like rsync, the whole line is escaped,
     /// `--out-format` text included.
     fn escaped_line(&self, text: &[u8]) {
+        if let Some(f) = &self.forward {
+            return f(false, true, text);
+        }
         let mut line = Vec::with_capacity(text.len() + 1);
         escape(text, self.charset, &mut line);
         line.push(b'\n');
@@ -112,6 +147,9 @@ impl Output {
     /// Error to stderr, escaped like the other lines. Build names into the message with
     /// [`path_msg`], not `Path::display()`, which turns invalid UTF-8 into U+FFFD.
     pub fn error(&self, msg: impl AsRef<[u8]>) {
+        if let Some(f) = &self.forward {
+            return f(true, true, &[b"fastrsync: ", msg.as_ref()].concat());
+        }
         self.flush();
         let mut line = b"fastrsync: ".to_vec();
         escape(msg.as_ref(), self.charset, &mut line);
@@ -285,7 +323,47 @@ pub struct Stats {
     pub errors: AtomicU64,
 }
 
+/// Plain copy of [`Stats`] for sending over the wire.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct StatsSnapshot(pub [u64; 14]);
+
+impl StatsSnapshot {
+    pub fn errors(&self) -> u64 {
+        self.0[13]
+    }
+}
+
 impl Stats {
+    fn fields(&self) -> [&AtomicU64; 14] {
+        [
+            &self.files,
+            &self.dirs,
+            &self.links,
+            &self.specials,
+            &self.total_size,
+            &self.created,
+            &self.transferred,
+            &self.transferred_bytes,
+            &self.cloned,
+            &self.delta_files,
+            &self.literal_bytes,
+            &self.matched_bytes,
+            &self.deleted,
+            &self.errors,
+        ]
+    }
+
+    pub fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot(self.fields().map(Self::get))
+    }
+
+    /// Add another process's counters into these.
+    pub fn absorb(&self, s: &StatsSnapshot) {
+        for (c, v) in self.fields().into_iter().zip(s.0) {
+            Self::add(c, v);
+        }
+    }
+
     pub fn add(c: &AtomicU64, n: u64) {
         c.fetch_add(n, Relaxed);
     }

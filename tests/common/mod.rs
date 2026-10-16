@@ -233,8 +233,10 @@ impl RunOut {
 }
 
 fn is_item_line(l: &[u8]) -> bool {
-    const SUMMARY: [&[u8]; 8] = [
+    const SUMMARY: [&[u8]; 10] = [
         b"sending incremental file list",
+        b"receiving incremental file list",
+        b"receiving file list",
         b"building file list",
         b"sent ",
         b"total size is",
@@ -340,4 +342,65 @@ pub fn normalize(items: Vec<String>, from: &str, to: &str) -> Vec<String> {
     let mut v: Vec<String> = items.into_iter().map(|l| l.replace(from, to)).collect();
     v.sort();
     v
+}
+
+/// A tree exercising every entry type and some awkward names and permissions.
+pub fn rich_tree(root: &Path) -> Tree {
+    let t = Tree::new(root);
+    t.file("a.txt", "alpha\n")
+        .file("empty", "")
+        .file(".hidden", "dot")
+        .file("with space.txt", "spaces")
+        .file("ünïcødé/файл.txt", "unicode")
+        .file("sub/b.txt", "bravo")
+        .file("sub/deep/er/c.txt", "charlie")
+        .file("big.bin", vec![7u8; 3 * 1024 * 1024 + 17])
+        .dir("emptydir")
+        .dir("sub/emptyinner")
+        .symlink("link", "a.txt")
+        .symlink("sub/dangling", "../nowhere")
+        .symlink("dirlink", "sub")
+        .fifo("pipe")
+        .chmod("a.txt", 0o600)
+        .chmod("sub/b.txt", 0o755)
+        .chmod("sub/deep", 0o750)
+        .settle_mtimes();
+    t
+}
+
+/// A stand-in for ssh: drops the host argument and runs the remote command locally,
+/// so remote transfers can be tested without an ssh server.
+pub fn fake_ssh(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("fake-ssh");
+    fs::write(&p, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n").unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// Run `args` through rsync and fastrsync as a remote transfer via [`fake_ssh`].
+/// `{dst}` becomes the per-tool name and `{host}` the `fakehost:` prefix.
+pub fn both_remote(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
+    let rsync_bin = reference_rsync()?;
+    let shim = fake_ssh(cwd);
+    let shim = shim.to_str().unwrap();
+    let sub = |d: &str| -> Vec<String> {
+        args.iter().map(|a| a.replace("{dst}", d).replace("{host}", "fakehost:")).collect()
+    };
+    let mut ra = vec!["-e".to_string(), shim.to_string(), format!("--rsync-path={}", rsync_bin.display())];
+    ra.extend(sub(dst_r));
+    let mut fa = vec!["-e".to_string(), shim.to_string(), format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync"))];
+    fa.extend(sub(dst_f));
+    let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let f = fastrsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>());
+    Some((r, f))
+}
+
+/// fastrsync alone as a remote transfer via [`fake_ssh`] (`{host}` = `fakehost:`).
+pub fn fastrsync_remote(cwd: &Path, args: &[&str]) -> RunOut {
+    let shim = fake_ssh(cwd);
+    let mut fa = vec!["-e".to_string(), shim.to_str().unwrap().to_string()];
+    fa.push(format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync")));
+    fa.extend(args.iter().map(|a| a.replace("{host}", "fakehost:")));
+    fastrsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>())
 }
