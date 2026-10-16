@@ -182,6 +182,31 @@ bench/run.sh /tmp/fr-bench all --cold      # drops the page cache between runs (
 `--no-clone` (hidden flag) forces buffered copies, which shows the engine's speed without APFS
 clones, e.g. for copies to another volume.
 
+### Verification harness (original plan §8)
+
+```bash
+bench/net/container.sh build              # Linux image: sshd, tc, strace, perf, inferno
+bench/net/container.sh net lan wan lossy  # rsync vs fastrsync over real ssh, tc-shaped links
+bench/net/container.sh syscalls           # strace -c syscall counts
+bench/net/container.sh flamegraph copy    # perf flamegraph (copy | noop | delta)
+bench/net/container.sh test               # cargo test + clippy on Linux
+bench/flamegraph.sh copy                  # macOS flamegraph via `sample` (cargo install inferno)
+bench/remote_setup.sh user@host           # install fastrsync on a real second machine
+FASTRSYNC_TEST_REMOTE=user@host cargo test --test real_remote   # tests over real ssh
+```
+
+- **What the container does:** it shapes its own loopback interface with `tc netem`, so ssh,
+  the `--streams` TCP connections (and later QUIC) all cross the same emulated link. The
+  container runs privileged (needed for `tc`, `perf` and `drop_caches`) and touches nothing
+  outside itself.
+- **Link profiles:**
+  - `lan`: 1 Gbit, ~0.2 ms RTT
+  - `wan`: 100 Mbit, ~20 ms RTT
+  - `lossy`: 20 Mbit, ~80 ms RTT, ~1% loss
+- **Benchmark A** also times `cp -a` and the platform's fastest stock copy (`cp -ac` clones
+  on macOS, `--reflink=auto` on Linux).
+- **Not covered:** NFS mounts (they need an NFS server).
+
 ### Results (M-series Mac, 10 cores, APFS, warm cache, rsync 3.5.1)
 
 | Workload | rsync | fastrsync | speedup |
@@ -223,6 +248,47 @@ from hashing.
 
 Peak memory is higher than rsync's (~130 MiB vs 9 MiB on A locally, ~230 MiB for a remote push) because whole directory listings
 and per-thread 1 MiB copy buffers are held at once; bounding that is on the list.
+
+### Over a network (Linux container, real sshd, `tc netem` on loopback, data on tmpfs, 3 runs)
+
+| Profile | Workload | rsync | fastrsync (ssh) | fastrsync `--streams 4` |
+|---|---|---:|---:|---:|
+| LAN 1 Gbit | 8k × 4 KiB push | 0.49 s | **0.46 s** | 0.47 s |
+| LAN | 256 MiB, 8 × 1 MiB changed | 0.49 s | **0.34 s** | 0.35 s |
+| LAN | 40k files, 3 changed | 0.32 s | **0.19 s** | 0.20 s |
+| WAN 100 Mbit, 20 ms | small push | 3.59 s | **3.40 s** | 3.88 s |
+| WAN | delta | 1.64 s | **1.57 s** | 1.78 s |
+| WAN | no-op | 1.82 s | **0.69 s** | 0.84 s |
+| Lossy 20 Mbit, 80 ms, 1% | small push | 79.2 s | 79.5 s | **24.4 s** |
+| Lossy | delta | 18.2 s | **17.0 s** | 22.2 s (±6.3) |
+| Lossy | no-op | 5.80 s | 3.73 s | **3.05 s** |
+
+What this shows:
+
+- **When a transfer is limited by the link or by ssh, the tools tie.** Both push data through
+  ssh's single encryption thread (~130 MB/s in this VM).
+- **fastrsync wins on no-ops** (1.7–2.6×), where rsync's single-threaded scan dominates.
+- **`--streams` wins big on lossy links** (3.3×). One TCP flow can't fill a lossy,
+  high-latency link; several can. On clean links its extra connection setup costs a little.
+- **One big file gains nothing from `--streams`:** all frames of a file use one stream.
+
+Syscalls (`strace -c -f`, Linux, 20k files; the original plan's bar is ≥ 50% fewer than rsync):
+
+| Workload | rsync | fastrsync |
+|---|---:|---:|
+| Copy 20k × 4 KiB | 404,488 | **182,155** (−55%) |
+| No-op over 20k files | 42,684 | 44,410 (+4%) |
+
+- **No-op:** both tools need two stats per file (source and destination), and Linux has no
+  bulk stat, so the no-op count can't drop much. fastrsync's no-op speed comes from
+  parallelism.
+- **Copy:** getting under the bar took two fixes found in these traces. An extra
+  `copy_file_range` call per file only to see EOF is now skipped. A `fchmod` after every
+  `chown` is now done only when setuid/setgid bits are involved.
+
+Flamegraphs (`bench/flamegraph.sh`; Linux via perf, macOS via `sample`) show the time going into
+`openat`/`copy_file_range` (copy), `pwrite` (delta) and `statx`/`getdents` (no-op). No lock
+contention or allocation shows up in the hot frames.
 
 ### What the measurements showed
 

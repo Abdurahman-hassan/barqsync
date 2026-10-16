@@ -26,7 +26,10 @@ pub fn clone_into_new(src: &File, tmp: &Path) -> io::Result<bool> {
     }
 }
 
-pub fn copy_new(src: &File, tmp: &Path, _size: u64, mode: u32) -> io::Result<Copied> {
+/// Bytes requested per `copy_file_range` call.
+const CHUNK: usize = 64 << 20;
+
+pub fn copy_new(src: &File, tmp: &Path, size: u64, mode: u32) -> io::Result<Copied> {
     let dst = create_new(tmp, mode)?;
     let mut copied: u64 = 0;
     loop {
@@ -37,7 +40,7 @@ pub fn copy_new(src: &File, tmp: &Path, _size: u64, mode: u32) -> io::Result<Cop
                 std::ptr::null_mut(),
                 dst.as_raw_fd(),
                 std::ptr::null_mut(),
-                64 << 20,
+                CHUNK,
                 0,
             )
         };
@@ -46,6 +49,11 @@ pub fn copy_new(src: &File, tmp: &Path, _size: u64, mode: u32) -> io::Result<Cop
         }
         if n > 0 {
             copied += n as u64;
+            // A short copy means EOF; once the expected size is in, skip the extra call that
+            // would only return 0 (one syscall per file saved). A file that grew keeps looping.
+            if (n as usize) < CHUNK && copied >= size {
+                return Ok(Copied::Written(dst));
+            }
             continue;
         }
         let err = io::Error::last_os_error();
