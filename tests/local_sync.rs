@@ -329,3 +329,116 @@ fn non_utf8_names_round_trip() {
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_same_tree(&snapshot(&src, true), &snapshot(&tmp.path().join("dst"), true));
 }
+
+/// Build `src` with a file, a directory (holding `x`) and a symlink per name (its target
+/// is the name plus an invalid UTF-8 byte), then compare rsync's and fastrsync's raw
+/// output under LC_ALL=`locale`, with and without `-8`, for `-rv --delete` (symlinks are
+/// skipped as non-regular files) and `-av --delete` (`name -> target`). Each destination
+/// starts with a stale file per name, so `deleting` lines are covered too.
+fn assert_names_escaped_like_rsync(names: &[&[u8]], locale: &str) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let at = |dir: &str, prefix: &[u8], name: &[u8]| tmp.path().join(dir).join(OsStr::from_bytes(&[prefix, name].concat()));
+    fs::create_dir(tmp.path().join("src")).unwrap();
+    for n in names {
+        fs::write(at("src", b"f-", n), n).unwrap();
+        fs::create_dir(at("src", b"d-", n)).unwrap();
+        fs::write(at("src", b"d-", n).join("x"), "x").unwrap();
+        std::os::unix::fs::symlink(OsStr::from_bytes(&[b"t-", *n, b"\xff"].concat()), at("src", b"l-", n)).unwrap();
+    }
+    let shown = |lines: Vec<Vec<u8>>| -> Vec<String> { lines.iter().map(|l| l.escape_ascii().to_string()).collect() };
+    for (i, flags) in [["-rv", "--delete"], ["-av", "--delete"]].iter().enumerate() {
+        for eight_bit in [false, true] {
+            let (dr, df) = (format!("r{i}-{eight_bit}"), format!("f{i}-{eight_bit}"));
+            for d in [&dr, &df] {
+                fs::create_dir(tmp.path().join(d)).unwrap();
+                for n in names {
+                    fs::write(at(d, b"s-", n), "stale").unwrap();
+                }
+            }
+            let mut args = flags.to_vec();
+            if eight_bit {
+                args.push("-8");
+            }
+            args.extend(["src/", "{dst}"]);
+            let (r, f) = both_in_locale(tmp.path(), locale, &args, &dr, &df).unwrap();
+            assert_eq!((r.code, f.code), (0, 0), "{args:?}\nrsync: {}\nfastrsync: {}", r.stderr, f.stderr);
+            assert_eq!(shown(r.raw_items()), shown(f.raw_items()), "LC_ALL={locale} {args:?}");
+            assert!(
+                !f.raw.iter().any(|&b| b < b' ' && b != b'\n' && b != b'\t'),
+                "raw control character in output: {}",
+                f.raw.escape_ascii()
+            );
+            assert_same_tree(
+                &without_mtimes(snapshot(&tmp.path().join(&dr), false)),
+                &without_mtimes(snapshot(&tmp.path().join(&df), false)),
+            );
+        }
+    }
+}
+
+#[test]
+fn control_characters_in_names_are_escaped_like_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    // Valid UTF-8 only, so the names can exist on APFS too.
+    let names: &[&[u8]] = &[
+        b"nl\nx",
+        b"esc\x1b[31mred",
+        b"ctl\x01",
+        b"tab\tx",
+        b"del\x7fx",
+        br"lit\#123x",
+        "café".as_bytes(),
+        "c1\u{9b}x".as_bytes(),
+    ];
+    assert_names_escaped_like_rsync(names, TEST_LOCALE);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_ascii_names_are_escaped_per_locale_like_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let names: &[&[u8]] = &[
+        b"caf\xc3\xa9",
+        b"c1\xc2\x9bx",
+        b"bad\xffx",
+        b"lat\xe9x",
+        b"overlong\xc0\x80",
+        b"surr\xed\xa0\x80",
+        b"big\xf4\x90\x80\x80",
+        b"five\xf8\x88\x80\x80\x80",
+        b"trunc\xe2\x82",
+        b"trunc2\xe2\x82(",
+        b"cut\\#\xff123",
+        b"ctl\x01\xe9",
+    ];
+    // No system has xx_XX installed: glibc falls back to the C locale for both tools.
+    for locale in ["C", "C.UTF-8", "xx_XX.UTF-8"] {
+        assert_names_escaped_like_rsync(names, locale);
+    }
+}
+
+/// Names in error messages are escaped from their raw bytes too: an invalid UTF-8
+/// byte shows as `\#377` (as in rsync), not as a U+FFFD that went through `Path::display()`.
+/// The source is missing, so the name never has to exist (APFS would refuse it).
+#[test]
+fn error_messages_escape_invalid_utf8_like_rsync() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("ok", "1");
+    let args = |dst: &'static str| [OsStr::new("-a"), OsStr::new("src/ok"), OsStr::from_bytes(b"src/no\xff"), OsStr::new(dst)];
+    for locale in ["C.UTF-8", "C"] {
+        let f = fastrsync_os_in_locale(tmp.path(), locale, &args("dst-f"));
+        assert_eq!(f.code, 23, "LC_ALL={locale}: {}", f.stderr);
+        assert!(f.stderr.contains(r#"link_stat "src/no\#377" failed"#), "LC_ALL={locale}: {}", f.stderr);
+        if let Some(r) = rsync_os_in_locale(tmp.path(), locale, &args("dst-r")) {
+            assert!(r.stderr.contains(r#"/src/no\#377" failed"#), "rsync, LC_ALL={locale}: {}", r.stderr);
+        }
+    }
+}

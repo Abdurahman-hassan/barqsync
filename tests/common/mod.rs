@@ -211,31 +211,39 @@ pub struct RunOut {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// `stdout` as bytes, before the lossy UTF-8 conversion.
+    pub raw: Vec<u8>,
 }
 
 impl RunOut {
     /// Item/deletion lines only, sorted (drops headers and summaries of both tools).
     pub fn items(&self) -> Vec<String> {
-        let mut v: Vec<String> = self
-            .stdout
-            .lines()
-            .filter(|l| {
-                !(l.is_empty()
-                    || l.starts_with("sending incremental file list")
-                    || l.starts_with("building file list")
-                    || l.starts_with("sent ")
-                    || l.starts_with("total size is")
-                    || l.starts_with("transferred ")
-                    || l.starts_with("Number of")
-                    || l.starts_with("Total ")
-                    || l.starts_with("Elapsed")
-                    || l.contains("(DRY RUN)"))
-            })
-            .map(str::to_string)
-            .collect();
+        let mut v: Vec<String> =
+            self.stdout.lines().filter(|l| is_item_line(l.as_bytes())).map(str::to_string).collect();
         v.sort();
         v
     }
+
+    /// [`items`](Self::items) as raw bytes, for output that is not valid UTF-8.
+    pub fn raw_items(&self) -> Vec<Vec<u8>> {
+        let mut v: Vec<Vec<u8>> = self.raw.split(|&b| b == b'\n').filter(|l| is_item_line(l)).map(<[u8]>::to_vec).collect();
+        v.sort();
+        v
+    }
+}
+
+fn is_item_line(l: &[u8]) -> bool {
+    const SUMMARY: [&[u8]; 8] = [
+        b"sending incremental file list",
+        b"building file list",
+        b"sent ",
+        b"total size is",
+        b"transferred ",
+        b"Number of",
+        b"Total ",
+        b"Elapsed",
+    ];
+    !(l.is_empty() || SUMMARY.iter().any(|p| l.starts_with(p)) || l.windows(9).any(|w| w == b"(DRY RUN)"))
 }
 
 fn run(cmd: &mut Command, cwd: &Path) -> RunOut {
@@ -244,15 +252,29 @@ fn run(cmd: &mut Command, cwd: &Path) -> RunOut {
         code: o.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        raw: o.stdout,
     }
 }
 
+/// Locale (LC_ALL) for both tools in differential runs. Under C/POSIX, the default in
+/// containers and CI, glibc rsync and fastrsync on Linux escape non-ASCII names as
+/// `\#ooo`; UTF-8 keeps them readable. Tests of that escaping pick their own locale.
+pub const TEST_LOCALE: &str = "C.UTF-8";
+
 pub fn fastrsync(cwd: &Path, args: &[&str]) -> RunOut {
-    run(Command::new(env!("CARGO_BIN_EXE_fastrsync")).args(args), cwd)
+    fastrsync_in_locale(cwd, TEST_LOCALE, args)
+}
+
+pub fn fastrsync_in_locale(cwd: &Path, locale: &str, args: &[&str]) -> RunOut {
+    run(Command::new(env!("CARGO_BIN_EXE_fastrsync")).env("LC_ALL", locale).args(args), cwd)
 }
 
 pub fn fastrsync_os(cwd: &Path, args: &[&OsStr]) -> RunOut {
-    run(Command::new(env!("CARGO_BIN_EXE_fastrsync")).args(args), cwd)
+    fastrsync_os_in_locale(cwd, TEST_LOCALE, args)
+}
+
+pub fn fastrsync_os_in_locale(cwd: &Path, locale: &str, args: &[&OsStr]) -> RunOut {
+    run(Command::new(env!("CARGO_BIN_EXE_fastrsync")).env("LC_ALL", locale).args(args), cwd)
 }
 
 /// Reference rsync (3.x, not openrsync). `RSYNC=/path` overrides discovery.
@@ -274,20 +296,34 @@ pub fn reference_rsync() -> Option<PathBuf> {
 }
 
 pub fn rsync(cwd: &Path, args: &[&str]) -> Option<RunOut> {
+    rsync_in_locale(cwd, TEST_LOCALE, args)
+}
+
+pub fn rsync_in_locale(cwd: &Path, locale: &str, args: &[&str]) -> Option<RunOut> {
     let r = reference_rsync()?;
-    Some(run(Command::new(r).args(args), cwd))
+    Some(run(Command::new(r).env("LC_ALL", locale).args(args), cwd))
+}
+
+pub fn rsync_os_in_locale(cwd: &Path, locale: &str, args: &[&OsStr]) -> Option<RunOut> {
+    let r = reference_rsync()?;
+    Some(run(Command::new(r).env("LC_ALL", locale).args(args), cwd))
 }
 
 /// Run the same arguments through rsync and fastrsync, substituting `{dst}`
 /// with a per-tool destination. Returns (rsync, fastrsync) results, or None
 /// when no reference rsync is installed.
 pub fn both(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
+    both_in_locale(cwd, TEST_LOCALE, args, dst_r, dst_f)
+}
+
+/// [`both`] with LC_ALL=`locale` for both tools.
+pub fn both_in_locale(cwd: &Path, locale: &str, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
     reference_rsync()?;
     let sub = |d: &str| -> Vec<String> { args.iter().map(|a| a.replace("{dst}", d)).collect() };
     let ra = sub(dst_r);
     let fa = sub(dst_f);
-    let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
-    let f = fastrsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>());
+    let r = rsync_in_locale(cwd, locale, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let f = fastrsync_in_locale(cwd, locale, &fa.iter().map(String::as_str).collect::<Vec<_>>());
     Some((r, f))
 }
 

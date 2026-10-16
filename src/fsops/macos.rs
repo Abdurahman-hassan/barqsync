@@ -16,31 +16,27 @@ const CLONE_NOOWNERCOPY: u32 = 0x0002;
 const CLONE_MIN_SIZE: u64 = 512 * 1024;
 
 pub fn copy_new(src: &File, tmp: &Path, size: u64, mode: u32) -> io::Result<Copied> {
-    if size < CLONE_MIN_SIZE {
-        let dst = create_new(tmp, mode)?;
-        copy_buffered(src, &dst)?;
-        return Ok(Copied::Written(dst));
+    if size >= CLONE_MIN_SIZE && clone_into_new(src, tmp)? {
+        return Ok(Copied::Clone);
     }
+    let dst = create_new(tmp, mode)?;
+    copy_buffered(src, &dst)?;
+    Ok(Copied::Written(dst))
+}
+
+/// Clone `src` to the new path `tmp` with `fclonefileat`. `Ok(false)` means the
+/// filesystem can't clone (non-APFS, cross-volume) and nothing was created.
+pub fn clone_into_new(src: &File, tmp: &Path) -> io::Result<bool> {
     let c = cstr(tmp)?;
     let r = unsafe {
-        libc::fclonefileat(
-            src.as_raw_fd(),
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            CLONE_NOFOLLOW | CLONE_NOOWNERCOPY,
-        )
+        libc::fclonefileat(src.as_raw_fd(), libc::AT_FDCWD, c.as_ptr(), CLONE_NOFOLLOW | CLONE_NOOWNERCOPY)
     };
     if r == 0 {
-        return Ok(Copied::Clone);
+        return Ok(true);
     }
     let err = io::Error::last_os_error();
     match err.raw_os_error() {
-        Some(libc::EEXIST) => Err(err),
-        Some(libc::ENOTSUP | libc::EXDEV | libc::EINVAL | libc::ENOSYS | libc::EPERM) => {
-            let dst = create_new(tmp, mode)?;
-            copy_buffered(src, &dst)?;
-            Ok(Copied::Written(dst))
-        }
+        Some(libc::ENOTSUP | libc::EXDEV | libc::EINVAL | libc::ENOSYS | libc::EPERM) => Ok(false),
         _ => Err(err),
     }
 }

@@ -1,6 +1,7 @@
 //! fastrsync: a parallel, rsync-compatible file synchronizer.
 
 pub mod cli;
+pub mod delta;
 pub mod diff;
 pub mod entry;
 pub mod filter;

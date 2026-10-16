@@ -15,8 +15,8 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M0 | toolchain, crate, release profile | done |
 | M1 | CLI, filters, parallel scan, quick-check diff, `-n -v` | done |
 | M2 | local sync engine: dirs, files, symlinks, specials, perms/times/owner, `--delete`, temp+rename, Ctrl-C cleanup | done |
-| M3 | delta engine: aligned blocks, FastCDC fallback, clone+patch, BLAKE3 verify | next |
-| M4 | remote over SSH (`host:path`) | planned |
+| M3 | delta engine: aligned blocks, FastCDC fallback, clone+patch, BLAKE3-verified matches | done |
+| M4 | remote over SSH (`host:path`) | next |
 | M5 | parallel TCP data streams (`--streams N`) | planned |
 | M6 | `-H`, `--progress`, `-i`, `getattrlistbulk`/`statx` fast paths | planned |
 
@@ -38,7 +38,8 @@ With Homebrew's keg-only rustup, add `/opt/homebrew/opt/rustup/bin` to `PATH`.
 `--out-format` (`%n`, `%L`), `--delete`, `--delete-excluded`,
 `--exclude/--include/--exclude-from/--include-from` (rsync wildcard rules, first match wins,
 `/` anchoring, trailing `/` for directories, `**`, `dir/***`), `-u`, `--size-only`, `-I`,
-`--ignore-existing`, `-x`, `--modify-window` (`-1` compares nanoseconds), `--inplace` (also
+`--ignore-existing`, `-x`, `--modify-window` (`-1` compares nanoseconds), `-W/--whole-file`,
+`--no-whole-file` (delta transfer; locally off by default, like rsync), `--inplace` (also
 writes new files directly, like rsync),
 `--fsync`, `--stats`, `-h`, `--threads N`.
 
@@ -47,6 +48,33 @@ Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 20 interrupted, 23 partial
 
 Known differences: on APFS, clones also carry extended attributes (rsync needs `-X` for those).
 Hard links (`-H`) are not preserved yet.
+
+## Delta transfer
+
+With `--no-whole-file` (and, from M4, by default for remote syncs), a changed file is rebuilt
+from the old destination file plus only the ranges that differ:
+
+1. **Aligned blocks first.** Both files are hashed in parallel in 64 KiB blocks at the same
+   offsets. This is ideal for in-place changes and appends (VM images, databases, logs).
+2. **FastCDC fallback.** If under half the bytes matched, both files are re-chunked by
+   content (16/32/64 KiB chunks inside 4 MiB segments, in parallel), so inserted or deleted
+   bytes only cost the chunks around them.
+3. **Clone + patch.** When matched ranges keep their offsets, the old file is cloned (APFS
+   `fclonefileat`, Linux `FICLONE`) and only the changed ranges are written. Otherwise the
+   new file is rebuilt in parallel. With `--inplace`, changes go straight into the destination.
+
+Blocks and chunks are matched by BLAKE3 (128-bit), so every reused range is cryptographically
+verified. That replaces the originally planned xxh3 + whole-file check, because a whole-file
+check would have to re-read the entire output and cancel out clone+patch. BLAKE3 per block runs
+at ~12.6 GB/s on all cores of an M-series Mac, faster than the SSD.
+
+| Change to a 6 MiB file | bytes written |
+| --- | ---: |
+| 4 KiB overwritten in place | 64 KiB |
+| 300 KB appended | 300 KB |
+| 777 bytes inserted at the start | 83 KB |
+| 12 KB removed from the middle | 109 KB |
+| truncated to 4 MiB | 17 B |
 
 ## Layout
 
@@ -57,8 +85,10 @@ src/filter.rs       rsync wildmatch + include/exclude rules
 src/diff.rs         quick check (size + mtime, --modify-window, -u, --size-only, ...)
 src/fsops/          readdir + fstatat, temp names, clone/copy, utimensat, mknod
 src/local/          planner (SRC... DEST → roots) and the parallel per-directory engine
+src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild)
 src/output.rs       rsync-style item lines and stats
 tests/local_sync.rs end-to-end tests, most of them differential against rsync 3.x
+tests/delta_sync.rs --no-whole-file end to end (clone+patch, --inplace, rebuild) vs rsync
 bench/              dataset generator + hyperfine runner
 ```
 
@@ -67,6 +97,10 @@ bench/              dataset generator + hyperfine runner
 ```bash
 cargo test
 ```
+
+The delta engine also has property tests (random insert/delete/overwrite/append/truncate
+sequences; every delta must rebuild the new file exactly via both rebuild and clone+patch).
+`PROPTEST_CASES=5000 cargo test --release delta` runs a longer sweep.
 
 The integration tests run each scenario through the reference rsync 3.x as well (found at
 `/opt/homebrew/bin/rsync`, `/usr/local/bin/rsync` or `/usr/bin/rsync`, or set
@@ -94,6 +128,22 @@ clones, e.g. for copies to another volume.
 | A with `--inplace` (both tools) | 29.6 s | 11.6 s | 2.6× |
 | C: 500k files, 3 changed, `-a` | 12.2 s | 3.4 s | 3.6× |
 
+Benchmark B: a 10 GiB image with 50 scattered 1 MiB overwrites, destination reset to the old
+version before every run. rsync and fastrsync runs were interleaved because big sequential
+writes on this machine slow down as the SSD's write cache fills, which biases back-to-back
+runs.
+
+| B: 10 GiB, 50 × 1 MiB changed | rsync | fastrsync | speedup |
+| --- | ---: | ---: | ---: |
+| `-a --no-whole-file`, APFS (clone + patch 50 MiB) | 20.2 / 19.5 / 22.7 s | 6.9 / 6.8 / 6.5 s | ~3× |
+| `-a --no-whole-file`, no clones (full rebuild, e.g. ext4/exFAT) | 20.2 / 19.5 / 22.7 s | 20.0 / 17.3 / 18.5 s | 1.0–1.2× |
+| `-a` (whole file), same APFS volume | 15.9 s | 0.013 s (clone of the source) | — |
+
+The last row says more about APFS than about fastrsync: on the same volume, a changed big file
+is simply cloned. When the destination can't be cloned, writing a whole new 10 GiB file is disk
+bound for both tools, so the delta engine's win comes from clone + patch (or `--inplace`), not
+from hashing.
+
 Peak memory is higher than rsync's (~130 MiB vs 9 MiB on A) because whole directory listings
 and per-thread 1 MiB copy buffers are held at once; bounding that is on the list.
 
@@ -107,5 +157,8 @@ and per-thread 1 MiB copy buffers are held at once; bounding that is on the list
   final name (rsync does the same with `--inplace`). The default stays rsync's atomic
   temp+rename. Either way the mtime is set last, so an interrupted copy never passes the
   quick check on the next run.
+- **Rebuilding big files must write in order.** Scattered parallel 4 MiB writes into a sparse
+  10 GiB file fell to 45–85 s once the SSD's write cache filled. Reading in parallel and writing
+  sequentially keeps it at rsync's speed or better.
 - **No-op syncs are bound by `lstat`.** They scale to ~20 threads; the next step is
   `getattrlistbulk` (macOS) and `statx` (Linux) bulk metadata reads.

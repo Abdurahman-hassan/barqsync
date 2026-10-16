@@ -8,11 +8,12 @@
 
 use super::Root;
 use crate::cli::Options;
+use crate::delta::{self, apply::apply};
 use crate::diff::{AttrDiff, DiffRules, FileAction, file_action};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::filter::Filter;
 use crate::fsops::{self, Copied};
-use crate::output::{Output, Stats};
+use crate::output::{Output, Stats, path_msg};
 use crate::paths::join_rel;
 use rayon::Scope;
 use rayon::prelude::*;
@@ -76,8 +77,9 @@ struct DirFixup {
     gid: Option<u32>,
 }
 
-fn quoted(rel: &[u8]) -> String {
-    String::from_utf8_lossy(if rel.is_empty() { b"." } else { rel }).into_owned()
+/// A name for a message: the root shows as `.`.
+fn quoted(rel: &[u8]) -> &[u8] {
+    if rel.is_empty() { b"." } else { rel }
 }
 
 impl<'a> Engine<'a> {
@@ -107,7 +109,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn err(&self, msg: impl std::fmt::Display) {
+    fn err(&self, msg: impl AsRef<[u8]>) {
         Stats::add(&self.stats.errors, 1);
         self.out.error(msg);
     }
@@ -132,7 +134,7 @@ impl<'a> Engine<'a> {
             Root::Contents { src, dst } => {
                 let src_meta = match fsops::stat(src) {
                     Ok(m) => m,
-                    Err(e) => return self.err(format!("link_stat \"{}\" failed: {e}", src.display())),
+                    Err(e) => return self.err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
                 };
                 Stats::add(&self.stats.dirs, 1);
                 let pre = if dest_exists && !dest_fresh {
@@ -163,7 +165,7 @@ impl<'a> Engine<'a> {
                     let meta = match fsops::lstat(&sp) {
                         Ok(m) => m,
                         Err(e) => {
-                            self.err(format!("link_stat \"{}\" failed: {e}", sp.display()));
+                            self.err(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
                             continue;
                         }
                     };
@@ -200,7 +202,7 @@ impl<'a> Engine<'a> {
         let src_ents = match fsops::read_dir_meta(&job.src) {
             Ok(v) => v,
             Err(e) => {
-                self.err(format!("opendir \"{}\" failed: {e}", job.src.display()));
+                self.err(path_msg("opendir \"", &job.src, format!("\" failed: {e}")));
                 return self.push_fixup(&job, false);
             }
         };
@@ -218,7 +220,7 @@ impl<'a> Engine<'a> {
             match fsops::read_dir_kinds(&job.dst) {
                 Ok(m) => m,
                 Err(e) => {
-                    self.err(format!("opendir \"{}\" failed: {e}", job.dst.display()));
+                    self.err(path_msg("opendir \"", &job.dst, format!("\" failed: {e}")));
                     return;
                 }
             }
@@ -273,7 +275,7 @@ impl<'a> Engine<'a> {
                         self.delete_tree(&path.join(&n), &join_rel(rel, &n), k, report);
                     }
                 }
-                Err(e) => return self.err(format!("opendir \"{}\" failed: {e}", path.display())),
+                Err(e) => return self.err(path_msg("opendir \"", path, format!("\" failed: {e}"))),
             }
             if report {
                 self.out.deleting(rel, true);
@@ -281,7 +283,7 @@ impl<'a> Engine<'a> {
             if !self.dry()
                 && let Err(e) = fs::remove_dir(path)
             {
-                return self.err(format!("delete_file: rmdir \"{}\" failed: {e}", path.display()));
+                return self.err(path_msg("delete_file: rmdir \"", path, format!("\" failed: {e}")));
             }
         } else {
             if report {
@@ -290,7 +292,7 @@ impl<'a> Engine<'a> {
             if !self.dry()
                 && let Err(e) = fs::remove_file(path)
             {
-                return self.err(format!("delete_file: unlink \"{}\" failed: {e}", path.display()));
+                return self.err(path_msg("delete_file: unlink \"", path, format!("\" failed: {e}")));
             }
         }
         Stats::add(&self.stats.deleted, 1);
@@ -309,7 +311,7 @@ impl<'a> Engine<'a> {
         match fs::remove_dir(path) {
             Ok(()) => true,
             Err(_) => {
-                self.err(format!("cannot delete non-empty directory: {}", quoted(rel)));
+                self.err([b"cannot delete non-empty directory: ", quoted(rel)].concat());
                 false
             }
         }
@@ -351,17 +353,17 @@ impl<'a> Engine<'a> {
         for level in fixups.chunk_by(|a, b| a.depth == b.depth) {
             level.par_iter().for_each(|f| {
                 if let Err(e) = fsops::lchown(&f.path, f.uid, f.gid) {
-                    self.err(format!("chown \"{}\" failed: {e}", f.path.display()));
+                    self.err(path_msg("chown \"", &f.path, format!("\" failed: {e}")));
                 }
                 if let Some(m) = f.mode
                     && let Err(e) = fsops::chmod(&f.path, m)
                 {
-                    self.err(format!("chmod \"{}\" failed: {e}", f.path.display()));
+                    self.err(path_msg("chmod \"", &f.path, format!("\" failed: {e}")));
                 }
                 if let Some((s, ns)) = f.mtime
                     && let Err(e) = fsops::set_mtime(&f.path, s, ns)
                 {
-                    self.err(format!("failed to set times on \"{}\": {e}", f.path.display()));
+                    self.err(path_msg("failed to set times on \"", &f.path, format!("\": {e}")));
                 }
             });
         }
@@ -409,7 +411,7 @@ impl<'a> Engine<'a> {
                             Ok(m) => dst_meta = Some(m),
                             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                             Err(e) => {
-                                self.err(format!("stat \"{}\" failed: {e}", dst_path.display()));
+                                self.err(path_msg("stat \"", &dst_path, format!("\" failed: {e}")));
                                 continue;
                             }
                         },
@@ -431,7 +433,7 @@ impl<'a> Engine<'a> {
                 Kind::Symlink => {
                     Stats::add(&self.stats.links, 1);
                     if !self.opts.links {
-                        self.out.info(format!("skipping non-regular file \"{}\"", quoted(&rel)));
+                        self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
                     changed |= self.handle_symlink(&e.meta, &rel, &src_path, &dst_path, dst_kind);
@@ -444,7 +446,7 @@ impl<'a> Engine<'a> {
                         _ => false,
                     };
                     if !allowed {
-                        self.out.info(format!("skipping non-regular file \"{}\"", quoted(&rel)));
+                        self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
                     changed |= self.handle_special(&e.meta, &rel, &dst_path, dst_kind);
@@ -472,7 +474,7 @@ impl<'a> Engine<'a> {
     ) -> bool {
         Stats::add(&self.stats.dirs, 1);
         if !self.opts.recursive {
-            self.out.info(format!("skipping directory {}", quoted(&rel)));
+            self.out.info([b"skipping directory ", quoted(&rel)].concat());
             return false;
         }
         let mut changed = false;
@@ -483,7 +485,7 @@ impl<'a> Engine<'a> {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    self.err(format!("stat \"{}\" failed: {e}", dst_path.display()));
+                    self.err(path_msg("stat \"", &dst_path, format!("\" failed: {e}")));
                     return false;
                 }
             },
@@ -491,7 +493,7 @@ impl<'a> Engine<'a> {
                 if !self.dry()
                     && let Err(e) = fs::remove_file(&dst_path)
                 {
-                    self.err(format!("unlink \"{}\" failed: {e}", dst_path.display()));
+                    self.err(path_msg("unlink \"", &dst_path, format!("\" failed: {e}")));
                     return false;
                 }
                 changed = true;
@@ -507,7 +509,7 @@ impl<'a> Engine<'a> {
             if !self.dry() {
                 let r = fs::DirBuilder::new().mode(0o700 | self.new_mode(&meta)).create(&dst_path);
                 if let Err(e) = r {
-                    self.err(format!("mkdir \"{}\" failed: {e}", dst_path.display()));
+                    self.err(path_msg("mkdir \"", &dst_path, format!("\" failed: {e}")));
                     return changed;
                 }
                 changed = true;
@@ -536,7 +538,7 @@ impl<'a> Engine<'a> {
         let target = match fs::read_link(src_path) {
             Ok(t) => t,
             Err(e) => {
-                self.err(format!("readlink \"{}\" failed: {e}", src_path.display()));
+                self.err(path_msg("readlink \"", src_path, format!("\" failed: {e}")));
                 return false;
             }
         };
@@ -583,7 +585,7 @@ impl<'a> Engine<'a> {
             finish_temp(&tmp, r)
         });
         if let Err(e) = res {
-            self.err(format!("symlink \"{}\" failed: {e}", dst_path.display()));
+            self.err(path_msg("symlink \"", dst_path, format!("\" failed: {e}")));
         }
         true
     }
@@ -628,7 +630,7 @@ impl<'a> Engine<'a> {
             },
         );
         if let Err(e) = res {
-            self.err(format!("mknod \"{}\" failed: {e}", dst_path.display()));
+            self.err(path_msg("mknod \"", dst_path, format!("\" failed: {e}")));
         }
         true
     }
@@ -647,7 +649,7 @@ impl<'a> Engine<'a> {
             Ok::<(), io::Error>(())
         })();
         if let Err(e) = r {
-            self.err(format!("failed to set attributes on \"{}\": {e}", path.display()));
+            self.err(path_msg("failed to set attributes on \"", path, format!("\": {e}")));
         }
     }
 
@@ -671,7 +673,8 @@ impl<'a> Engine<'a> {
         if let Err(e) = self.write_file(job)
             && !fsops::interrupted()
         {
-            self.err(format!("copy \"{}\" -> \"{}\" failed: {e}", job.src_path.display(), job.dst_path.display()));
+            let to = path_msg("\" -> \"", &job.dst_path, format!("\" failed: {e}"));
+            self.err(path_msg("copy \"", &job.src_path, to));
         }
     }
 
@@ -683,6 +686,16 @@ impl<'a> Engine<'a> {
         };
         let uid = self.rules.wanted_uid(src);
         let gid = self.rules.wanted_gid(src);
+
+        if self.delta_candidate(job) {
+            match self.write_delta(job, mode, uid, gid) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) if fsops::interrupted() => return Err(e),
+                // E.g. a file changed size while it was being hashed: send it whole.
+                Err(_) => {}
+            }
+        }
 
         if self.opts.inplace && job.dst_meta.is_some_and(|d| d.kind == Kind::File) {
             fsops::copy_into_existing(&job.src_path, &job.dst_path)?;
@@ -718,6 +731,78 @@ impl<'a> Engine<'a> {
             .and_then(|()| fsops::check_interrupt())
             .and_then(|()| fs::rename(&tmp, &job.dst_path));
         finish_temp(&tmp, r)
+    }
+
+    /// Delta transfer is opt-in locally (`--no-whole-file`), like rsync, and needs an
+    /// existing destination file to use as the basis.
+    fn delta_candidate(&self, job: &FileJob) -> bool {
+        self.opts.whole_file == Some(false)
+            && job.meta.size >= delta::MIN_DELTA_SIZE
+            && job.dst_meta.is_some_and(|d| d.kind == Kind::File && d.size > 0)
+    }
+
+    /// Update `job.dst_path` from the old destination file plus the changed ranges of
+    /// the source. Returns `Ok(false)` when nothing matched (a whole-file copy is cheaper).
+    ///
+    /// When matched ranges sit at the same offsets, the old file is cloned (APFS,
+    /// btrfs, XFS) and only the changed ranges are written; otherwise the new file is
+    /// rebuilt in parallel from both files. With `--inplace` and an in-place delta,
+    /// the changed ranges are written straight into the destination.
+    fn write_delta(&self, job: &FileJob, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<bool> {
+        let new = fs::File::open(&job.src_path)?;
+        let basis = fs::File::open(&job.dst_path)?;
+        let basis_size = basis.metadata()?.len();
+        let d = delta::local_delta(&new, job.meta.size, &basis, basis_size, &delta::Params::DEFAULT)?;
+        if d.matched_bytes() == 0 {
+            return Ok(false);
+        }
+        Stats::add(&self.stats.delta_files, 1);
+        Stats::add(&self.stats.literal_bytes, d.literal_bytes());
+        Stats::add(&self.stats.matched_bytes, d.matched_bytes());
+
+        if self.opts.inplace && d.is_in_place() {
+            let out = fs::OpenOptions::new().write(true).open(&job.dst_path)?;
+            apply(&d, &basis, &new, &out, true)?;
+            self.finish_delta_file(&out, &job.meta, mode, uid, gid)?;
+            return Ok(true);
+        }
+
+        let (dir, name) = split_dst(&job.dst_path);
+        let want_clone = !self.opts.no_clone && d.in_place_bytes() > 0;
+        let (tmp, cloned) = fsops::with_temp(dir, name, |tmp| {
+            if want_clone && fsops::clone_into_new(&basis, tmp)? {
+                return Ok(true);
+            }
+            fsops::create_new(tmp, 0o600).map(|_| false)
+        })?;
+        if cloned {
+            Stats::add(&self.stats.cloned, 1);
+        }
+        let r = (|| {
+            let out = fs::OpenOptions::new().write(true).open(&tmp)?;
+            apply(&d, &basis, &new, &out, cloned)?;
+            self.finish_delta_file(&out, &job.meta, mode, uid, gid)?;
+            drop(out);
+            fsops::check_interrupt()?;
+            fs::rename(&tmp, &job.dst_path)
+        })();
+        finish_temp(&tmp, r).map(|()| true)
+    }
+
+    /// Attributes for a delta-built file. It may be a clone of the old file, which
+    /// carries the old mode and mtime, so both are always set.
+    fn finish_delta_file(&self, f: &fs::File, src: &Meta, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+        fsops::fchown(f, uid, gid)?;
+        fsops::fchmod(f, mode)?;
+        if self.opts.times {
+            fsops::set_fd_mtime(f, src.mtime, src.mtime_ns)?;
+        } else {
+            fsops::set_fd_mtime_now(f)?;
+        }
+        if self.opts.fsync {
+            f.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Set owner, mode and mtime on a freshly written file, by descriptor when we

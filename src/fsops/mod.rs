@@ -300,6 +300,12 @@ pub fn copy_new(src: &Path, tmp: &Path, size: u64, allow_fast: bool, mode: u32) 
     platform::copy_new(&src_file, tmp, size, mode)
 }
 
+/// Create `tmp` as a copy-on-write clone of `basis` when the filesystem supports it
+/// (APFS, btrfs, XFS). `Ok(false)`: not supported, nothing was created.
+pub fn clone_into_new(basis: &File, tmp: &Path) -> io::Result<bool> {
+    platform::clone_into_new(basis, tmp)
+}
+
 pub(crate) fn create_new(path: &Path, mode: u32) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new().write(true).create_new(true).mode(mode & 0o777).open(path)
@@ -359,6 +365,12 @@ pub fn set_fd_mtime(f: &File, sec: i64, nsec: u32) -> io::Result<()> {
     let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ };
     let times = [omit, ts(sec, nsec)];
     cvt(unsafe { libc::futimens(f.as_raw_fd(), times.as_ptr()) }).map(drop)
+}
+
+pub fn set_fd_mtime_now(f: &File) -> io::Result<()> {
+    let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ };
+    let now = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW as _ };
+    cvt(unsafe { libc::futimens(f.as_raw_fd(), [omit, now].as_ptr()) }).map(drop)
 }
 
 pub fn lchown(path: &Path, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {

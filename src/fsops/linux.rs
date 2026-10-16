@@ -7,6 +7,25 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
+/// `_IOW(0x94, 9, int)`: share `src`'s extents with the destination (btrfs, XFS, ...).
+const FICLONE: libc::c_ulong = 0x4004_9409;
+
+/// Reflink `src` into the new path `tmp`. `Ok(false)` means the filesystem can't
+/// (ext4, cross-device, ...) and nothing is left behind.
+pub fn clone_into_new(src: &File, tmp: &Path) -> io::Result<bool> {
+    let dst = create_new(tmp, 0o600)?;
+    if unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE as _, src.as_raw_fd()) } == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    drop(dst);
+    let _ = std::fs::remove_file(tmp);
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL | libc::ENOTTY | libc::EPERM | libc::ENOSYS) => Ok(false),
+        _ => Err(err),
+    }
+}
+
 pub fn copy_new(src: &File, tmp: &Path, _size: u64, mode: u32) -> io::Result<Copied> {
     let dst = create_new(tmp, mode)?;
     let mut copied: u64 = 0;

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Benchmark fastrsync against rsync with hyperfine.
 #
-#   bench/gen.py  BENCH_DIR A C        # create datasets first
-#   bench/run.sh  BENCH_DIR [A|C|all] [--cold]
+#   bench/gen.py  BENCH_DIR A B C      # create datasets first
+#   bench/run.sh  BENCH_DIR [A|B|C|all] [--cold]
 #
 # --cold drops the OS page cache before every run (macOS: `sudo purge`,
 # Linux: drop_caches) so disk I/O is measured, not RAM; it needs sudo.
 # Env: RSYNC=/path/to/rsync  FASTRSYNC=/path/to/fastrsync  RUNS=5
 set -euo pipefail
 
-DIR=${1:?usage: bench/run.sh BENCH_DIR [A|C|all] [--cold]}
+DIR=${1:?usage: bench/run.sh BENCH_DIR [A|B|C|all] [--cold]}
 WHICH=${2:-all}
 COLD=${3:-}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -51,6 +51,24 @@ if [[ "$WHICH" == A || "$WHICH" == all ]]; then
     -n "rsync -a --inplace" "'$RSYNC' -a --inplace '$DIR/A_src/' '$DIR/A_dst/'" \
     -n "fastrsync -a --inplace" "'$FR' -a --inplace '$DIR/A_src/' '$DIR/A_dst/'" \
     --export-markdown "$OUT/A-$tag.md"
+fi
+
+if [[ "$WHICH" == B || "$WHICH" == all ]]; then
+  [[ -f "$DIR/B_src.img" ]] || { echo "missing $DIR/B_src.img (run bench/gen.py $DIR B)" >&2; exit 1; }
+  echo "== B: big file with scattered in-place changes ($(du -h "$DIR/B_src.img" | cut -f1))"
+  # Each run starts from a fresh copy of the old version (a CoW clone where possible).
+  if [[ $(uname) == Darwin ]]; then CLONE="cp -c"; else CLONE="cp --reflink=auto"; fi
+  RESET="rm -f '$DIR/B_work.img' && $CLONE '$DIR/B_dst.img' '$DIR/B_work.img' && touch -t 200001010000 '$DIR/B_work.img'"
+  hyperfine --runs "$RUNS" \
+    --prepare "$RESET$CACHE" \
+    -n "rsync -a" "'$RSYNC' -a '$DIR/B_src.img' '$DIR/B_work.img'" \
+    -n "rsync -a --no-whole-file" "'$RSYNC' -a --no-whole-file '$DIR/B_src.img' '$DIR/B_work.img'" \
+    -n "fastrsync -a" "'$FR' -a '$DIR/B_src.img' '$DIR/B_work.img'" \
+    -n "fastrsync -a --no-whole-file" "'$FR' -a --no-whole-file '$DIR/B_src.img' '$DIR/B_work.img'" \
+    -n "fastrsync -a --no-whole-file --no-clone" "'$FR' -a --no-whole-file --no-clone '$DIR/B_src.img' '$DIR/B_work.img'" \
+    -n "fastrsync -a --no-clone" "'$FR' -a --no-clone '$DIR/B_src.img' '$DIR/B_work.img'" \
+    --export-markdown "$OUT/B-$tag.md"
+  rm -f "$DIR/B_work.img"
 fi
 
 if [[ "$WHICH" == C || "$WHICH" == all ]]; then

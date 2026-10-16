@@ -7,11 +7,12 @@ use crate::entry::Kind;
 use crate::exit;
 use crate::filter::Filter;
 use crate::fsops;
-use crate::output::{Output, Stats};
+use crate::output::{Output, Stats, path_msg};
 use crate::paths::{split_source, wants_contents};
 use exec::Engine;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -50,7 +51,7 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
         if !src_is_dir && let (parent, Some(name)) = split_source(src) {
             let (dst_dir, dst_name) = split_source(&dest_path);
             let Some(dst_name) = dst_name else {
-                out.error(format!("invalid destination \"{}\"", dest_path.display()));
+                out.error(path_msg("invalid destination \"", &dest_path, "\""));
                 return Err(exit::SYNTAX);
             };
             return Ok(Plan {
@@ -65,22 +66,23 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
     let mut dest_created = false;
     if !dest_is_dir {
         if dest_meta.is_some() {
-            out.error(format!("destination \"{}\" exists and is not a directory", dest_path.display()));
+            out.error(path_msg("destination \"", &dest_path, "\" exists and is not a directory"));
             return Err(exit::FILE_IO);
         }
-        let shown = dest.to_string_lossy();
-        let shown = if shown.len() > 1 { shown.trim_end_matches('/') } else { &shown };
+        let raw = dest.as_bytes();
+        let shown = if raw.len() > 1 { &raw[..raw.iter().rposition(|&c| c != b'/').map_or(0, |p| p + 1)] } else { raw };
+        let created = [b"created directory ", shown].concat();
         if opts.dry_run {
-            out.info(format!("created directory {shown}"));
+            out.info(&created);
         } else {
             match fs::create_dir(&dest_path) {
                 Ok(()) => {
-                    out.info(format!("created directory {shown}"));
+                    out.info(&created);
                     dest_exists = true;
                     dest_created = true;
                 }
                 Err(e) => {
-                    out.error(format!("mkdir \"{}\" failed: {e}", dest_path.display()));
+                    out.error(path_msg("mkdir \"", &dest_path, format!("\" failed: {e}")));
                     return Err(exit::FILE_IO);
                 }
             }
@@ -101,7 +103,7 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
 }
 
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
-    let out = Output::new(opts.verbose, opts.out_format.clone());
+    let out = Output::new(opts.verbose, opts.out_format.clone(), opts.eight_bit_output);
     let filter = match Filter::new(&opts.filter_rules) {
         Ok(f) => f,
         Err(e) => {
@@ -120,7 +122,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         if let Root::Contents { src, .. } = root
             && fsops::stat(src).is_ok_and(|m| m.kind != Kind::Dir)
         {
-            out.error(format!("change_dir \"{}\" failed: Not a directory", src.display()));
+            out.error(path_msg("change_dir \"", src, "\" failed: Not a directory"));
             return exit::PARTIAL;
         }
     }

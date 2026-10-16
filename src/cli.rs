@@ -73,6 +73,9 @@ pub struct Cli {
     /// Output numbers in a human-readable format
     #[arg(short = 'h', long = "human-readable")]
     human: bool,
+    /// Leave high-bit chars unescaped in output
+    #[arg(short = '8', long = "8-bit-output")]
+    eight_bit_output: bool,
 
     /// Compress file data during the transfer
     #[arg(short = 'z', long)]
@@ -173,6 +176,7 @@ pub struct Options {
     pub progress: bool,
     pub stats: bool,
     pub human: bool,
+    pub eight_bit_output: bool,
 
     pub compress: bool,
     /// `None` means "decide automatically" (whole-file for local copies, delta for remote).
@@ -233,6 +237,7 @@ impl Options {
             progress: c.progress || c.partial_progress,
             stats: c.stats,
             human: c.human,
+            eight_bit_output: c.eight_bit_output,
             compress: c.compress,
             whole_file: if c.whole_file {
                 Some(true)
@@ -317,6 +322,14 @@ mod tests {
         .unwrap();
         let pats: Vec<_> = o.filter_rules.iter().map(|r| (r.include, r.pattern.as_str())).collect();
         assert_eq!(pats, vec![(true, "keep.log"), (false, "*.log"), (true, "x")]);
+    }
+
+    #[test]
+    fn eight_bit_output() {
+        assert!(!Options::parse_from(["fastrsync", "-a", "s", "d"]).unwrap().eight_bit_output);
+        for args in [&["fastrsync", "-8", "s", "d"][..], &["fastrsync", "-av8", "s", "d"], &["fastrsync", "--8-bit-output", "s", "d"]] {
+            assert!(Options::parse_from(args).unwrap().eight_bit_output, "{args:?}");
+        }
     }
 
     #[test]
