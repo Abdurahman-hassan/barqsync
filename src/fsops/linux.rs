@@ -61,3 +61,45 @@ pub fn copy_new(src: &File, tmp: &Path, _size: u64, mode: u32) -> io::Result<Cop
         }
     }
 }
+
+/// `fstatat` replacement: `statx` asks only for the fields sync decisions use and
+/// never forces a network filesystem to resynchronise attributes.
+pub fn statx_at(dirfd: std::os::fd::RawFd, name: &std::ffi::CStr) -> io::Result<crate::entry::Meta> {
+    use crate::entry::{Kind, Meta};
+    let mut sx: libc::statx = unsafe { std::mem::zeroed() };
+    let mask = libc::STATX_TYPE
+        | libc::STATX_MODE
+        | libc::STATX_NLINK
+        | libc::STATX_UID
+        | libc::STATX_GID
+        | libc::STATX_MTIME
+        | libc::STATX_INO
+        | libc::STATX_SIZE;
+    let flags = libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_DONT_SYNC;
+    if unsafe { libc::statx(dirfd, name.as_ptr(), flags, mask, &mut sx) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fmt = sx.stx_mode as u32 & libc::S_IFMT;
+    let kind = match fmt {
+        libc::S_IFREG => Kind::File,
+        libc::S_IFDIR => Kind::Dir,
+        libc::S_IFLNK => Kind::Symlink,
+        libc::S_IFIFO => Kind::Fifo,
+        libc::S_IFCHR => Kind::CharDev,
+        libc::S_IFBLK => Kind::BlockDev,
+        _ => Kind::Socket,
+    };
+    Ok(Meta {
+        kind,
+        size: sx.stx_size,
+        mtime: sx.stx_mtime.tv_sec,
+        mtime_ns: sx.stx_mtime.tv_nsec,
+        mode: sx.stx_mode as u32 & 0o7777,
+        uid: sx.stx_uid,
+        gid: sx.stx_gid,
+        dev: libc::makedev(sx.stx_dev_major, sx.stx_dev_minor),
+        ino: sx.stx_ino,
+        rdev: libc::makedev(sx.stx_rdev_major, sx.stx_rdev_minor),
+        nlink: sx.stx_nlink as u64,
+    })
+}

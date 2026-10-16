@@ -28,6 +28,9 @@ pub struct Cli {
     /// Copy symlinks as symlinks
     #[arg(short = 'l', long)]
     links: bool,
+    /// Preserve hard links
+    #[arg(short = 'H', long = "hard-links")]
+    hard_links: bool,
     /// Preserve permissions
     #[arg(short = 'p', long)]
     perms: bool,
@@ -53,6 +56,9 @@ pub struct Cli {
     /// Increase verbosity
     #[arg(short = 'v', long, action = ArgAction::Count)]
     verbose: u8,
+    /// Output a change-summary for all updates (twice: also unchanged items)
+    #[arg(short = 'i', long = "itemize-changes", action = ArgAction::Count)]
+    itemize: u8,
     /// Suppress non-error messages
     #[arg(short = 'q', long)]
     quiet: bool,
@@ -68,6 +74,9 @@ pub struct Cli {
     /// Same as --partial --progress
     #[arg(short = 'P')]
     partial_progress: bool,
+    /// Fine-grained output flags; `progress2` (or `progress`) shows overall progress
+    #[arg(long, value_name = "FLAGS")]
+    info: Vec<String>,
     /// Give some file-transfer stats
     #[arg(long)]
     stats: bool,
@@ -163,6 +172,7 @@ pub struct Cli {
 pub struct Options {
     pub recursive: bool,
     pub links: bool,
+    pub hard_links: bool,
     pub perms: bool,
     pub times: bool,
     pub group: bool,
@@ -171,6 +181,7 @@ pub struct Options {
     pub specials: bool,
 
     pub verbose: u8,
+    pub itemize: u8,
     pub quiet: bool,
     pub dry_run: bool,
     pub out_format: Option<String>,
@@ -225,6 +236,7 @@ impl Options {
         Options {
             recursive: c.recursive || a,
             links: c.links || a,
+            hard_links: c.hard_links,
             perms: c.perms || a,
             times: c.times || a,
             group: c.group || a,
@@ -232,10 +244,13 @@ impl Options {
             devices: c.devices || c.devices_specials || a,
             specials: c.specials || c.devices_specials || a,
             verbose: if c.quiet { 0 } else { c.verbose },
+            itemize: if c.quiet { 0 } else { c.itemize },
             quiet: c.quiet,
             dry_run: c.dry_run,
             out_format: c.out_format,
-            progress: c.progress || c.partial_progress,
+            progress: c.progress
+                || c.partial_progress
+                || c.info.iter().flat_map(|f| f.split(',')).any(|f| f.starts_with("progress") && f != "progress0"),
             stats: c.stats,
             human: c.human,
             eight_bit_output: c.eight_bit_output,
@@ -261,6 +276,9 @@ impl Options {
             modify_window: c.modify_window,
             rsh: c.rsh,
             remote_path: c.remote_path,
+            // Two workers per core: on APFS that gives the fastest metadata-bound syncs
+            // (filesystem latency is hidden by queue depth). Fewer threads use far less
+            // kernel CPU for nearly the same speed; see README.
             threads: c.threads.filter(|&n| n > 0).unwrap_or((cores * 2).clamp(4, 64)),
             streams: c.streams.unwrap_or(0),
             server: c.server,

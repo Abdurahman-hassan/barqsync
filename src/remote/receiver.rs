@@ -203,6 +203,7 @@ impl RemoteState {
             }
             eng.note_transfer(&job);
             if eng.dry() {
+                crate::progress::done(job.meta.size);
                 continue;
             }
             let sig = if self.delta { basis_signature(&job) } else { None };
@@ -321,6 +322,7 @@ impl RemoteState {
             return;
         }
         let dst = inc.job.dst_path.clone();
+        crate::progress::done(inc.job.meta.size);
         let (path, registered) = (inc.path.clone(), inc.registered);
         let r = self.finish(eng, inc);
         let r = if registered { finish_temp(&path, r) } else { r };
@@ -365,6 +367,7 @@ impl RemoteState {
                 }
             };
             let dst = job.dst_path.clone();
+            crate::progress::done(job.meta.size);
             if let Err(e) = self.write_small(eng, job, bytes)
                 && !fsops::interrupted()
             {
@@ -604,7 +607,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
         engine.err(format!("{unanswered} requested files were never received"));
         remote.abandon();
     }
-    pool.install(|| engine.apply_fixups());
+    pool.install(|| {
+        engine.link_followers();
+        engine.apply_fixups();
+    });
     Stats::add(&engine.stats.errors, sender_errors);
     let stats = engine.stats.snapshot();
     let _ = conn.msg(Msg::ReceiverDone { stats: stats.clone() });

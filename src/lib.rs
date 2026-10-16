@@ -9,6 +9,7 @@ pub mod fsops;
 pub mod local;
 pub mod output;
 pub mod paths;
+pub mod progress;
 pub mod proto;
 pub mod remote;
 

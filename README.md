@@ -18,7 +18,7 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M3 | delta engine: aligned blocks, FastCDC fallback, clone+patch, BLAKE3-verified matches | done |
 | M4 | remote over SSH (`host:path`): push and pull, small-file packing, delta over the wire, `-z`, `-e`, `--remote-path` | done |
 | M5 | parallel TLS data streams (`--streams N`), pinned ephemeral certificate, token auth, ssh fallback | done |
-| M6 | `-H`, `--progress`, `-i`, `getattrlistbulk`/`statx` fast paths | next |
+| M6 | `-H`, `--progress`/`--info=progress2`, `-i`/`%i`, `getattrlistbulk`/`statx` metadata reads | done |
 
 The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
@@ -34,7 +34,8 @@ With Homebrew's keg-only rustup, add `/opt/homebrew/opt/rustup/bin` to `PATH`.
 
 ## Supported options
 
-`-a` (= `-rlptgoD`), `-r -l -p -t -g -o -D --devices --specials`, `-v -q -n`,
+`-a` (= `-rlptgoD`), `-r -l -p -t -g -o -D --devices --specials`, `-H`, `-v -q -n`,
+`-i`/`-ii` (`%i` in `--out-format`), `--progress`/`-P`/`--info=progress2`,
 `--out-format` (`%n`, `%L`), `--delete`, `--delete-excluded`,
 `--exclude/--include/--exclude-from/--include-from` (rsync wildcard rules, first match wins,
 `/` anchoring, trailing `/` for directories, `**`, `dir/***`), `-u`, `--size-only`, `-I`,
@@ -46,8 +47,14 @@ writes new files directly, like rsync),
 Trailing-slash semantics match rsync: `src/` syncs the contents, `src` syncs the directory itself.
 Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 20 interrupted, 23 partial transfer).
 
-Known differences: on APFS, clones also carry extended attributes (rsync needs `-X` for those).
-Hard links (`-H`) are not preserved yet.
+Known differences:
+
+- On APFS, clones also carry extended attributes (rsync needs `-X` for those).
+- With `-H`, the same names end up sharing inodes as with rsync, but the name shown after
+  `=>` can differ. rsync links each group to the last name in its file list; fastrsync's
+  parallel walk links them to the first name it reaches.
+- `--progress` shows one overall line, like `--info=progress2`. Files are copied in
+  parallel, so per-file progress lines would interleave meaninglessly.
 
 ## Remote transfers
 
@@ -234,5 +241,15 @@ and per-thread 1 MiB copy buffers are held at once; bounding that is on the list
   small-file packs, the receiver buffered 834 MiB. Blocking sends inside nested parallel loops
   also overflowed a 2 MiB worker stack on 5000 directories. Now packs are bounded, the
   sender's serve path has no nested parallel loops, and workers get 32 MiB stacks.
-- **No-op syncs are bound by `lstat`.** They scale to ~20 threads; the next step is
-  `getattrlistbulk` (macOS) and `statx` (Linux) bulk metadata reads.
+- **No-op syncs are bound by APFS metadata reads, not syscalls.**
+  - With one thread, a 500k-file no-op takes 12.2 s but only 4.4 s of CPU: it waits on the
+    filesystem. Parallelism hides that latency up to ~4–6 threads; beyond that, wall time
+    stays near 3.5 s while kernel CPU climbs to 21 s at 20 threads.
+  - `getattrlistbulk` (macOS) returns a whole directory's names and attributes in a few
+    syscalls. It saves 8–12% wall time at 6–8 threads and 15–30% kernel CPU, but it can't
+    lower that floor.
+  - On Linux, `statx` asks only for the fields sync decisions need and never forces a
+    network filesystem to resync attributes. There is no bulk equivalent there.
+  - The default is 2 threads per core because that is fastest for no-op syncs. Fresh
+    small-file copies are as fast at one per core and fastest at 4–6 threads, and
+    `--threads 6` uses about a third of the kernel CPU.

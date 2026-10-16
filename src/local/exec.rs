@@ -17,7 +17,7 @@ use crate::diff::{AttrDiff, DiffRules, FileAction, file_action};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::filter::Filter;
 use crate::fsops::{self, Copied};
-use crate::output::{Output, Stats, path_msg};
+use crate::output::{Change, Link, Output, Stats, path_msg};
 use crate::paths::join_rel;
 use rayon::Scope;
 use rayon::prelude::*;
@@ -37,6 +37,8 @@ pub struct Engine<'a> {
     pub out: &'a Output,
     pub stats: Stats,
     fixups: Mutex<Vec<DirFixup>>,
+    /// `-H`: hard-link groups keyed by the source `(dev, ino)`.
+    hardlinks: Mutex<HashMap<(u64, u64), HardGroup>>,
     pub(crate) umask: u32,
     /// Set when this engine is the receiving end of a remote transfer.
     pub(crate) remote: Option<crate::remote::receiver::RemoteState>,
@@ -84,6 +86,21 @@ pub(crate) struct FileJob {
 /// optional destination-name override (a single file copied to a new name).
 pub(crate) type Entries = Vec<(u32, DirEnt, Option<OsString>)>;
 
+/// Names of one multiply-linked source file. The first name reached is transferred
+/// normally (the leader); the others are hard-linked to it once all data is written.
+struct HardGroup {
+    leader_dst: PathBuf,
+    leader_rel: Vec<u8>,
+    followers: Vec<Follower>,
+}
+
+struct Follower {
+    src_path: PathBuf,
+    dst_path: PathBuf,
+    rel: Vec<u8>,
+    meta: Meta,
+}
+
 struct DirFixup {
     depth: usize,
     path: PathBuf,
@@ -121,6 +138,7 @@ impl<'a> Engine<'a> {
             out,
             stats: Stats::default(),
             fixups: Mutex::new(Vec::new()),
+            hardlinks: Mutex::new(HashMap::new()),
             umask: fsops::current_umask(),
             remote: None,
         }
@@ -133,6 +151,29 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn dry(&self) -> bool {
         self.opts.dry_run
+    }
+
+    /// What differs between a source item and the existing destination item, for `-i`.
+    /// Without `-t`, an mtime difference is only reported for data that is rewritten
+    /// (shown as `T`: the time will be the transfer time).
+    pub(crate) fn attr_change(&self, src: &Meta, dst: &Meta, transferring: bool) -> Change {
+        Change {
+            time: (self.opts.times || transferring) && !self.rules.same_mtime(src, dst),
+            perms: self.opts.perms && src.mode != dst.mode,
+            owner: self.rules.wanted_uid(src).is_some_and(|u| u != dst.uid),
+            group: self.rules.wanted_gid(src).is_some_and(|g| g != dst.gid),
+            ..Change::default()
+        }
+    }
+
+    /// Report a directory: new (`cd+++++++++`), or what differs. Plain `-v` shows it
+    /// only when new or its time differs.
+    fn report_dir(&self, rel: &[u8], src: &Meta, pre: Option<&Meta>) {
+        let (change, significant) = match pre {
+            None => (Change::new_local(), true),
+            Some(p) => (self.attr_change(src, p, false), self.opts.times && !self.rules.same_mtime(src, p)),
+        };
+        self.out.item(rel, Kind::Dir, Link::None, change, significant);
     }
 
     /// Permissions for a newly written file or directory.
@@ -180,9 +221,7 @@ impl<'a> Engine<'a> {
     pub(crate) fn root_job(&self, src: PathBuf, dst: PathBuf, src_meta: Meta, root: u16, check_dst: bool) -> DirJob {
         Stats::add(&self.stats.dirs, 1);
         let pre = if check_dst { fsops::lstat(&dst).ok().filter(|m| m.kind == Kind::Dir) } else { None };
-        if pre.is_none() || pre.is_some_and(|p| self.opts.times && !self.rules.same_mtime(&src_meta, &p)) {
-            self.out.item(b"", Kind::Dir, None);
-        }
+        self.report_dir(b"", &src_meta, pre.as_ref());
         DirJob {
             src,
             dst,
@@ -417,11 +456,91 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// `-H`: true if this name leads its hard-link group (and is transferred normally);
+    /// otherwise it is queued to be linked to the leader at the end.
+    fn claim_leader(&self, meta: &Meta, src_path: &Path, dst_path: &Path, rel: &[u8]) -> bool {
+        let mut groups = self.hardlinks.lock().unwrap();
+        match groups.entry((meta.dev, meta.ino)) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(HardGroup { leader_dst: dst_path.to_path_buf(), leader_rel: rel.to_vec(), followers: Vec::new() });
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                o.get_mut().followers.push(Follower {
+                    src_path: src_path.to_path_buf(),
+                    dst_path: dst_path.to_path_buf(),
+                    rel: rel.to_vec(),
+                    meta: *meta,
+                });
+                false
+            }
+        }
+    }
+
+    /// `-H`: link every follower to its leader's destination (after all file data is
+    /// written, before directory attributes are fixed). Already-linked names are left alone.
+    pub fn link_followers(&self) {
+        let groups = std::mem::take(&mut *self.hardlinks.lock().unwrap());
+        let mut groups: Vec<HardGroup> = groups.into_values().filter(|g| !g.followers.is_empty()).collect();
+        groups.sort_by(|a, b| a.leader_rel.cmp(&b.leader_rel));
+        for mut g in groups {
+            g.followers.sort_by(|a, b| a.rel.cmp(&b.rel));
+            let leader = fsops::lstat(&g.leader_dst).ok().filter(|m| m.kind == Kind::File);
+            for f in g.followers {
+                if fsops::interrupted() {
+                    return;
+                }
+                let dst = fsops::lstat(&f.dst_path).ok();
+                if let (Some(l), Some(d)) = (leader, dst)
+                    && (l.dev, l.ino) == (d.dev, d.ino)
+                {
+                    self.out.item(&f.rel, Kind::File, Link::Hard(&g.leader_rel), Change::default(), false);
+                    continue;
+                }
+                if leader.is_none() && !self.dry() {
+                    // The leader wasn't written (an error, already reported): send this name on its own.
+                    if self.remote.is_none() {
+                        let dst_meta = dst.filter(|d| d.kind == Kind::File);
+                        let job = FileJob { idx: 0, src_path: f.src_path, dst_path: f.dst_path, rel: f.rel, meta: f.meta, dst_meta };
+                        self.transfer_file(&job);
+                    } else {
+                        self.err([&b"hard link target missing for "[..], &f.rel].concat());
+                    }
+                    continue;
+                }
+                let change = match dst {
+                    Some(d) if d.kind == Kind::File => Change {
+                        hardlink: true,
+                        size: d.size != f.meta.size,
+                        ..self.attr_change(&f.meta, &d, false)
+                    },
+                    _ => Change { hardlink: true, new: true, ..Change::default() },
+                };
+                self.out.item(&f.rel, Kind::File, Link::Hard(&g.leader_rel), change, true);
+                if dst.is_none() {
+                    Stats::add(&self.stats.created, 1);
+                }
+                if self.dry() {
+                    continue;
+                }
+                if dst.is_some_and(|d| d.kind == Kind::Dir) && !self.remove_conflicting_dir(&f.dst_path, &f.rel) {
+                    continue;
+                }
+                let (dir, name) = split_dst(&f.dst_path);
+                let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&g.leader_dst, tmp))
+                    .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, &f.dst_path)));
+                if let Err(e) = r {
+                    self.err(path_msg("link \"", &f.dst_path, format!("\" failed: {e}")));
+                }
+            }
+        }
+    }
+
     /// Apply directory attributes, deepest level first; directories on one level are
     /// independent so each level is applied in parallel.
     pub fn apply_fixups(&self) {
         let mut fixups = std::mem::take(&mut *self.fixups.lock().unwrap());
-        fixups.sort_unstable_by(|a, b| b.depth.cmp(&a.depth));
+        fixups.sort_unstable_by_key(|f| std::cmp::Reverse(f.depth));
         for level in fixups.chunk_by(|a, b| a.depth == b.depth) {
             level.par_iter().for_each(|f| {
                 if let Err(e) = fsops::lchown(&f.path, f.uid, f.gid) {
@@ -470,6 +589,11 @@ impl<'a> Engine<'a> {
                 Kind::File => {
                     Stats::add(&self.stats.files, 1);
                     Stats::add(&self.stats.total_size, e.meta.size);
+                    if self.opts.hard_links && e.meta.nlink > 1 && !self.claim_leader(&e.meta, &src_path, &dst_path, &rel) {
+                        // Linked at the end, which modifies this directory.
+                        changed = true;
+                        continue;
+                    }
                     let mut dst_meta = None;
                     match dst_kind {
                         Some(Kind::Dir) => {
@@ -489,8 +613,11 @@ impl<'a> Engine<'a> {
                         None => {}
                     }
                     match file_action(&e.meta, dst_meta.as_ref(), &self.rules) {
-                        FileAction::Skip => {}
+                        FileAction::Skip => self.out.item(&rel, Kind::File, Link::None, Change::default(), false),
                         FileAction::Attrs(a) => {
+                            if let Some(d) = &dst_meta {
+                                self.out.item(&rel, Kind::File, Link::None, self.attr_change(&e.meta, d, false), false);
+                            }
                             if !self.dry() {
                                 self.fix_attrs(&dst_path, &e.meta, a);
                             }
@@ -567,9 +694,7 @@ impl<'a> Engine<'a> {
             None => {}
         }
         let is_new = pre.is_none();
-        if is_new || pre.is_some_and(|p| self.opts.times && !self.rules.same_mtime(&meta, &p)) {
-            self.out.item(&rel, Kind::Dir, None);
-        }
+        self.report_dir(&rel, &meta, pre.as_ref());
         if is_new {
             Stats::add(&self.stats.created, 1);
             if !self.dry() {
@@ -614,8 +739,13 @@ impl<'a> Engine<'a> {
         match dst_kind {
             Some(Kind::Symlink) => {
                 if fs::read_link(dst_path).is_ok_and(|cur| cur == target) {
+                    let d = fsops::lstat(dst_path).ok();
+                    let change = d.map(|d| self.attr_change(meta, &d, false)).unwrap_or_default();
+                    // Symlink permissions aren't synced.
+                    let change = Change { perms: false, ..change };
+                    self.out.item(rel, Kind::Symlink, Link::Sym(target.as_os_str().as_bytes()), change, false);
                     if !self.dry()
-                        && let Ok(d) = fsops::lstat(dst_path)
+                        && let Some(d) = d
                     {
                         let a = self.rules.attrs_differ(meta, &d);
                         if a.owner {
@@ -628,14 +758,18 @@ impl<'a> Engine<'a> {
                     return false;
                 }
             }
-            Some(Kind::Dir) => {
-                if !self.remove_conflicting_dir(dst_path, rel) {
-                    return false;
-                }
-            }
+            Some(Kind::Dir) if !self.remove_conflicting_dir(dst_path, rel) => return false,
             _ => {}
         }
-        self.out.item(rel, Kind::Symlink, Some(target.as_os_str().as_bytes()));
+        let change = match dst_kind {
+            // The target changed: rsync shows `cLc` plus the attributes that differ.
+            Some(Kind::Symlink) => match fsops::lstat(dst_path) {
+                Ok(d) => Change { local: true, value: true, perms: false, ..self.attr_change(meta, &d, false) },
+                Err(_) => Change::new_local(),
+            },
+            _ => Change::new_local(),
+        };
+        self.out.item(rel, Kind::Symlink, Link::Sym(target.as_os_str().as_bytes()), change, true);
         if dst_kind.is_none() {
             Stats::add(&self.stats.created, 1);
         }
@@ -665,6 +799,7 @@ impl<'a> Engine<'a> {
                 if let Ok(d) = fsops::lstat(dst_path)
                     && d.rdev == meta.rdev
                 {
+                    self.out.item(rel, meta.kind, Link::None, self.attr_change(meta, &d, false), false);
                     let a = self.rules.attrs_differ(meta, &d);
                     if a.any() && !self.dry() {
                         self.fix_attrs(dst_path, meta, a);
@@ -672,14 +807,10 @@ impl<'a> Engine<'a> {
                     return false;
                 }
             }
-            Some(Kind::Dir) => {
-                if !self.remove_conflicting_dir(dst_path, rel) {
-                    return false;
-                }
-            }
+            Some(Kind::Dir) if !self.remove_conflicting_dir(dst_path, rel) => return false,
             _ => {}
         }
-        self.out.item(rel, meta.kind, None);
+        self.out.item(rel, meta.kind, Link::None, Change::new_local(), true);
         Stats::add(&self.stats.created, 1);
         if self.dry() {
             return true;
@@ -728,7 +859,14 @@ impl<'a> Engine<'a> {
 
     /// Report a file that is about to be (re)written: the item line and the counters.
     pub(crate) fn note_transfer(&self, job: &FileJob) {
-        self.out.item(&job.rel, Kind::File, None);
+        let change = match job.dst_meta {
+            Some(d) if d.kind == Kind::File => {
+                Change { transfer: true, size: d.size != job.meta.size, ..self.attr_change(&job.meta, &d, true) }
+            }
+            _ => Change { new: true, transfer: true, ..Change::default() },
+        };
+        self.out.item(&job.rel, Kind::File, Link::None, change, true);
+        crate::progress::planned(job.meta.size);
         Stats::add(&self.stats.transferred, 1);
         Stats::add(&self.stats.transferred_bytes, job.meta.size);
         if job.dst_meta.is_none() {
@@ -752,9 +890,12 @@ impl<'a> Engine<'a> {
         }
         self.note_transfer(job);
         if self.dry() {
+            crate::progress::done(job.meta.size);
             return;
         }
-        if let Err(e) = self.write_file(job)
+        let r = self.write_file(job);
+        crate::progress::done(job.meta.size);
+        if let Err(e) = r
             && !fsops::interrupted()
         {
             let to = path_msg("\" -> \"", &job.dst_path, format!("\" failed: {e}"));

@@ -37,7 +37,7 @@ fn spawn_server(opts: &Options, host: &str) -> io::Result<Child> {
 }
 
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
-    let out = Output::new(opts.verbose, opts.out_format.clone(), opts.eight_bit_output);
+    let out: &'static Output = Box::leak(Box::new(Output::new(opts)));
     let started = Instant::now();
 
     // Push (local sources, remote destination) or pull (remote sources on one host,
@@ -118,18 +118,22 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     }
 
-    if let Err(e) = streams::setup_client(&mut conn, opts.streams, !server_is_sender, &out) {
+    if let Err(e) = streams::setup_client(&mut conn, opts.streams, !server_is_sender, out) {
         out.error(format!("setting up parallel streams failed: {e}"));
         let _ = child.kill();
         return exit::PROTOCOL;
     }
 
+    let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));
     let (code, stats) = if server_is_sender {
-        let (code, stats) = receiver::run(&conn, opts, dest, &out);
+        let (code, stats) = receiver::run(&conn, opts, dest, out);
         (code, Some(stats))
     } else {
-        sender::run(&conn, opts, sources, &out)
+        sender::run(&conn, opts, sources, out)
     };
+    if let Some(r) = reporter {
+        r.finish(out);
+    }
     let _ = conn.finish();
     let _ = child.wait();
     out.flush();
@@ -139,7 +143,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     {
         let totals = Stats::default();
         totals.absorb(&s);
-        totals.print(&out, started.elapsed(), opts.human, opts.stats);
+        totals.print(out, started.elapsed(), opts.human, opts.stats);
     }
     out.flush();
     code

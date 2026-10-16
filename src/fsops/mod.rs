@@ -64,6 +64,7 @@ pub fn meta_from_stat(st: &libc::stat) -> Meta {
         dev: st.st_dev as u64,
         ino: st.st_ino as u64,
         rdev: st.st_rdev as u64,
+        nlink: st.st_nlink as u64,
     }
 }
 
@@ -81,14 +82,26 @@ impl DirHandle {
         Ok(DirHandle { fd: unsafe { OwnedFd::from_raw_fd(fd) } })
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+
     pub fn lstat(&self, name: &OsStr) -> io::Result<Meta> {
         let c = CString::new(name.as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        cvt(unsafe {
-            libc::fstatat(self.fd.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
-        })?;
-        Ok(meta_from_stat(&st))
+        #[cfg(target_os = "linux")]
+        {
+            platform::statx_at(self.fd.as_raw_fd(), &c)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            cvt(unsafe {
+                libc::fstatat(self.fd.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+            })?;
+            Ok(meta_from_stat(&st))
+        }
     }
 
     pub fn readlink(&self, name: &OsStr) -> io::Result<Vec<u8>> {
@@ -126,7 +139,30 @@ pub fn stat(path: &Path) -> io::Result<Meta> {
 
 /// Read a directory and `lstat` every child. Entries that vanish between `readdir`
 /// and `lstat` are skipped, matching rsync's behaviour for files deleted mid-scan.
+///
+/// On macOS the names and attributes come from `getattrlistbulk` (many entries per
+/// syscall) when the filesystem supports it.
 pub fn read_dir_meta(dir: &Path) -> io::Result<Vec<DirEnt>> {
+    #[cfg(target_os = "macos")]
+    if !bulk_disabled() {
+        let handle = DirHandle::open(dir)?;
+        if let Some(mut ents) = platform::read_dir_bulk(&handle)? {
+            ents.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+            return Ok(ents);
+        }
+    }
+    read_dir_stat(dir)
+}
+
+/// `FASTRSYNC_NO_BULK=1` forces the per-entry `fstatat` path (for benchmarking).
+#[cfg(target_os = "macos")]
+fn bulk_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FASTRSYNC_NO_BULK").is_some())
+}
+
+/// `readdir` + one `fstatat` per entry.
+pub fn read_dir_stat(dir: &Path) -> io::Result<Vec<DirEnt>> {
     let names: Vec<OsString> =
         fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
     let handle = DirHandle::open(dir)?;
@@ -480,6 +516,45 @@ pub fn am_root() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bulk / statx scanner must agree field-for-field with plain `fstatat`.
+    #[test]
+    fn fast_scanner_matches_fstatat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("file"), b"hello").unwrap();
+        fs::write(d.join("big"), vec![1u8; 300_000]).unwrap();
+        fs::create_dir(d.join("sub")).unwrap();
+        std::os::unix::fs::symlink("file", d.join("link")).unwrap();
+        fs::hard_link(d.join("file"), d.join("hard")).unwrap();
+        let c = cstr(&d.join("fifo")).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
+        let c = cstr(&d.join("file")).unwrap();
+        unsafe { libc::chmod(c.as_ptr(), 0o4751) };
+        set_mtime(&d.join("big"), 1_600_000_123, 456_789_000).unwrap();
+        for i in 0..2000 {
+            fs::write(d.join(format!("many-{i:04}")), i.to_string()).unwrap();
+        }
+        let fast = read_dir_meta(d).unwrap();
+        let plain: Vec<DirEnt> = {
+            let mut v: Vec<DirEnt> = fs::read_dir(d)
+                .unwrap()
+                .map(|e| {
+                    let name = e.unwrap().file_name();
+                    let p = d.join(&name);
+                    let meta = lstat(&p).unwrap();
+                    let link = (meta.kind == Kind::Symlink).then(|| read_link_bytes(&p).unwrap());
+                    DirEnt { name, meta, link }
+                })
+                .collect();
+            v.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+            v
+        };
+        assert_eq!(fast.len(), plain.len());
+        for (a, b) in fast.iter().zip(&plain) {
+            assert_eq!((&a.name, &a.meta, &a.link), (&b.name, &b.meta, &b.link));
+        }
+    }
 
     #[test]
     fn temp_names_are_unique_and_bounded() {

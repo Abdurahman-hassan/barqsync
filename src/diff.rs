@@ -129,6 +129,7 @@ mod tests {
             dev: 1,
             ino: 1,
             rdev: 0,
+            nlink: 1,
         }
     }
 

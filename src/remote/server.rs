@@ -35,10 +35,11 @@ pub fn run() -> i32 {
         return exit::PROTOCOL;
     }
     let fwd = conn.out.clone();
+    // In a push the items come from this (receiving) side but describe what the
+    // client sent, so they are shown as rsync's sender does (`<f...`).
     let out = Output::forwarding(
-        opts.verbose,
-        opts.out_format.clone(),
-        opts.eight_bit_output,
+        &opts,
+        !server_is_sender,
         Box::new(move |stderr, escape, text| {
             let _ = fwd.msg(Msg::Log { stderr, escape, text: text.to_vec() });
         }),

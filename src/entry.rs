@@ -54,6 +54,8 @@ pub struct Meta {
     pub dev: u64,
     pub ino: u64,
     pub rdev: u64,
+    /// Hard link count (`-H` groups files with `nlink > 1` by `(dev, ino)`).
+    pub nlink: u64,
 }
 
 impl Meta {
@@ -69,6 +71,7 @@ impl Meta {
             dev: md.dev(),
             ino: md.ino(),
             rdev: md.rdev(),
+            nlink: md.nlink(),
         }
     }
 }

@@ -158,6 +158,7 @@ impl Sender<'_> {
             };
             let id = file_id(dir, req.idx);
             let path = base.join(&e.name);
+            crate::progress::planned(e.meta.size);
             if req.sig.is_none() && e.meta.size <= proto::SMALL_FILE {
                 small.push((id, path));
             } else {
@@ -171,6 +172,7 @@ impl Sender<'_> {
             self.pending_files.fetch_add(1, SeqCst);
             s.spawn(move |_| {
                 if !fsops::interrupted() {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     let r = match sig {
                         Some(sig) => self.send_delta(id, &path, sig),
                         None => self.send_whole(id, &path),
@@ -179,6 +181,7 @@ impl Sender<'_> {
                         self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
                         self.send(Msg::FileEnd { id, ok: false });
                     }
+                    crate::progress::done(size);
                 }
                 self.pending_files.fetch_sub(1, SeqCst);
                 self.check_done();
@@ -194,6 +197,7 @@ impl Sender<'_> {
         for (id, data, path) in read {
             match data {
                 Ok(d) => {
+                    crate::progress::done(d.len() as u64);
                     if !blob.is_empty() && blob.len() + d.len() > proto::PACK_BYTES {
                         self.send(Msg::SmallPack { files: std::mem::take(&mut pack), blob: std::mem::take(&mut blob) });
                     }

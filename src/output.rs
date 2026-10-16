@@ -4,6 +4,7 @@
 //! log.c (`rwrite` + `filtered_fwrite`), so a name cannot put control characters or
 //! terminal escape sequences on the user's terminal.
 
+use crate::cli::Options;
 use crate::entry::Kind;
 use std::io::{BufWriter, Stdout, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -16,31 +17,120 @@ use std::time::Duration;
 /// `(stderr, escape, text)`, printed by the client (see [`Output::print_forwarded`]).
 pub type Forward = Box<dyn Fn(bool, bool, &[u8]) + Send + Sync>;
 
+struct Sink {
+    w: BufWriter<Stdout>,
+    /// The progress line currently drawn (without a newline), if any.
+    progress: Option<Vec<u8>>,
+}
+
+impl Sink {
+    /// Write complete lines, keeping the progress line (if any) drawn below them.
+    fn write_lines(&mut self, bytes: &[u8]) {
+        if self.progress.is_some() {
+            let _ = self.w.write_all(b"\r\x1b[K");
+        }
+        let _ = self.w.write_all(bytes);
+        if let Some(p) = &self.progress {
+            let _ = self.w.write_all(b"\r");
+            let _ = self.w.write_all(p);
+            let _ = self.w.flush();
+        }
+    }
+}
+
 pub struct Output {
-    out: Mutex<BufWriter<Stdout>>,
+    out: Mutex<Sink>,
+    /// stdout is a terminal (progress is redrawn in place only then).
+    tty: bool,
     verbose: u8,
+    /// Number of `-i`: at 2+, unchanged items are listed too.
+    itemize: u8,
     format: Option<String>,
+    /// The format contains `%i`: attribute-only changes and deletions are shown.
+    has_i: bool,
+    /// `-t` is on: an mtime difference shows as `t`, otherwise as `T` (rsync).
+    times: bool,
+    /// Items are reported from the sending side's point of view (`<f...`): a push,
+    /// whose items are produced by the remote receiver.
+    sender_view: bool,
     charset: Charset,
     forward: Option<Forward>,
 }
 
+/// What changed about one item, rendered by `%i` as rsync's `YXcstpoguax`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Change {
+    /// Didn't exist (or had another type): all attribute columns show `+`.
+    pub new: bool,
+    /// File data written (`>`, or `<` from the sender's view).
+    pub transfer: bool,
+    /// Created or changed in place: directories, symlinks, specials (`c`).
+    pub local: bool,
+    /// Hard-linked to an earlier name (`h`).
+    pub hardlink: bool,
+    /// Symlink target or device number changed (`c` column).
+    pub value: bool,
+    pub size: bool,
+    pub time: bool,
+    pub perms: bool,
+    pub owner: bool,
+    pub group: bool,
+}
+
+impl Change {
+    pub fn new_local() -> Change {
+        Change { new: true, local: true, ..Change::default() }
+    }
+
+    pub fn any_attr(&self) -> bool {
+        self.value || self.size || self.time || self.perms || self.owner || self.group
+    }
+
+    fn anything(&self) -> bool {
+        self.new || self.transfer || self.local || self.hardlink || self.any_attr()
+    }
+}
+
+/// What `%L` shows after a name.
+#[derive(Debug, Clone, Copy)]
+pub enum Link<'a> {
+    None,
+    /// ` -> target`
+    Sym(&'a [u8]),
+    /// ` => other name` (a hard link)
+    Hard(&'a [u8]),
+}
+
 impl Output {
-    /// `eight_bit` is `-8`/`--8-bit-output`: skip the charset check, escape only control characters.
-    pub fn new(verbose: u8, out_format: Option<String>, eight_bit: bool) -> Output {
-        let format = out_format.or_else(|| (verbose > 0).then(|| "%n%L".to_string()));
+    /// Output configured from the command line: `-v` lists items as `%n%L`, `-i` as
+    /// `%i %n%L`, `--out-format` overrides both; `-8` skips the charset check when escaping.
+    pub fn new(opts: &Options) -> Output {
+        let format = opts.out_format.clone().or_else(|| {
+            if opts.itemize > 0 {
+                Some("%i %n%L".to_string())
+            } else {
+                (opts.verbose > 0).then(|| "%n%L".to_string())
+            }
+        });
         Output {
-            out: Mutex::new(BufWriter::with_capacity(64 * 1024, std::io::stdout())),
-            verbose,
+            out: Mutex::new(Sink { w: BufWriter::with_capacity(64 * 1024, std::io::stdout()), progress: None }),
+            tty: std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            verbose: opts.verbose,
+            itemize: opts.itemize,
+            has_i: format.as_deref().is_some_and(|f| f.contains("%i")),
             format,
-            charset: Charset::for_output(eight_bit),
+            times: opts.times,
+            sender_view: false,
+            charset: Charset::for_output(opts.eight_bit_output),
             forward: None,
         }
     }
 
     /// Output for a server process: nothing is written locally, every line goes to
     /// `forward` unescaped, so the client escapes it for its own terminal and charset.
-    pub fn forwarding(verbose: u8, out_format: Option<String>, eight_bit: bool, forward: Forward) -> Output {
-        Output { forward: Some(forward), ..Output::new(verbose, out_format, eight_bit) }
+    /// `sender_view`: items are shown as the (client) sender sees them.
+    pub fn forwarding(opts: &Options, sender_view: bool, forward: Forward) -> Output {
+        Output { forward: Some(forward), sender_view, ..Output::new(opts) }
     }
 
     /// Print a line a server forwarded.
@@ -56,8 +146,29 @@ impl Output {
             self.flush();
             let _ = std::io::stderr().lock().write_all(&line);
         } else {
-            let _ = self.out.lock().unwrap().write_all(&line);
+            self.out.lock().unwrap().write_lines(&line);
         }
+    }
+
+    /// Draw the progress status line. Redrawn in place on a terminal; elsewhere only
+    /// the final status is printed. `last`: finish it with a newline.
+    pub fn progress(&self, status: &[u8], last: bool) {
+        if self.forward.is_some() || (!self.tty && !last) {
+            return;
+        }
+        let mut sink = self.out.lock().unwrap();
+        let _ = sink.w.write_all(b"\r");
+        let _ = sink.w.write_all(status);
+        if self.tty {
+            let _ = sink.w.write_all(b"\x1b[K");
+        }
+        if last {
+            let _ = sink.w.write_all(b"\n");
+            sink.progress = None;
+        } else {
+            sink.progress = Some(status.to_vec());
+        }
+        let _ = sink.w.flush();
     }
 
     pub fn verbose(&self) -> u8 {
@@ -68,9 +179,10 @@ impl Output {
         if let Some(f) = &self.forward {
             return f(false, false, bytes);
         }
-        let mut out = self.out.lock().unwrap();
-        let _ = out.write_all(bytes);
-        let _ = out.write_all(b"\n");
+        let mut line = Vec::with_capacity(bytes.len() + 1);
+        line.extend_from_slice(bytes);
+        line.push(b'\n');
+        self.out.lock().unwrap().write_lines(&line);
     }
 
     /// Write a line that may contain names. Like rsync, the whole line is escaped,
@@ -82,13 +194,52 @@ impl Output {
         let mut line = Vec::with_capacity(text.len() + 1);
         escape(text, self.charset, &mut line);
         line.push(b'\n');
-        let _ = self.out.lock().unwrap().write_all(&line);
+        self.out.lock().unwrap().write_lines(&line);
     }
 
-    /// Report a transferred/created item. `rel` is relative to the transfer root
-    /// (empty for the root itself, shown as `./`).
-    pub fn item(&self, rel: &[u8], kind: Kind, link_target: Option<&[u8]>) {
+    /// `%i`: rsync's 11-character change summary.
+    fn itemize_field(&self, kind: Kind, c: &Change) -> [u8; 11] {
+        let mut f = [b'.'; 11];
+        f[0] = if c.hardlink {
+            b'h'
+        } else if c.local {
+            b'c'
+        } else if c.transfer {
+            if self.sender_view { b'<' } else { b'>' }
+        } else {
+            b'.'
+        };
+        f[1] = match kind {
+            Kind::File => b'f',
+            Kind::Dir => b'd',
+            Kind::Symlink => b'L',
+            Kind::CharDev | Kind::BlockDev => b'D',
+            Kind::Fifo | Kind::Socket => b'S',
+        };
+        if c.new {
+            f[2..].fill(b'+');
+        } else if !c.anything() {
+            f[2..].fill(b' ');
+        } else {
+            let set = |on: bool, ch: u8| if on { ch } else { b'.' };
+            f[2] = set(c.value, b'c');
+            f[3] = set(c.size, b's');
+            f[4] = set(c.time, if self.times { b't' } else { b'T' });
+            f[5] = set(c.perms, b'p');
+            f[6] = set(c.owner, b'o');
+            f[7] = set(c.group, b'g');
+        }
+        f
+    }
+
+    /// Report an item. `rel` is relative to the transfer root (empty for the root
+    /// itself, shown as `./`). `significant`: shown by plain `-v` (transfers, creations,
+    /// directory time changes); `-i` also shows attribute-only changes, `-ii` everything.
+    pub fn item(&self, rel: &[u8], kind: Kind, link: Link, change: Change, significant: bool) {
         let Some(fmt) = &self.format else { return };
+        if !(significant || (self.has_i && change.anything()) || self.itemize >= 2) {
+            return;
+        }
         let mut name = if rel.is_empty() { b".".to_vec() } else { rel.to_vec() };
         if kind == Kind::Dir {
             name.push(b'/');
@@ -102,12 +253,18 @@ impl Output {
             }
             match chars.next() {
                 Some(b'n') => line.extend_from_slice(&name),
-                Some(b'L') => {
-                    if let Some(t) = link_target {
+                Some(b'L') => match link {
+                    Link::Sym(t) => {
                         line.extend_from_slice(b" -> ");
                         line.extend_from_slice(t);
                     }
-                }
+                    Link::Hard(t) => {
+                        line.extend_from_slice(b" => ");
+                        line.extend_from_slice(t);
+                    }
+                    Link::None => {}
+                },
+                Some(b'i') => line.extend_from_slice(&self.itemize_field(kind, &change)),
                 Some(b'%') => line.push(b'%'),
                 Some(other) => {
                     line.push(b'%');
@@ -119,21 +276,26 @@ impl Output {
         self.escaped_line(&line);
     }
 
+    /// A deletion: `deleting name` with `-v`, or `*deleting   name` when itemizing.
     pub fn deleting(&self, rel: &[u8], is_dir: bool) {
-        if self.verbose == 0 {
+        if self.verbose == 0 && !self.has_i {
             return;
         }
-        let mut line = b"deleting ".to_vec();
-        line.extend_from_slice(rel);
+        let mut name = rel.to_vec();
         if is_dir {
-            line.push(b'/');
+            name.push(b'/');
         }
+        let line = if self.has_i {
+            [&b"*deleting   "[..], &name].concat()
+        } else {
+            [&b"deleting "[..], &name].concat()
+        };
         self.escaped_line(&line);
     }
 
-    /// Informational message shown with `-v`; may contain raw name bytes.
+    /// Informational message shown with `-v` or `-i` (as rsync does); may contain raw name bytes.
     pub fn info(&self, msg: impl AsRef<[u8]>) {
-        if self.verbose > 0 {
+        if self.verbose > 0 || self.itemize > 0 {
             self.escaped_line(msg.as_ref());
         }
     }
@@ -158,7 +320,7 @@ impl Output {
     }
 
     pub fn flush(&self) {
-        let _ = self.out.lock().unwrap().flush();
+        let _ = self.out.lock().unwrap().w.flush();
     }
 }
 

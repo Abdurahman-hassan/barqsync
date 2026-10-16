@@ -103,7 +103,8 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
 }
 
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
-    let out = Output::new(opts.verbose, opts.out_format.clone(), opts.eight_bit_output);
+    // Process-lifetime output, shared with the progress thread.
+    let out: &'static Output = Box::leak(Box::new(Output::new(opts)));
     let filter = match Filter::new(&opts.filter_rules) {
         Ok(f) => f,
         Err(e) => {
@@ -112,7 +113,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     };
     let started = Instant::now();
-    let plan = match plan(opts, sources, dest, &out) {
+    let plan = match plan(opts, sources, dest, out) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -127,7 +128,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     }
 
-    let engine = Engine::new(opts, filter, &out);
+    let engine = Engine::new(opts, filter, out);
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
         .thread_name(|i| format!("fastrsync-{i}"))
@@ -139,6 +140,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
             return exit::IPC;
         }
     };
+    let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));
     pool.install(|| {
         for (i, root) in plan.roots.iter().enumerate() {
             // Only the first root may assume a freshly created destination is empty.
@@ -146,9 +148,13 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
             rayon::scope(|s| engine.run_root(s, root, plan.dest_exists, fresh));
         }
         if !fsops::interrupted() {
+            engine.link_followers();
             engine.apply_fixups();
         }
     });
+    if let Some(r) = reporter {
+        r.finish(out);
+    }
     out.flush();
     if fsops::interrupted() {
         fsops::cleanup_temps();
@@ -156,7 +162,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
 
     if opts.stats || opts.verbose > 0 {
-        engine.stats.print(&out, started.elapsed(), opts.human, opts.stats);
+        engine.stats.print(out, started.elapsed(), opts.human, opts.stats);
     }
     out.flush();
 
