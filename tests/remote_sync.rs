@@ -101,9 +101,10 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Old and new versions of a few large files (same size and changed size).
+/// Old and new versions of a few large files (same size and changed size), big
+/// enough (8 MiB+) to get page-cache hints.
 fn delta_fixture(root: &std::path::Path) {
-    let base = noise(5 << 20, 1);
+    let base = noise((8 << 20) + 12_345, 1);
     let mut edited = base.clone();
     edited[2_000_000..2_000_050].copy_from_slice(&noise(50, 2));
     let mut grown = noise(333, 3);

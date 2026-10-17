@@ -20,6 +20,11 @@ pub const MIN_SIZE: u64 = 8 << 20;
 /// Linux: unit of dropping and write-behind for sequential I/O.
 const WINDOW: u64 = 8 << 20;
 
+/// Uncached writes are synchronous on macOS (no write-behind), so code that receives
+/// data in small pieces should collect them into writes of [`WRITE_UNIT`] bytes.
+pub const SYNC_WRITES: bool = cfg!(target_os = "macos");
+pub const WRITE_UNIT: usize = 8 << 20;
+
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Turn the hints on or off for this process (`--no-drop-cache`).
@@ -45,7 +50,8 @@ pub fn read_once(f: &File, size: u64) -> bool {
     true
 }
 
-/// A range of a [`read_once`] file has been read and is not needed again soon.
+/// A range of a [`read_once`] file has been read and is not needed again soon
+/// (`len` 0: up to the end of the file).
 pub fn drop_read(f: &File, off: u64, len: u64) {
     #[cfg(target_os = "linux")]
     fadvise(f, off, len, libc::POSIX_FADV_DONTNEED);
@@ -93,6 +99,11 @@ impl Writer {
         #[cfg(not(target_os = "macos"))]
         let _ = f;
         Writer { on, queued: 0, pending: None }
+    }
+
+    /// Whether this file gets hints.
+    pub fn is_on(&self) -> bool {
+        self.on
     }
 
     /// Everything before `end` has been written.
@@ -144,4 +155,48 @@ fn drop_written(f: &File, off: u64, len: u64) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (f, off, len);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn small_files_get_no_hints() {
+        assert!(!wanted(MIN_SIZE - 1));
+    }
+
+    #[test]
+    fn hinted_write_and_read_keep_the_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        let data: Vec<u8> = (0..(20u64 << 20) + 123).map(|i| (i ^ (i >> 11)) as u8).collect();
+        let mut f = File::create(&path).unwrap();
+        let mut w = Writer::new(&f, data.len() as u64);
+        let mut end = 0u64;
+        for piece in data.chunks(3 << 20) {
+            f.write_all(piece).unwrap();
+            end += piece.len() as u64;
+            w.written_to(&f, end);
+        }
+        if wanted(data.len() as u64) {
+            // Windows close once 8 MiB are written: at 9 and at 18 MiB.
+            assert_eq!((w.queued, w.pending), (18 << 20, Some((9 << 20, 9 << 20))));
+        }
+        drop(f);
+        let mut f = File::open(&path).unwrap();
+        let mut r = Reader::new(&f, data.len() as u64);
+        let mut back = Vec::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            back.extend_from_slice(&buf[..n]);
+            r.read_to(&f, back.len() as u64);
+        }
+        assert!(back == data, "data changed");
+    }
 }

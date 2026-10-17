@@ -92,6 +92,16 @@ impl ReadAt for ReadOnce<'_> {
     }
 }
 
+impl Drop for ReadOnce<'_> {
+    /// One thread's read-ahead can pull in pages of a range another thread has already
+    /// read and dropped, so sweep the whole file once at the end.
+    fn drop(&mut self) {
+        if self.hinted {
+            cache::drop_read(self.file, 0, 0);
+        }
+    }
+}
+
 impl ReadAt for Vec<u8> {
     fn read_exact_at(&self, buf: &mut [u8], off: u64) -> io::Result<()> {
         let off = usize::try_from(off).map_err(|_| io::ErrorKind::UnexpectedEof)?;

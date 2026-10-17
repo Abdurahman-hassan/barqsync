@@ -263,6 +263,36 @@ fn inplace_and_fsync_produce_correct_files() {
     assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
 }
 
+/// Files of 8 MiB+ go through the page-cache-hinted copy paths (buffered copy,
+/// `--inplace` overwrite, clone or `copy_file_range`); the bytes must not change.
+#[test]
+fn big_files_with_and_without_cache_hints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    let big: Vec<u8> = (0..(9u64 << 20) + 777).map(|i| (i * 31 + i / 4099) as u8).collect();
+    t.file("big.img", &big).file("small", "x").settle_mtimes();
+    for (dst, extra) in [("d1", &["--no-clone"][..]), ("d2", &["--no-clone", "--no-drop-cache"]), ("d3", &[])] {
+        let mut args = vec!["-a"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["src/", dst]);
+        let r = fastrsync(tmp.path(), &args);
+        assert_eq!(r.code, 0, "{extra:?}: {}", r.stderr);
+        assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join(dst), true));
+    }
+    // Overwrite in place with a shorter, different version.
+    t.file("big.img", &big[1000..(8 << 20) + 1000 + 99]).settle_mtimes();
+    for extra in [&["--inplace", "--no-clone"][..], &["--inplace", "--no-clone", "--drop-cache"]] {
+        for dst in ["d1", "d2"] {
+            let mut args = vec!["-a"];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&["src/", dst]);
+            let r = fastrsync(tmp.path(), &args);
+            assert_eq!(r.code, 0, "{extra:?}: {}", r.stderr);
+            assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join(dst), true));
+        }
+    }
+}
+
 #[test]
 fn missing_source_reports_partial_transfer() {
     let tmp = tempfile::tempdir().unwrap();

@@ -53,6 +53,41 @@ struct Incoming {
     job: FileJob,
     /// Page-cache hints for the incoming data.
     hint: cache::Writer,
+    /// Data not written yet: offset and contiguous bytes (see [`Incoming::write`]).
+    held: (u64, Vec<u8>),
+}
+
+impl Incoming {
+    /// Write one piece of incoming data. Big files on macOS are written uncached, which
+    /// is synchronous and would stall the receive loop once per frame, so their
+    /// contiguous frames are collected into writes of `cache::WRITE_UNIT` bytes.
+    fn write(&mut self, off: u64, bytes: &[u8]) -> io::Result<()> {
+        if !(cache::SYNC_WRITES && self.hint.is_on()) {
+            self.file.write_all_at(bytes, off)?;
+            self.hint.written_to(&self.file, off + bytes.len() as u64);
+            return Ok(());
+        }
+        let held = self.held.1.len();
+        if held > 0 && (self.held.0 + held as u64 != off || held + bytes.len() > cache::WRITE_UNIT) {
+            self.flush()?;
+        }
+        if self.held.1.is_empty() {
+            self.held.0 = off;
+            self.held.1.reserve(cache::WRITE_UNIT);
+        }
+        self.held.1.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let (off, buf) = &mut self.held;
+        if !buf.is_empty() {
+            self.file.write_all_at(buf, *off)?;
+            self.hint.written_to(&self.file, *off + buf.len() as u64);
+            buf.clear();
+        }
+        Ok(())
+    }
 }
 
 pub struct RemoteState {
@@ -255,7 +290,7 @@ impl RemoteState {
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let hint = cache::Writer::new(&file, size);
-        let inc = Incoming { file, path, rename, registered, created, delta: false, size, job, hint };
+        let inc = Incoming { file, path, rename, registered, created, delta: false, size, job, hint, held: (0, Vec::new()) };
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
     }
@@ -300,7 +335,7 @@ impl RemoteState {
             return Err(e);
         }
         let hint = cache::Writer::new(&file, size);
-        let inc = Incoming { file, path, rename, registered, created: false, delta: true, size, job, hint };
+        let inc = Incoming { file, path, rename, registered, created: false, delta: true, size, job, hint, held: (0, Vec::new()) };
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
     }
@@ -308,11 +343,7 @@ impl RemoteState {
     fn data(&self, id: u64, off: u64, bytes: &[u8]) -> io::Result<()> {
         let mut incoming = self.incoming.lock().unwrap();
         match incoming.get_mut(&id) {
-            Some(inc) => {
-                inc.file.write_all_at(bytes, off)?;
-                inc.hint.written_to(&inc.file, off + bytes.len() as u64);
-                Ok(())
-            }
+            Some(inc) => inc.write(off, bytes),
             // The file failed to open on our side; its error was already reported.
             None => Ok(()),
         }
@@ -342,7 +373,8 @@ impl RemoteState {
         }
     }
 
-    fn finish(&self, eng: &Engine, inc: Incoming) -> io::Result<()> {
+    fn finish(&self, eng: &Engine, mut inc: Incoming) -> io::Result<()> {
+        inc.flush()?;
         inc.file.set_len(inc.size)?;
         let (mode, uid, gid) = eng.target_attrs(&inc.job);
         let meta = inc.job.meta;
@@ -391,7 +423,7 @@ impl RemoteState {
         let size = bytes.len() as u64;
         let write = file.write_all_at(bytes, 0);
         let hint = cache::Writer::new(&file, size);
-        let inc = Incoming { file, path: path.clone(), rename, registered, created, delta: false, size, job, hint };
+        let inc = Incoming { file, path: path.clone(), rename, registered, created, delta: false, size, job, hint, held: (0, Vec::new()) };
         let r = write.and_then(|()| self.finish(eng, inc));
         if registered { finish_temp(&path, r) } else { r }
     }

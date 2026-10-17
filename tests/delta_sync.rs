@@ -33,6 +33,10 @@ fn versions() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     let mut middle_cut = base.clone();
     middle_cut.drain(2 * MIB..2 * MIB + 12_345);
     let truncated = base[..4 * MIB + 17].to_vec();
+    // Big enough (8 MiB+) for page-cache hints on the hashing reads and rebuild writes.
+    let big = noise(9 * MIB + 4321, 9);
+    let mut big_edited = big.clone();
+    big_edited[8 * MIB + 5..8 * MIB + 5000].copy_from_slice(&noise(4995, 10));
     vec![
         ("in_place.img", base.clone(), overwritten),
         ("appended.log", base.clone(), appended),
@@ -41,6 +45,7 @@ fn versions() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
         ("truncated.bin", base.clone(), truncated),
         ("unrelated.bin", base.clone(), noise(3 * MIB, 6)),
         ("grown_from_small.bin", noise(70_000, 7), noise(2 * MIB, 8)),
+        ("big.img", big, big_edited),
     ]
 }
 

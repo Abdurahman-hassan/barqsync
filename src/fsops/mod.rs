@@ -421,7 +421,11 @@ fn copy_uncached(src: &File, dst: &File, size: u64) -> io::Result<u64> {
     while n > 0 {
         check_interrupt()?;
         reader.read_to(src, read);
-        let (w, r) = rayon::join(|| { let mut d = dst; d.write_all(&cur[..n]) }, || read_full(src, &mut next));
+        let write = || {
+            let mut d = dst;
+            d.write_all(&cur[..n])
+        };
+        let (w, r) = rayon::join(write, || read_full(src, &mut next));
         w?;
         written += n as u64;
         writer.written_to(dst, written);

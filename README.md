@@ -42,7 +42,8 @@ With Homebrew's keg-only rustup, add `/opt/homebrew/opt/rustup/bin` to `PATH`.
 `--ignore-existing`, `-x`, `--modify-window` (`-1` compares nanoseconds), `-W/--whole-file`,
 `--no-whole-file` (delta transfer; locally off by default, like rsync), `--inplace` (also
 writes new files directly, like rsync),
-`--fsync`, `--stats`, `-h`, `--threads N`.
+`--fsync`, `--stats`, `-h`, `--threads N`, `--drop-cache`/`--no-drop-cache` (page-cache hints
+for files of 8 MiB+, on by default; see [Page-cache hints](#page-cache-hints)).
 
 Trailing-slash semantics match rsync: `src/` syncs the contents, `src` syncs the directory itself.
 Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 20 interrupted, 23 partial transfer).
@@ -142,7 +143,7 @@ src/cli.rs          flags → Options (filter order preserved across --include/-
 src/paths.rs        host:path detection, trailing-slash rules
 src/filter.rs       rsync wildmatch + include/exclude rules
 src/diff.rs         quick check (size + mtime, --modify-window, -u, --size-only, ...)
-src/fsops/          readdir + fstatat, temp names, clone/copy, utimensat, mknod
+src/fsops/          readdir + fstatat, temp names, clone/copy, utimensat, mknod, page-cache hints
 src/local/          planner (SRC... DEST → roots) and the parallel per-directory engine
 src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild)
 src/proto/          wire frames (postcard + raw data, optional zstd), reader/writer threads
@@ -220,6 +221,67 @@ The last row says more about APFS than about fastrsync: on the same volume, a ch
 is simply cloned. When the destination can't be cloned, writing a whole new 10 GiB file is disk
 bound for both tools, so the delta engine's win comes from clone + patch (or `--inplace`), not
 from hashing.
+
+### Page-cache hints
+
+Files of 8 MiB or more are read and written with page-cache hints, so a big sync doesn't
+push other cached files and the memory of running applications out of RAM:
+
+- **macOS:** `F_NOCACHE` on both files. Pages that are already cached are still used, but no
+  new ones are cached.
+- **Linux:** `POSIX_FADV_SEQUENTIAL` while reading, and `POSIX_FADV_DONTNEED` on each range
+  once it's read. Writes start writeback (`sync_file_range`) every 8 MiB, wait for the window
+  before that one, then drop it, so only about two windows per file stay in the cache.
+
+The hints are on by default; `--no-drop-cache` turns them off. Smaller files are never hinted.
+
+Measured on benchmark B. Before every run, the B files were evicted from the page cache
+(`msync(MS_INVALIDATE)` on a mapping, no root needed) and a 1 GiB "canary" file was read in,
+standing in for an application's hot data. `mincore` then showed what was still cached.
+Runs alternated hints on and off, swapping the order every round. The last two rounds left
+30 s between runs for the SSD's write cache to drain. The machine was under memory pressure
+(16 GB, ~4.4 GB of swap in use, a 7.5 GB Podman VM), as a busy laptop is.
+
+| B, 10 GiB, 50 × 1 MiB changed | hints on | hints off | canary still cached (on / off) |
+| --- | ---: | ---: | --- |
+| `--no-whole-file` (hash both, clone + patch) | 6.29–6.54 s, median 6.3 | 6.69–7.10 s, median 6.8 | 100% in 4 of 4 / 0% |
+| `--no-whole-file --no-clone` (hash both, rebuild) | 14.7–16.3 s, median 15.8 (one 26.7 s outlier) | 17.1–20.7 s, median 18.8 | 0–100%, median 73% / 0% |
+| `--no-clone` (whole-file buffered copy) | 8.6–11.1 s, median 10.0 (one 18.8 s outlier) | 8.8–12.0 s, median 10.7 | 6–100%, median 32% / 0% |
+
+- **The canary is the clearest signal.** Without hints it was evicted completely in all 16
+  runs, and up to 2.8 GiB of the source stayed cached afterwards. With hints, the B files
+  were never cached. The canary still lost some pages in some runs, because other programs
+  were also competing for memory: another session's benchmark was running in the Podman VM
+  during the last rounds. File-backed pages (`vm_stat`) grew by up to 1.5 GiB per run without
+  hints, and by at most 0.25 GiB with them.
+- **No slowdown; delta runs got faster.** Hashing reads lose nothing without read-ahead,
+  because 10 threads read 4 MiB segments in parallel. The rebuild is probably faster because
+  10 GiB of written data never turns into cached pages the system then has to reclaim. The
+  two outliers with hints both ran straight after a long burst of big writes; with a 30 s
+  pause between runs, the same cases took 9.7 s and 14.7 s.
+- **Uncached copies must overlap reads and writes.** The first version kept the 1 MiB
+  read-then-write loop and took 14.9 s instead of 10.5 s, because uncached I/O on macOS is
+  synchronous (no read-ahead, no write-behind). Big files are now copied through two 8 MiB
+  buffers, reading the next one while the current one is written.
+- **Costs:** a big file synced twice in a row is re-read from disk the second time. On
+  Linux, `DONTNEED` also drops source pages that were cached before the sync. macOS
+  `F_NOCACHE` keeps those.
+
+On Linux this was checked for effect only. The timings of a disk inside a VM say little,
+so none were taken. The check ran in the Podman VM (kernel 6.19, aarch64) with a 512 MiB
+file whose cache was dropped before each run; `fincore` then measured each file:
+
+| Linux, XFS volume, 512 MiB | cached afterwards, hints on (src / dst) | hints off |
+| --- | ---: | ---: |
+| `--no-clone` (buffered copy) | 0 / 8 MiB | 474 / 482 MiB |
+| `--no-whole-file --no-clone` (hash both, rebuild) | 0 / 16 MiB | 490 / 500 MiB |
+| default (`copy_file_range`, reflinked on XFS) | 0 / 0 | 0 / 0 |
+
+On overlayfs (a container's root filesystem), only reads are dropped. `sync_file_range` on an
+overlay file doesn't reach the underlying file, so written pages stay dirty and can't be
+dropped. The delta hashing reads use 4 MiB segments on many threads, and one thread's
+read-ahead could pull in pages another thread had already dropped (96 MiB of 512). The file
+is therefore dropped once more as a whole when hashing and rebuilding are done.
 
 Peak memory is higher than rsync's (~130 MiB vs 9 MiB on A locally, ~230 MiB for a remote push) because whole directory listings
 and per-thread 1 MiB copy buffers are held at once; bounding that is on the list.
