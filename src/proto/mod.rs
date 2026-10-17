@@ -31,6 +31,7 @@ use crate::delta::cdc::CdcSig;
 use crate::delta::{BlockSig, ChunkSig, Op};
 use crate::entry::{DirEnt, Meta};
 use crate::output::StatsSnapshot;
+use crate::remote::adapt::Compression;
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 pub mod async_io;
@@ -43,7 +44,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"FASTRSYN";
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -122,6 +123,11 @@ pub enum Msg {
     StreamsReady { count: u16 },
     /// `--transport quic`: where to connect and how to authenticate (sent over ssh).
     QuicOffer(StreamOffer),
+    /// Adaptive strategy: the sender's link probe (see `remote::adapt`).
+    Ping,
+    Pong,
+    ProbeAck,
+    LinkInfo(crate::remote::adapt::LinkInfo),
     /// Last frame on a data stream.
     StreamEnd,
     /// The peer is giving up; the message says why.
@@ -175,7 +181,7 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 /// Encode a frame: `u32 LE body length`, `u8 kind`, body. Compressed bodies are
 /// `u32 LE raw length` + zstd stream. `Hello` is always postcard, so a peer of any
 /// version can read it before the session's [`Wire`] is agreed.
-pub fn encode(frame: &Frame, compress: bool, wire: Wire) -> io::Result<Vec<u8>> {
+pub fn encode(frame: &Frame, level: Option<i32>, wire: Wire) -> io::Result<Vec<u8>> {
     let (kind, body) = match frame {
         Frame::Msg(m) if wire == Wire::Rkyv && !matches!(m, Msg::Hello { .. }) => {
             (KIND_RKYV, rkyv::to_bytes::<rkyv::rancor::Error>(m).map_err(|e| invalid(e.to_string()))?.into_vec())
@@ -189,8 +195,8 @@ pub fn encode(frame: &Frame, compress: bool, wire: Wire) -> io::Result<Vec<u8>> 
             (KIND_DATA, b)
         }
     };
-    let (kind, body) = if compress && body.len() >= 256 {
-        let z = zstd::bulk::compress(&body, 1)?;
+    let (kind, body) = if let Some(level) = level.filter(|_| body.len() >= 256) {
+        let z = zstd::bulk::compress(&body, level)?;
         if z.len() + 4 < body.len() {
             let mut b = Vec::with_capacity(4 + z.len());
             b.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -309,7 +315,7 @@ pub struct FrameSender {
     tx: Tx,
     /// Parallel data streams, when attached: file data goes here instead of `tx`.
     data: Option<Arc<Vec<Tx>>>,
-    compress: bool,
+    comp: Arc<Compression>,
     wire: Wire,
 }
 
@@ -329,7 +335,14 @@ fn data_key(f: &Frame) -> Option<u64> {
 impl FrameSender {
     /// Encode and queue a frame. Fails when the connection is gone.
     pub fn send(&self, frame: Frame) -> io::Result<()> {
-        let buf = encode(&frame, self.compress, self.wire)?;
+        let level = self.comp.level(matches!(frame, Frame::Msg(Msg::SmallPack { .. })));
+        let t = std::time::Instant::now();
+        let buf = encode(&frame, level, self.wire)?;
+        if level.is_some()
+            && let Frame::Msg(Msg::SmallPack { blob, .. }) | Frame::Data { bytes: blob, .. } = &frame
+        {
+            self.comp.observe(blob.len(), t.elapsed());
+        }
         let tx = match (&self.data, data_key(&frame)) {
             (Some(streams), Some(key)) if !streams.is_empty() => &streams[(key % streams.len() as u64) as usize],
             _ => &self.tx,
@@ -340,7 +353,7 @@ impl FrameSender {
     /// Close every data stream with `StreamEnd`, after all file data has been queued.
     pub fn end_data_streams(&self) -> io::Result<()> {
         for tx in self.data.iter().flat_map(|d| d.iter()) {
-            let buf = encode(&Frame::Msg(Msg::StreamEnd), false, self.wire)?;
+            let buf = encode(&Frame::Msg(Msg::StreamEnd), None, self.wire)?;
             tx.send(buf)?;
         }
         Ok(())
@@ -348,6 +361,11 @@ impl FrameSender {
 
     pub fn msg(&self, m: Msg) -> io::Result<()> {
         self.send(Frame::Msg(m))
+    }
+
+    /// The link is measured: compression levels follow it from now on.
+    pub fn set_link(&self, link: crate::remote::adapt::LinkInfo) {
+        self.comp.set_link(link);
     }
 }
 
@@ -431,7 +449,7 @@ impl Conn {
             })
             .expect("spawn reader thread");
         Conn {
-            out: FrameSender { tx: Tx::Thread(tx), data: None, compress, wire: Wire::Postcard },
+            out: FrameSender { tx: Tx::Thread(tx), data: None, comp: Arc::new(Compression::new(compress, false, None)), wire: Wire::Postcard },
             rx,
             rtx: spare,
             writer: Some(Joiner::Thread(writer)),
@@ -454,7 +472,7 @@ impl Conn {
         let clear = ClearOnDrop(spare.clone());
         async_io::spawn_reader(reader, rtx, false, Some(Box::new(move || drop(clear))));
         Conn {
-            out: FrameSender { tx: Tx::Task(tx), data: None, compress, wire: Wire::Postcard },
+            out: FrameSender { tx: Tx::Task(tx), data: None, comp: Arc::new(Compression::new(compress, false, None)), wire: Wire::Postcard },
             rx,
             rtx: spare,
             writer: Some(Joiner::Task(task)),
@@ -489,8 +507,9 @@ impl Conn {
     /// current one stays open, idle, until [`Conn::finish`]; `session` is closed after
     /// everything sent on the new streams has been delivered.
     pub fn switch(&mut self, reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, session: Box<dyn std::any::Any + Send + Sync>) {
-        let mut new = Conn::start(reader, writer, self.out.compress);
+        let mut new = Conn::start(reader, writer, false);
         new.out.wire = self.out.wire;
+        new.out.comp = self.out.comp.clone();
         new.session = Some(session);
         let old = std::mem::replace(self, new);
         self.under = Some(Box::new(old));
@@ -552,9 +571,9 @@ impl Conn {
         self.rtx.lock().unwrap().take();
     }
 
-    /// Turn compression on or off for frames sent from now on (before handing out clones).
-    pub fn set_compress(&mut self, on: bool) {
-        self.out.compress = on;
+    /// How frames sent from now on are compressed (before handing out clones).
+    pub fn set_compression(&mut self, comp: Compression) {
+        self.out.comp = Arc::new(comp);
     }
 
     /// Encode messages sent from now on with `wire` (before handing out clones).
@@ -609,7 +628,7 @@ mod tests {
     use super::*;
 
     fn roundtrip(f: Frame, compress: bool) -> Frame {
-        let buf = encode(&f, compress, Wire::Postcard).unwrap();
+        let buf = encode(&f, compress.then_some(1), Wire::Postcard).unwrap();
         read_frame(&mut &buf[..]).unwrap().unwrap()
     }
 
@@ -625,7 +644,7 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        let buf = encode(&Frame::Data { id: 1, off: 0, bytes: bytes.clone() }, true, Wire::Postcard).unwrap();
+        let buf = encode(&Frame::Data { id: 1, off: 0, bytes: bytes.clone() }, Some(1), Wire::Postcard).unwrap();
         assert!(buf.len() < bytes.len() / 10, "repetitive data should compress");
     }
 
@@ -668,7 +687,7 @@ mod tests {
         for wire in [Wire::Postcard, Wire::Rkyv] {
             for m in rich_messages() {
                 let want = format!("{m:?}");
-                let buf = encode(&Frame::Msg(m), false, wire).unwrap();
+                let buf = encode(&Frame::Msg(m), None, wire).unwrap();
                 match read_frame(&mut &buf[..]).unwrap().unwrap() {
                     Frame::Msg(got) => assert_eq!(format!("{got:?}"), want, "{wire:?}"),
                     other => panic!("{other:?}"),
@@ -677,13 +696,13 @@ mod tests {
         }
         // Hello stays postcard so any version can read it.
         let hello = rich_messages().remove(0);
-        assert_eq!(encode(&Frame::Msg(hello), false, Wire::Rkyv).unwrap()[4], KIND_MSG);
+        assert_eq!(encode(&Frame::Msg(hello), None, Wire::Rkyv).unwrap()[4], KIND_MSG);
     }
 
     #[test]
     fn corrupt_rkyv_messages_are_rejected() {
         for m in rich_messages().into_iter().skip(1) {
-            let buf = encode(&Frame::Msg(m), false, Wire::Rkyv).unwrap();
+            let buf = encode(&Frame::Msg(m), None, Wire::Rkyv).unwrap();
             let body = buf.len() - 5;
             // Truncated archives, and archives with bytes flipped near the root (where
             // rkyv keeps relative pointers and lengths), must fail validation, not panic.

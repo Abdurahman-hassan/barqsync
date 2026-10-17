@@ -3,6 +3,7 @@
 //! [`crate::proto`] over its stdin/stdout. Either side can be the sender; both sides
 //! run the same [`sender`] and [`receiver`] code.
 
+pub mod adapt;
 pub mod client;
 pub mod receiver;
 pub mod sender;
@@ -36,6 +37,25 @@ impl Transport {
     pub const MAX_STREAMS: usize = 128;
 }
 
+/// `--strategy`: adapt routing and compression to a measured link (see [`adapt`]), or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum Strategy {
+    Adaptive,
+    Fixed,
+}
+
+impl Strategy {
+    pub const DEFAULT: Strategy = Strategy::Fixed;
+}
+
+impl crate::cli::Options {
+    /// How this side compresses what it sends.
+    pub fn compression(&self) -> adapt::Compression {
+        adapt::Compression::new(self.compress, self.strategy == Strategy::Adaptive, self.compress_level)
+    }
+}
+
 /// Worker stack size. Tasks block on the connection's backpressure, and rayon lets a
 /// waiting thread run other tasks on its stack, so allow for deep nesting.
 pub(crate) const WORKER_STACK: usize = 32 << 20;
@@ -51,9 +71,17 @@ pub(crate) enum Stop {
 
 /// Next incoming frame, giving up early on Ctrl-C.
 pub(crate) fn recv(conn: &Conn) -> Result<Frame, Stop> {
+    recv_until(conn, None)
+}
+
+/// [`recv`], giving up at `deadline`.
+pub(crate) fn recv_until(conn: &Conn, deadline: Option<std::time::Instant>) -> Result<Frame, Stop> {
     loop {
         if fsops::interrupted() {
             return Err(Stop::Interrupted);
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() > d) {
+            return Err(Stop::Io(io::Error::new(io::ErrorKind::TimedOut, "no answer from the peer")));
         }
         match conn.rx.recv_timeout(Duration::from_millis(200)) {
             Ok(Ok(f)) => return Ok(f),

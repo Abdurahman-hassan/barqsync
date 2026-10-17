@@ -3,7 +3,7 @@
 use crate::chmod::ChmodRule;
 use crate::delta::DeltaMode;
 use crate::proto::Wire;
-use crate::remote::Transport;
+use crate::remote::{Strategy, Transport};
 use crate::scan::Scanner;
 use crate::filter::{RuleSpec, read_rules_file};
 use anyhow::{Context, Result, bail};
@@ -247,6 +247,12 @@ pub struct Cli {
     /// Remote data path: the ssh pipe alone, TLS-over-TCP streams, or QUIC
     #[arg(long, value_enum, value_name = "MODE", env = "FASTRSYNC_TRANSPORT", hide_env = true)]
     transport: Option<Transport>,
+    /// Measure the link and pick delta vs whole files and compression from it, or don't
+    #[arg(long, value_enum, value_name = "MODE", env = "FASTRSYNC_STRATEGY", hide_env = true)]
+    strategy: Option<Strategy>,
+    /// zstd level for compressed frames (default: 1, or chosen from the link speed)
+    #[arg(long = "compress-level", value_name = "N", value_parser = clap::value_parser!(i32).range(1..=19))]
+    compress_level: Option<i32>,
     /// Network I/O layer for the ssh pipe and TCP streams (benchmarking aid)
     #[arg(long = "net-io", value_name = "LAYER", value_parser = ["threads", "tokio"], hide = true, env = "FASTRSYNC_NET_IO", hide_env = true)]
     net_io: Option<String>,
@@ -349,6 +355,8 @@ pub struct Options {
     pub wire: Wire,
     /// `--net-io=tokio`: the plan's tokio-driven connection layer (see `proto::async_io`).
     pub net_io_tokio: bool,
+    pub strategy: Strategy,
+    pub compress_level: Option<i32>,
 
     pub server: bool,
     pub sender: bool,
@@ -483,6 +491,8 @@ impl Options {
             },
             wire: c.wire,
             net_io_tokio: c.net_io.as_deref() == Some("tokio"),
+            strategy: c.strategy.unwrap_or(Strategy::DEFAULT),
+            compress_level: c.compress_level,
             server: c.server,
             sender: c.sender,
             paths: c.paths,

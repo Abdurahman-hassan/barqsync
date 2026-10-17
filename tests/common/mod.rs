@@ -395,6 +395,11 @@ pub fn fake_ssh(dir: &Path) -> PathBuf {
 /// Run `args` through rsync and fastrsync as a remote transfer via [`fake_ssh`].
 /// `{dst}` becomes the per-tool name and `{host}` the `fakehost:` prefix.
 pub fn both_remote(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
+    both_remote_env(cwd, args, dst_r, dst_f, &[])
+}
+
+/// [`both_remote`] with extra environment for fastrsync.
+pub fn both_remote_env(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str, env: &[(&str, &str)]) -> Option<(RunOut, RunOut)> {
     let rsync_bin = reference_rsync()?;
     let shim = fake_ssh(cwd);
     let shim = shim.to_str().unwrap();
@@ -406,8 +411,12 @@ pub fn both_remote(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Optio
     let mut fa = vec!["-e".to_string(), shim.to_string(), format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync"))];
     fa.extend(sub(dst_f));
     let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
-    let f = fastrsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>());
-    Some((r, f))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fastrsync"));
+    cmd.env("LC_ALL", TEST_LOCALE).args(&fa);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    Some((r, run(&mut cmd, cwd)))
 }
 
 /// A [`fake_ssh`] that cuts the remote command's output after `CUT_BYTES` bytes (a
@@ -445,7 +454,8 @@ rm -f "$fifo"
 }
 
 /// [`both_remote`] through a given remote-shell stand-in. fastrsync stays on the ssh
-/// pipe (whatever `FASTRSYNC_TRANSPORT` says), so the shim sees all of its traffic.
+/// pipe with the fixed strategy (whatever `FASTRSYNC_TRANSPORT` / `FASTRSYNC_STRATEGY`
+/// say), so the shim sees all of its traffic and no link probe.
 pub fn both_remote_via(cwd: &Path, shim: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
     let rsync_bin = reference_rsync()?;
     let shim = shim.to_str().unwrap();
@@ -457,7 +467,14 @@ pub fn both_remote_via(cwd: &Path, shim: &Path, args: &[&str], dst_r: &str, dst_
     let mut fa = vec!["-e".to_string(), shim.to_string(), format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync"))];
     fa.extend(sub(dst_f));
     let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
-    let f = run(Command::new(env!("CARGO_BIN_EXE_fastrsync")).env("LC_ALL", TEST_LOCALE).env("FASTRSYNC_TRANSPORT", "ssh").args(&fa), cwd);
+    let f = run(
+        Command::new(env!("CARGO_BIN_EXE_fastrsync"))
+            .env("LC_ALL", TEST_LOCALE)
+            .env("FASTRSYNC_TRANSPORT", "ssh")
+            .env("FASTRSYNC_STRATEGY", "fixed")
+            .args(&fa),
+        cwd,
+    );
     Some((r, f))
 }
 

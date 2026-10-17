@@ -24,6 +24,7 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M9 | the original plan's delta design as `--delta=cdc` (FastCDC throughout, xxh3 + BLAKE3, mmap); measured slower, so `blocks` stays the default | done |
 | M10 | the original plan's scanner as `--scanner=jwalk` (jwalk + DashMap index + queues A–D); measured slower, so `dirtask` stays the default | done |
 | M11 | QUIC transport (`--transport quic`, quinn), rkyv wire format (`--wire rkyv`), tokio connection layer (`--net-io=tokio`) | done |
+| M12 | adaptive strategy (`--strategy adaptive`): link probe, whole-vs-delta routing by link speed, pack compression with link-based zstd levels, `--compress-level`; up to 7.6× on compressible data, slower on incompressible, so `fixed` stays the default | done |
 
 The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
@@ -51,7 +52,8 @@ writes new files directly, like rsync),
 for files of 8 MiB+, on by default; see [Page-cache hints](#page-cache-hints)),
 `--delta=blocks|cdc` (delta design, see [Delta transfer](#delta-transfer); for a remote
 transfer the receiver's choice applies), `--scanner=dirtask|jwalk`, `--transport
-ssh|tcp|quic` with `--streams N`, `--wire postcard|rkyv` (see [Remote transfers](#remote-transfers)).
+ssh|tcp|quic` with `--streams N`, `--wire postcard|rkyv` (see [Remote transfers](#remote-transfers)),
+`--strategy adaptive|fixed` and `--compress-level N` (see [Adaptive strategy](#adaptive-strategy---strategy-adaptive)).
 
 Also, with rsync's semantics locally and over ssh (each has a differential test in
 `tests/rsync_flags.rs`):
@@ -210,7 +212,73 @@ Through the local fake-ssh shim (no link: CPU and protocol overhead only; macOS,
 
 On one machine the fresh push is disk-bound whatever carries it, and the metadata-bound no-op
 is a few percent slower over QUIC (userspace UDP and crypto on top of the same work). What a
-transport is for shows on a real or emulated link; see the network results below.
+transport is for shows on a link. Over real sshd shaped with `tc netem` in the Linux
+container (`bench/net/net_bench.sh`, datasets at `SCALE=0.5`, 3 runs; lan = 1 Gbit/0.2 ms,
+wan = 100 Mbit/20 ms, lossy = 20 Mbit/80 ms with ~1% loss):
+
+| Profile, workload | rsync | ssh pipe | ssh, tokio I/O | `--transport tcp` (4) | `--transport quic` | quic, `--wire rkyv` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| lan, 4,000 small files | 0.35 s | **0.31 s** | 0.31 s | 0.32 s | 0.33 s | 0.32 s |
+| lan, 3 changed of 20,000 | 0.26 s | **0.18 s** | 0.18 s | 0.19 s | 0.19 s | 0.20 s |
+| wan, 4,000 small files | 2.24 s | **2.07 s** | 2.07 s | 2.39 s | 2.08 s | 2.12 s |
+| wan, 128 MiB delta | 1.65 s | 1.56 s | 1.59 s | 1.75 s | **1.55 s** | 1.54 s |
+| wan, 3 changed of 20,000 | 1.21 s | 0.67 s | **0.64 s** | 0.78 s | 0.71 s | 0.84 s |
+| lossy, 4,000 small files | 38.6 s | 38.2 s | 39.5 s | 13.0 s | **9.1 s** | 11.8 s |
+| lossy, 128 MiB delta | 18.6 s | 21.1 s | 20.3 s | 15.4 s | **9.3 s** | 13.1 s |
+| lossy, 3 changed of 20,000 | 4.0 s | **2.1 s** | 2.2 s | 2.8 s | 2.3 s | 5.3 s (±3.5) |
+
+QUIC matches the ssh pipe on a clean WAN and is a few percent slower on a LAN, but on a lossy,
+long link it is 2–4× faster than the ssh pipe and faster than TCP streams too: one connection
+recovers from loss per stream instead of stalling every byte behind a lost packet. It costs a
+UDP port on the server, and up to 3 s per run where UDP is blocked. So the ssh pipe stays the
+default, and `--transport quic` is the choice for lossy or long-distance links. rkyv and the
+tokio I/O layer are within noise of postcard and threads, which stay the defaults.
+
+(The first network run had QUIC 1.6–2× slower than the ssh pipe on LAN and WAN: the control
+stream queued behind 256 MiB of buffered file data, and closing waited out QUIC's closing
+period. Prioritizing the control stream, right-sizing the windows and a FIN-for-FIN close
+fixed both; `bench/results/net-20261017-095932.md` is that first run.)
+
+### Adaptive strategy (`--strategy adaptive`)
+
+The original plan's §4: measure the link once, then choose per file.
+
+1. **Probe.** Before the first listing the sender pings the receiver for the round-trip
+   time, then sends 256 KiB of incompressible data over the path file data will take (spread
+   over every data stream), timed until the receiver acknowledges it. Only if that looks like
+   500 Mbit/s or more does a 4 MiB burst follow for an accurate figure, so a slow link pays
+   for a quarter megabyte and two round trips. Probe frames say which burst they belong to,
+   so they may arrive in any order. `-vv` prints the result.
+2. **Routing** (the receiver, per file): up to 128 KiB packed, never as a delta; 128 KiB to
+   32 MiB sent whole on links of 1 Gbit/s or more (hashing both copies costs more than
+   sending the file) and as a delta below that; larger files always as deltas. `-W` and
+   `--no-whole-file` override it and skip the probe.
+3. **Compression** (the sender): small-file packs are zstd-compressed even without `-z`, at
+   level 1 from 1 Gbit/s, 3 from 100 Mbit/s and 6 below, stepped down whenever compressing
+   (on all cores) would fall behind the link. Incompressible packs go raw, as before. `-z`
+   compresses all data at that level; `--compress-level N` fixes the level.
+
+Measured in the same network run (half-scale datasets; `text` = 2,000 compressible text
+files of 8–32 KiB, `mid` = 20 files of 4 MiB with 1 KiB changed):
+
+| Profile, workload | `--strategy fixed` (ssh) | `--strategy adaptive` (ssh) | fixed, quic | adaptive, quic |
+| --- | ---: | ---: | ---: | ---: |
+| lan, small files | **0.31 s** | 0.36 s | 0.33 s | 0.37 s |
+| lan, text | 0.52 s | 0.37 s | 0.54 s | **0.36 s** |
+| lan, mid | **0.26 s** | 0.29 s | 0.26 s | 0.30 s |
+| wan, small files | **2.07 s** | 2.16 s | 2.08 s | 2.22 s |
+| wan, text | 4.03 s | **1.99 s** | 4.12 s | 1.99 s |
+| wan, 3 changed of 20,000 | **0.67 s** | 0.74 s | 0.71 s | 0.79 s |
+| lossy, text | 99.2 s | 28.7 s | 48.6 s | **13.1 s** |
+| lossy, 128 MiB delta | 21.1 s | 13.2 s | 9.3 s | **7.8 s** |
+
+Compressing packs by default pays off on compressible data: 1.4× on the LAN, 2× on the WAN,
+7.6× on the lossy link together with QUIC. On incompressible data the strategy costs 4–22%:
+the probe (two round trips plus 4 MiB on a fast link, ~40 ms on the LAN) and compressing packs
+that then go out raw. Mid-size files gain nothing on these links (they stay deltas below
+1 Gbit/s). Since neither strategy is faster across the board, `--strategy fixed` stays the
+default; `--strategy adaptive` (with `--transport quic` on lossy links) is the choice for
+compressible data over slower links.
 
 ## Delta transfer
 

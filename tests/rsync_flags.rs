@@ -230,7 +230,8 @@ fn partial_dir_files_are_used_and_removed_like_rsync() {
     assert!(tmp.path().join("df/.rsync-partial/other").exists(), "--delete must spare the partial dir");
 
     let args = ["-ai", "--partial-dir=.rsync-partial", "--delete", "--stats", "src/", "{host}{dst}"];
-    let (r, f) = both_remote(tmp.path(), &args, "pr", "pf").unwrap();
+    // The delta basis is the point here; keep adaptive routing from sending it whole.
+    let (r, f) = both_remote_env(tmp.path(), &args, "pr", "pf", &[("FASTRSYNC_STRATEGY", "fixed")]).unwrap();
     same_output(&r, &f, &[], "push --partial-dir");
     assert_same_tree(&snap_partial(&tmp.path().join("pr")), &snap_partial(&tmp.path().join("pf")));
     let matched = f.stdout.lines().find(|l| l.starts_with("Matched data")).unwrap_or_default().to_string();
@@ -507,6 +508,10 @@ fn backups_match_rsync() {
     seed(tmp.path(), "src/", &dsts.iter().map(String::as_str).collect::<Vec<_>>());
     for d in &dsts {
         Tree::new(tmp.path().join(d)).file("sub/extra", "extra").file("gone", "gone").file("old~", "older backup");
+        // The same times in every tool's copy (backups keep them).
+        for (rel, t) in [("sub/extra", 21), ("gone", 22), ("old~", 23)] {
+            set_mtime(&tmp.path().join(d).join(rel), BASE_TIME + 900_000 + t);
+        }
     }
     t.file("a", "HELLO, changed").file("sub/b", "WORLD").file("ip", "INPLACE").settle_mtimes();
     for (i, flags) in cases.iter().enumerate() {

@@ -5,7 +5,7 @@
 //! out packed many-per-frame, larger ones as `Data` streams, and files the receiver
 //! already has an old version of as deltas against the signature it sent.
 
-use super::{Stop, WORKER_STACK, recv};
+use super::{Stop, Strategy, WORKER_STACK, adapt, recv};
 use crate::cli::Options;
 use crate::checksum::{self, Sum};
 use crate::delta::{self, Delta, Op, Params, ReadAt, ReadOnce, cdc};
@@ -469,6 +469,16 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
         out.error(&msg);
         let _ = conn.msg(Msg::Fatal { msg });
         return (exit::SYNTAX, None);
+    }
+    if opts.strategy == Strategy::Adaptive && opts.whole_file.is_none() {
+        match adapt::probe(conn, out) {
+            Ok(link) => conn.out.set_link(link),
+            Err(Stop::Interrupted) => return (exit::SIGNAL, None),
+            Err(Stop::Io(e)) => {
+                out.error(format!("link probe failed: {e}"));
+                return (exit::PROTOCOL, None);
+            }
+        }
     }
     let roots = resolve_roots(opts, sources, &filter, out, &errors);
     let sender = Sender {

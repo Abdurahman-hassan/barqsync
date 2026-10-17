@@ -134,7 +134,8 @@ fn delta_over_the_wire() {
         for pull in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             delta_fixture(tmp.path());
-            let mut args = vec!["-a", "--stats"];
+            // Delta mechanics: keep the adaptive strategy from sending these whole.
+            let mut args = vec!["-a", "--stats", "--strategy", "fixed"];
             args.extend_from_slice(extra);
             if pull {
                 args.extend_from_slice(&["{host}src/", "dst"]);
@@ -258,7 +259,7 @@ fn parallel_tls_streams_push_and_pull() {
                 t.file(&format!("many/f{i:03}"), noise(1000 + i * 13, i as u64));
             }
             t.settle_mtimes();
-            let mut args = vec!["-avv", "--stats", "--transport", "tcp", "--streams", "4"];
+            let mut args = vec!["-avv", "--stats", "--strategy", "fixed", "--transport", "tcp", "--streams", "4"];
             args.extend_from_slice(extra);
             if pull {
                 args.extend_from_slice(&["{host}src/", "dst"]);
@@ -302,7 +303,7 @@ fn quic_push_and_pull_in_both_wire_formats() {
                 t.file(&format!("many/f{i:03}"), noise(1000 + i * 13, i as u64));
             }
             t.settle_mtimes();
-            let mut args = vec!["-avv", "--stats", "--transport", "quic", "--streams", "4", "--wire", wire];
+            let mut args = vec!["-avv", "--stats", "--strategy", "fixed", "--transport", "quic", "--streams", "4", "--wire", wire];
             if pull {
                 args.extend_from_slice(&["{host}src/", "dst"]);
             } else {
@@ -334,4 +335,65 @@ fn quic_falls_back_to_ssh() {
     assert!(f.stdout.contains("QUIC: could not connect") && f.stdout.contains("using the ssh connection"), "{}", f.stdout);
     assert!(started.elapsed() < std::time::Duration::from_secs(15), "fallback took {:?}", started.elapsed());
     assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
+}
+
+#[test]
+fn adaptive_strategy_routes_by_link_speed() {
+    // delta_fixture: two files of ~8 MiB with old copies on the receiver.
+    for (bps, whole) in [("10000000000", true), ("20000000", false)] {
+        for pull in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            delta_fixture(tmp.path());
+            let mut args = vec!["-a", "--stats", "--strategy", "adaptive"];
+            if pull {
+                args.extend_from_slice(&["{host}src/", "dst"]);
+            } else {
+                args.extend_from_slice(&["src/", "{host}dst"]);
+            }
+            let f = remote_with_env(tmp.path(), &args, &[("FASTRSYNC_TEST_LINK_BPS", bps)]);
+            assert_eq!(f.code, 0, "{bps} pull={pull}\n{}\n{}", f.stdout, f.stderr);
+            let matched = stat_bytes(&f.stdout, "Matched data: ");
+            // 10 Gbit/s: files under 32 MiB go whole; 20 Mbit/s: as deltas.
+            assert_eq!(matched == 0, whole, "{bps} pull={pull}: matched {matched}");
+            let mut want = snapshot(&tmp.path().join("src"), true);
+            let got = snapshot(&tmp.path().join("dst"), true);
+            want.get_mut(b".".as_slice()).unwrap().mtime = got[b".".as_slice()].mtime;
+            assert_same_tree(&want, &got);
+        }
+    }
+}
+
+#[test]
+fn adaptive_strategy_probes_the_link() {
+    for transport in ["ssh", "tcp", "quic"] {
+        let tmp = tempfile::tempdir().unwrap();
+        delta_fixture(tmp.path());
+        let f = remote_with_env(
+            tmp.path(),
+            &["-avv", "--stats", "--strategy", "adaptive", "--transport", transport, "src/", "{host}dst"],
+            &[],
+        );
+        assert_eq!(f.code, 0, "{transport}\n{}\n{}", f.stdout, f.stderr);
+        assert!(f.stdout.lines().any(|l| l.starts_with("link: ") && l.contains("Mbit/s")), "{transport}: {}", f.stdout);
+        let mut want = snapshot(&tmp.path().join("src"), true);
+        let got = snapshot(&tmp.path().join("dst"), true);
+        want.get_mut(b".".as_slice()).unwrap().mtime = got[b".".as_slice()].mtime;
+        assert_same_tree(&want, &got);
+    }
+}
+
+#[test]
+fn whole_file_flags_override_the_adaptive_strategy() {
+    for (flag, delta) in [("-W", false), ("--no-whole-file", true)] {
+        let tmp = tempfile::tempdir().unwrap();
+        delta_fixture(tmp.path());
+        let f = remote_with_env(
+            tmp.path(),
+            &["-avv", "--stats", "--strategy", "adaptive", flag, "src/", "{host}dst"],
+            &[("FASTRSYNC_TEST_LINK_BPS", "10000000000")],
+        );
+        assert_eq!(f.code, 0, "{flag}\n{}\n{}", f.stdout, f.stderr);
+        assert!(!f.stdout.lines().any(|l| l.starts_with("link: ")), "{flag}: no probe expected: {}", f.stdout);
+        assert_eq!(stat_bytes(&f.stdout, "Matched data: ") > 0, delta, "{flag}: {}", f.stdout);
+    }
 }

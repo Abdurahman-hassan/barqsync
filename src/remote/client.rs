@@ -100,6 +100,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     };
     // Hello itself always goes out as postcard; everything after it in this format.
     conn.set_wire(opts.wire);
+    conn.set_compression(opts.compression());
     let mut server_opts = opts.clone();
     server_opts.paths = server_paths;
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };

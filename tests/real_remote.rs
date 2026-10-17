@@ -93,7 +93,7 @@ fn delta_over_a_real_link() {
     assert_eq!(h.fastrsync(tmp.path(), &["-a", "src/", &target]).code, 0);
     data[3_000_000..3_000_100].fill(0xAB);
     t.file("big.img", &data).mtime("big.img", BASE_TIME + 777);
-    let r = h.fastrsync(tmp.path(), &["-a", "--stats", "src/", &target]);
+    let r = h.fastrsync(tmp.path(), &["-a", "--stats", "--strategy", "fixed", "src/", &target]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     let literal: u64 = r
         .stdout

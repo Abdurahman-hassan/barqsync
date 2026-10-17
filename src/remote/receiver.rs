@@ -6,7 +6,7 @@
 //! arrived and its parent has created it (see [`Slot`]); file data is assembled from
 //! `SmallPack`, `FileBegin`/`DeltaBegin` + `Data` + `FileEnd` frames.
 
-use super::{MAX_PACKS_IN_FLIGHT, Stop, WORKER_STACK, recv};
+use super::{MAX_PACKS_IN_FLIGHT, Stop, Strategy, WORKER_STACK, adapt, recv};
 use crate::cli::Options;
 use crate::checksum::Sum;
 use crate::delta::{self, Delta, DeltaMode, Op, ReadAt, ReadOnce, apply::apply, cdc};
@@ -143,6 +143,9 @@ pub struct RemoteState {
     scan_done: AtomicBool,
     /// Ask for deltas of changed files (rsync's remote default; off with `-W`).
     delta: bool,
+    /// Adaptive strategy: the link the sender measured; files it says are better sent
+    /// whole are requested without a signature.
+    link: Option<adapt::LinkInfo>,
     /// Small-file packs queued or being written (bounded, see `MAX_PACKS_IN_FLIGHT`).
     packs: Mutex<usize>,
     pack_done: Condvar,
@@ -173,6 +176,7 @@ impl RemoteState {
             inflight: AtomicUsize::new(0),
             scan_done: AtomicBool::new(false),
             delta: opts.whole_file != Some(true),
+            link: None,
             packs: Mutex::new(0),
             pack_done: Condvar::new(),
             sums: Mutex::new(HashMap::new()),
@@ -343,7 +347,8 @@ impl RemoteState {
                 crate::progress::done(job.meta.size);
                 continue;
             }
-            let sig = if self.delta { basis_signature(&job, eng.opts.delta) } else { None };
+            let routed = self.link.is_none_or(|l| l.wants_delta(job.meta.size));
+            let sig = if self.delta && routed { basis_signature(&job, eng.opts.delta) } else { None };
             reqs.push(NeedReq { idx: job.idx, sig });
             self.needed.lock().unwrap().insert(file_id(wire_dir, job.idx), job);
         }
@@ -711,8 +716,19 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
         (code, StatsSnapshot::default())
     };
     let mut ids = IdMap::default();
+    let mut probe = adapt::ProbeReceiver::default();
+    let mut link = None;
     let mut roots = loop {
-        match recv(conn) {
+        let f = recv(conn);
+        if let Ok(f) = &f {
+            match probe.handle(conn, f) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => return fail(exit::PROTOCOL, format!("connection error: {e}")),
+            }
+        }
+        match f {
+            Ok(Frame::Msg(Msg::LinkInfo(l))) => link = Some(l),
             Ok(Frame::Msg(Msg::Roots(r))) => break r,
             Ok(Frame::Msg(Msg::IdNames { users, groups })) => ids.add(&users, &groups),
             Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
@@ -744,7 +760,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
             return (code, StatsSnapshot::default());
         }
     };
-    engine.remote = Some(RemoteState::new(conn.out.clone(), opts, ids));
+    let mut state = RemoteState::new(conn.out.clone(), opts, ids);
+    // Adaptive strategy: route by the measured link unless -W / --no-whole-file decided.
+    state.link = link.filter(|_| opts.strategy == Strategy::Adaptive && opts.whole_file.is_none());
+    engine.remote = Some(state);
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
         .thread_name(|i| format!("fastrsync-recv-{i}"))
