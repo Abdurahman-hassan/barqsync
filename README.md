@@ -580,6 +580,33 @@ changed big file is simply cloned (last B row); when the destination can't be cl
 whole new 10 GiB file is disk-bound for both tools, so the delta engine's win comes from
 clone + patch (or `--inplace`), not from hashing.
 
+### A real second machine (over Tailscale)
+
+An Intel MacBook Pro (i9-9980HK, macOS 15.8, rsync 3.5.1) reached from the M-series Mac over
+Tailscale, across the internet: about 4 Mbit/s towards this Mac, 0.3–0.6 Mbit/s back, 60–400
+ms round trips with some loss (`bench/remote_setup.sh`, `bench/real_host.sh HOST 0.5`, 3 runs).
+
+- **Correctness:** `tests/real_remote.rs` passes against it: round trips over the ssh pipe, TCP
+  streams and QUIC; a delta over the real link; and the same item lines and resulting tree as
+  rsync between the same two machines.
+
+| Workload (pulls from the MacBook unless noted) | rsync | barqsync | `--strategy adaptive` |
+| --- | ---: | ---: | ---: |
+| 200 small files, fresh | 5.8 s | 5.2 s | 4.9 s |
+| 200 compressible text files, fresh | 7.0 s | 5.5 s | **4.8 s** |
+| 8 MiB file, 4 × 64 KiB changed (delta) | 3.7 s | **3.0 s** | 8.3 s |
+| 1,000 files, 3 changed | 3.2 s | **2.1 s** | 3.4 s |
+| 100 small files, fresh push (0.3–0.6 Mbit/s uplink) | **7.5 s** | 8.0 s (±2.8) | 10.9 s |
+
+On a link this slow the network decides: barqsync is 1.1–1.5× faster than rsync on pulls and
+ties on the small push. The adaptive strategy's probe cost more than it saved here (a fixed
+256 KiB burst at well under 1 Mbit/s), which led to two fixes: the probe now starts at 16 KiB
+and grows only while the link looks fast, and its estimate never subtracts more than half the
+measured time for the round trip, so a jittery link reads as slow instead of absurdly fast.
+With both, the probe measured this link at 0.1 Mbit/s with one 16 KiB burst. `--transport
+tcp` and `quic` fell back to ssh here: the MacBook's firewall blocks incoming connections to
+an unsigned binary (`socketfilterfw --unblockapp ~/bin/barqsync` on the remote allows it).
+
 ### Page-cache hints
 
 Files of 8 MiB or more are read and written with page-cache hints, so a big sync doesn't

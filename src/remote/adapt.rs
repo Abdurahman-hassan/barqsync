@@ -1,10 +1,10 @@
 //! Adaptive strategy (`--strategy adaptive`, the original plan's §4).
 //!
 //! Before the first listing the sender measures the link: a ping for the round-trip time,
-//! then a burst of incompressible probe data over the same path file data will take (all
-//! data streams), timed until the receiver acknowledges it. 256 KiB first; only when that
-//! looks like 500 Mbit/s or more, another 4 MiB for an accurate figure, so a slow link pays
-//! for a quarter megabyte and two round trips. The result goes to the receiver as
+//! then bursts of incompressible probe data over the same path file data will take (all
+//! data streams), each timed until the receiver acknowledges it: 16 KiB, then 256 KiB if
+//! that looked faster than 20 Mbit/s, then 4 MiB if faster than 500 Mbit/s. A slow link
+//! pays for 16 KiB and two round trips; a fast one gets an accurate figure. The result goes to the receiver as
 //! `LinkInfo` and drives:
 //!
 //! - **routing** (the receiver, per file): up to 128 KiB packed, never delta; 128 KiB to
@@ -33,8 +33,11 @@ pub fn is_probe(id: u64) -> bool {
 }
 
 const PROBE_FRAME: usize = 64 << 10;
+const PROBE_TINY: u64 = 16 << 10;
 const PROBE_SMALL: u64 = 256 << 10;
 const PROBE_LARGE: u64 = 4 << 20;
+/// Above this (from the tiny probe) the small one runs.
+const SMALL_FROM_BPS: u64 = 20_000_000;
 /// Above this (from the small probe) the large one runs.
 const LARGE_FROM_BPS: u64 = 500_000_000;
 pub const GBIT: u64 = 1_000_000_000;
@@ -75,8 +78,15 @@ pub(crate) fn probe(conn: &Conn, out: &Output) -> Result<LinkInfo, Stop> {
         Some(bps) => LinkInfo { bps, rtt_us: 0 },
         None => {
             let rtt = ping(conn, out)?;
-            let small = burst(conn, out, PROBE_SMALL, rtt)?;
-            let bps = if small >= LARGE_FROM_BPS { burst(conn, out, PROBE_LARGE, rtt)? } else { small };
+            // Grow the burst only while the link looks fast: on a slow link a big probe
+            // would cost more than the transfer it is meant to speed up.
+            let mut bps = burst(conn, out, PROBE_TINY, rtt)?;
+            if bps >= SMALL_FROM_BPS {
+                bps = burst(conn, out, PROBE_SMALL, rtt)?;
+            }
+            if bps >= LARGE_FROM_BPS {
+                bps = burst(conn, out, PROBE_LARGE, rtt)?;
+            }
             LinkInfo { bps, rtt_us: rtt.as_micros() as u64 }
         }
     };
@@ -129,8 +139,12 @@ fn burst(conn: &Conn, out: &Output, bytes: u64, rtt: Duration) -> Result<u64, St
         i += 1;
     }
     reply(conn, out, |m| matches!(m, Msg::ProbeAck))?;
-    // The acknowledgement adds one round trip to the transmission time.
-    let secs = t.elapsed().saturating_sub(rtt).max(Duration::from_micros(100)).as_secs_f64();
+    // The acknowledgement adds one round trip to the transmission time. Round trips
+    // jitter, though, and on a slow, jittery link a small burst's transmission time is
+    // within that noise: subtract at most half of what was measured, so an estimate errs
+    // towards a slow link (deltas, stronger compression) rather than an absurdly fast one.
+    let took = t.elapsed();
+    let secs = took.saturating_sub(rtt).max(took / 2).max(Duration::from_micros(100)).as_secs_f64();
     Ok((bytes as f64 * 8.0 / secs) as u64)
 }
 

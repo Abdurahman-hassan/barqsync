@@ -56,7 +56,7 @@ impl Drop for Host {
 }
 
 fn transports() -> Vec<Vec<&'static str>> {
-    vec![vec![], vec!["--streams", "4"]]
+    vec![vec![], vec!["--transport", "tcp", "--streams", "4"], vec!["--transport", "quic"]]
 }
 
 #[test]
@@ -127,7 +127,13 @@ fn matches_rsync_between_the_same_machines() {
         v.sort();
         v
     };
-    assert_eq!(rsync_items, f.items());
+    // Only the destination named in "created directory ..." differs per tool.
+    let unify = |v: Vec<String>, d: &str| -> Vec<String> {
+        let mut v: Vec<String> = v.into_iter().map(|l| l.replace(&format!("{}/{d}", h.dir), &format!("{}/DST", h.dir))).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(unify(rsync_items, "r"), unify(f.items(), "f"));
     // Bring both results back with the same tool and compare.
     for d in ["r", "f"] {
         assert_eq!(h.barqsync(tmp.path(), &["-a", &format!("{}/", h.remote(d)), &format!("back-{d}")]).code, 0);

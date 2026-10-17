@@ -376,11 +376,9 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
 
 ## 10. Still open
 
-- **A real second machine.** Every network number so far is from `tc netem` on loopback in
-  the Linux container. The Intel MacBook Pro at 192.168.1.13 is ready to be used once
-  key-based ssh works (`ssh-copy-id -i ~/.ssh/id_ed25519.pub a.hamdy@192.168.1.13`, run by
-  you); then `bench/remote_setup.sh`, `BARQSYNC_TEST_REMOTE=... cargo test --test real_remote`
-  and `REMOTE=... bench/run.sh DIR D` measure a real LAN, including `--transport quic`.
+- **A fast real link.** The Intel MacBook Pro was tested over Tailscale across the internet
+  (real-host tests pass; 1.1–1.5× rsync on a ~4 Mbit/s link, see the README), but not on a
+  LAN, and TCP/QUIC there need its firewall to allow the binary.
 - **Cold-cache runs** (`bench/run.sh DIR all --cold`) need `sudo purge` on macOS.
 - **NFS** isn't covered (no server).
 - **From rsync's feature set:** xattrs and ACLs (`-X`, `-A`), daemon mode (`rsync://`), and the
