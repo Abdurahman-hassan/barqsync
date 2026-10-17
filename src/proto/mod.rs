@@ -589,6 +589,13 @@ impl Conn {
         }
         let _ = self.out.tx.send(Vec::new());
         let r = self.writer.take().map_or(Ok(()), Joiner::join);
+        if self.session.is_some() {
+            // QUIC: wait (bounded) for the peer to end its control stream too. Once both
+            // sides have read each other's end, closing can't cut anything off, and
+            // neither waits on a close notice that a process exiting might never send.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.rx.recv_deadline(deadline).is_ok() {}
+        }
         drop(self.session.take());
         if let Some(under) = self.under.take() {
             let _ = under.finish();

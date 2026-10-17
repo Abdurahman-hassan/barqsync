@@ -39,10 +39,11 @@ fn rt() -> &'static tokio::runtime::Runtime {
 fn transport() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     t.max_concurrent_uni_streams(256u32.into());
-    // Windows sized for fast, high-latency links: 16 MiB per stream, 256 MiB in all.
-    t.stream_receive_window((16u32 << 20).into());
-    t.receive_window((256u32 << 20).into());
-    t.send_window(256 << 20);
+    // Enough in flight for 1 Gbit/s at 100 ms (12.5 MB), not much more: data buffered
+    // beyond what the link holds only delays the control stream behind it.
+    t.stream_receive_window((8u32 << 20).into());
+    t.receive_window((24u32 << 20).into());
+    t.send_window(24 << 20);
     // A peer that vanished is noticed within 15 s (ssh would see EOF at once).
     t.max_idle_timeout(Some(Duration::from_secs(15).try_into().expect("idle timeout")));
     t.keep_alive_interval(Some(Duration::from_secs(3)));
@@ -51,7 +52,8 @@ fn transport() -> Arc<TransportConfig> {
 
 /// An established, authenticated QUIC connection with its control stream.
 pub struct Session {
-    endpoint: Endpoint,
+    /// Kept for the session's lifetime: the endpoint drives the connection.
+    _endpoint: Endpoint,
     conn: Connection,
     control: Option<(SendStream, RecvStream)>,
 }
@@ -133,7 +135,7 @@ impl Pending {
             }
         })?;
         let endpoint = self.endpoint.take().expect("endpoint");
-        Ok(Session { endpoint, conn, control: Some((send, recv)) })
+        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)) })
     }
 }
 
@@ -185,13 +187,16 @@ pub fn connect(offer: &StreamOffer) -> io::Result<Session> {
         .await
         .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "QUIC did not connect")))
     })?;
-    Ok(Session { endpoint, conn, control: Some((send, recv)) })
+    Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)) })
 }
 
 impl Session {
     /// The control stream as blocking halves.
     pub fn control(&mut self) -> (Box<dyn Read + Send>, Box<dyn Write + Send>) {
         let (send, recv) = self.control.take().expect("control stream taken once");
+        // Listings and requests go ahead of queued file data: every round trip of the
+        // protocol waits on them.
+        let _ = send.set_priority(1);
         (Box::new(SyncIoBridge::new_with_handle(recv, rt().handle().clone())), Box::new(QuicWrite::new(send)))
     }
 
@@ -212,13 +217,24 @@ impl Session {
 }
 
 impl Drop for Session {
-    /// Close once everything sent has been taken (the writers wait for that).
+    /// Every stream has been finished and taken by the peer by now (the writers wait for
+    /// that), so close without waiting out QUIC's closing period (three probe timeouts,
+    /// ~100 ms on a LAN): nothing is left to deliver.
     fn drop(&mut self) {
+        if std::env::var_os("FASTRSYNC_QUIC_STATS").is_some() {
+            let s = self.conn.stats();
+            eprintln!(
+                "quic: rtt {:?}, cwnd {}, sent {} pkts / {} B, lost {} pkts, congestion events {}, mtu {}",
+                s.path.rtt,
+                s.path.cwnd,
+                s.path.sent_packets,
+                s.udp_tx.bytes,
+                s.path.lost_packets,
+                s.path.congestion_events,
+                s.path.current_mtu
+            );
+        }
         self.conn.close(0u32.into(), b"done");
-        let ep = self.endpoint.clone();
-        rt().block_on(async move {
-            let _ = tokio::time::timeout(CLOSE_TIMEOUT, ep.wait_idle()).await;
-        });
     }
 }
 
