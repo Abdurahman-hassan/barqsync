@@ -224,8 +224,22 @@ Hashing itself is not what loses: on a cached 2 GiB file the cdc signature takes
 touch of a mapped 16 KiB page is a page fault (about 1 s of CPU per 2 GiB on macOS), and mapped
 pages go through the page cache. Two 10 GiB files are more than this Mac's 16 GB of RAM, so the
 mapped reads evict and fault their way through, while `pread` with `F_NOCACHE` streams.
-`cdc` wins one case: a shifted file that fits in RAM, rebuilt without clones. There it hashes
+On Linux (the aarch64 container, VM disk, files scaled to 2.5 GiB for B and 512 MiB for E, so
+B's two files still exceed the VM's 3.7 GiB of RAM) the picture is the same for big files and
+better for `cdc` on small shifted ones, because mapped pages fault in cheaply there:
+
+| Dataset | Where | `--delta=blocks` | `--delta=cdc` |
+| --- | --- | ---: | ---: |
+| B (2.5 GiB) | local, copy + patch | **2.0–2.5 s** | 4.8–6.2 s |
+| B | local, `--no-clone` | **4.4–5.3 s** | 6.5–6.8 s |
+| B | remote (fake ssh) | **2.1–2.8 s** | 2.7–3.0 s |
+| E (512 MiB) | local, copy + patch | 0.7–1.3 s | **0.5–0.6 s** |
+| E | local, `--no-clone` | 0.7–0.9 s | **0.4–0.4 s** |
+| E | remote (fake ssh) | 0.7–0.8 s | 0.7–0.9 s |
+
+`cdc` wins where a shifted file fits in RAM, most clearly when it is rebuilt without clones. There it hashes
 each file once, while `blocks` first tries aligned blocks and only then falls back to chunks.
+Those wins are under a second; the losses on big files are tens of seconds.
 Following the defaults rule (the faster design stays the default), `--delta=blocks` remains the
 default and `--delta=cdc` stays selectable.
 
