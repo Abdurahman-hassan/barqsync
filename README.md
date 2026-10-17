@@ -38,6 +38,20 @@ cargo install barqsync      # needs Rust: https://rustup.rs
 barqsync -av src/ dst/
 ```
 
+If `barqsync` is not found after installing, ensure Cargo's binary directory (`~/.cargo/bin`) is in your `PATH`:
+
+- **Zsh (`~/.zshrc`) — default on macOS:**
+  ```bash
+  echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
+  source ~/.zshrc
+  ```
+
+- **Bash (`~/.bashrc` on Linux or `~/.bash_profile` on macOS):**
+  ```bash
+  echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc        # Linux
+  echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bash_profile  # macOS
+  ```
+
 macOS and Linux only. For remote transfers, barqsync has to be installed on both machines
 (like rsync), or pointed to with `--remote-path`.
 
