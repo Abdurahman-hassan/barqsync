@@ -28,7 +28,8 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M13 | io_uring batches for received small files (`--io-uring`, Linux): 24% fewer syscalls, no faster, so opt-in; found on the way: skipping a redundant truncate made small-file pushes onto XFS 3.2× faster | done |
 | M14 | full verification: local A/B/C/D vs rsync and `cp`, Linux syscall counts and flamegraphs, every transport and strategy over lan/wan/lossy links; README and as-built plan updated | done |
 
-The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
+The test suite passes on macOS (APFS; 145 tests, also built as x86_64 and run under Rosetta)
+and Linux (aarch64 container, 148 tests, compared against rsync 3.2.7).
 
 ## Build
 

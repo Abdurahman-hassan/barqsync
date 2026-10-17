@@ -284,7 +284,10 @@ one file use the same stream, so they stay in order.
 
 ### Testing
 
-- **Coverage:** 79 tests on macOS and 81 on Linux (aarch64 container, glibc rsync 3.2.7).
+- **Coverage:** 145 tests on macOS (arm64, and x86_64 under Rosetta: BLAKE3/zstd x86 SIMD
+  paths, `getattrlistbulk` on Intel builds) and 148 on Linux (aarch64 container, glibc rsync
+  3.2.7). The whole suite also runs with each alternative design as the default
+  (`BARQSYNC_DELTA`, `_SCANNER`, `_TRANSPORT`, `_WIRE`, `_STRATEGY`, `_NET_IO`, `_IO_URING`).
 - **Differential tests:** most tests run the same command through rsync and barqsync and
   require identical printed items and identical trees (content, mode, mtime, symlink targets,
   hard-link groups).
