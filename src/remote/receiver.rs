@@ -8,15 +8,19 @@
 
 use super::{MAX_PACKS_IN_FLIGHT, Stop, WORKER_STACK, recv};
 use crate::cli::Options;
+use crate::checksum::Sum;
 use crate::delta::{self, Delta, Op, ReadAt, ReadOnce, apply::apply};
-use crate::entry::{DirEnt, Kind};
+use crate::entry::{DirEnt, Kind, Meta};
+use crate::ids::IdMap;
+use crate::local::flags::write_sparse_at;
+use crate::select::{self, Sel};
 use crate::exit;
 use crate::filter::Filter;
 use crate::fsops::{self, Copied, cache};
 use crate::local::exec::{DirJob, Engine, FileJob, finish_temp, split_dst};
 use crate::output::{Output, Stats, StatsSnapshot, path_msg};
 use crate::paths::{split_source, wants_contents};
-use crate::proto::{Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, file_id};
+use crate::proto::{Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
 use rayon::Scope;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -32,7 +36,7 @@ enum Slot {
     /// Ready (created by its parent), waiting for the listing.
     Job(DirJob),
     /// A `src` root (no trailing slash): named items synced into `dst_dir`.
-    Items { dst_dir: PathBuf, rename: Option<OsString>, dst_is_new: bool },
+    Items { dst_dir: PathBuf, rename: Option<OsString>, dst_is_new: bool, sel: Option<&'static Sel> },
     /// The listing arrived first.
     Batch { dir: u32, entries: Vec<DirEnt> },
 }
@@ -55,6 +59,8 @@ struct Incoming {
     hint: cache::Writer,
     /// Data not written yet: offset and contiguous bytes (see [`Incoming::write`]).
     held: (u64, Vec<u8>),
+    /// How much of the file, from offset 0, holds received data (kept by `--partial`).
+    prefix: Prefix,
 }
 
 impl Incoming {
@@ -90,6 +96,41 @@ impl Incoming {
     }
 }
 
+/// Tracks the contiguous received prefix of a file: copy ranges are in place from the
+/// start, literal data arrives in order.
+#[derive(Default)]
+struct Prefix {
+    done: u64,
+    /// Copy ranges `(off, len)` not yet reached, in ascending order.
+    copies: std::collections::VecDeque<(u64, u64)>,
+}
+
+impl Prefix {
+    fn with_copies(ops: &[Op]) -> Prefix {
+        let mut copies: Vec<(u64, u64)> = ops.iter().map(|o| (o.off(), o.len())).collect();
+        copies.sort_unstable();
+        let mut p = Prefix { done: 0, copies: copies.into() };
+        p.advance();
+        p
+    }
+
+    fn advance(&mut self) {
+        while let Some(&(off, len)) = self.copies.front()
+            && off <= self.done
+        {
+            self.done = self.done.max(off + len);
+            self.copies.pop_front();
+        }
+    }
+
+    fn data(&mut self, off: u64, len: u64) {
+        if off <= self.done {
+            self.done = self.done.max(off + len);
+            self.advance();
+        }
+    }
+}
+
 pub struct RemoteState {
     out: FrameSender,
     slots: Mutex<HashMap<(u16, Vec<u8>), Slot>>,
@@ -103,6 +144,12 @@ pub struct RemoteState {
     /// Small-file packs queued or being written (bounded, see `MAX_PACKS_IN_FLIGHT`).
     packs: Mutex<usize>,
     pack_done: Condvar,
+    /// `-c`: the sender's checksums, per listing.
+    sums: Mutex<HashMap<u32, Vec<Option<Sum>>>>,
+    /// Sender uid/gid -> local uid/gid, by name (see [`crate::ids`]).
+    ids: Mutex<IdMap>,
+    /// `--remove-source-files`: entries to report back to the sender, per root.
+    synced: Mutex<HashMap<u16, SyncedFiles>>,
 }
 
 /// Literal ranges arrive as `Data` frames, never through [`apply`].
@@ -115,7 +162,7 @@ impl ReadAt for NoLiteral {
 }
 
 impl RemoteState {
-    fn new(out: FrameSender, opts: &Options) -> RemoteState {
+    fn new(out: FrameSender, opts: &Options, ids: IdMap) -> RemoteState {
         RemoteState {
             out,
             slots: Mutex::new(HashMap::new()),
@@ -126,6 +173,33 @@ impl RemoteState {
             delta: opts.whole_file != Some(true),
             packs: Mutex::new(0),
             pack_done: Condvar::new(),
+            sums: Mutex::new(HashMap::new()),
+            ids: Mutex::new(ids),
+            synced: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn src_sum(&self, dir: u32, idx: u32) -> Option<Sum> {
+        self.sums.lock().unwrap().get(&dir)?.get(idx as usize).copied().flatten()
+    }
+
+    /// `--remove-source-files`: the receiver has this entry; tell the sender (in batches).
+    pub(crate) fn synced(&self, root: u16, rel: &[u8], meta: &Meta) {
+        let mut map = self.synced.lock().unwrap();
+        let v = map.entry(root).or_default();
+        v.push((rel.to_vec(), meta.size, meta.mtime));
+        if v.len() >= 1000 {
+            let files = std::mem::take(v);
+            drop(map);
+            let _ = self.out.msg(Msg::Synced { root, files });
+        }
+    }
+
+    fn flush_synced(&self) {
+        for (root, files) in self.synced.lock().unwrap().drain() {
+            if !files.is_empty() {
+                let _ = self.out.msg(Msg::Synced { root, files });
+            }
         }
     }
 
@@ -163,7 +237,26 @@ impl RemoteState {
         }
     }
 
-    fn on_batch<'s, 'a: 's>(&self, s: &Scope<'s>, eng: &'s Engine<'a>, root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt>) {
+    #[allow(clippy::too_many_arguments)]
+    fn on_batch<'s, 'a: 's>(
+        &self,
+        s: &Scope<'s>,
+        eng: &'s Engine<'a>,
+        root: u16,
+        dir: u32,
+        rel: Vec<u8>,
+        mut entries: Vec<DirEnt>,
+        sums: Vec<Option<Sum>>,
+    ) {
+        if !sums.is_empty() {
+            self.sums.lock().unwrap().insert(dir, sums);
+        }
+        {
+            let ids = self.ids.lock().unwrap();
+            if !ids.is_empty() {
+                entries.iter_mut().for_each(|e| ids.apply(&mut e.meta));
+            }
+        }
         let key = (root, rel);
         let mut slots = self.slots.lock().unwrap();
         match slots.remove(&key) {
@@ -172,13 +265,15 @@ impl RemoteState {
                 job.wire_dir = dir;
                 self.spawn_listing(s, eng, job, entries);
             }
-            Some(Slot::Items { dst_dir, rename, dst_is_new }) => {
+            Some(Slot::Items { dst_dir, rename, dst_is_new, sel }) => {
                 drop(slots);
                 self.inflight.fetch_add(1, SeqCst);
                 s.spawn(move |s| {
                     let entries = entries.into_iter().enumerate().map(|(i, e)| (i as u32, e, rename.clone())).collect();
-                    eng.run_items(s, Path::new(""), &dst_dir, root, dir, entries, dst_is_new);
-                    eng.remote.as_ref().unwrap().task_done();
+                    eng.run_items(s, Path::new(""), &dst_dir, root, dir, entries, dst_is_new, sel);
+                    let r = eng.remote.as_ref().unwrap();
+                    r.sums.lock().unwrap().remove(&dir);
+                    r.task_done();
                 });
             }
             _ => {
@@ -190,9 +285,12 @@ impl RemoteState {
     fn spawn_listing<'s, 'a: 's>(&self, s: &Scope<'s>, eng: &'s Engine<'a>, job: DirJob, entries: Vec<DirEnt>) {
         self.inflight.fetch_add(1, SeqCst);
         s.spawn(move |s| {
+            let dir = job.wire_dir;
             let entries = entries.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
             eng.process_listing(s, job, entries);
-            eng.remote.as_ref().unwrap().task_done();
+            let r = eng.remote.as_ref().unwrap();
+            r.sums.lock().unwrap().remove(&dir);
+            r.task_done();
         });
     }
 
@@ -287,24 +385,38 @@ impl RemoteState {
 
     fn file_begin(&self, eng: &Engine, id: u64, size: u64) -> io::Result<()> {
         let job = self.take_job(id)?;
+        eng.backup_existing_file(&job);
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let hint = cache::Writer::new(&file, size);
-        let inc = Incoming { file, path, rename, registered, created, delta: false, size, job, hint, held: (0, Vec::new()) };
+        let inc = Incoming {
+            file,
+            path,
+            rename,
+            registered,
+            created,
+            delta: false,
+            size,
+            job,
+            hint,
+            held: (0, Vec::new()),
+            prefix: Prefix::default(),
+        };
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
     }
 
     fn delta_begin(&self, eng: &Engine, id: u64, size: u64, copies: Vec<Op>) -> io::Result<()> {
         let job = self.take_job(id)?;
-        let basis = File::open(&job.dst_path)?;
+        eng.backup_existing_file(&job);
+        let basis = File::open(job.basis_path())?;
         let d = Delta { size, ops: copies };
         let matched: u64 = d.ops.iter().map(Op::len).sum();
         Stats::add(&eng.stats.delta_files, 1);
         Stats::add(&eng.stats.matched_bytes, matched);
         Stats::add(&eng.stats.literal_bytes, size.saturating_sub(matched));
 
-        let (file, path, rename, registered, has_basis) = if eng.opts.inplace && d.is_in_place() {
+        let (file, path, rename, registered, has_basis) = if eng.opts.inplace && d.is_in_place() && job.basis.is_none() {
             let f = fs::OpenOptions::new().write(true).open(&job.dst_path)?;
             (f, job.dst_path.clone(), false, false, true)
         } else {
@@ -335,15 +447,36 @@ impl RemoteState {
             return Err(e);
         }
         let hint = cache::Writer::new(&file, size);
-        let inc = Incoming { file, path, rename, registered, created: false, delta: true, size, job, hint, held: (0, Vec::new()) };
+        let inc = Incoming {
+            file,
+            path,
+            rename,
+            registered,
+            created: false,
+            delta: true,
+            size,
+            job,
+            hint,
+            held: (0, Vec::new()),
+            prefix: Prefix::with_copies(&d.ops),
+        };
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
     }
 
-    fn data(&self, id: u64, off: u64, bytes: &[u8]) -> io::Result<()> {
+    fn data(&self, eng: &Engine, id: u64, off: u64, bytes: &[u8]) -> io::Result<()> {
         let mut incoming = self.incoming.lock().unwrap();
         match incoming.get_mut(&id) {
-            Some(inc) => inc.write(off, bytes),
+            Some(inc) => {
+                if eng.opts.sparse && inc.created && !inc.delta {
+                    write_sparse_at(&inc.file, bytes, off)?;
+                    inc.hint.written_to(&inc.file, off + bytes.len() as u64);
+                } else {
+                    inc.write(off, bytes)?;
+                }
+                inc.prefix.data(off, bytes.len() as u64);
+                Ok(())
+            }
             // The file failed to open on our side; its error was already reported.
             None => Ok(()),
         }
@@ -364,30 +497,46 @@ impl RemoteState {
         let dst = inc.job.dst_path.clone();
         crate::progress::done(inc.job.meta.size);
         let (path, registered) = (inc.path.clone(), inc.registered);
-        let r = self.finish(eng, inc);
+        let (job, r) = self.finish(eng, inc);
         let r = if registered { finish_temp(&path, r) } else { r };
-        if let Err(e) = r
-            && !fsops::interrupted()
-        {
-            eng.err(path_msg("receiving \"", &dst, format!("\" failed: {e}")));
+        match r {
+            Ok(()) => eng.file_written(&job),
+            Err(e) if !fsops::interrupted() => eng.err(path_msg("receiving \"", &dst, format!("\" failed: {e}"))),
+            Err(_) => {}
         }
     }
 
-    fn finish(&self, eng: &Engine, mut inc: Incoming) -> io::Result<()> {
-        inc.flush()?;
-        inc.file.set_len(inc.size)?;
-        let (mode, uid, gid) = eng.target_attrs(&inc.job);
-        let meta = inc.job.meta;
-        if inc.created && !inc.delta {
+    fn finish(&self, eng: &Engine, mut inc: Incoming) -> (FileJob, io::Result<()>) {
+        let flushed = inc.flush();
+        let Incoming { file, path, rename, created, delta, size, job, .. } = inc;
+        let r = flushed.and_then(|()| Self::finish_file(eng, file, &path, rename, created, delta, size, &job));
+        (job, r)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_file(
+        eng: &Engine,
+        file: File,
+        path: &Path,
+        rename: bool,
+        created: bool,
+        delta: bool,
+        size: u64,
+        job: &FileJob,
+    ) -> io::Result<()> {
+        file.set_len(size)?;
+        let (mode, uid, gid) = eng.target_attrs(job);
+        let meta = job.meta;
+        if created && !delta {
             let mtime = eng.opts.times.then_some((meta.mtime, meta.mtime_ns));
-            eng.apply_new_file_attrs(&inc.path, Copied::Written(inc.file), mode, uid, gid, mtime)?;
+            eng.apply_new_file_attrs(path, Copied::Written(file), mode, uid, gid, mtime)?;
         } else {
-            eng.finish_delta_file(&inc.file, &meta, mode, uid, gid)?;
-            drop(inc.file);
+            eng.finish_delta_file(&file, &meta, mode, uid, gid)?;
+            drop(file);
         }
         fsops::check_interrupt()?;
-        if inc.rename {
-            fs::rename(&inc.path, &inc.job.dst_path)?;
+        if rename {
+            fs::rename(path, &job.dst_path)?;
         }
         Ok(())
     }
@@ -418,20 +567,33 @@ impl RemoteState {
     }
 
     fn write_small(&self, eng: &Engine, job: FileJob, bytes: &[u8]) -> io::Result<()> {
+        eng.backup_existing_file(&job);
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let size = bytes.len() as u64;
-        let write = file.write_all_at(bytes, 0);
-        let hint = cache::Writer::new(&file, size);
-        let inc = Incoming { file, path: path.clone(), rename, registered, created, delta: false, size, job, hint, held: (0, Vec::new()) };
-        let r = write.and_then(|()| self.finish(eng, inc));
-        if registered { finish_temp(&path, r) } else { r }
+        let write = if eng.opts.sparse && created { write_sparse_at(&file, bytes, 0) } else { file.write_all_at(bytes, 0) };
+        let r = write.and_then(|()| Self::finish_file(eng, file, &path, rename, created, false, size, &job));
+        let r = if registered { finish_temp(&path, r) } else { r };
+        if r.is_ok() {
+            eng.file_written(&job);
+        }
+        r
     }
 
-    /// Discard every partially received file (after a failed transfer).
-    fn abandon(&self) {
+    /// Deal with every partially received file after a failed transfer: discarded, or
+    /// with `--partial` cut to the data received so far and kept.
+    fn abandon(&self, eng: &Engine) {
         for (_, inc) in self.incoming.lock().unwrap().drain() {
-            if inc.registered {
+            if !inc.registered {
+                continue;
+            }
+            let mut inc = inc;
+            let keep = eng.opts.partial
+                && inc.flush().is_ok()
+                && inc.prefix.done > 0
+                && inc.file.set_len(inc.prefix.done).is_ok()
+                && eng.keep_partial(&inc.path, &inc.job.dst_path);
+            if !keep {
                 fsops::drop_temp(&inc.path);
             }
         }
@@ -442,11 +604,14 @@ impl RemoteState {
 /// reply with a delta: aligned blocks when the size is unchanged (in-place edits),
 /// content-defined chunks when it changed (inserts, deletes, appends).
 fn basis_signature(job: &FileJob) -> Option<Sig> {
-    let d = job.dst_meta?;
+    let d = match &job.basis {
+        Some(p) => fsops::lstat(p).ok()?,
+        None => job.dst_meta?,
+    };
     if d.kind != Kind::File || d.size == 0 || job.meta.size < delta::MIN_DELTA_SIZE {
         return None;
     }
-    let f = File::open(&job.dst_path).ok()?;
+    let f = File::open(job.basis_path()).ok()?;
     let f = ReadOnce::new(&f, d.size);
     let p = delta::Params::DEFAULT;
     if job.meta.size == d.size {
@@ -458,7 +623,9 @@ fn basis_signature(job: &FileJob) -> Option<Sig> {
 
 /// Decide what each root maps to on this side: rsync's destination rules (a single
 /// file may be copied to a new name; otherwise DEST is a directory, created if needed).
-fn plan_dest(eng: &Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -> Result<Vec<(u16, Slot)>, i32> {
+/// Also returns the directory the roots write into.
+/// Records the destination in `eng` (see [`Engine::set_dest`]).
+fn plan_dest(eng: &mut Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -> Result<Vec<(u16, Slot)>, i32> {
     let dest_path = PathBuf::from(dest);
     let dest_meta = fs::metadata(&dest_path).ok();
     let dest_is_dir = dest_meta.as_ref().is_some_and(|m| m.is_dir());
@@ -466,7 +633,8 @@ fn plan_dest(eng: &Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -> Re
     if let [root] = roots
         && let [item] = root.items.as_slice()
         && !root.contents
-        && item.meta.kind != Kind::Dir
+        && root.sel.is_none()
+        && (item.meta.kind != Kind::Dir || (!eng.opts.recursive && dest_meta.is_none()))
         && !dest_is_dir
         && !wants_contents(dest)
     {
@@ -474,7 +642,8 @@ fn plan_dest(eng: &Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -> Re
             out.error(path_msg("invalid destination \"", &dest_path, "\""));
             return Err(exit::SYNTAX);
         };
-        return Ok(vec![(0, Slot::Items { dst_dir, rename: Some(dst_name), dst_is_new: false })]);
+        eng.set_dest(&dst_dir);
+        return Ok(vec![(0, Slot::Items { dst_dir, rename: Some(dst_name), dst_is_new: false, sel: None })]);
     }
 
     let mut dest_exists = dest_is_dir;
@@ -499,20 +668,26 @@ fn plan_dest(eng: &Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -> Re
     }
     // Only a single root may assume a freshly created destination is empty.
     let fresh = created && roots.len() == 1;
-    Ok(roots
+    eng.set_dest(&dest_path);
+    let eng = &*eng;
+    let slots = roots
         .iter()
         .enumerate()
         .map(|(r, root)| {
             let r = r as u16;
+            let sel = root.sel.clone().map(select::leak);
             let slot = match (root.contents, root.meta) {
                 (true, Some(meta)) => {
-                    Slot::Job(eng.root_job(PathBuf::new(), dest_path.clone(), meta, r, dest_exists && !fresh))
+                    let mut job = eng.root_job(PathBuf::new(), dest_path.clone(), meta, r, dest_exists && !fresh);
+                    job.sel = sel.and_then(|s| s.at_root(eng.opts.recursive));
+                    Slot::Job(job)
                 }
-                _ => Slot::Items { dst_dir: dest_path.clone(), rename: None, dst_is_new: !dest_exists || fresh },
+                _ => Slot::Items { dst_dir: dest_path.clone(), rename: None, dst_is_new: !dest_exists || fresh, sel },
             };
             (r, slot)
         })
-        .collect())
+        .collect();
+    Ok(slots)
 }
 
 /// Run the receiving side until the sender is done. Sends `ReceiverDone` with the
@@ -523,9 +698,11 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
         let _ = conn.msg(Msg::Fatal { msg });
         (code, StatsSnapshot::default())
     };
-    let roots = loop {
+    let mut ids = IdMap::default();
+    let mut roots = loop {
         match recv(conn) {
             Ok(Frame::Msg(Msg::Roots(r))) => break r,
+            Ok(Frame::Msg(Msg::IdNames { users, groups })) => ids.add(&users, &groups),
             Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
             Ok(Frame::Msg(Msg::Fatal { msg })) => {
                 out.error(format!("remote: {msg}"));
@@ -540,15 +717,19 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
         Ok(f) => f,
         Err(e) => return fail(exit::SYNTAX, format!("{e:#}")),
     };
+    for root in &mut roots {
+        root.meta.iter_mut().for_each(|m| ids.apply(m));
+        root.items.iter_mut().for_each(|e| ids.apply(&mut e.meta));
+    }
     let mut engine = Engine::new(opts, filter, out);
-    let slots = match plan_dest(&engine, &roots, dest, out) {
+    let slots = match plan_dest(&mut engine, &roots, dest, out) {
         Ok(s) => s,
         Err(code) => {
             let _ = conn.msg(Msg::Fatal { msg: "the receiver could not prepare the destination".into() });
             return (code, StatsSnapshot::default());
         }
     };
-    engine.remote = Some(RemoteState::new(conn.out.clone(), opts));
+    engine.remote = Some(RemoteState::new(conn.out.clone(), opts, ids));
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
         .thread_name(|i| format!("fastrsync-recv-{i}"))
@@ -587,10 +768,14 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
                     }
                 };
                 let r = match frame {
-                    Frame::Data { id, off, bytes } => remote.data(id, off, &bytes),
+                    Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
                     Frame::Msg(m) => match m {
-                        Msg::DirBatch { root, dir, rel, entries } => {
-                            remote.on_batch(s, engine, root, dir, rel, entries);
+                        Msg::DirBatch { root, dir, rel, entries, sums } => {
+                            remote.on_batch(s, engine, root, dir, rel, entries, sums);
+                            Ok(())
+                        }
+                        Msg::IdNames { users, groups } => {
+                            remote.ids.lock().unwrap().add(&users, &groups);
                             Ok(())
                         }
                         Msg::FileBegin { id, size } => remote.file_begin(engine, id, size),
@@ -641,19 +826,20 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
     });
 
     if let Some(code) = failure {
-        remote.abandon();
+        remote.abandon(engine);
         fsops::cleanup_temps();
         return (code, engine.stats.snapshot());
     }
     let unanswered = remote.needed.lock().unwrap().len() + remote.incoming.lock().unwrap().len();
     if unanswered > 0 {
         engine.err(format!("{unanswered} requested files were never received"));
-        remote.abandon();
+        remote.abandon(engine);
     }
     pool.install(|| {
         engine.link_followers();
         engine.apply_fixups();
     });
+    remote.flush_synced();
     Stats::add(&engine.stats.errors, sender_errors);
     let stats = engine.stats.snapshot();
     let _ = conn.msg(Msg::ReceiverDone { stats: stats.clone() });

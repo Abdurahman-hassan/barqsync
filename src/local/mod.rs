@@ -1,6 +1,7 @@
 //! Local (disk-to-disk) sync: argument planning and the run loop.
 
 pub mod exec;
+pub mod flags;
 
 use crate::cli::Options;
 use crate::entry::Kind;
@@ -9,6 +10,7 @@ use crate::filter::Filter;
 use crate::fsops;
 use crate::output::{Output, Stats, path_msg};
 use crate::paths::{split_source, wants_contents};
+use crate::select::{self, Sel};
 use exec::Engine;
 use std::ffi::OsString;
 use std::fs;
@@ -24,6 +26,9 @@ pub enum Root {
     /// `src` (no trailing slash) or single files: named entries of `src_dir` are
     /// synced into `dst_dir`, each possibly under a different destination name.
     Items { src_dir: PathBuf, dst_dir: PathBuf, items: Vec<(OsString, OsString)> },
+    /// `-R`/`--files-from`: the selected paths below `base`, under their relative names.
+    /// `with_root`: `base` itself is part of the transfer (`./`).
+    Select { base: PathBuf, dst: PathBuf, sel: &'static Sel, with_root: bool },
 }
 
 #[derive(Debug)]
@@ -33,6 +38,8 @@ pub struct Plan {
     pub dest_exists: bool,
     /// The destination directory was created by this run.
     pub dest_created: bool,
+    /// The directory roots write into (for a single file copied to a new name, its parent).
+    pub dest_root: PathBuf,
 }
 
 /// Turn SRC... DEST into transfer roots following rsync's rules, creating DEST
@@ -43,21 +50,25 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
     let dest_is_dir = dest_meta.as_ref().is_some_and(|m| m.is_dir());
 
     // Single non-directory source to a non-directory destination: copy under DEST's name.
-    if sources.len() == 1 && !dest_is_dir && !wants_contents(dest) {
+    if sources.len() == 1 && !dest_is_dir && !wants_contents(dest) && !opts.relative {
         let src = Path::new(&sources[0]);
         let src_meta = fs::symlink_metadata(src).ok();
         let src_is_dir = src_meta.as_ref().is_some_and(|m| m.is_dir())
             || (wants_contents(&sources[0]) && fs::metadata(src).is_ok_and(|m| m.is_dir()));
-        if !src_is_dir && let (parent, Some(name)) = split_source(src) {
+        // Without -r a lone directory (no trailing slash) is one item, so it is copied
+        // under DEST's name like a file.
+        let lone_dir = src_is_dir && !opts.recursive && !wants_contents(&sources[0]) && dest_meta.is_none();
+        if (!src_is_dir || lone_dir) && let (parent, Some(name)) = split_source(src) {
             let (dst_dir, dst_name) = split_source(&dest_path);
             let Some(dst_name) = dst_name else {
                 out.error(path_msg("invalid destination \"", &dest_path, "\""));
                 return Err(exit::SYNTAX);
             };
             return Ok(Plan {
-                roots: vec![Root::Items { src_dir: parent, dst_dir, items: vec![(name, dst_name)] }],
+                roots: vec![Root::Items { src_dir: parent, dst_dir: dst_dir.clone(), items: vec![(name, dst_name)] }],
                 dest_exists: true,
                 dest_created: false,
+                dest_root: dst_dir,
             });
         }
     }
@@ -90,6 +101,17 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
     }
 
     let mut roots = Vec::new();
+    if opts.relative {
+        let sel_roots = match &opts.files_from {
+            Some(list) => select::from_list(&sources[0], list),
+            None => select::from_relative_args(sources),
+        };
+        for r in sel_roots {
+            let sel = select::leak(r.sel);
+            roots.push(Root::Select { base: r.base, dst: dest_path.clone(), sel, with_root: r.with_root });
+        }
+        return Ok(Plan { roots, dest_exists, dest_created, dest_root: dest_path });
+    }
     for s in sources {
         let sp = PathBuf::from(s);
         match split_source(&sp) {
@@ -99,7 +121,7 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
             _ => roots.push(Root::Contents { src: sp, dst: dest_path.clone() }),
         }
     }
-    Ok(Plan { roots, dest_exists, dest_created })
+    Ok(Plan { roots, dest_exists, dest_created, dest_root: dest_path })
 }
 
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
@@ -128,7 +150,8 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     }
 
-    let engine = Engine::new(opts, filter, out);
+    let mut engine = Engine::new(opts, filter, out);
+    engine.set_dest(&plan.dest_root);
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
         .thread_name(|i| format!("fastrsync-{i}"))

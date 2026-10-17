@@ -19,6 +19,7 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M4 | remote over SSH (`host:path`): push and pull, small-file packing, delta over the wire, `-z`, `-e`, `--remote-path` | done |
 | M5 | parallel TLS data streams (`--streams N`), pinned ephemeral certificate, token auth, ssh fallback | done |
 | M6 | `-H`, `--progress`/`--info=progress2`, `-i`/`%i`, `getattrlistbulk`/`statx` metadata reads | done |
+| M7 | common rsync flags: `-c -S -R -d -L -k -K -b -O`, `--partial(-dir)`, `--files-from`, `--existing`, `--max/min-size`, `--link/compare-dest`, `--numeric-ids`, `--chmod`, `--remove-source-files` | done |
 
 The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
@@ -45,8 +46,33 @@ writes new files directly, like rsync),
 `--fsync`, `--stats`, `-h`, `--threads N`, `--drop-cache`/`--no-drop-cache` (page-cache hints
 for files of 8 MiB+, on by default; see [Page-cache hints](#page-cache-hints)).
 
+Also, with rsync's semantics locally and over ssh (each has a differential test in
+`tests/rsync_flags.rs`):
+
+| Option | Notes |
+| --- | --- |
+| `-c/--checksum` | Same-size files are compared by whole-file BLAKE3 (128-bit). Files are hashed in parallel, by the sender for its side. A rewritten file shows `>fc`. |
+| `-S/--sparse` | Runs of zeros (4 KiB blocks) become holes. Clones and kernel copies are skipped, since they would keep the zeros as data. |
+| `--partial`, `--partial-dir=DIR`, `-P` | On Ctrl-C or a dropped connection, the received prefix is kept as the destination file, or in `DIR` (created 0700). A file left in `DIR` is the delta basis next time and is removed once the file is complete. A relative `DIR` is excluded from the transfer and protected from `--delete`. |
+| `-R/--relative` | Full relative paths, `/./` to trim the prefix. Implied directories get their source attributes but are never pruned by `--delete`. |
+| `--files-from=FILE`, `-0/--from0` | Implies `-R` and `-d`; `-a` no longer implies `-r`. `#`/`;` comments, a trailing `/` lists a directory's contents, `.` or a leading `./` includes the root itself. `-` reads stdin. The client reads the list and sends it to the server. |
+| `-d/--dirs` | Directories are created without recursing. |
+| `--existing`, `--max-size`, `--min-size` | rsync's size syntax (`1.5M`, `4KB` = 4000, `1M-1`). |
+| `-b/--backup`, `--suffix`, `--backup-dir` | Replaced and deleted files are kept (hard link, or a copy with `--inplace`). Without `--backup-dir`, `*~` backups are protected from `--delete` and `-O` is forced on, as in rsync. |
+| `--link-dest`, `--compare-dest` | Checked even when the destination file exists but differs. Identical data and attributes → hard link / skip. Identical data, other attributes → local copy (`cf`). Otherwise the alt file is the delta basis and what the new file is itemized against. |
+| `-L`, `-k`, `-K` | `-L` reports dangling links (`symlink has no referent`, exit 23). With `-K`, like rsync on macOS, the kept symlink gets the directory's time. |
+| `--numeric-ids` | Without it, remote transfers map users and groups by name (id 0 never), as rsync does. |
+| `--chmod=CHMOD` | rsync's syntax (`D`/`F`, `ugoa`, `+-=`, `rwxXst`, octal), applied to the source modes as sent. |
+| `--remove-source-files` | Non-directories the receiver has (transferred or already up to date) are removed from the source, unless their size or mtime changed meanwhile. |
+| `-O/--omit-dir-times` | |
+
 Trailing-slash semantics match rsync: `src/` syncs the contents, `src` syncs the directory itself.
 Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 20 interrupted, 23 partial transfer).
+
+Still missing: `-X/--xattrs`, `-A/--acls` and daemon mode (`rsync://`, `host::module`), as
+well as `--delete-before/-after/-delay`, `--no-OPTION`, `--copy-dest`, `--fuzzy`, `-T`,
+`--bwlimit`, `--timeout`, `--log-file`, `--usermap/--groupmap/--chown`, `--no-implied-dirs`,
+`--no-R`, and a remote (`host:`) `--files-from` list.
 
 Known differences:
 
@@ -56,6 +82,17 @@ Known differences:
   parallel walk links them to the first name it reaches.
 - `--progress` shows one overall line, like `--info=progress2`. Files are copied in
   parallel, so per-file progress lines would interleave meaninglessly.
+- `-R` with an absolute path: rsync shows the names with a leading `/` (`/private/...`),
+  fastrsync without it. The files land in the same place.
+- rsync doesn't strip comment lines from a `--files-from` list it forwards to a remote
+  sender, and it rejects names like `a/../b` there. fastrsync handles both the same way
+  in every direction.
+- `--partial` keeps the contiguous received prefix of the files in flight. rsync handles one
+  file at a time, so it keeps at most one partial file; fastrsync can keep several.
+- After a missing `--files-from` entry, rsync leaves out the "created directory" line;
+  fastrsync prints it.
+- With `-K`, rsync on macOS also tries to chmod the symlink and fails ("Too many levels of
+  symbolic links"); fastrsync leaves the mode alone.
 
 ## Remote transfers
 
@@ -140,11 +177,16 @@ at ~12.6 GB/s on all cores of an M-series Mac, faster than the SSD.
 
 ```
 src/cli.rs          flags → Options (filter order preserved across --include/--exclude)
+src/chmod.rs        --chmod parser and mode tweaks
+src/select.rs       -R / --files-from path selection (implied directories)
+src/checksum.rs     -c whole-file BLAKE3 on a dedicated pool
+src/ids.rs          user/group name mapping for remote transfers (--numeric-ids off)
 src/paths.rs        host:path detection, trailing-slash rules
 src/filter.rs       rsync wildmatch + include/exclude rules
 src/diff.rs         quick check (size + mtime, --modify-window, -u, --size-only, ...)
 src/fsops/          readdir + fstatat, temp names, clone/copy, utimensat, mknod, page-cache hints
-src/local/          planner (SRC... DEST → roots) and the parallel per-directory engine
+src/local/          planner (SRC... DEST → roots) and the parallel per-directory engine;
+                    flags.rs: link/compare-dest, backups, partial, sparse, -L/-k, removals
 src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild)
 src/proto/          wire frames (postcard + raw data, optional zstd), reader/writer threads
 src/remote/         client (spawns the server over ssh), server, sender and receiver roles
@@ -152,6 +194,7 @@ src/output.rs       rsync-style item lines and stats
 tests/local_sync.rs end-to-end tests, most of them differential against rsync 3.x
 tests/delta_sync.rs --no-whole-file end to end (clone+patch, --inplace, rebuild) vs rsync
 tests/remote_sync.rs push/pull through a fake ssh, differential against rsync over the same shim
+tests/rsync_flags.rs the options above, locally and over the fake ssh (and one that cuts it)
 bench/              dataset generator + hyperfine runner
 ```
 
@@ -182,6 +225,31 @@ bench/run.sh /tmp/fr-bench all --cold      # drops the page cache between runs (
 
 `--no-clone` (hidden flag) forces buffered copies, which shows the engine's speed without APFS
 clones, e.g. for copies to another volume.
+
+### Verification harness (original plan §8)
+
+```bash
+bench/net/container.sh build              # Linux image: sshd, tc, strace, perf, inferno
+bench/net/container.sh net lan wan lossy  # rsync vs fastrsync over real ssh, tc-shaped links
+bench/net/container.sh syscalls           # strace -c syscall counts
+bench/net/container.sh flamegraph copy    # perf flamegraph (copy | noop | delta)
+bench/net/container.sh test               # cargo test + clippy on Linux
+bench/flamegraph.sh copy                  # macOS flamegraph via `sample` (cargo install inferno)
+bench/remote_setup.sh user@host           # install fastrsync on a real second machine
+FASTRSYNC_TEST_REMOTE=user@host cargo test --test real_remote   # tests over real ssh
+```
+
+- **What the container does:** it shapes its own loopback interface with `tc netem`, so ssh,
+  the `--streams` TCP connections (and later QUIC) all cross the same emulated link. The
+  container runs privileged (needed for `tc`, `perf` and `drop_caches`) and touches nothing
+  outside itself.
+- **Link profiles:**
+  - `lan`: 1 Gbit, ~0.2 ms RTT
+  - `wan`: 100 Mbit, ~20 ms RTT
+  - `lossy`: 20 Mbit, ~80 ms RTT, ~1% loss
+- **Benchmark A** also times `cp -a` and the platform's fastest stock copy (`cp -ac` clones
+  on macOS, `--reflink=auto` on Linux).
+- **Not covered:** NFS mounts (they need an NFS server).
 
 ### Results (M-series Mac, 10 cores, APFS, warm cache, rsync 3.5.1)
 
@@ -285,6 +353,47 @@ is therefore dropped once more as a whole when hashing and rebuilding are done.
 
 Peak memory is higher than rsync's (~130 MiB vs 9 MiB on A locally, ~230 MiB for a remote push) because whole directory listings
 and per-thread 1 MiB copy buffers are held at once; bounding that is on the list.
+
+### Over a network (Linux container, real sshd, `tc netem` on loopback, data on tmpfs, 3 runs)
+
+| Profile | Workload | rsync | fastrsync (ssh) | fastrsync `--streams 4` |
+|---|---|---:|---:|---:|
+| LAN 1 Gbit | 8k × 4 KiB push | 0.49 s | **0.46 s** | 0.47 s |
+| LAN | 256 MiB, 8 × 1 MiB changed | 0.49 s | **0.34 s** | 0.35 s |
+| LAN | 40k files, 3 changed | 0.32 s | **0.19 s** | 0.20 s |
+| WAN 100 Mbit, 20 ms | small push | 3.59 s | **3.40 s** | 3.88 s |
+| WAN | delta | 1.64 s | **1.57 s** | 1.78 s |
+| WAN | no-op | 1.82 s | **0.69 s** | 0.84 s |
+| Lossy 20 Mbit, 80 ms, 1% | small push | 79.2 s | 79.5 s | **24.4 s** |
+| Lossy | delta | 18.2 s | **17.0 s** | 22.2 s (±6.3) |
+| Lossy | no-op | 5.80 s | 3.73 s | **3.05 s** |
+
+What this shows:
+
+- **When a transfer is limited by the link or by ssh, the tools tie.** Both push data through
+  ssh's single encryption thread (~130 MB/s in this VM).
+- **fastrsync wins on no-ops** (1.7–2.6×), where rsync's single-threaded scan dominates.
+- **`--streams` wins big on lossy links** (3.3×). One TCP flow can't fill a lossy,
+  high-latency link; several can. On clean links its extra connection setup costs a little.
+- **One big file gains nothing from `--streams`:** all frames of a file use one stream.
+
+Syscalls (`strace -c -f`, Linux, 20k files; the original plan's bar is ≥ 50% fewer than rsync):
+
+| Workload | rsync | fastrsync |
+|---|---:|---:|
+| Copy 20k × 4 KiB | 404,488 | **182,155** (−55%) |
+| No-op over 20k files | 42,684 | 44,410 (+4%) |
+
+- **No-op:** both tools need two stats per file (source and destination), and Linux has no
+  bulk stat, so the no-op count can't drop much. fastrsync's no-op speed comes from
+  parallelism.
+- **Copy:** getting under the bar took two fixes found in these traces. An extra
+  `copy_file_range` call per file only to see EOF is now skipped. A `fchmod` after every
+  `chown` is now done only when setuid/setgid bits are involved.
+
+Flamegraphs (`bench/flamegraph.sh`; Linux via perf, macOS via `sample`) show the time going into
+`openat`/`copy_file_range` (copy), `pwrite` (delta) and `statx`/`getdents` (no-op). No lock
+contention or allocation shows up in the hot frames.
 
 ### What the measurements showed
 

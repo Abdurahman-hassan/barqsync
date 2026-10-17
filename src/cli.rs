@@ -1,7 +1,9 @@
 //! Command-line interface: an rsync-compatible subset of flags, resolved into [`Options`].
 
+use crate::chmod::ChmodRule;
 use crate::filter::{RuleSpec, read_rules_file};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use std::os::unix::ffi::OsStrExt;
 use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -37,12 +39,42 @@ pub struct Cli {
     /// Preserve modification times
     #[arg(short = 't', long)]
     times: bool,
+    /// Omit directories from --times
+    #[arg(short = 'O', long = "omit-dir-times")]
+    omit_dir_times: bool,
     /// Preserve group
     #[arg(short = 'g', long)]
     group: bool,
     /// Preserve owner (super-user only)
     #[arg(short = 'o', long)]
     owner: bool,
+    /// Transform symlinks into the files/directories they point to
+    #[arg(short = 'L', long = "copy-links")]
+    copy_links: bool,
+    /// Transform symlinks to directories into directories
+    #[arg(short = 'k', long = "copy-dirlinks")]
+    copy_dirlinks: bool,
+    /// Treat symlinked directories on the receiver as directories
+    #[arg(short = 'K', long = "keep-dirlinks")]
+    keep_dirlinks: bool,
+    /// Transfer directories without recursing
+    #[arg(short = 'd', long)]
+    dirs: bool,
+    /// Use relative path names
+    #[arg(short = 'R', long)]
+    relative: bool,
+    /// Read the list of source files from FILE (`-` for stdin)
+    #[arg(long = "files-from", value_name = "FILE")]
+    files_from: Option<OsString>,
+    /// --files-from lists are delimited by NUL bytes
+    #[arg(short = '0', long)]
+    from0: bool,
+    /// Affect file and/or directory permissions (e.g. `Dg+s,Fo-w`)
+    #[arg(long, value_name = "CHMOD")]
+    chmod: Vec<String>,
+    /// Don't map uid/gid values by user/group name
+    #[arg(long = "numeric-ids")]
+    numeric_ids: bool,
     /// Same as --devices --specials
     #[arg(short = 'D')]
     devices_specials: bool,
@@ -74,6 +106,12 @@ pub struct Cli {
     /// Same as --partial --progress
     #[arg(short = 'P')]
     partial_progress: bool,
+    /// Keep partially transferred files
+    #[arg(long)]
+    partial: bool,
+    /// Put a partially transferred file into DIR
+    #[arg(long = "partial-dir", value_name = "DIR")]
+    partial_dir: Option<OsString>,
     /// Fine-grained output flags; `progress2` (or `progress`) shows overall progress
     #[arg(long, value_name = "FLAGS")]
     info: Vec<String>,
@@ -102,6 +140,9 @@ pub struct Cli {
     /// fsync every written file
     #[arg(long)]
     fsync: bool,
+    /// Turn sequences of nulls into sparse blocks
+    #[arg(short = 'S', long)]
+    sparse: bool,
     /// Never use copy-on-write clones / reflinks (benchmarking aid)
     #[arg(long = "no-clone", hide = true)]
     no_clone: bool,
@@ -137,6 +178,36 @@ pub struct Cli {
     /// Skip files that match in size
     #[arg(long = "size-only")]
     size_only: bool,
+    /// Skip based on checksum, not mod-time & size
+    #[arg(short = 'c', long)]
+    checksum: bool,
+    /// Skip creating new files on receiver
+    #[arg(long, visible_alias = "ignore-non-existing")]
+    existing: bool,
+    /// Don't transfer any file larger than SIZE
+    #[arg(long = "max-size", value_name = "SIZE")]
+    max_size: Option<String>,
+    /// Don't transfer any file smaller than SIZE
+    #[arg(long = "min-size", value_name = "SIZE")]
+    min_size: Option<String>,
+    /// Make backups (see --suffix & --backup-dir)
+    #[arg(short = 'b', long)]
+    backup: bool,
+    /// Make backups into hierarchy based in DIR
+    #[arg(long = "backup-dir", value_name = "DIR")]
+    backup_dir: Option<OsString>,
+    /// Backup suffix (default ~ w/o --backup-dir)
+    #[arg(long, value_name = "SUFFIX")]
+    suffix: Option<String>,
+    /// Also compare destination files relative to DIR
+    #[arg(long = "compare-dest", value_name = "DIR")]
+    compare_dest: Vec<OsString>,
+    /// Hardlink to files in DIR when unchanged
+    #[arg(long = "link-dest", value_name = "DIR")]
+    link_dest: Vec<OsString>,
+    /// Sender removes synchronized files (non-directory)
+    #[arg(long = "remove-source-files")]
+    remove_source_files: bool,
     /// Don't skip files that match size and time
     #[arg(short = 'I', long = "ignore-times")]
     ignore_times: bool,
@@ -181,10 +252,21 @@ pub struct Options {
     pub hard_links: bool,
     pub perms: bool,
     pub times: bool,
+    /// `-O`, also forced by `--backup` without `--backup-dir` (rsync).
+    pub omit_dir_times: bool,
     pub group: bool,
     pub owner: bool,
     pub devices: bool,
     pub specials: bool,
+    pub copy_links: bool,
+    pub copy_dirlinks: bool,
+    pub keep_dirlinks: bool,
+    pub dirs: bool,
+    pub relative: bool,
+    /// `--files-from`: the listed paths, read by the client (also sent to the server).
+    pub files_from: Option<Vec<Vec<u8>>>,
+    pub chmod: Vec<ChmodRule>,
+    pub numeric_ids: bool,
 
     pub verbose: u8,
     pub itemize: u8,
@@ -204,6 +286,10 @@ pub struct Options {
     pub no_clone: bool,
     /// Page-cache hints for big files (see `fsops::cache`).
     pub drop_cache: bool,
+    pub sparse: bool,
+    /// `--partial` (also implied by `--partial-dir` and `-P`).
+    pub partial: bool,
+    pub partial_dir: Option<OsString>,
 
     pub delete: bool,
     pub delete_excluded: bool,
@@ -215,6 +301,18 @@ pub struct Options {
     pub ignore_existing: bool,
     pub one_file_system: bool,
     pub modify_window: i64,
+    pub checksum: bool,
+    pub existing: bool,
+    pub max_size: Option<u64>,
+    pub min_size: Option<u64>,
+    pub backup: bool,
+    pub backup_dir: Option<OsString>,
+    /// Resolved backup suffix: `--suffix`, else `~` without `--backup-dir`, else empty.
+    pub suffix: String,
+    /// `--link-dest` / `--compare-dest` directories, in order.
+    pub alt_dest: Vec<OsString>,
+    pub alt_link: bool,
+    pub remove_source_files: bool,
 
     pub rsh: Option<String>,
     pub remote_path: Option<String>,
@@ -234,8 +332,37 @@ impl Options {
     {
         let matches = Cli::command().try_get_matches_from(args)?;
         let cli = Cli::from_arg_matches(&matches)?;
-        let filter_rules = ordered_filter_rules(&cli, &matches)?;
-        Ok(Options::from_cli(cli, filter_rules))
+        let mut filter_rules = ordered_filter_rules(&cli, &matches)?;
+        // rsync protects a relative partial dir (and hides one on the sender) with a
+        // trailing exclude rule.
+        if let Some(d) = &cli.partial_dir
+            && !d.as_bytes().starts_with(b"/")
+        {
+            let d = String::from_utf8_lossy(d.as_bytes()).trim_end_matches('/').to_string();
+            filter_rules.push(RuleSpec { include: false, pattern: format!("{d}/") });
+        }
+        let chmod = parse_chmod_args(&cli.chmod)?;
+        let max_size = cli.max_size.as_deref().map(|s| parse_size(s, "--max-size")).transpose()?;
+        let min_size = cli.min_size.as_deref().map(|s| parse_size(s, "--min-size")).transpose()?;
+        if !cli.link_dest.is_empty() && !cli.compare_dest.is_empty() {
+            bail!("--link-dest cannot be combined with --compare-dest");
+        }
+        let files_from = match &cli.files_from {
+            Some(f) => Some(read_files_from(f, cli.from0)?),
+            None => None,
+        };
+        let mut o = Options::from_cli(cli, filter_rules);
+        o.chmod = chmod;
+        o.max_size = max_size;
+        o.min_size = min_size;
+        if files_from.is_some() {
+            // rsync: --files-from implies -R and -d, and -a no longer implies -r.
+            o.relative = true;
+            o.dirs = true;
+            o.recursive = matches.get_flag("recursive");
+        }
+        o.files_from = files_from;
+        Ok(o)
     }
 
     fn from_cli(c: Cli, filter_rules: Vec<RuleSpec>) -> Options {
@@ -247,10 +374,19 @@ impl Options {
             hard_links: c.hard_links,
             perms: c.perms || a,
             times: c.times || a,
+            omit_dir_times: c.omit_dir_times || (c.backup && c.backup_dir.is_none()),
             group: c.group || a,
             owner: c.owner || a,
             devices: c.devices || c.devices_specials || a,
             specials: c.specials || c.devices_specials || a,
+            copy_links: c.copy_links,
+            copy_dirlinks: c.copy_dirlinks,
+            keep_dirlinks: c.keep_dirlinks,
+            dirs: c.dirs,
+            relative: c.relative,
+            files_from: None,
+            chmod: Vec::new(),
+            numeric_ids: c.numeric_ids,
             verbose: if c.quiet { 0 } else { c.verbose },
             itemize: if c.quiet { 0 } else { c.itemize },
             quiet: c.quiet,
@@ -274,6 +410,9 @@ impl Options {
             fsync: c.fsync,
             no_clone: c.no_clone,
             drop_cache: c.drop_cache || !c.no_drop_cache,
+            sparse: c.sparse,
+            partial: c.partial || c.partial_progress || c.partial_dir.is_some(),
+            partial_dir: c.partial_dir,
             delete: c.delete || c.delete_excluded,
             delete_excluded: c.delete_excluded,
             filter_rules,
@@ -283,6 +422,16 @@ impl Options {
             ignore_existing: c.ignore_existing,
             one_file_system: c.one_file_system,
             modify_window: c.modify_window,
+            checksum: c.checksum,
+            existing: c.existing,
+            max_size: None,
+            min_size: None,
+            backup: c.backup || c.backup_dir.is_some(),
+            suffix: c.suffix.unwrap_or_else(|| if c.backup_dir.is_some() { String::new() } else { "~".to_string() }),
+            backup_dir: c.backup_dir,
+            alt_link: !c.link_dest.is_empty(),
+            alt_dest: if c.link_dest.is_empty() { c.compare_dest } else { c.link_dest },
+            remove_source_files: c.remove_source_files,
             rsh: c.rsh,
             remote_path: c.remote_path,
             // Two workers per core: on APFS that gives the fastest metadata-bound syncs
@@ -295,6 +444,82 @@ impl Options {
             paths: c.paths,
         }
     }
+}
+
+fn parse_chmod_args(specs: &[String]) -> Result<Vec<ChmodRule>> {
+    crate::chmod::parse_all(specs, crate::fsops::current_umask())
+}
+
+/// rsync's size syntax: a number with an optional fraction, an optional unit (`b k m g t
+/// p`; `KB` = 1000, `K`/`KiB` = 1024), and an optional `+1`/`-1` adjustment.
+pub fn parse_size(arg: &str, opt: &str) -> Result<u64> {
+    let invalid = || anyhow::anyhow!("{opt} value is invalid: {arg}");
+    let b = arg.as_bytes();
+    let mut i = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    if b.get(i) == Some(&b'.') {
+        i += 1 + b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+    }
+    let number: f64 = if i == 0 { return Err(invalid()) } else { arg[..i].parse().map_err(|_| invalid())? };
+    let mut rest = &b[i..];
+    let reps = match rest.first() {
+        None | Some(b'+') | Some(b'-') => 0,
+        Some(&c) => {
+            rest = &rest[1..];
+            match c.to_ascii_lowercase() {
+                b'b' => 0,
+                b'k' => 1,
+                b'm' => 2,
+                b'g' => 3,
+                b't' => 4,
+                b'p' => 5,
+                _ => return Err(invalid()),
+            }
+        }
+    };
+    let mult: u64 = match rest.first() {
+        Some(b'b') | Some(b'B') => {
+            rest = &rest[1..];
+            1000
+        }
+        None | Some(b'+') | Some(b'-') => 1024,
+        _ if rest.len() >= 2 && rest[..2].eq_ignore_ascii_case(b"ib") => {
+            rest = &rest[2..];
+            1024
+        }
+        _ => return Err(invalid()),
+    };
+    let mut size = (mult.pow(reps) as f64 * number) as i128;
+    if let [sign @ (b'+' | b'-'), b'1', tail @ ..] = rest {
+        size += if *sign == b'+' { 1 } else { -1 };
+        rest = tail;
+    }
+    if !rest.is_empty() || size < 0 {
+        return Err(invalid());
+    }
+    Ok(size as u64)
+}
+
+/// Read a `--files-from` list: one path per line (or NUL-separated with `--from0`);
+/// blank lines and, without `--from0`, lines starting with `#` or `;` are skipped.
+fn read_files_from(file: &OsString, from0: bool) -> Result<Vec<Vec<u8>>> {
+    use std::io::Read;
+    let data = if file == "-" {
+        let mut v = Vec::new();
+        std::io::stdin().read_to_end(&mut v).context("reading --files-from from stdin")?;
+        v
+    } else {
+        if let crate::paths::Location::Remote { .. } = crate::paths::parse_location(file) {
+            bail!("a remote --files-from list is not supported");
+        }
+        std::fs::read(file).with_context(|| format!("failed to open files-from file {}", file.to_string_lossy()))?
+    };
+    let sep = if from0 { 0 } else { b'\n' };
+    Ok(data
+        .split(|&c| c == sep)
+        .map(|l| if !from0 { l.strip_suffix(b"\r").unwrap_or(l) } else { l })
+        .filter(|l| !l.is_empty() && (from0 || !matches!(l[0], b'#' | b';')))
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 /// Include/exclude options are order-sensitive across flags, so rebuild the
@@ -358,6 +583,49 @@ mod tests {
         for args in [&["fastrsync", "-8", "s", "d"][..], &["fastrsync", "-av8", "s", "d"], &["fastrsync", "--8-bit-output", "s", "d"]] {
             assert!(Options::parse_from(args).unwrap().eight_bit_output, "{args:?}");
         }
+    }
+
+    #[test]
+    fn sizes_parse_like_rsync() {
+        for (arg, want) in [
+            ("100", 100),
+            ("4K", 4096),
+            ("4k", 4096),
+            ("4KB", 4000),
+            ("4KiB", 4096),
+            ("1.5M", 1_572_864),
+            ("1M-1", 1_048_575),
+            ("1G+1", 1_073_741_825),
+            ("10b", 10),
+        ] {
+            assert_eq!(parse_size(arg, "--max-size").unwrap(), want, "{arg}");
+        }
+        for bad in ["", "K", "4X", "4KQ", "4K+2", "-1"] {
+            assert!(parse_size(bad, "--max-size").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn files_from_implies_relative_and_dirs_but_not_recursion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let list = tmp.path().join("list");
+        std::fs::write(&list, "# comment\na/b\n\n; c\nc\r\n").unwrap();
+        let l = list.to_str().unwrap();
+        let o = Options::parse_from(["fastrsync", "-a", "--files-from", l, "s", "d"]).unwrap();
+        assert!(o.relative && o.dirs && !o.recursive);
+        assert_eq!(o.files_from.unwrap(), vec![b"a/b".to_vec(), b"c".to_vec()]);
+        let o = Options::parse_from(["fastrsync", "-ar", "--files-from", l, "s", "d"]).unwrap();
+        assert!(o.recursive);
+    }
+
+    #[test]
+    fn backup_suffix_defaults() {
+        let o = Options::parse_from(["fastrsync", "-b", "s", "d"]).unwrap();
+        assert_eq!(o.suffix, "~");
+        let o = Options::parse_from(["fastrsync", "--backup-dir=bk", "s", "d"]).unwrap();
+        assert!(o.backup);
+        assert_eq!(o.suffix, "");
+        assert!(Options::parse_from(["fastrsync", "--link-dest=a", "--compare-dest=b", "s", "d"]).is_err());
     }
 
     #[test]
