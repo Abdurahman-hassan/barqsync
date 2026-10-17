@@ -31,7 +31,17 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 The test suite passes on macOS (APFS; 145 tests, also built as x86_64 and run under Rosetta)
 and Linux (aarch64 container, 148 tests, compared against rsync 3.2.7).
 
-## Build
+## Install
+
+```bash
+cargo install barqsync      # needs Rust: https://rustup.rs
+barqsync -av src/ dst/
+```
+
+macOS and Linux only. For remote transfers, barqsync has to be installed on both machines
+(like rsync), or pointed to with `--remote-path`.
+
+## Build from source
 
 ```bash
 brew install rustup && rustup default stable   # macOS; or https://rustup.rs
@@ -710,3 +720,10 @@ contention or allocation shows up in the hot frames.
   - The default is 2 threads per core because that is fastest for no-op syncs. Fresh
     small-file copies are as fast at one per core and fastest at 4–6 threads, and
     `--threads 6` uses about a third of the kernel CPU.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state otherwise, any
+contribution intentionally submitted for inclusion in barqsync, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or conditions.
