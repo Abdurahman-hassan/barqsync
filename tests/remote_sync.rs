@@ -397,3 +397,32 @@ fn whole_file_flags_override_the_adaptive_strategy() {
         assert_eq!(stat_bytes(&f.stdout, "Matched data: ") > 0, delta, "{flag}: {}", f.stdout);
     }
 }
+
+#[test]
+fn io_uring_pack_writes_match_rsync() {
+    // Linux writes received packs in io_uring batches; elsewhere the flag is a no-op.
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    for d in 0..12 {
+        for i in 0..120 {
+            t.file(&format!("d{d:02}/f{i:03}"), noise(50 + i * 41, (d * 1000 + i) as u64));
+        }
+    }
+    t.file("empty", "").chmod("d00/f000", 0o600).chmod("d01/f001", 0o4755).settle_mtimes();
+    let (r, f) = both_remote_env(tmp.path(), &["-ai", "src/", "{host}{dst}"], "dr", "df", &[("FASTRSYNC_IO_URING", "1")]).unwrap();
+    assert_eq!(f.code, 0, "{}", f.stderr);
+    assert_eq!(normalize(r.items(), "dr", "D"), normalize(f.items(), "df", "D"));
+    assert_same_tree(&snapshot(&tmp.path().join("dr"), true), &snapshot(&tmp.path().join("df"), true));
+    // Again into an existing tree: every file replaced through the batch path.
+    t.file("d03/f010", "changed").settle_mtimes();
+    for d in ["dr", "df"] {
+        Tree::new(tmp.path().join(d)).file("d05/f005", "stale");
+    }
+    let (r, f) = both_remote_env(tmp.path(), &["-ai", "src/", "{host}{dst}"], "dr", "df", &[("FASTRSYNC_IO_URING", "1")]).unwrap();
+    assert_eq!(f.code, 0, "{}", f.stderr);
+    assert_eq!(normalize(r.items(), "dr", "D"), normalize(f.items(), "df", "D"));
+    assert_same_tree(&snapshot(&tmp.path().join("dr"), true), &snapshot(&tmp.path().join("df"), true));
+}

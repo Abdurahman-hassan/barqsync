@@ -35,6 +35,11 @@ pub fn apply(delta: &Delta, basis: &dyn ReadAt, literal: &dyn ReadAt, out: &File
         })?;
     } else {
         rebuild_in_order(&pieces, basis, literal, out, delta.size)?;
+        // The rebuild wrote 0..size in order: the file has its length (and truncating it
+        // would make XFS flush it on close).
+        if delta.size > 0 {
+            return Ok(());
+        }
     }
     out.set_len(delta.size)
 }

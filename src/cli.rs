@@ -253,6 +253,9 @@ pub struct Cli {
     /// zstd level for compressed frames (default: 1, or chosen from the link speed)
     #[arg(long = "compress-level", value_name = "N", value_parser = clap::value_parser!(i32).range(1..=19))]
     compress_level: Option<i32>,
+    /// Linux: write received small files in io_uring batches
+    #[arg(long = "io-uring", env = "FASTRSYNC_IO_URING", hide_env = true, value_parser = clap::builder::FalseyValueParser::new())]
+    io_uring: bool,
     /// Network I/O layer for the ssh pipe and TCP streams (benchmarking aid)
     #[arg(long = "net-io", value_name = "LAYER", value_parser = ["threads", "tokio"], hide = true, env = "FASTRSYNC_NET_IO", hide_env = true)]
     net_io: Option<String>,
@@ -357,6 +360,8 @@ pub struct Options {
     pub net_io_tokio: bool,
     pub strategy: Strategy,
     pub compress_level: Option<i32>,
+    /// `--io-uring` (Linux): batched small-file writes on the receiver (see `fsops::uring`).
+    pub io_uring: bool,
 
     pub server: bool,
     pub sender: bool,
@@ -492,6 +497,7 @@ impl Options {
             wire: c.wire,
             net_io_tokio: c.net_io.as_deref() == Some("tokio"),
             strategy: c.strategy.unwrap_or(Strategy::DEFAULT),
+            io_uring: c.io_uring,
             compress_level: c.compress_level,
             server: c.server,
             sender: c.sender,

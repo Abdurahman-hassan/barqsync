@@ -244,6 +244,29 @@ one file use the same stream, so they stay in order.
 - jwalk's workers block inside rayon's `par_bridge`, so the hook must not use rayon itself
   (a nested `par_iter` there deadlocked); big directories are stat'ed on plain threads.
 
+### M11: QUIC, rkyv, tokio layer (branch `m11-quic-rkyv`)
+
+- `--transport ssh|tcp|quic`: QUIC (quinn) set up over ssh like `--streams`, control and
+  listings on one stream, file data on `--streams` more; 3 s fallback to ssh.
+- `--wire postcard|rkyv` (rkyv validated with bytecheck; frames carry their encoding).
+- The tokio connection layer for ssh/TCP behind the hidden `--net-io=tokio`.
+- Measured: QUIC ties the ssh pipe on a clean WAN, is a few percent slower on a LAN and 2–4×
+  faster on a lossy link (after fixing control-stream starvation and the close). rkyv and
+  tokio I/O are within noise. Defaults stay ssh / postcard / threads.
+
+### M12: adaptive strategy (branch `m12-adaptive`)
+
+- Link probe (ping + 256 KiB, 4 MiB more on fast links), whole-vs-delta routing at 1 Gbit/s
+  and 32 MiB, pack compression with link-based zstd levels, `--compress-level`.
+- Up to 7.6× faster on compressible data (with QUIC on a lossy link), 4–22% slower on
+  incompressible data; `fixed` stays the default.
+
+### M13: io_uring (branch `m13-io-uring`)
+
+- Received small-file packs as three ring batches (openat, write, close) per pack.
+- 24% fewer syscalls, no faster; opt-in. Fixed on the way: a redundant truncate of every
+  received file, which cost XFS a writeback per file (3.2× faster small-file pushes).
+
 ### Testing
 
 - **Coverage:** 79 tests on macOS and 81 on Linux (aarch64 container, glibc rsync 3.2.7).

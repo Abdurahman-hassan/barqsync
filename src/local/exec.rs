@@ -1356,6 +1356,31 @@ impl<'a> Engine<'a> {
 
     /// Set owner, mode and mtime on a freshly written file, by descriptor when we
     /// still hold one (one metadata update each, no path lookups).
+    /// Owner, mode and time of a file this run created and wrote, through its descriptor.
+    pub(crate) fn set_written_attrs(
+        &self,
+        f: &fs::File,
+        mode: u32,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mtime: Option<(i64, u32)>,
+    ) -> io::Result<()> {
+        fsops::fchown(f, uid, gid)?;
+        // open() already applied `mode & !umask`; only fix up what it couldn't set:
+        // bits masked by the umask, and setuid/setgid/sticky (which also covers the
+        // bits chown clears).
+        if mode & !self.umask & 0o777 != mode {
+            fsops::fchmod(f, mode)?;
+        }
+        if let Some((s, ns)) = mtime {
+            fsops::set_fd_mtime(f, s, ns)?;
+        }
+        if self.opts.fsync {
+            f.sync_all()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_new_file_attrs(
         &self,
         path: &Path,
@@ -1366,22 +1391,7 @@ impl<'a> Engine<'a> {
         mtime: Option<(i64, u32)>,
     ) -> io::Result<()> {
         match copied {
-            Copied::Written(f) => {
-                fsops::fchown(&f, uid, gid)?;
-                // open() already applied `mode & !umask`; only fix up what it couldn't set:
-                // bits masked by the umask, and setuid/setgid/sticky (which also covers the
-                // bits chown clears).
-                if mode & !self.umask & 0o777 != mode {
-                    fsops::fchmod(&f, mode)?;
-                }
-                if let Some((s, ns)) = mtime {
-                    fsops::set_fd_mtime(&f, s, ns)?;
-                }
-                if self.opts.fsync {
-                    f.sync_all()?;
-                }
-                Ok(())
-            }
+            Copied::Written(f) => self.set_written_attrs(&f, mode, uid, gid, mtime),
             Copied::Clone => {
                 Stats::add(&self.stats.cloned, 1);
                 fsops::lchown(path, uid, gid)?;

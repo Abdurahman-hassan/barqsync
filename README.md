@@ -25,6 +25,7 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M10 | the original plan's scanner as `--scanner=jwalk` (jwalk + DashMap index + queues A–D); measured slower, so `dirtask` stays the default | done |
 | M11 | QUIC transport (`--transport quic`, quinn), rkyv wire format (`--wire rkyv`), tokio connection layer (`--net-io=tokio`) | done |
 | M12 | adaptive strategy (`--strategy adaptive`): link probe, whole-vs-delta routing by link speed, pack compression with link-based zstd levels, `--compress-level`; up to 7.6× on compressible data, slower on incompressible, so `fixed` stays the default | done |
+| M13 | io_uring batches for received small files (`--io-uring`, Linux): 24% fewer syscalls, no faster, so opt-in; found on the way: skipping a redundant truncate made small-file pushes onto XFS 3.2× faster | done |
 
 The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
@@ -53,7 +54,8 @@ for files of 8 MiB+, on by default; see [Page-cache hints](#page-cache-hints)),
 `--delta=blocks|cdc` (delta design, see [Delta transfer](#delta-transfer); for a remote
 transfer the receiver's choice applies), `--scanner=dirtask|jwalk`, `--transport
 ssh|tcp|quic` with `--streams N`, `--wire postcard|rkyv` (see [Remote transfers](#remote-transfers)),
-`--strategy adaptive|fixed` and `--compress-level N` (see [Adaptive strategy](#adaptive-strategy---strategy-adaptive)).
+`--strategy adaptive|fixed` and `--compress-level N` (see [Adaptive strategy](#adaptive-strategy---strategy-adaptive)),
+`--io-uring` (Linux; see [io_uring](#io_uring---io-uring-linux)).
 
 Also, with rsync's semantics locally and over ssh (each has a differential test in
 `tests/rsync_flags.rs`):
@@ -279,6 +281,33 @@ that then go out raw. Mid-size files gain nothing on these links (they stay delt
 1 Gbit/s). Since neither strategy is faster across the board, `--strategy fixed` stays the
 default; `--strategy adaptive` (with `--transport quic` on lossy links) is the choice for
 compressible data over slower links.
+
+### io_uring (`--io-uring`, Linux)
+
+The original plan's Phase 4.1. A receiver writes each small-file pack in three io_uring
+submissions per pack (up to 256 operations each) instead of three syscalls per file: create
+every temp file (`openat`), write every file, close every file. Owner, mode, times and the
+rename stay ordinary syscalls. Each worker thread keeps its own ring; if the kernel or a
+seccomp profile refuses io_uring, the normal path is used. The plan named tokio-uring; this
+uses the `io-uring` crate it is built on, since batching is the point and tokio-uring
+submits per future.
+
+Remote push (fake ssh) of 20,000 files of 4 KiB in the Linux container (kernel 6.19, 5 runs,
+`bench/uring.sh`):
+
+| Receiver writes onto | normal | `--io-uring` | syscalls normal / io_uring |
+| --- | ---: | ---: | ---: |
+| tmpfs | 148 ms (±15) | 133 ms (±16) | 249,705 / 190,295 |
+| XFS (the VM's disk) | **218 ms** (±28) | 265 ms (±41) | 249,529 / 190,377 |
+
+A quarter fewer syscalls, but no measurable time saved: the filesystem work per file is the
+same, and a syscall costs well under a microsecond. So `--io-uring` stays opt-in.
+
+The first measurement showed `--io-uring` 2.8× faster on XFS, and not because of io_uring:
+the normal path truncated every received file to its size even when it had just written
+exactly that much, and XFS writes back a truncated file when it is closed (its protection
+against the truncate-then-write pattern). Skipping the redundant truncate made the normal
+path 3.2× faster on XFS (689 → 218 ms), for every transfer, with or without io_uring.
 
 ## Delta transfer
 
