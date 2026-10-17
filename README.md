@@ -263,6 +263,12 @@ Runs alternated hints on and off, swapping the order every round. The last two r
   read-then-write loop and took 14.9 s instead of 10.5 s, because uncached I/O on macOS is
   synchronous (no read-ahead, no write-behind). Big files are now copied through two 8 MiB
   buffers, reading the next one while the current one is written.
+- **The remote receiver must write in big pieces too.** Pushing B through the fake-ssh
+  pipe (`-W`, whole file) took 15.0 / 14.4 s with hints and 11.3 / 11.1 s without. The
+  receiver writes `Data` frames on its single receive loop, and each uncached 1 MiB write
+  stalled that loop. On macOS it now collects a big file's contiguous frames into 8 MiB
+  writes: 12.3 / 10.8 s with hints, 11.8 / 10.3 s without. A remote delta push of B
+  was faster with hints from the start: 6.34 / 6.36 s, against 6.70 / 7.09 s without.
 - **Costs:** a big file synced twice in a row is re-read from disk the second time. On
   Linux, `DONTNEED` also drops source pages that were cached before the sync. macOS
   `F_NOCACHE` keeps those.
