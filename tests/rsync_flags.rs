@@ -755,6 +755,10 @@ fn remove_source_files_matches_rsync() {
         seed(tmp.path(), &format!("{d}-src/"), &[d]);
         fs::write(tmp.path().join(format!("{d}-src/f3")), "3").unwrap();
         fs::write(tmp.path().join(format!("{d}-src/sub/f4")), "4").unwrap();
+        // The same times in every tool's copy, however long creating them took.
+        for (rel, t) in [("f3", 11), ("sub/f4", 12), ("sub", 13), ("", 14)] {
+            set_mtime(&tmp.path().join(format!("{d}-src")).join(rel), BASE_TIME + 900_000 + t);
+        }
     }
     let (r, f) = both(tmp.path(), &["-ai", "--remove-source-files", "{dst}-src/", "{dst}"], "dr", "df").unwrap();
     same_output(&r, &f, &[], "local");

@@ -2,6 +2,8 @@
 
 use crate::chmod::ChmodRule;
 use crate::delta::DeltaMode;
+use crate::proto::Wire;
+use crate::remote::Transport;
 use crate::scan::Scanner;
 use crate::filter::{RuleSpec, read_rules_file};
 use anyhow::{Context, Result, bail};
@@ -239,9 +241,18 @@ pub struct Cli {
     /// Number of worker threads (default: 2x CPU cores)
     #[arg(long, value_name = "N")]
     threads: Option<usize>,
-    /// Number of parallel TCP data streams for remote transfers
+    /// Number of parallel data streams for remote transfers (TCP, or QUIC streams)
     #[arg(long, value_name = "N")]
     streams: Option<usize>,
+    /// Remote data path: the ssh pipe alone, TLS-over-TCP streams, or QUIC
+    #[arg(long, value_enum, value_name = "MODE", env = "FASTRSYNC_TRANSPORT", hide_env = true)]
+    transport: Option<Transport>,
+    /// Network I/O layer for the ssh pipe and TCP streams (benchmarking aid)
+    #[arg(long = "net-io", value_name = "LAYER", value_parser = ["threads", "tokio"], hide = true, env = "FASTRSYNC_NET_IO", hide_env = true)]
+    net_io: Option<String>,
+    /// Control-message encoding on the wire
+    #[arg(long, value_enum, value_name = "FORMAT", default_value_t, env = "FASTRSYNC_WIRE", hide_env = true)]
+    wire: Wire,
 
     #[arg(long, hide = true)]
     server: bool,
@@ -254,6 +265,7 @@ pub struct Cli {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Options {
     pub recursive: bool,
     pub links: bool,
@@ -300,6 +312,7 @@ pub struct Options {
     pub sparse: bool,
     /// `--partial` (also implied by `--partial-dir` and `-P`).
     pub partial: bool,
+    #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
     pub partial_dir: Option<OsString>,
 
     pub delete: bool,
@@ -317,10 +330,12 @@ pub struct Options {
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
     pub backup: bool,
+    #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
     pub backup_dir: Option<OsString>,
     /// Resolved backup suffix: `--suffix`, else `~` without `--backup-dir`, else empty.
     pub suffix: String,
     /// `--link-dest` / `--compare-dest` directories, in order.
+    #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
     pub alt_dest: Vec<OsString>,
     pub alt_link: bool,
     pub remove_source_files: bool,
@@ -328,10 +343,16 @@ pub struct Options {
     pub rsh: Option<String>,
     pub remote_path: Option<String>,
     pub threads: usize,
+    /// Data streams for `transport` (0: everything on the ssh pipe).
     pub streams: usize,
+    pub transport: Transport,
+    pub wire: Wire,
+    /// `--net-io=tokio`: the plan's tokio-driven connection layer (see `proto::async_io`).
+    pub net_io_tokio: bool,
 
     pub server: bool,
     pub sender: bool,
+    #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
     pub paths: Vec<OsString>,
 }
 
@@ -451,7 +472,17 @@ impl Options {
             // (filesystem latency is hidden by queue depth). Fewer threads use far less
             // kernel CPU for nearly the same speed; see README.
             threads: c.threads.filter(|&n| n > 0).unwrap_or((cores * 2).clamp(4, 64)),
-            streams: c.streams.unwrap_or(0),
+            // `--streams N` alone means TCP streams, as before `--transport` existed.
+            transport: c.transport.unwrap_or(if c.streams.is_some_and(|n| n > 0) { Transport::Tcp } else { Transport::DEFAULT }),
+            streams: match c.transport {
+                Some(Transport::Ssh) => 0,
+                Some(Transport::Quic) => c.streams.unwrap_or(Transport::QUIC_STREAMS).clamp(1, Transport::MAX_STREAMS),
+                Some(Transport::Tcp) => c.streams.unwrap_or(Transport::TCP_STREAMS).clamp(1, Transport::MAX_STREAMS),
+                None if Transport::DEFAULT == Transport::Quic => c.streams.unwrap_or(Transport::QUIC_STREAMS).min(Transport::MAX_STREAMS),
+                None => c.streams.unwrap_or(0).min(Transport::MAX_STREAMS),
+            },
+            wire: c.wire,
+            net_io_tokio: c.net_io.as_deref() == Some("tokio"),
             server: c.server,
             sender: c.sender,
             paths: c.paths,

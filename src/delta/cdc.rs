@@ -31,6 +31,7 @@ pub type Blake3 = [u8; 32];
 
 /// One chunk of a basis file, as the receiver sends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ChunkSignature {
     pub offset: u64,
     pub length: u32,
@@ -39,6 +40,7 @@ pub struct ChunkSignature {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CdcSig {
     pub size: u64,
     pub chunks: Vec<ChunkSignature>,

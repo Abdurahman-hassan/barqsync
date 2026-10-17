@@ -83,7 +83,12 @@ impl Tree {
         all.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
         for (i, p) in all.iter().enumerate() {
             let md = fs::symlink_metadata(p).unwrap();
-            if md.file_type().is_symlink() || md.file_type().is_fifo_like() {
+            if md.file_type().is_symlink() {
+                continue;
+            }
+            if md.file_type().is_fifo_like() {
+                // Opening a FIFO would block: set its time by path.
+                set_mtime_by_path(p, BASE_TIME + i as u64 * 7);
                 continue;
             }
             set_mtime(p, BASE_TIME + i as u64 * 7);
@@ -112,6 +117,15 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         }
         out.push(p);
     }
+}
+
+/// `utimensat` without opening the file (FIFOs, devices).
+pub fn set_mtime_by_path(p: &Path, secs: u64) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    let t = libc::timespec { tv_sec: secs as libc::time_t, tv_nsec: 0 };
+    let r = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [t, t].as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+    assert_eq!(r, 0, "utimensat {}: {}", p.display(), std::io::Error::last_os_error());
 }
 
 pub fn set_mtime(p: &Path, secs: u64) {
@@ -430,7 +444,8 @@ rm -f "$fifo"
     p
 }
 
-/// [`both_remote`] through a given remote-shell stand-in.
+/// [`both_remote`] through a given remote-shell stand-in. fastrsync stays on the ssh
+/// pipe (whatever `FASTRSYNC_TRANSPORT` says), so the shim sees all of its traffic.
 pub fn both_remote_via(cwd: &Path, shim: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
     let rsync_bin = reference_rsync()?;
     let shim = shim.to_str().unwrap();
@@ -442,7 +457,7 @@ pub fn both_remote_via(cwd: &Path, shim: &Path, args: &[&str], dst_r: &str, dst_
     let mut fa = vec!["-e".to_string(), shim.to_string(), format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync"))];
     fa.extend(sub(dst_f));
     let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
-    let f = fastrsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>());
+    let f = run(Command::new(env!("CARGO_BIN_EXE_fastrsync")).env("LC_ALL", TEST_LOCALE).env("FASTRSYNC_TRANSPORT", "ssh").args(&fa), cwd);
     Some((r, f))
 }
 

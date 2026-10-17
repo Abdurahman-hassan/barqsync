@@ -29,7 +29,7 @@ fn spawn_server(opts: &Options, host: &str) -> io::Result<Child> {
     Command::new(program)
         .args(argv)
         .arg(host)
-        .arg(format!("{quoted} --server"))
+        .arg(if opts.net_io_tokio { format!("{quoted} --server --net-io=tokio") } else { format!("{quoted} --server") })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -86,7 +86,20 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         out.error("remote shell has no stdin/stdout");
         return exit::IPC;
     };
-    let mut conn = Conn::start(stdout, stdin, opts.compress);
+    let mut conn = if crate::proto::async_io::enabled() {
+        use crate::proto::async_io::FdIo;
+        match (FdIo::new(stdout.into()), FdIo::new(stdin.into())) {
+            (Ok(r), Ok(w)) => Conn::start_async(r, w, opts.compress),
+            (Err(e), _) | (_, Err(e)) => {
+                out.error(format!("remote shell pipes: {e}"));
+                return exit::IPC;
+            }
+        }
+    } else {
+        Conn::start(stdout, stdin, opts.compress)
+    };
+    // Hello itself always goes out as postcard; everything after it in this format.
+    conn.set_wire(opts.wire);
     let mut server_opts = opts.clone();
     server_opts.paths = server_paths;
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };
@@ -118,7 +131,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     }
 
-    if let Err(e) = streams::setup_client(&mut conn, opts.streams, !server_is_sender, out) {
+    if let Err(e) = streams::setup_client(&mut conn, opts.transport, opts.streams, !server_is_sender, out) {
         out.error(format!("setting up parallel streams failed: {e}"));
         let _ = child.kill();
         return exit::PROTOCOL;

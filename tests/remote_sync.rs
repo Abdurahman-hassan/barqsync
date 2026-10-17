@@ -258,7 +258,7 @@ fn parallel_tls_streams_push_and_pull() {
                 t.file(&format!("many/f{i:03}"), noise(1000 + i * 13, i as u64));
             }
             t.settle_mtimes();
-            let mut args = vec!["-avv", "--stats", "--streams", "4"];
+            let mut args = vec!["-avv", "--stats", "--transport", "tcp", "--streams", "4"];
             args.extend_from_slice(extra);
             if pull {
                 args.extend_from_slice(&["{host}src/", "dst"]);
@@ -283,10 +283,55 @@ fn parallel_streams_fall_back_to_ssh() {
     rich_tree(&tmp.path().join("src"));
     let f = remote_with_env(
         tmp.path(),
-        &["-av", "--streams", "3", "src/", "{host}dst"],
+        &["-av", "--transport", "tcp", "--streams", "3", "src/", "{host}dst"],
         &[("FASTRSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")],
     );
     assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
     assert!(f.stdout.contains("using the ssh connection"), "{}", f.stdout);
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
+}
+
+#[test]
+fn quic_push_and_pull_in_both_wire_formats() {
+    for wire in ["postcard", "rkyv"] {
+        for pull in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            delta_fixture(tmp.path());
+            let t = Tree::new(tmp.path().join("src"));
+            for i in 0..300 {
+                t.file(&format!("many/f{i:03}"), noise(1000 + i * 13, i as u64));
+            }
+            t.settle_mtimes();
+            let mut args = vec!["-avv", "--stats", "--transport", "quic", "--streams", "4", "--wire", wire];
+            if pull {
+                args.extend_from_slice(&["{host}src/", "dst"]);
+            } else {
+                args.extend_from_slice(&["src/", "{host}dst"]);
+            }
+            let f = remote_with_env(tmp.path(), &args, &[]);
+            assert_eq!(f.code, 0, "{wire} pull={pull}\n{}\n{}", f.stdout, f.stderr);
+            assert!(f.stdout.contains("using QUIC to"), "{}", f.stdout);
+            let mut want = snapshot(&tmp.path().join("src"), true);
+            let got = snapshot(&tmp.path().join("dst"), true);
+            want.get_mut(b".".as_slice()).unwrap().mtime = got[b".".as_slice()].mtime;
+            assert_same_tree(&want, &got);
+            assert!(stat_bytes(&f.stdout, "Matched data: ") > 9 << 20, "delta over QUIC: {}", f.stdout);
+        }
+    }
+}
+
+#[test]
+fn quic_falls_back_to_ssh() {
+    let tmp = tempfile::tempdir().unwrap();
+    rich_tree(&tmp.path().join("src"));
+    let started = std::time::Instant::now();
+    let f = remote_with_env(
+        tmp.path(),
+        &["-av", "--transport", "quic", "src/", "{host}dst"],
+        &[("FASTRSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")],
+    );
+    assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
+    assert!(f.stdout.contains("QUIC: could not connect") && f.stdout.contains("using the ssh connection"), "{}", f.stdout);
+    assert!(started.elapsed() < std::time::Duration::from_secs(15), "fallback took {:?}", started.elapsed());
     assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
 }

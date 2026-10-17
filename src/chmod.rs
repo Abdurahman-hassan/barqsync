@@ -8,6 +8,7 @@ const CHMOD_BITS: u32 = 0o7777;
 
 /// One comma-separated clause, resolved to AND/OR masks when parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ChmodRule {
     dirs_only: bool,
     files_only: bool,

@@ -15,11 +15,16 @@ jwalk = "0.9.0"
 libc = "0.2.190"
 memmap2 = "0.9.11"
 postcard = { version = "1.1.3", features = ["use-std"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 rayon = "1.12.0"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
+rkyv = "0.8"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 shlex = "2.0.1"
+tokio = { version = "1.53.3", default-features = false, features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7.20", default-features = false, features = ["io", "io-util"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 zstd = "0.14.2"
 

@@ -32,13 +32,18 @@ use crate::delta::{BlockSig, ChunkSig, Op};
 use crate::entry::{DirEnt, Meta};
 use crate::output::StatsSnapshot;
 use crossbeam_channel::{Receiver, Sender, bounded};
+
+pub mod async_io;
+pub mod wire;
+
+pub use wire::Wire;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"FASTRSYN";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -59,6 +64,7 @@ pub fn split_id(id: u64) -> (u32, u32) {
 
 /// One source argument as the sender sees it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RootInfo {
     /// `src/`: the directory's contents are transferred (its own metadata is in `meta`).
     /// Otherwise the entries in `items` are transferred by name.
@@ -73,6 +79,7 @@ pub struct RootInfo {
 /// The receiver's basis-file signature, chosen by the receiver: aligned blocks when the
 /// file kept its size (in-place edits), content-defined chunks when it changed size.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Sig {
     Blocks(BlockSig),
     Chunks(ChunkSig),
@@ -82,6 +89,7 @@ pub enum Sig {
 
 /// Server → client: where to open parallel data streams and how to authenticate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct StreamOffer {
     /// `ip:port` the server listens on (the server end of the ssh connection).
     pub addr: String,
@@ -95,12 +103,14 @@ pub struct StreamOffer {
 pub type SyncedFiles = Vec<(Vec<u8>, u64, i64)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct NeedReq {
     pub idx: u32,
     pub sig: Option<Sig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Msg {
     /// Client → server, first frame. `opts.paths` holds the server-side paths.
     Hello { magic: [u8; 8], version: u32, server_is_sender: bool, opts: Box<Options> },
@@ -110,6 +120,8 @@ pub enum Msg {
     StreamUnavailable { reason: String },
     /// Client → server: how many streams it established (0 = stay on the ssh pipe).
     StreamsReady { count: u16 },
+    /// `--transport quic`: where to connect and how to authenticate (sent over ssh).
+    QuicOffer(StreamOffer),
     /// Last frame on a data stream.
     StreamEnd,
     /// The peer is giving up; the message says why.
@@ -149,8 +161,11 @@ pub enum Frame {
     Data { id: u64, off: u64, bytes: Vec<u8> },
 }
 
+/// A postcard-encoded message.
 const KIND_MSG: u8 = 0;
 const KIND_DATA: u8 = 1;
+/// An rkyv-encoded message (`--wire=rkyv`).
+const KIND_RKYV: u8 = 2;
 const FLAG_ZSTD: u8 = 0x80;
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -158,9 +173,13 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 }
 
 /// Encode a frame: `u32 LE body length`, `u8 kind`, body. Compressed bodies are
-/// `u32 LE raw length` + zstd stream.
-pub fn encode(frame: &Frame, compress: bool) -> io::Result<Vec<u8>> {
+/// `u32 LE raw length` + zstd stream. `Hello` is always postcard, so a peer of any
+/// version can read it before the session's [`Wire`] is agreed.
+pub fn encode(frame: &Frame, compress: bool, wire: Wire) -> io::Result<Vec<u8>> {
     let (kind, body) = match frame {
+        Frame::Msg(m) if wire == Wire::Rkyv && !matches!(m, Msg::Hello { .. }) => {
+            (KIND_RKYV, rkyv::to_bytes::<rkyv::rancor::Error>(m).map_err(|e| invalid(e.to_string()))?.into_vec())
+        }
         Frame::Msg(m) => (KIND_MSG, postcard::to_stdvec(m).map_err(|e| invalid(e.to_string()))?),
         Frame::Data { id, off, bytes } => {
             let mut b = Vec::with_capacity(16 + bytes.len());
@@ -206,13 +225,22 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
             Err(e) => return Err(e),
         }
     }
+    let mut body = vec![0u8; body_len(&hdr)?];
+    r.read_exact(&mut body)?;
+    decode_body(hdr[4], body).map(Some)
+}
+
+/// Body length from a frame header, checked against [`MAX_FRAME`].
+pub(crate) fn body_len(hdr: &[u8; 5]) -> io::Result<usize> {
     let len = u32::from_le_bytes(hdr[..4].try_into().unwrap()) as usize;
     if len > MAX_FRAME {
         return Err(invalid(format!("frame of {len} bytes exceeds the limit")));
     }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body)?;
-    let kind = hdr[4];
+    Ok(len)
+}
+
+/// Decode a frame body of the given kind.
+pub(crate) fn decode_body(kind: u8, mut body: Vec<u8>) -> io::Result<Frame> {
     if kind & FLAG_ZSTD != 0 {
         let raw = u32::from_le_bytes(body.get(..4).ok_or_else(|| invalid("short frame"))?.try_into().unwrap());
         if raw as usize > MAX_FRAME {
@@ -221,7 +249,14 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
         body = zstd::bulk::decompress(&body[4..], raw as usize)?;
     }
     match kind & !FLAG_ZSTD {
-        KIND_MSG => Ok(Some(Frame::Msg(postcard::from_bytes(&body).map_err(|e| invalid(e.to_string()))?))),
+        KIND_MSG => Ok(Frame::Msg(postcard::from_bytes(&body).map_err(|e| invalid(e.to_string()))?)),
+        KIND_RKYV => {
+            // Validated (bytecheck) before use; the archive needs aligned storage.
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(body.len());
+            aligned.extend_from_slice(&body);
+            let m = rkyv::from_bytes::<Msg, rkyv::rancor::Error>(&aligned).map_err(|e| invalid(format!("bad message: {e}")))?;
+            Ok(Frame::Msg(m))
+        }
         KIND_DATA => {
             if body.len() < 16 {
                 return Err(invalid("short data frame"));
@@ -229,9 +264,41 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
             let id = u64::from_le_bytes(body[..8].try_into().unwrap());
             let off = u64::from_le_bytes(body[8..16].try_into().unwrap());
             body.drain(..16);
-            Ok(Some(Frame::Data { id, off, bytes: body }))
+            Ok(Frame::Data { id, off, bytes: body })
         }
         k => Err(invalid(format!("unknown frame kind {k}"))),
+    }
+}
+
+/// Where encoded frames are queued: a writer thread's channel, or a writer task's.
+#[derive(Clone)]
+enum Tx {
+    Thread(Sender<Vec<u8>>),
+    Task(tokio::sync::mpsc::Sender<Vec<u8>>),
+}
+
+impl Tx {
+    fn send(&self, buf: Vec<u8>) -> io::Result<()> {
+        let r = match self {
+            Tx::Thread(t) => t.send(buf).map_err(drop),
+            Tx::Task(t) => t.blocking_send(buf).map_err(drop),
+        };
+        r.map_err(|()| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+    }
+}
+
+/// A writer thread or task, joined when the connection finishes.
+enum Joiner {
+    Thread(JoinHandle<io::Result<()>>),
+    Task(tokio::task::JoinHandle<io::Result<()>>),
+}
+
+impl Joiner {
+    fn join(self) -> io::Result<()> {
+        match self {
+            Joiner::Thread(h) => h.join().unwrap_or_else(|_| Err(io::Error::other("writer thread panicked"))),
+            Joiner::Task(h) => async_io::rt().block_on(h).unwrap_or_else(|e| Err(io::Error::other(e))),
+        }
     }
 }
 
@@ -239,10 +306,11 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
 /// calling thread, so many tasks can compress in parallel; writer threads only write.
 #[derive(Clone)]
 pub struct FrameSender {
-    tx: Sender<Vec<u8>>,
+    tx: Tx,
     /// Parallel data streams, when attached: file data goes here instead of `tx`.
-    data: Option<Arc<Vec<Sender<Vec<u8>>>>>,
+    data: Option<Arc<Vec<Tx>>>,
     compress: bool,
+    wire: Wire,
 }
 
 /// Which data stream a frame belongs on (`None`: control, stays on the main stream).
@@ -261,19 +329,19 @@ fn data_key(f: &Frame) -> Option<u64> {
 impl FrameSender {
     /// Encode and queue a frame. Fails when the connection is gone.
     pub fn send(&self, frame: Frame) -> io::Result<()> {
-        let buf = encode(&frame, self.compress)?;
+        let buf = encode(&frame, self.compress, self.wire)?;
         let tx = match (&self.data, data_key(&frame)) {
             (Some(streams), Some(key)) if !streams.is_empty() => &streams[(key % streams.len() as u64) as usize],
             _ => &self.tx,
         };
-        tx.send(buf).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+        tx.send(buf)
     }
 
     /// Close every data stream with `StreamEnd`, after all file data has been queued.
     pub fn end_data_streams(&self) -> io::Result<()> {
         for tx in self.data.iter().flat_map(|d| d.iter()) {
-            let buf = encode(&Frame::Msg(Msg::StreamEnd), false)?;
-            tx.send(buf).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "data stream closed"))?;
+            let buf = encode(&Frame::Msg(Msg::StreamEnd), false, self.wire)?;
+            tx.send(buf)?;
         }
         Ok(())
     }
@@ -292,9 +360,14 @@ pub struct Conn {
     /// thread, which clears it when the main stream ends, so a spare never keeps the
     /// channel open after the peer is gone. [`Conn::seal`] clears it too.
     rtx: Arc<std::sync::Mutex<Option<Sender<io::Result<Frame>>>>>,
-    writer: Option<JoinHandle<io::Result<()>>>,
-    data_writers: Vec<JoinHandle<io::Result<()>>>,
+    writer: Option<Joiner>,
+    data_writers: Vec<Joiner>,
     data_in: usize,
+    /// What this connection runs over and must outlive it (a QUIC session).
+    session: Option<Box<dyn std::any::Any + Send + Sync>>,
+    /// The connection this one replaced (the ssh pipe, once control moved to QUIC):
+    /// idle, but kept open until this one finishes.
+    under: Option<Box<Conn>>,
 }
 
 /// Clears the spare sender when the main reader thread exits, however it exits.
@@ -358,13 +431,69 @@ impl Conn {
             })
             .expect("spawn reader thread");
         Conn {
-            out: FrameSender { tx, data: None, compress },
+            out: FrameSender { tx: Tx::Thread(tx), data: None, compress, wire: Wire::Postcard },
             rx,
             rtx: spare,
-            writer: Some(writer),
+            writer: Some(Joiner::Thread(writer)),
             data_writers: Vec::new(),
             data_in: 0,
+            session: None,
+            under: None,
         }
+    }
+
+    /// [`Conn::start`] with tokio tasks instead of threads (`FASTRSYNC_NET_IO=tokio`).
+    pub fn start_async(
+        reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+        writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+        compress: bool,
+    ) -> Conn {
+        let (tx, task) = async_io::spawn_writer(writer, 16);
+        let (rtx, rx) = bounded::<io::Result<Frame>>(16);
+        let spare = Arc::new(std::sync::Mutex::new(Some(rtx.clone())));
+        let clear = ClearOnDrop(spare.clone());
+        async_io::spawn_reader(reader, rtx, false, Some(Box::new(move || drop(clear))));
+        Conn {
+            out: FrameSender { tx: Tx::Task(tx), data: None, compress, wire: Wire::Postcard },
+            rx,
+            rtx: spare,
+            writer: Some(Joiner::Task(task)),
+            data_writers: Vec::new(),
+            data_in: 0,
+            session: None,
+            under: None,
+        }
+    }
+
+    /// [`Conn::attach_data_out`] for tokio streams.
+    pub fn attach_data_out_async(&mut self, streams: Vec<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>) {
+        let mut senders = Vec::with_capacity(streams.len());
+        for s in streams {
+            let (tx, task) = async_io::spawn_writer(s, 4);
+            self.data_writers.push(Joiner::Task(task));
+            senders.push(Tx::Task(tx));
+        }
+        self.out.data = Some(Arc::new(senders));
+    }
+
+    /// [`Conn::attach_data_in`] for tokio streams.
+    pub fn attach_data_in_async(&mut self, streams: Vec<Box<dyn tokio::io::AsyncRead + Unpin + Send>>) {
+        let Some(rtx) = self.rtx.lock().unwrap().clone() else { return };
+        for s in streams {
+            self.data_in += 1;
+            async_io::spawn_reader(s, rtx.clone(), true, None);
+        }
+    }
+
+    /// Carry this connection on new streams from now on (control moving to QUIC). The
+    /// current one stays open, idle, until [`Conn::finish`]; `session` is closed after
+    /// everything sent on the new streams has been delivered.
+    pub fn switch(&mut self, reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, session: Box<dyn std::any::Any + Send + Sync>) {
+        let mut new = Conn::start(reader, writer, self.out.compress);
+        new.out.wire = self.out.wire;
+        new.session = Some(session);
+        let old = std::mem::replace(self, new);
+        self.under = Some(Box::new(old));
     }
 
     /// Send file data over these streams from now on (the sending side).
@@ -373,8 +502,8 @@ impl Conn {
         for (i, s) in streams.into_iter().enumerate() {
             // Shallow queues: N streams × depth × ~4 MiB frames is the memory bound.
             let (tx, wrx) = bounded::<Vec<u8>>(4);
-            self.data_writers.push(spawn_writer(format!("fastrsync-data-{i}"), s, wrx));
-            senders.push(tx);
+            self.data_writers.push(Joiner::Thread(spawn_writer(format!("fastrsync-data-{i}"), s, wrx)));
+            senders.push(Tx::Thread(tx));
         }
         self.out.data = Some(Arc::new(senders));
     }
@@ -428,6 +557,11 @@ impl Conn {
         self.out.compress = on;
     }
 
+    /// Encode messages sent from now on with `wire` (before handing out clones).
+    pub fn set_wire(&mut self, wire: Wire) {
+        self.out.wire = wire;
+    }
+
     pub fn send(&self, frame: Frame) -> io::Result<()> {
         self.out.send(frame)
     }
@@ -454,10 +588,12 @@ impl Conn {
             let _ = h.join();
         }
         let _ = self.out.tx.send(Vec::new());
-        match self.writer.take() {
-            Some(h) => h.join().unwrap_or_else(|_| Err(io::Error::other("writer thread panicked"))),
-            None => Ok(()),
+        let r = self.writer.take().map_or(Ok(()), Joiner::join);
+        drop(self.session.take());
+        if let Some(under) = self.under.take() {
+            let _ = under.finish();
         }
+        r
     }
 }
 
@@ -466,7 +602,7 @@ mod tests {
     use super::*;
 
     fn roundtrip(f: Frame, compress: bool) -> Frame {
-        let buf = encode(&f, compress).unwrap();
+        let buf = encode(&f, compress, Wire::Postcard).unwrap();
         read_frame(&mut &buf[..]).unwrap().unwrap()
     }
 
@@ -482,7 +618,7 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        let buf = encode(&Frame::Data { id: 1, off: 0, bytes: bytes.clone() }, true).unwrap();
+        let buf = encode(&Frame::Data { id: 1, off: 0, bytes: bytes.clone() }, true, Wire::Postcard).unwrap();
         assert!(buf.len() < bytes.len() / 10, "repetitive data should compress");
     }
 
@@ -492,6 +628,69 @@ mod tests {
         match roundtrip(Frame::Msg(m), true) {
             Frame::Msg(Msg::Need { dir, files }) => assert_eq!((dir, files.len(), files[0].idx), (7, 1, 2)),
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// Messages with every awkward field type, for both wire formats.
+    fn rich_messages() -> Vec<Msg> {
+        use crate::entry::Kind;
+        use std::os::unix::ffi::OsStringExt;
+        let meta = Meta { kind: Kind::File, size: 7, mtime: -3, mtime_ns: 9, mode: 0o644, uid: 1, gid: 2, dev: 3, ino: 4, rdev: 0, nlink: 1 };
+        let name = std::ffi::OsString::from_vec(vec![b'a', 0xff, b'\n']);
+        let mut sel = Sel { named: true, ..Sel::default() };
+        sel.children.insert(b"sub".to_vec(), Sel { contents: true, ..Sel::default() });
+        let opts = crate::cli::Options::parse_from(["fastrsync", "-a", "--partial-dir=.p", "src/", "dst"]).unwrap();
+        let sig = crate::delta::cdc::signature(&[5u8; 300_000], &crate::delta::Params::DEFAULT);
+        vec![
+            Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender: false, opts: Box::new(opts) },
+            Msg::Roots(vec![RootInfo { contents: true, meta: Some(meta), items: Vec::new(), sel: Some(sel) }]),
+            Msg::DirBatch {
+                root: 1,
+                dir: 2,
+                rel: b"x/y".to_vec(),
+                entries: vec![DirEnt { name, meta, link: Some(b"t".to_vec()) }],
+                sums: vec![Some([1; 16])],
+            },
+            Msg::Need { dir: 2, files: vec![NeedReq { idx: 0, sig: Some(Sig::Cdc(sig)) }] },
+            Msg::SmallPack { files: vec![(file_id(2, 0), 3)], blob: b"abc".to_vec() },
+        ]
+    }
+
+    #[test]
+    fn rich_messages_roundtrip_in_both_wire_formats() {
+        for wire in [Wire::Postcard, Wire::Rkyv] {
+            for m in rich_messages() {
+                let want = format!("{m:?}");
+                let buf = encode(&Frame::Msg(m), false, wire).unwrap();
+                match read_frame(&mut &buf[..]).unwrap().unwrap() {
+                    Frame::Msg(got) => assert_eq!(format!("{got:?}"), want, "{wire:?}"),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        // Hello stays postcard so any version can read it.
+        let hello = rich_messages().remove(0);
+        assert_eq!(encode(&Frame::Msg(hello), false, Wire::Rkyv).unwrap()[4], KIND_MSG);
+    }
+
+    #[test]
+    fn corrupt_rkyv_messages_are_rejected() {
+        for m in rich_messages().into_iter().skip(1) {
+            let buf = encode(&Frame::Msg(m), false, Wire::Rkyv).unwrap();
+            let body = buf.len() - 5;
+            // Truncated archives, and archives with bytes flipped near the root (where
+            // rkyv keeps relative pointers and lengths), must fail validation, not panic.
+            for cut in [1, 4, body / 2] {
+                let mut b = buf[..buf.len() - cut].to_vec();
+                b[..4].copy_from_slice(&((body - cut) as u32).to_le_bytes());
+                assert!(read_frame(&mut &b[..]).is_err() || cut == 0);
+            }
+            for back in 1..=12.min(body) {
+                let mut b = buf.clone();
+                let i = b.len() - back;
+                b[i] ^= 0xA5;
+                let _ = read_frame(&mut &b[..]);
+            }
         }
     }
 

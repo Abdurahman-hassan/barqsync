@@ -5,10 +5,18 @@
 use super::{receiver, sender, streams};
 use crate::exit;
 use crate::output::Output;
+use crate::proto::async_io::FdIo;
 use crate::proto::{Conn, Frame, MAGIC, Msg, VERSION};
 
 pub fn run() -> i32 {
-    let mut conn = Conn::start(std::io::stdin(), std::io::stdout(), false);
+    let mut conn = match async_stdio() {
+        Some(Ok((r, w))) => Conn::start_async(r, w, false),
+        Some(Err(e)) => {
+            eprintln!("fastrsync --server: stdin/stdout: {e}");
+            return exit::IPC;
+        }
+        None => Conn::start(std::io::stdin(), std::io::stdout(), false),
+    };
     let (server_is_sender, opts) = match conn.recv() {
         Ok(Frame::Msg(Msg::Hello { magic, version, server_is_sender, opts })) => {
             if magic != MAGIC || version != VERSION {
@@ -25,11 +33,12 @@ pub fn run() -> i32 {
         }
     };
     conn.set_compress(opts.compress);
+    conn.set_wire(opts.wire);
     crate::fsops::cache::set_enabled(opts.drop_cache);
     if conn.msg(Msg::HelloAck { version: VERSION }).is_err() {
         return exit::PROTOCOL;
     }
-    if let Err(e) = streams::setup_server(&mut conn, opts.streams, server_is_sender) {
+    if let Err(e) = streams::setup_server(&mut conn, opts.transport, opts.streams, server_is_sender) {
         eprintln!("fastrsync --server: setting up parallel streams failed: {e}");
         let _ = conn.msg(Msg::Fatal { msg: format!("parallel stream setup failed: {e}") });
         let _ = conn.finish();
@@ -59,4 +68,17 @@ pub fn run() -> i32 {
     drop(out);
     let _ = conn.finish();
     code
+}
+
+/// `FASTRSYNC_NET_IO=tokio`: stdin and stdout (duplicated) as non-blocking tokio I/O.
+fn async_stdio() -> Option<std::io::Result<(FdIo, FdIo)>> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if !crate::proto::async_io::enabled() {
+        return None;
+    }
+    let dup = |fd| {
+        let d = unsafe { libc::dup(fd) };
+        if d < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(d) }) }
+    };
+    Some((|| Ok((FdIo::new(dup(0)?)?, FdIo::new(dup(1)?)?)))())
 }

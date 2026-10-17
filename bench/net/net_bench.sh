@@ -63,7 +63,11 @@ touch -d '2001-01-01' "$W/big_old.img"
 
 RSYNC_R="rsync -a -e ssh"
 FAST_SSH="$FR -a -e ssh"
-FAST_TCP="$FR -a -e ssh --streams 4"
+FAST_TCP="$FR -a -e ssh --transport tcp --streams 4"
+FAST_SSH_TOKIO="$FR -a -e ssh --net-io=tokio"
+FAST_TCP_TOKIO="$FR -a -e ssh --net-io=tokio --transport tcp --streams 4"
+FAST_QUIC="$FR -a -e ssh --transport quic"
+FAST_QUIC_RKYV="$FR -a -e ssh --transport quic --wire rkyv"
 
 # Loopback's 64 KiB MTU makes netem drop whole bursts and stall TCP on retransmission
 # timeouts; use an Ethernet MTU and a queue deep enough for the bandwidth-delay product.
@@ -107,7 +111,11 @@ for p in $PROFILES; do
     hyperfine --runs "$RUNS" --warmup 0 --prepare "$prep" --style basic \
       -n "rsync" "$RSYNC_R $args" \
       -n "fastrsync (ssh pipe)" "$FAST_SSH $args" \
+      -n "fastrsync ssh, tokio I/O" "$FAST_SSH_TOKIO $args" \
       -n "fastrsync --streams 4" "$FAST_TCP $args" \
+      -n "fastrsync --streams 4, tokio I/O" "$FAST_TCP_TOKIO $args" \
+      -n "fastrsync --transport quic" "$FAST_QUIC $args" \
+      -n "fastrsync quic + rkyv" "$FAST_QUIC_RKYV $args" \
       --export-markdown "/tmp/$p-$wl.md" 2>&1 | grep -E "Benchmark|Time|±" || true
     { echo; echo "### $wl"; echo; cat "/tmp/$p-$wl.md"; } >> "$REPORT"
   done

@@ -22,6 +22,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 /// Which directory scanner the engine uses (`--scanner`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Scanner {
     /// One task per directory: `readdir` + `getattrlistbulk` (macOS) / `statx` (Linux).
     #[default]

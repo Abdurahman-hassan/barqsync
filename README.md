@@ -23,6 +23,7 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M8 | verification harness: Linux container with sshd and `tc netem` link profiles, `strace -c`, flamegraphs, `cp` baselines | done |
 | M9 | the original plan's delta design as `--delta=cdc` (FastCDC throughout, xxh3 + BLAKE3, mmap); measured slower, so `blocks` stays the default | done |
 | M10 | the original plan's scanner as `--scanner=jwalk` (jwalk + DashMap index + queues A–D); measured slower, so `dirtask` stays the default | done |
+| M11 | QUIC transport (`--transport quic`, quinn), rkyv wire format (`--wire rkyv`), tokio connection layer (`--net-io=tokio`) | done |
 
 The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
@@ -49,7 +50,8 @@ writes new files directly, like rsync),
 `--fsync`, `--stats`, `-h`, `--threads N`, `--drop-cache`/`--no-drop-cache` (page-cache hints
 for files of 8 MiB+, on by default; see [Page-cache hints](#page-cache-hints)),
 `--delta=blocks|cdc` (delta design, see [Delta transfer](#delta-transfer); for a remote
-transfer the receiver's choice applies).
+transfer the receiver's choice applies), `--scanner=dirtask|jwalk`, `--transport
+ssh|tcp|quic` with `--streams N`, `--wire postcard|rkyv` (see [Remote transfers](#remote-transfers)).
 
 Also, with rsync's semantics locally and over ssh (each has a differential test in
 `tests/rsync_flags.rs`):
@@ -149,7 +151,66 @@ connections and control messages stay on ssh:
    server address), both sides carry on over the ssh pipe; `-v` says so.
 
 `-vv` reports how many streams are in use. Encryption and `-z` compression then run on one
-thread per stream instead of in a single ssh process.
+thread per stream instead of in a single ssh process. `--streams N` on its own means
+`--transport tcp`.
+
+### QUIC (`--transport quic`)
+
+The original plan's transport. Setup works like `--streams`: over the authenticated ssh
+connection the server opens a UDP endpoint on the address the client reached it at, with a
+fresh self-signed certificate (TLS 1.3, ALPN `fastrsync`), and sends the address, the
+certificate's BLAKE3 fingerprint and a random token. The client connects within 3 s,
+accepting only that certificate, and presents the token on the first stream; the server
+acknowledges it. Then:
+
+- **Everything moves to QUIC.** Control messages and directory listings use that first
+  (bidirectional) stream; file data uses `--streams` unidirectional streams (default 16, up
+  to 128), routed by file id exactly as over TCP. The ssh connection stays open, idle, until
+  the end.
+- **Fallback.** If UDP doesn't get through in 3 s, both sides carry on over the ssh pipe
+  (`-v` says so). A peer that disappears is noticed within 15 s (QUIC idle timeout with
+  keep-alives), where ssh would see the pipe close at once.
+- **Clean shutdown.** Each stream is finished and waited for (bounded) until the peer has
+  read it, before the connection closes, so nothing in flight is lost when a process exits.
+
+quinn drives a connection from one task, which limits QUIC to about 350 MB/s per transfer on
+this Mac over loopback; TLS-over-TCP streams scale with the number of streams.
+
+### Wire format (`--wire postcard|rkyv`)
+
+Control messages (listings, requests, signatures) are postcard-encoded by default.
+`--wire rkyv` uses the original plan's rkyv instead: fixed-layout archives, checked with
+bytecheck before use, with non-UTF-8 names carried as raw bytes. Each frame says which
+encoding it holds, so the session agrees on one in `Hello` (always postcard, so any version
+can read it). File data frames are raw either way. rkyv measured no faster (see
+[Transports](#transports-and-wire-formats-measured)): the messages are decoded into owned
+structures anyway, so its zero-copy reads don't come into play.
+
+### Connection layer
+
+The plan had tokio own all network I/O. QUIC runs on a small tokio runtime (2 worker
+threads); the protocol's reader and writer threads reach it through blocking bridges. For the
+ssh pipe and TCP streams a tokio layer is built as well (reader and writer tasks, the ssh
+pipe through non-blocking descriptors, TLS through tokio-rustls), behind the hidden
+`--net-io=tokio`. The thread-based layer stays the default because it measured at least as
+fast.
+
+### Transports and wire formats, measured
+
+Through the local fake-ssh shim (no link: CPU and protocol overhead only; macOS, 3 runs,
+`bench/transport_modes.sh` and `bench/interleave.py`):
+
+| Mode | A: fresh push, 200k files (interleaved) | C: 3 changed of 500k files |
+| --- | ---: | ---: |
+| ssh pipe, postcard | 34.8 s | 4.33 s |
+| ssh pipe, rkyv | 34.9 s | 4.34 s |
+| `--transport tcp --streams 4` | 35.0 s | 4.30 s |
+| `--transport quic` (16 streams) | 34.5 s | 4.53 s |
+| `--transport quic --wire rkyv` | 34.8 s | 4.66 s |
+
+On one machine the fresh push is disk-bound whatever carries it, and the metadata-bound no-op
+is a few percent slower over QUIC (userspace UDP and crypto on top of the same work). What a
+transport is for shows on a real or emulated link; see the network results below.
 
 ## Delta transfer
 
@@ -307,8 +368,10 @@ src/local/          planner (SRC... DEST → roots) and the parallel per-directo
 src/scan.rs         --scanner=jwalk tree scan (jwalk hook) and the destination index
 src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild);
                     cdc.rs: --delta=cdc (stitched parallel FastCDC, xxh3 + BLAKE3, mmap)
-src/proto/          wire frames (postcard + raw data, optional zstd), reader/writer threads
-src/remote/         client (spawns the server over ssh), server, sender and receiver roles
+src/proto/          wire frames (postcard or rkyv + raw data, optional zstd), reader/writer
+                    threads; async_io.rs: the tokio runtime and the tokio connection layer
+src/remote/         client (spawns the server over ssh), server, sender and receiver roles;
+                    streams.rs: --transport tcp, quic.rs: --transport quic
 src/output.rs       rsync-style item lines and stats
 tests/local_sync.rs end-to-end tests, most of them differential against rsync 3.x
 tests/delta_sync.rs --no-whole-file end to end (clone+patch, --inplace, rebuild) vs rsync
@@ -326,8 +389,9 @@ cargo test
 The delta engine also has property tests (random insert/delete/overwrite/append/truncate
 sequences; every delta must rebuild the new file exactly via both rebuild and clone+patch).
 `PROPTEST_CASES=5000 cargo test --release delta` runs a longer sweep.
-`FASTRSYNC_DELTA=cdc cargo test` runs the whole suite with `--delta=cdc` as the default, and
-`FASTRSYNC_SCANNER=jwalk cargo test` with `--scanner=jwalk`.
+`FASTRSYNC_DELTA=cdc cargo test` runs the whole suite with `--delta=cdc` as the default;
+`FASTRSYNC_SCANNER=jwalk`, `FASTRSYNC_TRANSPORT=quic`, `FASTRSYNC_WIRE=rkyv` and
+`FASTRSYNC_NET_IO=tokio` do the same for the other alternatives.
 
 The integration tests run each scenario through the reference rsync 3.x as well (found at
 `/opt/homebrew/bin/rsync`, `/usr/local/bin/rsync` or `/usr/bin/rsync`, or set

@@ -36,6 +36,7 @@ pub mod exit {
 }
 
 pub fn run(opts: Options) -> i32 {
+    proto::async_io::set_enabled(opts.net_io_tokio);
     if opts.server {
         return remote::server::run();
     }

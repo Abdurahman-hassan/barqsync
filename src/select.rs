@@ -13,12 +13,18 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+// The tree is recursive: rkyv needs its bounds spelled out.
+#[rkyv(serialize_bounds(__S: rkyv::ser::Writer + rkyv::ser::Allocator, __S::Error: rkyv::rancor::Source))]
+#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
+#[rkyv(bytecheck(bounds(__C: rkyv::validation::ArchiveContext, __C::Error: rkyv::rancor::Source)))]
 pub struct Sel {
     /// The path itself was named (a SRC argument or a `--files-from` line).
     pub named: bool,
     /// Named with a trailing `/` (or as `.`): all its children are listed, one level
     /// deep unless recursing.
     pub contents: bool,
+    #[rkyv(omit_bounds)]
     pub children: BTreeMap<Vec<u8>, Sel>,
 }
 

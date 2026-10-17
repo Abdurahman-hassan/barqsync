@@ -488,6 +488,7 @@ pub struct Stats {
 
 /// Plain copy of [`Stats`] for sending over the wire.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct StatsSnapshot(pub [u64; 14]);
 
 impl StatsSnapshot {

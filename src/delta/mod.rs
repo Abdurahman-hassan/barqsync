@@ -60,6 +60,7 @@ impl Params {
 
 /// Which delta design to use (`--delta`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum DeltaMode {
     /// Aligned blocks first, FastCDC fallback; BLAKE3-128; `pread`.
     #[default]
@@ -163,6 +164,7 @@ fn segments(size: u64, segment: usize) -> Vec<(u64, usize)> {
 
 /// One step of rebuilding the new file; ops are ordered by `off` and cover `0..size`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Op {
     /// `new[off..off+len] == basis[basis_off..basis_off+len]`.
     Copy { off: u64, basis_off: u64, len: u64 },
@@ -248,6 +250,7 @@ impl Delta {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockSig {
     pub block_size: u32,
     pub size: u64,
@@ -286,6 +289,7 @@ pub fn diff_blocks(new: &BlockSig, basis: &BlockSig) -> Delta {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ChunkEntry {
     pub off: u64,
     pub len: u32,
@@ -293,6 +297,7 @@ pub struct ChunkEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ChunkSig {
     pub size: u64,
     pub chunks: Vec<ChunkEntry>,
