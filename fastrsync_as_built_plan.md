@@ -2,8 +2,11 @@
 
 This document is a companion to `rust_rsync_replacement_master_plan.md`, in the same order. It
 describes what was built, what changed from the original plan and why, how it performs, and
-what is still open. The code is about 6,800 lines of Rust plus about 1,400 lines of tests,
-built in milestones M0–M6.
+what is still open. The code is about 12,000 lines of Rust plus about 2,800 lines of tests
+(148 tests), built in milestones M0–M14. M0–M6 built the design described here; M7–M14 added
+rsync's common flags, the verification harness, and every component of the original plan
+that M0–M6 had replaced, each benchmarked against the replacement: the faster one is the
+default and the other stays selectable (§9).
 
 ---
 
@@ -21,8 +24,14 @@ file. fastrsync keeps rsync's command line and behavior, and gets its speed from
 Every result below is against Homebrew rsync 3.5.1 on an M-series Mac (10 cores, 16 GB, APFS
 SSD).
 
-| Original target | Target | Measured | Notes |
+| Original target | Target | Measured (M14) | Notes |
 |---|---|---|---|
+| Scan / no-op sync | 5–8× | **5.2×** locally (500k files: 18.2 s → 3.5 s; 3.6× against rsync's faster M6 run) | APFS metadata latency is the floor (see §8) |
+| Small files over the network | 10–20× | **2.2×** push, **4.0×** remote no-op (pipe); **4.2×** on a lossy link with `--transport quic` | Emulated links in the Linux container; no real second machine yet |
+| 10 GB delta sync | 4–6× | **4.1×** vs rsync's delta (24.3 s → 5.9 s) | APFS clone + patch; ~1× without clones |
+| Local copy at full hardware speed | line rate | big files: instant APFS clone; small files **2.1–2.6×** rsync, **3.7×** `cp -a`, faster than `cp -ac` | Linux: 55% fewer syscalls than rsync for a copy |
+
+---|---|---|---|
 | Scan / no-op sync | 5–8× | **3.3×** (500k files: 11.4 s → 3.5 s) | APFS metadata latency is the floor (see §8) |
 | Small files over the network | 10–20× | **2.7×** push, **4.9×** remote no-op | Through a local pipe; real network not measured |
 | 10 GB delta sync | 4–6× | **~3×** vs rsync's delta (19.5–22.7 s → 6.5–6.9 s) | APFS clone + patch; 1.0–1.2× without clones |
@@ -78,18 +87,24 @@ codegen-units = 1
 panic = "abort"
 ```
 
-**Not used, and why:**
+Added in M7–M14 for the original plan's designs (selectable; see §9 for which won):
 
-- **tokio / tokio-uring:** file I/O blocks anyway; threads + rayon are simpler and fast enough.
-- **jwalk + DashMap:** replaced by the per-directory pipeline. Memory grows with directories,
-  not files, and transfers start before the scan ends.
-- **xxhash-rust:** BLAKE3 alone hashes at 12.6 GB/s on all cores, faster than the SSD.
-- **memmap2:** `pread` into per-thread buffers cannot crash if a file shrinks mid-read.
-- **rkyv:** serialization never showed up as a cost.
-- **quinn:** replaced by ssh plus TLS-over-TCP streams.
-- **indicatif:** a small built-in progress line.
-- **filetime:** it opens files to set times, which blocks forever on a FIFO; `utimensat` is
-  used instead.
+```toml
+memmap2 = "0.9"          # --delta=cdc reads files through mmap
+xxhash-rust = "0.8"      # --delta=cdc: xxh3 filter before BLAKE3
+jwalk = "0.9"            # --scanner=jwalk
+dashmap = "6.2"          # --scanner=jwalk destination index
+rkyv = "0.8"             # --wire rkyv
+quinn = "0.11"           # --transport quic
+tokio = "1"              # QUIC runtime; --net-io=tokio for ssh/TCP
+tokio-util = "0.7"       # blocking bridges to QUIC streams
+tokio-rustls = "0.26"    # --net-io=tokio TCP streams
+io-uring = "0.7"         # --io-uring (Linux)
+```
+
+**Still not used:** indicatif (a small built-in progress line); filetime (it opens files to
+set times, which blocks forever on a FIFO; `utimensat` is used); tokio-uring (the `io-uring`
+crate underneath it, for explicit batching).
 
 ---
 
@@ -333,38 +348,40 @@ Measurements that shaped the design:
 
 ---
 
-## 9. Changes from the original plan
+## 9. The original plan's components: built, measured, chosen
 
-| Original plan | As built | Reason |
-|---|---|---|
-| QUIC over UDP (quinn), up to 128 streams | ssh pipe + `--streams N` TLS-over-TCP | Your choice at planning time. UDP is often blocked, and quinn tends to be CPU-bound. |
-| jwalk + DashMap of both trees | Per-directory rayon pipeline | Streaming; memory grows with directories |
-| xxh3 filter + BLAKE3 per chunk | BLAKE3-128 per block/chunk | One hash, faster than the disk, cryptographically verified. The plan's version is `--delta=cdc` (M9), measured slower. |
-| FastCDC for every large file | Aligned blocks first, FastCDC fallback | In-place edits are the common case for big files. The plan's version is `--delta=cdc` (M9). |
-| Merge chunks across 16 MB regions | Fixed cut points at 4 MiB segment edges | Deterministic; at most one extra chunk per segment. `--delta=cdc` stitches regions exactly (M9). |
-| rkyv zero-copy | serde + postcard | Not a bottleneck |
-| tokio / tokio-uring | Threads, crossbeam, rayon | File I/O blocks anyway |
-| mmap | pread into per-thread buffers | No crash if a file shrinks mid-read; `--delta=cdc` uses mmap and measured 4–7× slower on 10 GiB files (M9) |
-| `std::fs::copy` | Own clone / `copy_file_range` / buffered paths | Measured clone threshold, fd-based attributes |
-| Starter code's temp names | `.name.XXXXXX` built from raw bytes | The original collapsed every non-UTF-8 name onto one temp name |
-| Starter code "crash-safe" without fsync | rsync semantics; `--fsync` optional | rsync doesn't fsync either |
+Rule (your choice at the M7 planning step): build each component the original plan's way,
+benchmark it against the M0–M6 design, keep the faster one as the default and leave the other
+selectable.
+
+| Original plan | Flag | Measured against the M0–M6 design | Default |
+|---|---|---|---|
+| FastCDC for every delta, 16 MB regions merged at the boundaries, xxh3 + BLAKE3, mmap | `--delta=cdc` (M9) | 4–7× slower on a 10 GiB file (mmap faults and page-cache pressure; hashing itself is faster); faster only for a shifted file that fits in RAM. Its exact region stitching sends 21× less on shifted files than forced segment cuts, so `blocks` adopted it | `blocks` |
+| jwalk + DashMap, queues A–D | `--scanner=jwalk` (M10) | 9–11% slower locally on macOS (no `getattrlistbulk`), 1.6–2.1× slower on Linux; 7% faster for a macOS remote no-op | `dirtask` |
+| QUIC (quinn), up to 128 streams, ssh bootstrap and fallback | `--transport quic` (M11) | Ties the ssh pipe on a clean WAN, 2–8% slower on a LAN, **2–4× faster on a lossy link**; up to 3 s lost where UDP is blocked | ssh pipe |
+| rkyv | `--wire rkyv` (M11) | Within noise of postcard (messages are decoded into owned structures either way) | postcard |
+| tokio owns network I/O | `--net-io=tokio` (M11, hidden; QUIC always on tokio) | Within noise of threads for the ssh pipe and TCP streams | threads |
+| Adaptive strategy: link probe, size routing, pack compression, adaptive zstd | `--strategy adaptive` (M12) | **1.4–7.6× faster on compressible data**, 4–22% slower on incompressible data (probe and wasted compression) | `fixed` |
+| io_uring batched small-file writes | `--io-uring` (M13) | 24% fewer syscalls, no time saved | off |
+| `posix_fadvise` page-cache hints | `--drop-cache` (S2/M7) | No slowdown; delta runs faster; other cached data survives | on |
+
+Kept as built (not in the rework list): the per-directory engine's own clone/copy paths,
+`.name.XXXXXX` temp names from raw bytes, rsync's fsync semantics (`--fsync` optional),
+`utimensat` instead of filetime, the built-in progress line.
 
 ---
 
 ## 10. Still open
 
-Being built now, in this order (approved plan "M7–M14"); each one is benchmarked against the
-current design and the faster one stays the default:
-
-- **M10** jwalk + DashMap scanner with queues A–D (`--scanner`).
-- **M11** tokio + rkyv (`--wire`) + QUIC (`--transport quic|tcp|ssh`).
-- **M12** adaptive strategy: link probe, size routing, pack compression, adaptive zstd level.
-- **M13** io_uring on Linux (`--io-uring`).
-- **M14** full verification (every transport and link profile, cold cache, the real Intel Mac)
-  and these documents.
-
-The real second machine (Intel MacBook Pro at 192.168.1.13) needs key-based ssh first:
-`ssh-copy-id -i ~/.ssh/id_ed25519.pub a.hamdy@192.168.1.13`.
-
-Also still missing from rsync's feature set: xattrs and ACLs (`-X`, `-A`), daemon mode
-(`rsync://`), and the single-argument listing mode.
+- **A real second machine.** Every network number so far is from `tc netem` on loopback in
+  the Linux container. The Intel MacBook Pro at 192.168.1.13 is ready to be used once
+  key-based ssh works (`ssh-copy-id -i ~/.ssh/id_ed25519.pub a.hamdy@192.168.1.13`, run by
+  you); then `bench/remote_setup.sh`, `FASTRSYNC_TEST_REMOTE=... cargo test --test real_remote`
+  and `REMOTE=... bench/run.sh DIR D` measure a real LAN, including `--transport quic`.
+- **Cold-cache runs** (`bench/run.sh DIR all --cold`) need `sudo purge` on macOS.
+- **NFS** isn't covered (no server).
+- **From rsync's feature set:** xattrs and ACLs (`-X`, `-A`), daemon mode (`rsync://`), and the
+  single-argument listing mode.
+- **Worth trying next:** making QUIC the default where UDP is known to work (it is 2–4×
+  faster on lossy links), and a cheaper probe so `--strategy adaptive` stops costing 4–22%
+  on incompressible data.

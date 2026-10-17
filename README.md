@@ -26,6 +26,7 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M11 | QUIC transport (`--transport quic`, quinn), rkyv wire format (`--wire rkyv`), tokio connection layer (`--net-io=tokio`) | done |
 | M12 | adaptive strategy (`--strategy adaptive`): link probe, whole-vs-delta routing by link speed, pack compression with link-based zstd levels, `--compress-level`; up to 7.6× on compressible data, slower on incompressible, so `fixed` stays the default | done |
 | M13 | io_uring batches for received small files (`--io-uring`, Linux): 24% fewer syscalls, no faster, so opt-in; found on the way: skipping a redundant truncate made small-file pushes onto XFS 3.2× faster | done |
+| M14 | full verification: local A/B/C/D vs rsync and `cp`, Linux syscall counts and flamegraphs, every transport and strategy over lan/wan/lossy links; README and as-built plan updated | done |
 
 The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
@@ -535,42 +536,38 @@ FASTRSYNC_TEST_REMOTE=user@host cargo test --test real_remote   # tests over rea
 
 ### Results (M-series Mac, 10 cores, APFS, warm cache, rsync 3.5.1)
 
-| Workload | rsync | fastrsync | speedup |
-| --- | ---: | ---: | ---: |
-| A: fresh copy, 200k × 4 KiB files, `-a` | 43.5 s | 18.3 s | 2.4× |
-| A with `--inplace` (both tools) | 29.6 s | 11.6 s | 2.6× |
-| C: 500k files, 3 changed, `-a` | 12.2 s | 3.4 s | 3.6× |
+Final measurement (M14, default options, 3 runs each, `bench/run.sh DIR all`; the M6 numbers
+for comparison):
+
+| Workload | rsync | fastrsync | speedup | at M6 |
+| --- | ---: | ---: | ---: | ---: |
+| A: fresh copy, 200k × 4 KiB files, `-a` | 42.4 s | 20.5 s | 2.1× | 2.4× |
+| A with `--inplace` (both tools) | 30.0 s | 11.7 s | 2.6× | 2.6× |
+| A, `cp -a` / `cp -ac` (APFS clones) | 76.0 s / 25.9 s | 20.5 s | 3.7× / 1.3× | — |
+| C: 500k files, 3 changed, `-a` | 18.2 s (±6.1) | 3.49 s | 5.2× | 3.6× |
+| B: 10 GiB, 50 × 1 MiB changed, `--no-whole-file` (clone + patch) | 24.3 s (±6.6) | 5.9 s | 4.1× | ~3× |
+| B without clones (full rebuild, e.g. ext4/exFAT) | 24.3 s (±6.6) | 25.7 s | 0.9× | 1.0–1.2× |
+| B, `-a` (whole file), same APFS volume | 16.1 s | 0.014 s (clone) | — | — |
+
+rsync's no-op and delta times varied more in this run (C 12.2 s at M6, ±6 s here), so the
+speedups are best read as ranges. A fresh copy is 0.2–2 s slower than at M6 run to run (the
+SSD's state matters more than any code change in between); fastrsync still beats a clone
+copy (`cp -ac`) of the same tree.
 
 Benchmark D: remote push through a local fake-ssh shim (`bench/run.sh DIR D`). That measures
-the protocol and parallelism over a pipe, not a network; set `REMOTE=user@host` to run the
-same comparison over real ssh.
+the protocol and parallelism over a pipe, not a network; link profiles are in
+[Transports and wire formats](#transports-and-wire-formats-measured).
 
-| D: remote push (pipe) | rsync | fastrsync | speedup |
-| --- | ---: | ---: | ---: |
-| fresh copy, 200k × 4 KiB files | 45.3 s | 16.9 s | 2.7× |
-| 500k files, 3 changed | 15.2 s | 3.1 s | 4.9× |
-| fresh copy, `--streams 4` (TLS over loopback) | 43.9 s | 17.2 s | 2.6× |
+| D: remote push (pipe) | rsync | fastrsync | speedup | at M6 |
+| --- | ---: | ---: | ---: | ---: |
+| fresh copy, 200k × 4 KiB files | 42.4 s | 19.3 s | 2.2× | 2.7× |
+| fresh copy, `--streams 4` (TLS over loopback) | 42.4 s | 16.4 s | 2.6× | 2.6× |
+| 500k files, 3 changed | 12.9 s | 3.26 s | 4.0× | 4.9× |
 
-On one machine `--streams` neither helps nor hurts: the pipe isn't the bottleneck, APFS
-metadata is. Its benefit is meant for real links where a single ssh channel is the limit
-(high latency, or more bandwidth than one ssh encryption thread delivers). That hasn't been
-measured yet; `REMOTE=user@host bench/run.sh DIR D` does it.
-
-Benchmark B: a 10 GiB image with 50 scattered 1 MiB overwrites, destination reset to the old
-version before every run. rsync and fastrsync runs were interleaved because big sequential
-writes on this machine slow down as the SSD's write cache fills, which biases back-to-back
-runs.
-
-| B: 10 GiB, 50 × 1 MiB changed | rsync | fastrsync | speedup |
-| --- | ---: | ---: | ---: |
-| `-a --no-whole-file`, APFS (clone + patch 50 MiB) | 20.2 / 19.5 / 22.7 s | 6.9 / 6.8 / 6.5 s | ~3× |
-| `-a --no-whole-file`, no clones (full rebuild, e.g. ext4/exFAT) | 20.2 / 19.5 / 22.7 s | 20.0 / 17.3 / 18.5 s | 1.0–1.2× |
-| `-a` (whole file), same APFS volume | 15.9 s | 0.013 s (clone of the source) | — |
-
-The last row says more about APFS than about fastrsync: on the same volume, a changed big file
-is simply cloned. When the destination can't be cloned, writing a whole new 10 GiB file is disk
-bound for both tools, so the delta engine's win comes from clone + patch (or `--inplace`), not
-from hashing.
+Benchmark B resets the destination to the old version before every run. On the same volume a
+changed big file is simply cloned (last B row); when the destination can't be cloned, writing a
+whole new 10 GiB file is disk-bound for both tools, so the delta engine's win comes from
+clone + patch (or `--inplace`), not from hashing.
 
 ### Page-cache hints
 
