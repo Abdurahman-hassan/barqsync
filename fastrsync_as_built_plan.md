@@ -209,6 +209,27 @@ one file use the same stream, so they stay in order.
 - `--progress`/`-P`/`--info=progress2`: one overall progress line.
 - macOS `getattrlistbulk` and Linux `statx` metadata reads.
 
+### M7: rsync drop-in flags + page-cache hints (branch `m7-integrated`, 3e58983)
+
+- `-c -S -R -d -L -k -K -b -O`, `--partial(-dir)`, `--files-from`, `--existing`,
+  `--max/min-size`, `--backup-dir`, `--link/compare-dest`, `--numeric-ids`, `--chmod`,
+  `--remove-source-files`, each with a differential test (`tests/rsync_flags.rs`).
+- Page-cache hints for files of 8 MiB+: `F_NOCACHE` (macOS), `fadvise` + bounded write-behind
+  (Linux); `--no-drop-cache` turns them off.
+
+### M8: verification harness (part of `m7-integrated`)
+
+- Linux container with sshd and `tc netem` profiles (lan, wan, lossy), `strace -c` counts,
+  perf flamegraphs, `cp` baselines; see the README's benchmark section.
+
+### M9: the plan's delta design as `--delta=cdc` (branch `m9-delta-cdc`)
+
+- FastCDC for every delta, chunked in parallel 16 MiB regions and stitched so the result
+  equals one sequential pass; `ChunkSignature { offset, length, xxh3_hash, blake3_hash }`;
+  files read through memmap2; files of 128 KiB or less never sent as deltas.
+- Measured 4–7× slower than `--delta=blocks` on a 10 GiB file (mmap page faults and page
+  cache pressure; hashing itself is not slower), so `blocks` stays the default.
+
 ### Testing
 
 - **Coverage:** 79 tests on macOS and 81 on Linux (aarch64 container, glibc rsync 3.2.7).
@@ -281,12 +302,12 @@ Measurements that shaped the design:
 |---|---|---|
 | QUIC over UDP (quinn), up to 128 streams | ssh pipe + `--streams N` TLS-over-TCP | Your choice at planning time. UDP is often blocked, and quinn tends to be CPU-bound. |
 | jwalk + DashMap of both trees | Per-directory rayon pipeline | Streaming; memory grows with directories |
-| xxh3 filter + BLAKE3 per chunk | BLAKE3-128 per block/chunk | One hash, faster than the disk, cryptographically verified |
-| FastCDC for every large file | Aligned blocks first, FastCDC fallback | In-place edits are the common case for big files |
-| Merge chunks across 16 MB regions | Fixed cut points at 4 MiB segment edges | Deterministic; at most one extra chunk per segment |
+| xxh3 filter + BLAKE3 per chunk | BLAKE3-128 per block/chunk | One hash, faster than the disk, cryptographically verified. The plan's version is `--delta=cdc` (M9), measured slower. |
+| FastCDC for every large file | Aligned blocks first, FastCDC fallback | In-place edits are the common case for big files. The plan's version is `--delta=cdc` (M9). |
+| Merge chunks across 16 MB regions | Fixed cut points at 4 MiB segment edges | Deterministic; at most one extra chunk per segment. `--delta=cdc` stitches regions exactly (M9). |
 | rkyv zero-copy | serde + postcard | Not a bottleneck |
 | tokio / tokio-uring | Threads, crossbeam, rayon | File I/O blocks anyway |
-| mmap | pread into per-thread buffers | No crash if a file shrinks mid-read |
+| mmap | pread into per-thread buffers | No crash if a file shrinks mid-read; `--delta=cdc` uses mmap and measured 4–7× slower on 10 GiB files (M9) |
 | `std::fs::copy` | Own clone / `copy_file_range` / buffered paths | Measured clone threshold, fd-based attributes |
 | Starter code's temp names | `.name.XXXXXX` built from raw bytes | The original collapsed every non-UTF-8 name onto one temp name |
 | Starter code "crash-safe" without fsync | rsync semantics; `--fsync` optional | rsync doesn't fsync either |

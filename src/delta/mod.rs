@@ -9,14 +9,19 @@
 //!   only the changed blocks.
 //! - **Content-defined chunks** (FastCDC): chunk boundaries follow the content, so data
 //!   that moved (inserts/deletes) still matches. Used as the fallback when aligned
-//!   blocks match poorly. Segment edges are forced cut points, so chunking is
-//!   deterministic and parallel; a shift costs at most one extra chunk per segment.
+//!   blocks match poorly. Chunked in parallel per segment and joined at the segment
+//!   edges so the cuts are exactly those of one sequential pass (see
+//!   [`chunk_signature`]).
 //!
 //! Matching uses BLAKE3 truncated to 128 bits, so every reused range is
 //! cryptographically verified (no separate whole-file pass, which would have to
 //! re-read the entire output).
+//!
+//! That is [`DeltaMode::Blocks`]. [`DeltaMode::Cdc`] is the original plan's design
+//! instead: see [`cdc`].
 
 pub mod apply;
+pub mod cdc;
 
 use crate::fsops::cache;
 use rayon::prelude::*;
@@ -38,6 +43,8 @@ pub struct Params {
     pub cdc_min: usize,
     pub cdc_avg: usize,
     pub cdc_max: usize,
+    /// `--delta=cdc`: unit of parallel chunking, stitched afterwards (see [`cdc`]).
+    pub cdc_region: usize,
 }
 
 impl Params {
@@ -47,11 +54,27 @@ impl Params {
         cdc_min: 16 << 10,
         cdc_avg: 32 << 10,
         cdc_max: 64 << 10,
+        cdc_region: 16 << 20,
     };
 }
 
-/// Files smaller than this are always sent whole: a delta can't save enough to matter.
-pub const MIN_DELTA_SIZE: u64 = 64 << 10;
+/// Which delta design to use (`--delta`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+pub enum DeltaMode {
+    /// Aligned blocks first, FastCDC fallback; BLAKE3-128; `pread`.
+    #[default]
+    Blocks,
+    /// FastCDC for every delta; xxh3 filter confirmed by BLAKE3; `mmap`.
+    Cdc,
+}
+
+/// Files of at most this size are always sent whole: a delta can't save enough to matter.
+pub const MIN_DELTA_SIZE: u64 = 128 << 10;
+
+/// Whether a new file of `size` bytes may be sent as a delta.
+pub fn worth_delta(size: u64) -> bool {
+    size > MIN_DELTA_SIZE
+}
 
 pub fn strong_hash(data: &[u8]) -> Hash128 {
     blake3::hash(data).as_bytes()[..16].try_into().unwrap()
@@ -275,22 +298,58 @@ pub struct ChunkSig {
     pub chunks: Vec<ChunkEntry>,
 }
 
+/// Content-defined chunks, cut exactly where one sequential FastCDC pass over the whole
+/// file would cut (the original plan's merging at region boundaries; [`cdc`] explains why
+/// this works), computed in parallel with one read of the file.
+///
+/// Each segment is read with `cdc_max` extra bytes and chunked from its first byte until a
+/// chunk ends at or past the segment's end; with the extra bytes every one of those cuts is
+/// real. A sequential pass then joins the segments: from the previous segment's last cut it
+/// chunks on (reading `cdc_max`-byte windows) until it reaches one of this segment's cuts,
+/// and takes the rest of the segment's chunks from there.
 pub fn chunk_signature(src: &dyn ReadAt, size: u64, p: &Params) -> io::Result<ChunkSig> {
     let per_seg: Vec<Vec<ChunkEntry>> = segments(size, p.segment)
         .into_par_iter()
         .map(|(seg_off, len)| {
-            with_range(src, seg_off, len, |buf| {
-                fastcdc::v2020::FastCDC::new(buf, p.cdc_min, p.cdc_avg, p.cdc_max)
-                    .map(|c| ChunkEntry {
+            let seg_end = seg_off + len as u64;
+            let read = (size - seg_off).min((len + p.cdc_max) as u64) as usize;
+            with_range(src, seg_off, read, |buf| {
+                let mut out = Vec::new();
+                for c in fastcdc::v2020::FastCDC::new(buf, p.cdc_min, p.cdc_avg, p.cdc_max) {
+                    out.push(ChunkEntry {
                         off: seg_off + c.offset as u64,
                         len: c.length as u32,
                         hash: strong_hash(&buf[c.offset..c.offset + c.length]),
-                    })
-                    .collect()
+                    });
+                    if seg_off + (c.offset + c.length) as u64 >= seg_end {
+                        break;
+                    }
+                }
+                out
             })
         })
         .collect::<io::Result<_>>()?;
-    Ok(ChunkSig { size, chunks: per_seg.into_iter().flatten().collect() })
+    let mut chunks: Vec<ChunkEntry> = Vec::with_capacity(per_seg.iter().map(Vec::len).sum());
+    let mut pos = 0u64;
+    for seg in per_seg {
+        let Some(last) = seg.last().map(|c| c.off + c.len as u64) else { continue };
+        while pos < last {
+            if let Ok(i) = seg.binary_search_by_key(&pos, |c| c.off) {
+                chunks.extend_from_slice(&seg[i..]);
+                pos = last;
+                break;
+            }
+            let window = (size - pos).min(p.cdc_max as u64) as usize;
+            let c = with_range(src, pos, window, |buf| {
+                let n = fastcdc::v2020::FastCDC::new(buf, p.cdc_min, p.cdc_avg, p.cdc_max).next().map_or(buf.len(), |c| c.length);
+                ChunkEntry { off: pos, len: n as u32, hash: strong_hash(&buf[..n]) }
+            })?;
+            pos += c.len as u64;
+            chunks.push(c);
+        }
+    }
+    debug_assert_eq!(pos, size);
+    Ok(ChunkSig { size, chunks })
 }
 
 /// Match new-file chunks against basis chunks by content. A chunk found at the same

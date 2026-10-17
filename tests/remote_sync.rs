@@ -128,7 +128,9 @@ fn stat_bytes(stdout: &str, label: &str) -> u64 {
 
 #[test]
 fn delta_over_the_wire() {
-    for extra in [&[][..], &["-z"], &["--inplace"], &["--no-clone"]] {
+    let modes: [&[&str]; 7] =
+        [&[], &["-z"], &["--inplace"], &["--no-clone"], &["--delta=cdc"], &["--delta=cdc", "--inplace"], &["--delta=cdc", "-z"]];
+    for extra in modes {
         for pull in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             delta_fixture(tmp.path());

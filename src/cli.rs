@@ -1,6 +1,7 @@
 //! Command-line interface: an rsync-compatible subset of flags, resolved into [`Options`].
 
 use crate::chmod::ChmodRule;
+use crate::delta::DeltaMode;
 use crate::filter::{RuleSpec, read_rules_file};
 use anyhow::{Context, Result, bail};
 use std::os::unix::ffi::OsStrExt;
@@ -134,6 +135,9 @@ pub struct Cli {
     /// Always use the delta-transfer algorithm
     #[arg(long = "no-whole-file", overrides_with = "whole_file")]
     no_whole_file: bool,
+    /// Delta design: aligned blocks with a FastCDC fallback, or FastCDC throughout
+    #[arg(long, value_enum, value_name = "MODE", default_value_t, env = "FASTRSYNC_DELTA", hide_env = true)]
+    delta: DeltaMode,
     /// Write files directly at their final name (no temp file + rename)
     #[arg(long)]
     inplace: bool,
@@ -281,6 +285,8 @@ pub struct Options {
     pub compress: bool,
     /// `None` means "decide automatically" (whole-file for local copies, delta for remote).
     pub whole_file: Option<bool>,
+    /// The receiver's choice decides a remote transfer (its signature type says which).
+    pub delta: DeltaMode,
     pub inplace: bool,
     pub fsync: bool,
     pub no_clone: bool,
@@ -406,6 +412,7 @@ impl Options {
             } else {
                 None
             },
+            delta: c.delta,
             inplace: c.inplace,
             fsync: c.fsync,
             no_clone: c.no_clone,

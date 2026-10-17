@@ -19,7 +19,9 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M4 | remote over SSH (`host:path`): push and pull, small-file packing, delta over the wire, `-z`, `-e`, `--remote-path` | done |
 | M5 | parallel TLS data streams (`--streams N`), pinned ephemeral certificate, token auth, ssh fallback | done |
 | M6 | `-H`, `--progress`/`--info=progress2`, `-i`/`%i`, `getattrlistbulk`/`statx` metadata reads | done |
-| M7 | common rsync flags: `-c -S -R -d -L -k -K -b -O`, `--partial(-dir)`, `--files-from`, `--existing`, `--max/min-size`, `--link/compare-dest`, `--numeric-ids`, `--chmod`, `--remove-source-files` | done |
+| M7 | common rsync flags: `-c -S -R -d -L -k -K -b -O`, `--partial(-dir)`, `--files-from`, `--existing`, `--max/min-size`, `--link/compare-dest`, `--numeric-ids`, `--chmod`, `--remove-source-files`; page-cache hints | done |
+| M8 | verification harness: Linux container with sshd and `tc netem` link profiles, `strace -c`, flamegraphs, `cp` baselines | done |
+| M9 | the original plan's delta design as `--delta=cdc` (FastCDC throughout, xxh3 + BLAKE3, mmap); measured slower, so `blocks` stays the default | done |
 
 The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
@@ -44,7 +46,9 @@ With Homebrew's keg-only rustup, add `/opt/homebrew/opt/rustup/bin` to `PATH`.
 `--no-whole-file` (delta transfer; locally off by default, like rsync), `--inplace` (also
 writes new files directly, like rsync),
 `--fsync`, `--stats`, `-h`, `--threads N`, `--drop-cache`/`--no-drop-cache` (page-cache hints
-for files of 8 MiB+, on by default; see [Page-cache hints](#page-cache-hints)).
+for files of 8 MiB+, on by default; see [Page-cache hints](#page-cache-hints)),
+`--delta=blocks|cdc` (delta design, see [Delta transfer](#delta-transfer); for a remote
+transfer the receiver's choice applies).
 
 Also, with rsync's semantics locally and over ssh (each has a differential test in
 `tests/rsync_flags.rs`):
@@ -154,8 +158,9 @@ from the old destination file plus only the ranges that differ:
 1. **Aligned blocks first.** Both files are hashed in parallel in 64 KiB blocks at the same
    offsets. This is ideal for in-place changes and appends (VM images, databases, logs).
 2. **FastCDC fallback.** If under half the bytes matched, both files are re-chunked by
-   content (16/32/64 KiB chunks inside 4 MiB segments, in parallel), so inserted or deleted
-   bytes only cost the chunks around them.
+   content (16/32/64 KiB chunks), so inserted or deleted bytes only cost the chunks around
+   them. Chunking runs in parallel over 4 MiB segments, joined so the cuts are exactly those of
+   one sequential pass (see [`--delta=cdc`](#--deltacdc-the-original-plans-design)).
 3. **Clone + patch.** When matched ranges keep their offsets, the old file is cloned (APFS
    `fclonefileat`, Linux `FICLONE`) and only the changed ranges are written. Otherwise the
    new file is rebuilt in parallel. With `--inplace`, changes go straight into the destination.
@@ -169,9 +174,60 @@ at ~12.6 GB/s on all cores of an M-series Mac, faster than the SSD.
 | --- | ---: |
 | 4 KiB overwritten in place | 64 KiB |
 | 300 KB appended | 300 KB |
-| 777 bytes inserted at the start | 83 KB |
-| 12 KB removed from the middle | 109 KB |
+| 777 bytes inserted at the start | 42 KB |
+| 12 KB removed from the middle | 274 KB |
 | truncated to 4 MiB | 17 B |
+
+After an insert or delete, the chunk boundaries of the two files fall back into step within a
+few chunks; in the middle-cut case above it took eight. Files of 128 KiB or less are always
+sent whole.
+
+### `--delta=cdc`: the original plan's design
+
+`--delta=cdc` builds the delta engine the way the original plan describes it, for comparison:
+
+- **FastCDC for every delta** (16/32/64 KiB chunks), no aligned-block pass. Files are chunked
+  in parallel in 16 MiB regions, then stitched: the sequential chain continues from the last
+  cut before each region until it lands on one of the region's own cuts. FastCDC restarts its
+  hash at every cut, so from there both chains agree, and the result is exactly one sequential
+  FastCDC pass over the whole file, whatever the thread count. A property test checks this at
+  1, 2 and 8 threads.
+- **`ChunkSignature { offset, length, xxh3_hash, blake3_hash }`.** An xxh3 hash table finds
+  candidates; a match only counts when BLAKE3 (256-bit) agrees too. The sender computes BLAKE3
+  only for chunks whose xxh3 is in the receiver's signature.
+- **Files read through `mmap`** (memmap2) for hashing and for copy/literal ranges. The size is
+  checked after mapping, and a file that changed since it was listed is sent whole. A file
+  truncated *while* mapped can still raise `SIGBUS`.
+
+Clone + patch, the in-order rebuild and `--inplace` work the same way for both designs.
+
+Measured on the same Mac (warm cache, 3 interleaved runs, `bench/delta_modes.sh`):
+
+| Dataset | Where | `--delta=blocks` | `--delta=cdc` |
+| --- | --- | ---: | ---: |
+| B: 10 GiB, 50 × 1 MiB overwritten in place | local, clone + patch | **5.9–6.3 s** | 42.5–47.3 s |
+| B | local, `--no-clone` (rebuild) | **16.0–16.8 s** | 77.4–84.2 s |
+| B | remote (fake ssh) | **6.0–6.1 s** | 37.9–43.3 s |
+| E: 2 GiB, 40 inserts/deletes of 1–64 KiB | local, clone + patch | **2.8–3.5 s** | 3.2–3.5 s |
+| E | local, `--no-clone` (rebuild) | 3.1–3.5 s | **2.2–2.5 s** |
+| E | remote (fake ssh) | **2.6–2.8 s** | 3.6–4.6 s |
+
+One idea from the plan did measure better and is now part of the default: exact stitching of
+the parallel FastCDC regions. `blocks` used to force a cut at every 4 MiB segment edge, so
+once content shifted, the chunks around every edge stopped matching: on E it sent 86.5 MB of
+literal data. Its fallback now joins segments like `cdc` does (one read pass, `cdc_max`-byte
+windows at the joins) and sends the same 4.1 MB as `cdc`, while getting a little faster
+(remote E 2.8 → 2.7 s). On a 100 Mbit link those 82 MB are about 6.5 s.
+
+Hashing itself is not what loses: on a cached 2 GiB file the cdc signature takes 230 ms against
+300 ms for the blocks-mode chunk signature. The difference is how the data is read. Every first
+touch of a mapped 16 KiB page is a page fault (about 1 s of CPU per 2 GiB on macOS), and mapped
+pages go through the page cache. Two 10 GiB files are more than this Mac's 16 GB of RAM, so the
+mapped reads evict and fault their way through, while `pread` with `F_NOCACHE` streams.
+`cdc` wins one case: a shifted file that fits in RAM, rebuilt without clones. There it hashes
+each file once, while `blocks` first tries aligned blocks and only then falls back to chunks.
+Following the defaults rule (the faster design stays the default), `--delta=blocks` remains the
+default and `--delta=cdc` stays selectable.
 
 ## Layout
 
@@ -187,7 +243,8 @@ src/diff.rs         quick check (size + mtime, --modify-window, -u, --size-only,
 src/fsops/          readdir + fstatat, temp names, clone/copy, utimensat, mknod, page-cache hints
 src/local/          planner (SRC... DEST → roots) and the parallel per-directory engine;
                     flags.rs: link/compare-dest, backups, partial, sparse, -L/-k, removals
-src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild)
+src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild);
+                    cdc.rs: --delta=cdc (stitched parallel FastCDC, xxh3 + BLAKE3, mmap)
 src/proto/          wire frames (postcard + raw data, optional zstd), reader/writer threads
 src/remote/         client (spawns the server over ssh), server, sender and receiver roles
 src/output.rs       rsync-style item lines and stats
@@ -207,6 +264,7 @@ cargo test
 The delta engine also has property tests (random insert/delete/overwrite/append/truncate
 sequences; every delta must rebuild the new file exactly via both rebuild and clone+patch).
 `PROPTEST_CASES=5000 cargo test --release delta` runs a longer sweep.
+`FASTRSYNC_DELTA=cdc cargo test` runs the whole suite with `--delta=cdc` as the default.
 
 The integration tests run each scenario through the reference rsync 3.x as well (found at
 `/opt/homebrew/bin/rsync`, `/usr/local/bin/rsync` or `/usr/bin/rsync`, or set

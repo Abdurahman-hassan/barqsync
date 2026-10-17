@@ -27,6 +27,7 @@ use crate::checksum::Sum;
 use crate::cli::Options;
 use crate::ids::Names;
 use crate::select::Sel;
+use crate::delta::cdc::CdcSig;
 use crate::delta::{BlockSig, ChunkSig, Op};
 use crate::entry::{DirEnt, Meta};
 use crate::output::StatsSnapshot;
@@ -37,7 +38,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"FASTRSYN";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -75,6 +76,8 @@ pub struct RootInfo {
 pub enum Sig {
     Blocks(BlockSig),
     Chunks(ChunkSig),
+    /// `--delta=cdc`: FastCDC chunks with xxh3 and BLAKE3 hashes.
+    Cdc(CdcSig),
 }
 
 /// Server → client: where to open parallel data streams and how to authenticate.

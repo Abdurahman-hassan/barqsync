@@ -102,7 +102,7 @@ fn check_mode(extra: &[&str]) {
 
     if have_rsync {
         let mut rargs = vec!["-a", "--no-whole-file"];
-        rargs.extend(extra.iter().filter(|a| **a != "--no-clone"));
+        rargs.extend(extra.iter().filter(|a| **a != "--no-clone" && !a.starts_with("--delta")));
         rargs.extend_from_slice(&["src/", "dr"]);
         let r = rsync(tmp.path(), &rargs).unwrap();
         assert_eq!(r.code, 0, "{}", r.stderr);
@@ -125,6 +125,21 @@ fn delta_inplace() {
 #[test]
 fn delta_rebuild_without_clones() {
     check_mode(&["--no-clone"]);
+}
+
+#[test]
+fn cdc_delta_with_clone_and_patch() {
+    check_mode(&["--delta=cdc"]);
+}
+
+#[test]
+fn cdc_delta_inplace() {
+    check_mode(&["--delta=cdc", "--inplace"]);
+}
+
+#[test]
+fn cdc_delta_rebuild_without_clones() {
+    check_mode(&["--delta=cdc", "--no-clone"]);
 }
 
 #[test]

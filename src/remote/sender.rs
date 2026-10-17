@@ -8,7 +8,7 @@
 use super::{Stop, WORKER_STACK, recv};
 use crate::cli::Options;
 use crate::checksum::{self, Sum};
-use crate::delta::{self, Op, Params, ReadAt, ReadOnce};
+use crate::delta::{self, Delta, Op, Params, ReadAt, ReadOnce, cdc};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::ids;
 use crate::local::flags::{adjust_listing, adjust_mode, remove_source};
@@ -320,6 +320,13 @@ impl Sender<'_> {
     fn send_delta(&self, id: u64, path: &Path, sig: Sig) -> io::Result<()> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
+        if let Sig::Cdc(basis) = &sig {
+            return match cdc::Mapped::new(&file, size) {
+                Ok(m) => self.send_ops(id, &file, &cdc::diff(m.bytes(), basis, &Params::DEFAULT), &m),
+                Err(e) if cdc::is_changed(&e) => self.send_whole_file(id, &file),
+                Err(e) => Err(e),
+            };
+        }
         let f = ReadOnce::new(&file, size);
         let d = match sig {
             Sig::Blocks(basis) => {
@@ -331,15 +338,22 @@ impl Sender<'_> {
                 delta::diff_blocks(&delta::block_signature(&f, size, &p)?, &basis)
             }
             Sig::Chunks(basis) => delta::diff_chunks(&delta::chunk_signature(&f, size, &Params::DEFAULT)?, &basis),
+            Sig::Cdc(_) => unreachable!(),
         };
+        self.send_ops(id, &file, &d, &f)
+    }
+
+    /// Send a delta: the copy ops up front, then the literal ranges read from `src`.
+    fn send_ops(&self, id: u64, file: &File, d: &Delta, src: &dyn ReadAt) -> io::Result<()> {
         if d.matched_bytes() == 0 {
-            return self.send_whole_file(id, &file);
+            return self.send_whole_file(id, file);
         }
+        let size = d.size;
         let copies: Vec<Op> = d.ops.iter().copied().filter(|o| matches!(o, Op::Copy { .. })).collect();
         self.send(Msg::DeltaBegin { id, size, copies });
         for op in &d.ops {
             if let Op::Literal { off, len } = *op {
-                self.send_range(&f, id, off, len)?;
+                self.send_range(src, id, off, len)?;
             }
         }
         self.send(Msg::FileEnd { id, ok: true });

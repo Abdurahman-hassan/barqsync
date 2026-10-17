@@ -9,7 +9,7 @@
 use super::{MAX_PACKS_IN_FLIGHT, Stop, WORKER_STACK, recv};
 use crate::cli::Options;
 use crate::checksum::Sum;
-use crate::delta::{self, Delta, Op, ReadAt, ReadOnce, apply::apply};
+use crate::delta::{self, Delta, DeltaMode, Op, ReadAt, ReadOnce, apply::apply, cdc};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::ids::IdMap;
 use crate::local::flags::write_sparse_at;
@@ -341,7 +341,7 @@ impl RemoteState {
                 crate::progress::done(job.meta.size);
                 continue;
             }
-            let sig = if self.delta { basis_signature(&job) } else { None };
+            let sig = if self.delta { basis_signature(&job, eng.opts.delta) } else { None };
             reqs.push(NeedReq { idx: job.idx, sig });
             self.needed.lock().unwrap().insert(file_id(wire_dir, job.idx), job);
         }
@@ -439,8 +439,13 @@ impl RemoteState {
                 }
             }
         };
-        let basis_size = job.dst_meta.map_or(0, |m| m.size);
-        if let Err(e) = apply(&d, &ReadOnce::new(&basis, basis_size), &NoLiteral, &file, has_basis) {
+        let r = if eng.opts.delta == DeltaMode::Cdc {
+            basis.metadata().and_then(|m| cdc::Mapped::new(&basis, m.len())).and_then(|m| apply(&d, &m, &NoLiteral, &file, has_basis))
+        } else {
+            let basis_size = job.dst_meta.map_or(0, |m| m.size);
+            apply(&d, &ReadOnce::new(&basis, basis_size), &NoLiteral, &file, has_basis)
+        };
+        if let Err(e) = r {
             if registered {
                 fsops::drop_temp(&path);
             }
@@ -602,16 +607,21 @@ impl RemoteState {
 
 /// Signature of the destination file to send along with a request, so the sender can
 /// reply with a delta: aligned blocks when the size is unchanged (in-place edits),
-/// content-defined chunks when it changed (inserts, deletes, appends).
-fn basis_signature(job: &FileJob) -> Option<Sig> {
+/// content-defined chunks when it changed (inserts, deletes, appends). `--delta=cdc`
+/// always sends content-defined chunks.
+fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<Sig> {
     let d = match &job.basis {
         Some(p) => fsops::lstat(p).ok()?,
         None => job.dst_meta?,
     };
-    if d.kind != Kind::File || d.size == 0 || job.meta.size < delta::MIN_DELTA_SIZE {
+    if d.kind != Kind::File || d.size == 0 || !delta::worth_delta(job.meta.size) {
         return None;
     }
     let f = File::open(job.basis_path()).ok()?;
+    if mode == DeltaMode::Cdc {
+        let m = cdc::Mapped::new(&f, d.size).ok()?;
+        return Some(Sig::Cdc(cdc::signature(m.bytes(), &delta::Params::DEFAULT)));
+    }
     let f = ReadOnce::new(&f, d.size);
     let p = delta::Params::DEFAULT;
     if job.meta.size == d.size {

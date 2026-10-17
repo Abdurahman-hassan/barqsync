@@ -12,7 +12,7 @@
 
 use super::Root;
 use crate::cli::Options;
-use crate::delta::{self, apply::apply};
+use crate::delta::{self, DeltaMode, apply::apply, cdc};
 use crate::diff::{AttrDiff, DiffRules, FileAction, file_action_sum};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::filter::Filter;
@@ -1216,7 +1216,7 @@ impl<'a> Engine<'a> {
     /// existing destination file to use as the basis.
     fn delta_candidate(&self, job: &FileJob) -> bool {
         self.opts.whole_file == Some(false)
-            && job.meta.size >= delta::MIN_DELTA_SIZE
+            && delta::worth_delta(job.meta.size)
             && (job.basis.is_some() || job.dst_meta.is_some_and(|d| d.kind == Kind::File && d.size > 0))
     }
 
@@ -1231,8 +1231,20 @@ impl<'a> Engine<'a> {
         let new = fs::File::open(&job.src_path)?;
         let basis = fs::File::open(job.basis_path())?;
         let basis_size = basis.metadata()?.len();
-        let (new_r, basis_r) = (delta::ReadOnce::new(&new, job.meta.size), delta::ReadOnce::new(&basis, basis_size));
-        let d = delta::local_delta(&new_r, job.meta.size, &basis_r, basis_size, &delta::Params::DEFAULT)?;
+        let p = &delta::Params::DEFAULT;
+        let (maps, reads);
+        let (d, new_r, basis_r): (delta::Delta, &dyn delta::ReadAt, &dyn delta::ReadAt) = if self.opts.delta == DeltaMode::Cdc {
+            maps = match (cdc::Mapped::new(&new, job.meta.size), cdc::Mapped::new(&basis, basis_size)) {
+                (Ok(n), Ok(b)) => (n, b),
+                // Changed since it was listed: copy it whole instead.
+                (Err(e), _) | (_, Err(e)) if cdc::is_changed(&e) => return Ok(false),
+                (Err(e), _) | (_, Err(e)) => return Err(e),
+            };
+            (cdc::local_delta(maps.0.bytes(), maps.1.bytes(), p), &maps.0, &maps.1)
+        } else {
+            reads = (delta::ReadOnce::new(&new, job.meta.size), delta::ReadOnce::new(&basis, basis_size));
+            (delta::local_delta(&reads.0, job.meta.size, &reads.1, basis_size, p)?, &reads.0, &reads.1)
+        };
         if d.matched_bytes() == 0 {
             return Ok(false);
         }
@@ -1242,7 +1254,7 @@ impl<'a> Engine<'a> {
 
         if self.opts.inplace && d.is_in_place() && job.basis.is_none() {
             let out = fs::OpenOptions::new().write(true).open(&job.dst_path)?;
-            apply(&d, &basis_r, &new_r, &out, true)?;
+            apply(&d, basis_r, new_r, &out, true)?;
             self.finish_delta_file(&out, &job.meta, mode, uid, gid)?;
             return Ok(true);
         }
@@ -1260,7 +1272,7 @@ impl<'a> Engine<'a> {
         }
         let r = (|| {
             let out = fs::OpenOptions::new().write(true).open(&tmp)?;
-            apply(&d, &basis_r, &new_r, &out, cloned)?;
+            apply(&d, basis_r, new_r, &out, cloned)?;
             self.finish_delta_file(&out, &job.meta, mode, uid, gid)?;
             drop(out);
             fsops::check_interrupt()?;
