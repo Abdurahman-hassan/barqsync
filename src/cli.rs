@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "fastrsync",
+    name = "barqsync",
     version,
     about = "A fast, parallel, rsync-compatible file synchronizer",
     disable_help_flag = true
@@ -139,10 +139,10 @@ pub struct Cli {
     #[arg(long = "no-whole-file", overrides_with = "whole_file")]
     no_whole_file: bool,
     /// Directory scanner: one task per directory, or a jwalk tree scan feeding queues
-    #[arg(long, value_enum, value_name = "MODE", default_value_t, env = "FASTRSYNC_SCANNER", hide_env = true)]
+    #[arg(long, value_enum, value_name = "MODE", default_value_t, env = "BARQSYNC_SCANNER", hide_env = true)]
     scanner: Scanner,
     /// Delta design: aligned blocks with a FastCDC fallback, or FastCDC throughout
-    #[arg(long, value_enum, value_name = "MODE", default_value_t, env = "FASTRSYNC_DELTA", hide_env = true)]
+    #[arg(long, value_enum, value_name = "MODE", default_value_t, env = "BARQSYNC_DELTA", hide_env = true)]
     delta: DeltaMode,
     /// Write files directly at their final name (no temp file + rename)
     #[arg(long)]
@@ -234,7 +234,7 @@ pub struct Cli {
     /// Specify the remote shell to use
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     rsh: Option<String>,
-    /// Path to fastrsync on the remote machine
+    /// Path to barqsync on the remote machine
     #[arg(long = "remote-path", visible_alias = "rsync-path", value_name = "PROGRAM")]
     remote_path: Option<String>,
 
@@ -245,22 +245,22 @@ pub struct Cli {
     #[arg(long, value_name = "N")]
     streams: Option<usize>,
     /// Remote data path: the ssh pipe alone, TLS-over-TCP streams, or QUIC
-    #[arg(long, value_enum, value_name = "MODE", env = "FASTRSYNC_TRANSPORT", hide_env = true)]
+    #[arg(long, value_enum, value_name = "MODE", env = "BARQSYNC_TRANSPORT", hide_env = true)]
     transport: Option<Transport>,
     /// Measure the link and pick delta vs whole files and compression from it, or don't
-    #[arg(long, value_enum, value_name = "MODE", env = "FASTRSYNC_STRATEGY", hide_env = true)]
+    #[arg(long, value_enum, value_name = "MODE", env = "BARQSYNC_STRATEGY", hide_env = true)]
     strategy: Option<Strategy>,
     /// zstd level for compressed frames (default: 1, or chosen from the link speed)
     #[arg(long = "compress-level", value_name = "N", value_parser = clap::value_parser!(i32).range(1..=19))]
     compress_level: Option<i32>,
     /// Linux: write received small files in io_uring batches
-    #[arg(long = "io-uring", env = "FASTRSYNC_IO_URING", hide_env = true, value_parser = clap::builder::FalseyValueParser::new())]
+    #[arg(long = "io-uring", env = "BARQSYNC_IO_URING", hide_env = true, value_parser = clap::builder::FalseyValueParser::new())]
     io_uring: bool,
     /// Network I/O layer for the ssh pipe and TCP streams (benchmarking aid)
-    #[arg(long = "net-io", value_name = "LAYER", value_parser = ["threads", "tokio"], hide = true, env = "FASTRSYNC_NET_IO", hide_env = true)]
+    #[arg(long = "net-io", value_name = "LAYER", value_parser = ["threads", "tokio"], hide = true, env = "BARQSYNC_NET_IO", hide_env = true)]
     net_io: Option<String>,
     /// Control-message encoding on the wire
-    #[arg(long, value_enum, value_name = "FORMAT", default_value_t, env = "FASTRSYNC_WIRE", hide_env = true)]
+    #[arg(long, value_enum, value_name = "FORMAT", default_value_t, env = "BARQSYNC_WIRE", hide_env = true)]
     wire: Wire,
 
     #[arg(long, hide = true)]
@@ -615,14 +615,14 @@ mod tests {
 
     #[test]
     fn archive_expands() {
-        let o = Options::parse_from(["fastrsync", "-a", "s/", "d"]).unwrap();
+        let o = Options::parse_from(["barqsync", "-a", "s/", "d"]).unwrap();
         assert!(o.recursive && o.links && o.perms && o.times && o.group && o.owner);
         assert!(o.devices && o.specials);
     }
 
     #[test]
     fn combined_short_flags() {
-        let o = Options::parse_from(["fastrsync", "-avzn", "s/", "d"]).unwrap();
+        let o = Options::parse_from(["barqsync", "-avzn", "s/", "d"]).unwrap();
         assert!(o.recursive && o.compress && o.dry_run);
         assert_eq!(o.verbose, 1);
     }
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn filter_order_is_preserved_across_flags() {
         let o = Options::parse_from([
-            "fastrsync", "--include", "keep.log", "--exclude", "*.log", "--include", "x", "s", "d",
+            "barqsync", "--include", "keep.log", "--exclude", "*.log", "--include", "x", "s", "d",
         ])
         .unwrap();
         let pats: Vec<_> = o.filter_rules.iter().map(|r| (r.include, r.pattern.as_str())).collect();
@@ -639,8 +639,8 @@ mod tests {
 
     #[test]
     fn eight_bit_output() {
-        assert!(!Options::parse_from(["fastrsync", "-a", "s", "d"]).unwrap().eight_bit_output);
-        for args in [&["fastrsync", "-8", "s", "d"][..], &["fastrsync", "-av8", "s", "d"], &["fastrsync", "--8-bit-output", "s", "d"]] {
+        assert!(!Options::parse_from(["barqsync", "-a", "s", "d"]).unwrap().eight_bit_output);
+        for args in [&["barqsync", "-8", "s", "d"][..], &["barqsync", "-av8", "s", "d"], &["barqsync", "--8-bit-output", "s", "d"]] {
             assert!(Options::parse_from(args).unwrap().eight_bit_output, "{args:?}");
         }
     }
@@ -671,26 +671,26 @@ mod tests {
         let list = tmp.path().join("list");
         std::fs::write(&list, "# comment\na/b\n\n; c\nc\r\n").unwrap();
         let l = list.to_str().unwrap();
-        let o = Options::parse_from(["fastrsync", "-a", "--files-from", l, "s", "d"]).unwrap();
+        let o = Options::parse_from(["barqsync", "-a", "--files-from", l, "s", "d"]).unwrap();
         assert!(o.relative && o.dirs && !o.recursive);
         assert_eq!(o.files_from.unwrap(), vec![b"a/b".to_vec(), b"c".to_vec()]);
-        let o = Options::parse_from(["fastrsync", "-ar", "--files-from", l, "s", "d"]).unwrap();
+        let o = Options::parse_from(["barqsync", "-ar", "--files-from", l, "s", "d"]).unwrap();
         assert!(o.recursive);
     }
 
     #[test]
     fn backup_suffix_defaults() {
-        let o = Options::parse_from(["fastrsync", "-b", "s", "d"]).unwrap();
+        let o = Options::parse_from(["barqsync", "-b", "s", "d"]).unwrap();
         assert_eq!(o.suffix, "~");
-        let o = Options::parse_from(["fastrsync", "--backup-dir=bk", "s", "d"]).unwrap();
+        let o = Options::parse_from(["barqsync", "--backup-dir=bk", "s", "d"]).unwrap();
         assert!(o.backup);
         assert_eq!(o.suffix, "");
-        assert!(Options::parse_from(["fastrsync", "--link-dest=a", "--compare-dest=b", "s", "d"]).is_err());
+        assert!(Options::parse_from(["barqsync", "--link-dest=a", "--compare-dest=b", "s", "d"]).is_err());
     }
 
     #[test]
     fn negative_modify_window() {
-        let o = Options::parse_from(["fastrsync", "--modify-window=-1", "s", "d"]).unwrap();
+        let o = Options::parse_from(["barqsync", "--modify-window=-1", "s", "d"]).unwrap();
         assert_eq!(o.modify_window, -1);
     }
 }

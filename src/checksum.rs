@@ -16,7 +16,7 @@ static POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     rayon::ThreadPoolBuilder::new()
         .num_threads(n)
-        .thread_name(|i| format!("fastrsync-sum-{i}"))
+        .thread_name(|i| format!("barqsync-sum-{i}"))
         .build()
         .expect("checksum thread pool")
 });

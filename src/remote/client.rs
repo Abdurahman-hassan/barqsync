@@ -1,4 +1,4 @@
-//! Client side of a remote transfer: start `fastrsync --server` through the remote
+//! Client side of a remote transfer: start `barqsync --server` through the remote
 //! shell, send it the role, paths and options, then run the opposite role locally.
 
 use super::{Stop, receiver, recv, sender, streams};
@@ -17,13 +17,13 @@ fn spawn_server(opts: &Options, host: &str) -> io::Result<Child> {
     let rsh = opts
         .rsh
         .clone()
-        .or_else(|| std::env::var("FASTRSYNC_RSH").ok())
+        .or_else(|| std::env::var("BARQSYNC_RSH").ok())
         .unwrap_or_else(|| "ssh".to_string());
     let mut argv = shlex::split(&rsh)
         .filter(|a| !a.is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("cannot parse remote shell {rsh:?}")))?;
     let program = argv.remove(0);
-    let remote = opts.remote_path.clone().unwrap_or_else(|| "fastrsync".to_string());
+    let remote = opts.remote_path.clone().unwrap_or_else(|| "barqsync".to_string());
     let quoted = shlex::try_quote(&remote)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad --remote-path: {e}")))?;
     Command::new(program)
@@ -126,7 +126,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
             let status = child.wait().ok().and_then(|s| s.code());
             out.error(
                 "connection unexpectedly closed before the handshake \
-                 (is fastrsync installed on the remote host? see --remote-path)",
+                 (is barqsync installed on the remote host? see --remote-path)",
             );
             return if status == Some(255) { exit::RSH } else { exit::PROTOCOL };
         }

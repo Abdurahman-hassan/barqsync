@@ -2,7 +2,7 @@
 # strace, perf and inferno for syscall counts and flamegraphs (original plan §8).
 #
 #   bench/net/container.sh build
-#   bench/net/container.sh net        # tc network profiles: rsync vs fastrsync over ssh
+#   bench/net/container.sh net        # tc network profiles: rsync vs barqsync over ssh
 #   bench/net/container.sh syscalls   # strace -c counts
 #   bench/net/container.sh flamegraph # perf + inferno
 FROM docker.io/library/rust:1-bookworm

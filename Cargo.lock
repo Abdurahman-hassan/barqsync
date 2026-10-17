@@ -119,6 +119,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "barqsync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "crossbeam-channel",
+ "ctrlc",
+ "dashmap",
+ "fastcdc",
+ "io-uring",
+ "jwalk",
+ "libc",
+ "memmap2",
+ "postcard",
+ "proptest",
+ "quinn",
+ "rayon",
+ "rcgen",
+ "rkyv",
+ "rustls",
+ "serde",
+ "shlex",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "xxhash-rust",
+ "zstd",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -531,38 +563,6 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
-
-[[package]]
-name = "fastrsync"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "crossbeam-channel",
- "ctrlc",
- "dashmap",
- "fastcdc",
- "io-uring",
- "jwalk",
- "libc",
- "memmap2",
- "postcard",
- "proptest",
- "quinn",
- "rayon",
- "rcgen",
- "rkyv",
- "rustls",
- "serde",
- "shlex",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "xxhash-rust",
- "zstd",
-]
 
 [[package]]
 name = "find-msvc-tools"

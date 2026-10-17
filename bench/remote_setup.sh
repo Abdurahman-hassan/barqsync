@@ -3,7 +3,7 @@
 #
 #   bench/remote_setup.sh user@host
 #
-# Builds fastrsync for the host's architecture, copies it to ~/bin/fastrsync there, and
+# Builds barqsync for the host's architecture, copies it to ~/bin/barqsync there, and
 # reports whether a reference rsync 3.x is available on the host.
 set -euo pipefail
 HOST=${1:?usage: bench/remote_setup.sh user@host}
@@ -27,8 +27,8 @@ echo "host: $HOST ($os/$arch) → $target"
 rustup target add "$target" >/dev/null 2>&1 || true
 cargo build --release -q --manifest-path "$ROOT/Cargo.toml" --target "$target"
 "${SSH[@]}" 'mkdir -p ~/bin'
-scp -q "$ROOT/target/$target/release/fastrsync" "$HOST:bin/fastrsync"
-echo "installed: $("${SSH[@]}" '~/bin/fastrsync --version')"
+scp -q "$ROOT/target/$target/release/barqsync" "$HOST:bin/barqsync"
+echo "installed: $("${SSH[@]}" '~/bin/barqsync --version')"
 
 ref=$("${SSH[@]}" 'for c in /usr/local/bin/rsync /opt/homebrew/bin/rsync /usr/bin/rsync; do v=$($c --version 2>/dev/null | head -1); case "$v" in "rsync  version 3"*) echo "$c"; exit;; esac; done' || true)
 if [[ -n "$ref" ]]; then
@@ -39,6 +39,6 @@ fi
 cat <<EOF
 
 Run the real-host tests and benchmarks with:
-  FASTRSYNC_TEST_REMOTE=$HOST FASTRSYNC_TEST_REMOTE_RSYNC=${ref:-<rsync path>} cargo test --test real_remote
-  REMOTE=$HOST REMOTE_FASTRSYNC=bin/fastrsync REMOTE_RSYNC=${ref:-<rsync path>} bench/run.sh <dir> D
+  BARQSYNC_TEST_REMOTE=$HOST BARQSYNC_TEST_REMOTE_RSYNC=${ref:-<rsync path>} cargo test --test real_remote
+  REMOTE=$HOST REMOTE_BARQSYNC=bin/barqsync REMOTE_RSYNC=${ref:-<rsync path>} bench/run.sh <dir> D
 EOF

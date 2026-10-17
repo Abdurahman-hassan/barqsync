@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(user_id(&name), Some(uid));
         let g = group_name(gid).expect("current group has a name");
         assert_eq!(group_id(&g), Some(gid));
-        assert_eq!(user_id(b"no-such-user-fastrsync"), None);
+        assert_eq!(user_id(b"no-such-user-barqsync"), None);
     }
 
     #[test]

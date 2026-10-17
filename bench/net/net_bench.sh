@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Network benchmarks (original plan §8): rsync vs fastrsync over a real sshd on loopback,
+# Network benchmarks (original plan §8): rsync vs barqsync over a real sshd on loopback,
 # with the link shaped by tc netem. Runs inside the container (bench/net/container.sh net).
 #
 # Profiles (netem applies on each pass through `lo`, so a round trip is delayed twice
@@ -24,16 +24,16 @@ WORKLOADS=${WORKLOADS:-small delta noop}
 VARIANTS=${VARIANTS:-rsync ssh ssh-tokio tcp tcp-tokio quic quic-rkyv}
 RUNS=${RUNS:-3}
 SCALE=${SCALE:-1}
-FR=/target/release/fastrsync
+FR=/target/release/barqsync
 W=/bench
 OUT=/work/bench/results
 mkdir -p "$OUT" "$W"
 tag=$(date +%Y%m%d-%H%M%S)
 REPORT="$OUT/net-$tag.md"
 
-echo "== building fastrsync (release)"
+echo "== building barqsync (release)"
 cargo build --release -q
-ln -sf "$FR" /usr/local/bin/fastrsync
+ln -sf "$FR" /usr/local/bin/barqsync
 
 echo "== starting sshd on 127.0.0.1"
 ssh-keygen -A >/dev/null
@@ -122,7 +122,7 @@ trap 'tc qdisc del dev lo root 2>/dev/null || true' EXIT
 {
   echo "# Network benchmarks ($tag)"
   echo
-  echo "rsync $(rsync --version | head -1 | awk '{print $3}') vs fastrsync, real sshd on loopback shaped with tc netem; $RUNS runs each."
+  echo "rsync $(rsync --version | head -1 | awk '{print $3}') vs barqsync, real sshd on loopback shaped with tc netem; $RUNS runs each."
   echo
 } > "$REPORT"
 
@@ -153,15 +153,15 @@ for p in $PROFILES; do
     for v in $VARIANTS; do
       case $v in
         rsync) cmds+=(-n "rsync" "$RSYNC_R $args") ;;
-        ssh) cmds+=(-n "fastrsync (ssh pipe)" "$FAST_SSH $args") ;;
-        ssh-tokio) cmds+=(-n "fastrsync ssh, tokio I/O" "$FAST_SSH_TOKIO $args") ;;
-        tcp) cmds+=(-n "fastrsync --streams 4" "$FAST_TCP $args") ;;
-        tcp-tokio) cmds+=(-n "fastrsync --streams 4, tokio I/O" "$FAST_TCP_TOKIO $args") ;;
-        quic) cmds+=(-n "fastrsync --transport quic" "$FAST_QUIC $args") ;;
-        quic-rkyv) cmds+=(-n "fastrsync quic + rkyv" "$FAST_QUIC_RKYV $args") ;;
-        fixed) cmds+=(-n "fastrsync --strategy fixed" "$FAST_FIXED $args") ;;
-        adaptive) cmds+=(-n "fastrsync --strategy adaptive" "$FAST_ADAPT $args") ;;
-        quic-adaptive) cmds+=(-n "fastrsync quic, adaptive" "$FAST_QUIC_ADAPT $args") ;;
+        ssh) cmds+=(-n "barqsync (ssh pipe)" "$FAST_SSH $args") ;;
+        ssh-tokio) cmds+=(-n "barqsync ssh, tokio I/O" "$FAST_SSH_TOKIO $args") ;;
+        tcp) cmds+=(-n "barqsync --streams 4" "$FAST_TCP $args") ;;
+        tcp-tokio) cmds+=(-n "barqsync --streams 4, tokio I/O" "$FAST_TCP_TOKIO $args") ;;
+        quic) cmds+=(-n "barqsync --transport quic" "$FAST_QUIC $args") ;;
+        quic-rkyv) cmds+=(-n "barqsync quic + rkyv" "$FAST_QUIC_RKYV $args") ;;
+        fixed) cmds+=(-n "barqsync --strategy fixed" "$FAST_FIXED $args") ;;
+        adaptive) cmds+=(-n "barqsync --strategy adaptive" "$FAST_ADAPT $args") ;;
+        quic-adaptive) cmds+=(-n "barqsync quic, adaptive" "$FAST_QUIC_ADAPT $args") ;;
         *) echo "unknown variant $v" >&2; exit 1 ;;
       esac
     done

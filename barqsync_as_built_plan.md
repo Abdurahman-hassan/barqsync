@@ -1,4 +1,4 @@
-# fastrsync: The Plan as Built
+# barqsync: The Plan as Built
 
 This document is a companion to `rust_rsync_replacement_master_plan.md`, in the same order. It
 describes what was built, what changed from the original plan and why, how it performs, and
@@ -15,7 +15,7 @@ default and the other stays selectable (§9).
 The main lesson from building it: **rsync 3.x is not slow because of its algorithms.** It
 already uses xxh128 checksums and zstd, and it pipelines its protocol. It is slow because it
 is single-threaded at both ends and does one blocking create/write/rename/utime sequence per
-file. fastrsync keeps rsync's command line and behavior, and gets its speed from:
+file. barqsync keeps rsync's command line and behavior, and gets its speed from:
 
 - parallelism: one task per directory, files copied in parallel;
 - fewer filesystem metadata operations;
@@ -39,9 +39,9 @@ SSD).
 
 ---
 
-## 2. Where rsync is slow, and what fastrsync does about it
+## 2. Where rsync is slow, and what barqsync does about it
 
-| rsync's real limit | fastrsync |
+| rsync's real limit | barqsync |
 |---|---|
 | One process walks the tree | One rayon task per directory; a directory's subtasks start as soon as its listing is read |
 | Receiver does every file sequentially | Files written in parallel (local pool, or the remote receiver's pool) |
@@ -148,7 +148,7 @@ crate underneath it, for explicit batching).
 ### Remote (ssh)
 
 ```
-client ──ssh──► fastrsync --server   (role, paths and options travel in the Hello frame)
+client ──ssh──► barqsync --server   (role, paths and options travel in the Hello frame)
 
 sender                                   receiver
   Roots ──────────────────────────────►  plan destination
@@ -285,7 +285,7 @@ one file use the same stream, so they stay in order.
 ### Testing
 
 - **Coverage:** 79 tests on macOS and 81 on Linux (aarch64 container, glibc rsync 3.2.7).
-- **Differential tests:** most tests run the same command through rsync and fastrsync and
+- **Differential tests:** most tests run the same command through rsync and barqsync and
   require identical printed items and identical trees (content, mode, mtime, symlink targets,
   hard-link groups).
 - **Remote tests:** run through a fake ssh that starts the server locally, against rsync over
@@ -322,7 +322,7 @@ bench/gen.py, run.sh  datasets A/B/C, hyperfine runner incl. remote (D) and --co
 All runs use hyperfine on a warm cache. Big-file runs were interleaved, because on this
 machine large sequential writes slow down as the SSD's write cache fills.
 
-| Workload | rsync | fastrsync |
+| Workload | rsync | barqsync |
 |---|---:|---:|
 | A: copy 200k × 4 KiB files | 43.5 s | 18.3 s (2.4×) |
 | A with `--inplace` (both tools) | 29.6 s | 11.6 s (2.6×) |
@@ -376,7 +376,7 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
 - **A real second machine.** Every network number so far is from `tc netem` on loopback in
   the Linux container. The Intel MacBook Pro at 192.168.1.13 is ready to be used once
   key-based ssh works (`ssh-copy-id -i ~/.ssh/id_ed25519.pub a.hamdy@192.168.1.13`, run by
-  you); then `bench/remote_setup.sh`, `FASTRSYNC_TEST_REMOTE=... cargo test --test real_remote`
+  you); then `bench/remote_setup.sh`, `BARQSYNC_TEST_REMOTE=... cargo test --test real_remote`
   and `REMOTE=... bench/run.sh DIR D` measure a real LAN, including `--transport quic`.
 - **Cold-cache runs** (`bench/run.sh DIR all --cold`) need `sudo purge` on macOS.
 - **NFS** isn't covered (no server).

@@ -1,8 +1,8 @@
 //! Opt-in tests against a real second machine over real ssh (key auth). Skipped unless
-//! `FASTRSYNC_TEST_REMOTE=user@host` is set; prepare the host with `bench/remote_setup.sh`.
+//! `BARQSYNC_TEST_REMOTE=user@host` is set; prepare the host with `bench/remote_setup.sh`.
 //!
-//! - `FASTRSYNC_TEST_REMOTE_BIN`: fastrsync on the host (default `bin/fastrsync`)
-//! - `FASTRSYNC_TEST_REMOTE_RSYNC`: rsync 3.x on the host, for the comparison test
+//! - `BARQSYNC_TEST_REMOTE_BIN`: barqsync on the host (default `bin/barqsync`)
+//! - `BARQSYNC_TEST_REMOTE_RSYNC`: rsync 3.x on the host, for the comparison test
 //!
 //! Each test round-trips a tree through the host (push, then pull back) and compares the
 //! result with the source, for every transport; the comparison test also pushes with
@@ -23,10 +23,10 @@ struct Host {
 
 impl Host {
     fn get(name: &str) -> Option<Host> {
-        let addr = std::env::var("FASTRSYNC_TEST_REMOTE").ok()?;
-        let bin = std::env::var("FASTRSYNC_TEST_REMOTE_BIN").unwrap_or_else(|_| "bin/fastrsync".into());
-        let rsync = std::env::var("FASTRSYNC_TEST_REMOTE_RSYNC").ok();
-        let dir = format!("/tmp/fastrsync-test-{name}-{}", std::process::id());
+        let addr = std::env::var("BARQSYNC_TEST_REMOTE").ok()?;
+        let bin = std::env::var("BARQSYNC_TEST_REMOTE_BIN").unwrap_or_else(|_| "bin/barqsync".into());
+        let rsync = std::env::var("BARQSYNC_TEST_REMOTE_RSYNC").ok();
+        let dir = format!("/tmp/barqsync-test-{name}-{}", std::process::id());
         let h = Host { addr, bin, rsync, dir };
         h.ssh(&format!("rm -rf '{0}' && mkdir -p '{0}'", h.dir));
         Some(h)
@@ -42,10 +42,10 @@ impl Host {
         format!("{}:{}/{sub}", self.addr, self.dir)
     }
 
-    fn fastrsync(&self, cwd: &Path, args: &[&str]) -> RunOut {
+    fn barqsync(&self, cwd: &Path, args: &[&str]) -> RunOut {
         let mut all = vec!["--remote-path".to_string(), self.bin.clone()];
         all.extend(args.iter().map(|a| a.to_string()));
-        fastrsync(cwd, &all.iter().map(String::as_str).collect::<Vec<_>>())
+        barqsync(cwd, &all.iter().map(String::as_str).collect::<Vec<_>>())
     }
 }
 
@@ -61,7 +61,7 @@ fn transports() -> Vec<Vec<&'static str>> {
 
 #[test]
 fn round_trip_through_real_host() {
-    let Some(h) = Host::get("roundtrip") else { return eprintln!("SKIP: FASTRSYNC_TEST_REMOTE not set") };
+    let Some(h) = Host::get("roundtrip") else { return eprintln!("SKIP: BARQSYNC_TEST_REMOTE not set") };
     let tmp = tempfile::tempdir().unwrap();
     rich_tree(&tmp.path().join("src"));
     for (i, t) in transports().iter().enumerate() {
@@ -70,13 +70,13 @@ fn round_trip_through_real_host() {
         push.extend(t);
         let target = format!("{}/", h.remote(&sub));
         push.extend(["src/", target.as_str()]);
-        let r = h.fastrsync(tmp.path(), &push);
+        let r = h.barqsync(tmp.path(), &push);
         assert_eq!(r.code, 0, "push {t:?}: {}", r.stderr);
         let back = format!("back{i}");
         let mut pull = vec!["-a"];
         pull.extend(t);
         pull.extend([target.as_str(), back.as_str()]);
-        let r = h.fastrsync(tmp.path(), &pull);
+        let r = h.barqsync(tmp.path(), &pull);
         assert_eq!(r.code, 0, "pull {t:?}: {}", r.stderr);
         assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join(&back), true));
     }
@@ -84,16 +84,16 @@ fn round_trip_through_real_host() {
 
 #[test]
 fn delta_over_a_real_link() {
-    let Some(h) = Host::get("delta") else { return eprintln!("SKIP: FASTRSYNC_TEST_REMOTE not set") };
+    let Some(h) = Host::get("delta") else { return eprintln!("SKIP: BARQSYNC_TEST_REMOTE not set") };
     let tmp = tempfile::tempdir().unwrap();
     let t = Tree::new(tmp.path().join("src"));
     let mut data: Vec<u8> = (0..8u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
     t.file("big.img", &data).settle_mtimes();
     let target = format!("{}/", h.remote("d"));
-    assert_eq!(h.fastrsync(tmp.path(), &["-a", "src/", &target]).code, 0);
+    assert_eq!(h.barqsync(tmp.path(), &["-a", "src/", &target]).code, 0);
     data[3_000_000..3_000_100].fill(0xAB);
     t.file("big.img", &data).mtime("big.img", BASE_TIME + 777);
-    let r = h.fastrsync(tmp.path(), &["-a", "--stats", "--strategy", "fixed", "src/", &target]);
+    let r = h.barqsync(tmp.path(), &["-a", "--stats", "--strategy", "fixed", "src/", &target]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     let literal: u64 = r
         .stdout
@@ -102,15 +102,15 @@ fn delta_over_a_real_link() {
         .and_then(|v| v.split_whitespace().next()?.parse().ok())
         .unwrap();
     assert!(literal < 1 << 20, "only the changed region should travel, sent {literal}");
-    assert_eq!(h.fastrsync(tmp.path(), &["-a", &target, "back"]).code, 0);
+    assert_eq!(h.barqsync(tmp.path(), &["-a", &target, "back"]).code, 0);
     assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("back"), true));
 }
 
 #[test]
 fn matches_rsync_between_the_same_machines() {
-    let Some(h) = Host::get("vs-rsync") else { return eprintln!("SKIP: FASTRSYNC_TEST_REMOTE not set") };
+    let Some(h) = Host::get("vs-rsync") else { return eprintln!("SKIP: BARQSYNC_TEST_REMOTE not set") };
     let (Some(remote_rsync), Some(local_rsync)) = (h.rsync.clone(), reference_rsync()) else {
-        return eprintln!("SKIP: set FASTRSYNC_TEST_REMOTE_RSYNC and install rsync 3.x locally");
+        return eprintln!("SKIP: set BARQSYNC_TEST_REMOTE_RSYNC and install rsync 3.x locally");
     };
     let tmp = tempfile::tempdir().unwrap();
     rich_tree(&tmp.path().join("src"));
@@ -120,7 +120,7 @@ fn matches_rsync_between_the_same_machines() {
         .output()
         .unwrap();
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
-    let f = h.fastrsync(tmp.path(), &["-ai", "src/", &format!("{}/", h.remote("f"))]);
+    let f = h.barqsync(tmp.path(), &["-ai", "src/", &format!("{}/", h.remote("f"))]);
     assert_eq!(f.code, 0, "{}", f.stderr);
     let rsync_items: Vec<String> = {
         let mut v: Vec<String> = String::from_utf8_lossy(&r.stdout).lines().map(str::to_string).filter(|l| !l.is_empty()).collect();
@@ -130,7 +130,7 @@ fn matches_rsync_between_the_same_machines() {
     assert_eq!(rsync_items, f.items());
     // Bring both results back with the same tool and compare.
     for d in ["r", "f"] {
-        assert_eq!(h.fastrsync(tmp.path(), &["-a", &format!("{}/", h.remote(d)), &format!("back-{d}")]).code, 0);
+        assert_eq!(h.barqsync(tmp.path(), &["-a", &format!("{}/", h.remote(d)), &format!("back-{d}")]).code, 0);
     }
     assert_same_tree(&snapshot(&tmp.path().join("back-r"), true), &snapshot(&tmp.path().join("back-f"), true));
 }

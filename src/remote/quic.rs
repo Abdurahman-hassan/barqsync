@@ -2,7 +2,7 @@
 //!
 //! Setup runs over the already authenticated ssh connection, like `--streams`:
 //! 1. the server opens a UDP endpoint on the address the client reached it at, with a
-//!    fresh self-signed certificate (ALPN `fastrsync`, TLS 1.3), and sends the address,
+//!    fresh self-signed certificate (ALPN `barqsync`, TLS 1.3), and sends the address,
 //!    the certificate's BLAKE3 fingerprint and a random token;
 //! 2. the client connects within 3 s, accepting only that certificate, opens the
 //!    bidirectional control stream and writes the token on it;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::io::SyncIoBridge;
 
-const ALPN: &[u8] = b"fastrsync";
+const ALPN: &[u8] = b"barqsync";
 /// The client gives up on QUIC (and stays on ssh) after this long.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long closing waits for the peer to take the last data.
@@ -87,7 +87,7 @@ pub fn listen() -> io::Result<(StreamOffer, Listener)> {
     };
     let addr = endpoint.local_addr()?;
     // The same test hook as `--streams`: advertise an unreachable address.
-    let advertised = std::env::var("FASTRSYNC_TEST_STREAM_ADDR").unwrap_or_else(|_| addr.to_string());
+    let advertised = std::env::var("BARQSYNC_TEST_STREAM_ADDR").unwrap_or_else(|_| addr.to_string());
     Ok((StreamOffer { addr: advertised, fingerprint, token }, Listener { endpoint, token }))
 }
 
@@ -221,7 +221,7 @@ impl Drop for Session {
     /// that), so close without waiting out QUIC's closing period (three probe timeouts,
     /// ~100 ms on a LAN): nothing is left to deliver.
     fn drop(&mut self) {
-        if std::env::var_os("FASTRSYNC_QUIC_STATS").is_some() {
+        if std::env::var_os("BARQSYNC_QUIC_STATS").is_some() {
             let s = self.conn.stats();
             eprintln!(
                 "quic: rtt {:?}, cwnd {}, sent {} pkts / {} B, lost {} pkts, congestion events {}, mtu {}",

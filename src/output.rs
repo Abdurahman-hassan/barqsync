@@ -311,10 +311,10 @@ impl Output {
     /// [`path_msg`], not `Path::display()`, which turns invalid UTF-8 into U+FFFD.
     pub fn error(&self, msg: impl AsRef<[u8]>) {
         if let Some(f) = &self.forward {
-            return f(true, true, &[b"fastrsync: ", msg.as_ref()].concat());
+            return f(true, true, &[b"barqsync: ", msg.as_ref()].concat());
         }
         self.flush();
-        let mut line = b"fastrsync: ".to_vec();
+        let mut line = b"barqsync: ".to_vec();
         escape(msg.as_ref(), self.charset, &mut line);
         line.push(b'\n');
         let _ = std::io::stderr().lock().write_all(&line);
@@ -374,7 +374,7 @@ fn locale_charset() -> Charset {
 /// reports UTF-8 on Darwin whatever the locale (measured with rsync 3.5.1 under LC_ALL=C
 /// and en_US.ISO8859-1), so valid UTF-8 is never escaped there. Mirrored rather than
 /// applying the Linux rule: APFS only stores UTF-8 names, and escaping them under
-/// LC_ALL=C would only make fastrsync's output differ from the local rsync's.
+/// LC_ALL=C would only make barqsync's output differ from the local rsync's.
 #[cfg(not(target_os = "linux"))]
 fn locale_charset() -> Charset {
     Charset::Utf8

@@ -1,5 +1,5 @@
 //! Remote transfers over a remote shell (ssh by default), like rsync's: the client
-//! runs `fastrsync --server` on the other machine and the two talk the protocol in
+//! runs `barqsync --server` on the other machine and the two talk the protocol in
 //! [`crate::proto`] over its stdin/stdout. Either side can be the sender; both sides
 //! run the same [`sender`] and [`receiver`] code.
 

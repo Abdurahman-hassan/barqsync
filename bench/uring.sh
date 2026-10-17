@@ -6,7 +6,7 @@
 # syscall count of the whole transfer (strace -f -c).
 set -euo pipefail
 RUNS=${RUNS:-5}
-FR=/target/release/fastrsync
+FR=/target/release/barqsync
 OUT=/work/bench/results
 tag=$(date +%Y%m%d-%H%M%S)
 REPORT="$OUT/uring-$tag.md"

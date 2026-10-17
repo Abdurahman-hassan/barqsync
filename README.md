@@ -1,9 +1,9 @@
-# fastrsync
+# barqsync
 
 A parallel, rsync-compatible file synchronizer written in Rust.
 
 rsync is single-threaded on both the sending and receiving side, and its receiver makes one
-blocking open/write/rename/utimes sequence per file. fastrsync keeps rsync's command line and
+blocking open/write/rename/utimes sequence per file. barqsync keeps rsync's command line and
 semantics but runs one task per directory across all cores, copies files in parallel, and
 uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 `copy_file_range`) so file data never passes through userspace when it doesn't need to.
@@ -35,7 +35,7 @@ The test suite passes on macOS (APFS) and Linux (aarch64 container, compared aga
 ```bash
 brew install rustup && rustup default stable   # macOS; or https://rustup.rs
 cargo build --release
-./target/release/fastrsync -av src/ dst/
+./target/release/barqsync -av src/ dst/
 ```
 
 With Homebrew's keg-only rustup, add `/opt/homebrew/opt/rustup/bin` to `PATH`.
@@ -90,33 +90,33 @@ Known differences:
 
 - On APFS, clones also carry extended attributes (rsync needs `-X` for those).
 - With `-H`, the same names end up sharing inodes as with rsync, but the name shown after
-  `=>` can differ. rsync links each group to the last name in its file list; fastrsync's
+  `=>` can differ. rsync links each group to the last name in its file list; barqsync's
   parallel walk links them to the first name it reaches.
 - `--progress` shows one overall line, like `--info=progress2`. Files are copied in
   parallel, so per-file progress lines would interleave meaninglessly.
 - `-R` with an absolute path: rsync shows the names with a leading `/` (`/private/...`),
-  fastrsync without it. The files land in the same place.
+  barqsync without it. The files land in the same place.
 - rsync doesn't strip comment lines from a `--files-from` list it forwards to a remote
-  sender, and it rejects names like `a/../b` there. fastrsync handles both the same way
+  sender, and it rejects names like `a/../b` there. barqsync handles both the same way
   in every direction.
 - `--partial` keeps the contiguous received prefix of the files in flight. rsync handles one
-  file at a time, so it keeps at most one partial file; fastrsync can keep several.
+  file at a time, so it keeps at most one partial file; barqsync can keep several.
 - After a missing `--files-from` entry, rsync leaves out the "created directory" line;
-  fastrsync prints it.
+  barqsync prints it.
 - With `-K`, rsync on macOS also tries to chmod the symlink and fails ("Too many levels of
-  symbolic links"); fastrsync leaves the mode alone.
+  symbolic links"); barqsync leaves the mode alone.
 
 ## Remote transfers
 
 ```bash
-fastrsync -avz src/ user@host:/backup/src/        # push
-fastrsync -av user@host:/data/ ./data/            # pull
-fastrsync -av -e "ssh -p 2222" --remote-path=/opt/bin/fastrsync src/ host:dst/
+barqsync -avz src/ user@host:/backup/src/        # push
+barqsync -av user@host:/data/ ./data/            # pull
+barqsync -av -e "ssh -p 2222" --remote-path=/opt/bin/barqsync src/ host:dst/
 ```
 
-Like rsync, the client starts `fastrsync --server` on the other machine through the remote
-shell (`ssh` by default, `-e` or `FASTRSYNC_RSH` to change it, `--remote-path` when the binary
-isn't on the remote `PATH`). fastrsync has to be installed on both ends. Either side can be the
+Like rsync, the client starts `barqsync --server` on the other machine through the remote
+shell (`ssh` by default, `-e` or `BARQSYNC_RSH` to change it, `--remote-path` when the binary
+isn't on the remote `PATH`). barqsync has to be installed on both ends. Either side can be the
 sender, and both sides run the same code:
 
 - **Pipelined listings.** The sender scans in parallel and streams one listing per directory
@@ -163,7 +163,7 @@ thread per stream instead of in a single ssh process. `--streams N` on its own m
 
 The original plan's transport. Setup works like `--streams`: over the authenticated ssh
 connection the server opens a UDP endpoint on the address the client reached it at, with a
-fresh self-signed certificate (TLS 1.3, ALPN `fastrsync`), and sends the address, the
+fresh self-signed certificate (TLS 1.3, ALPN `barqsync`), and sends the address, the
 certificate's BLAKE3 fingerprint and a random token. The client connects within 3 s,
 accepting only that certificate, and presents the token on the first stream; the server
 acknowledges it. Then:
@@ -487,9 +487,9 @@ cargo test
 The delta engine also has property tests (random insert/delete/overwrite/append/truncate
 sequences; every delta must rebuild the new file exactly via both rebuild and clone+patch).
 `PROPTEST_CASES=5000 cargo test --release delta` runs a longer sweep.
-`FASTRSYNC_DELTA=cdc cargo test` runs the whole suite with `--delta=cdc` as the default;
-`FASTRSYNC_SCANNER=jwalk`, `FASTRSYNC_TRANSPORT=quic`, `FASTRSYNC_WIRE=rkyv` and
-`FASTRSYNC_NET_IO=tokio` do the same for the other alternatives.
+`BARQSYNC_DELTA=cdc cargo test` runs the whole suite with `--delta=cdc` as the default;
+`BARQSYNC_SCANNER=jwalk`, `BARQSYNC_TRANSPORT=quic`, `BARQSYNC_WIRE=rkyv` and
+`BARQSYNC_NET_IO=tokio` do the same for the other alternatives.
 
 The integration tests run each scenario through the reference rsync 3.x as well (found at
 `/opt/homebrew/bin/rsync`, `/usr/local/bin/rsync` or `/usr/bin/rsync`, or set
@@ -513,13 +513,13 @@ clones, e.g. for copies to another volume.
 
 ```bash
 bench/net/container.sh build              # Linux image: sshd, tc, strace, perf, inferno
-bench/net/container.sh net lan wan lossy  # rsync vs fastrsync over real ssh, tc-shaped links
+bench/net/container.sh net lan wan lossy  # rsync vs barqsync over real ssh, tc-shaped links
 bench/net/container.sh syscalls           # strace -c syscall counts
 bench/net/container.sh flamegraph copy    # perf flamegraph (copy | noop | delta)
 bench/net/container.sh test               # cargo test + clippy on Linux
 bench/flamegraph.sh copy                  # macOS flamegraph via `sample` (cargo install inferno)
-bench/remote_setup.sh user@host           # install fastrsync on a real second machine
-FASTRSYNC_TEST_REMOTE=user@host cargo test --test real_remote   # tests over real ssh
+bench/remote_setup.sh user@host           # install barqsync on a real second machine
+BARQSYNC_TEST_REMOTE=user@host cargo test --test real_remote   # tests over real ssh
 ```
 
 - **What the container does:** it shapes its own loopback interface with `tc netem`, so ssh,
@@ -539,7 +539,7 @@ FASTRSYNC_TEST_REMOTE=user@host cargo test --test real_remote   # tests over rea
 Final measurement (M14, default options, 3 runs each, `bench/run.sh DIR all`; the M6 numbers
 for comparison):
 
-| Workload | rsync | fastrsync | speedup | at M6 |
+| Workload | rsync | barqsync | speedup | at M6 |
 | --- | ---: | ---: | ---: | ---: |
 | A: fresh copy, 200k × 4 KiB files, `-a` | 42.4 s | 20.5 s | 2.1× | 2.4× |
 | A with `--inplace` (both tools) | 30.0 s | 11.7 s | 2.6× | 2.6× |
@@ -551,14 +551,14 @@ for comparison):
 
 rsync's no-op and delta times varied more in this run (C 12.2 s at M6, ±6 s here), so the
 speedups are best read as ranges. A fresh copy is 0.2–2 s slower than at M6 run to run (the
-SSD's state matters more than any code change in between); fastrsync still beats a clone
+SSD's state matters more than any code change in between); barqsync still beats a clone
 copy (`cp -ac`) of the same tree.
 
 Benchmark D: remote push through a local fake-ssh shim (`bench/run.sh DIR D`). That measures
 the protocol and parallelism over a pipe, not a network; link profiles are in
 [Transports and wire formats](#transports-and-wire-formats-measured).
 
-| D: remote push (pipe) | rsync | fastrsync | speedup | at M6 |
+| D: remote push (pipe) | rsync | barqsync | speedup | at M6 |
 | --- | ---: | ---: | ---: | ---: |
 | fresh copy, 200k × 4 KiB files | 42.4 s | 19.3 s | 2.2× | 2.7× |
 | fresh copy, `--streams 4` (TLS over loopback) | 42.4 s | 16.4 s | 2.6× | 2.6× |
@@ -641,7 +641,7 @@ and per-thread 1 MiB copy buffers are held at once; bounding that is on the list
 
 ### Over a network (Linux container, real sshd, `tc netem` on loopback, data on tmpfs, 3 runs)
 
-| Profile | Workload | rsync | fastrsync (ssh) | fastrsync `--streams 4` |
+| Profile | Workload | rsync | barqsync (ssh) | barqsync `--streams 4` |
 |---|---|---:|---:|---:|
 | LAN 1 Gbit | 8k × 4 KiB push | 0.49 s | **0.46 s** | 0.47 s |
 | LAN | 256 MiB, 8 × 1 MiB changed | 0.49 s | **0.34 s** | 0.35 s |
@@ -657,20 +657,20 @@ What this shows:
 
 - **When a transfer is limited by the link or by ssh, the tools tie.** Both push data through
   ssh's single encryption thread (~130 MB/s in this VM).
-- **fastrsync wins on no-ops** (1.7–2.6×), where rsync's single-threaded scan dominates.
+- **barqsync wins on no-ops** (1.7–2.6×), where rsync's single-threaded scan dominates.
 - **`--streams` wins big on lossy links** (3.3×). One TCP flow can't fill a lossy,
   high-latency link; several can. On clean links its extra connection setup costs a little.
 - **One big file gains nothing from `--streams`:** all frames of a file use one stream.
 
 Syscalls (`strace -c -f`, Linux, 20k files; the original plan's bar is ≥ 50% fewer than rsync):
 
-| Workload | rsync | fastrsync |
+| Workload | rsync | barqsync |
 |---|---:|---:|
 | Copy 20k × 4 KiB | 404,488 | **182,155** (−55%) |
 | No-op over 20k files | 42,684 | 44,410 (+4%) |
 
 - **No-op:** both tools need two stats per file (source and destination), and Linux has no
-  bulk stat, so the no-op count can't drop much. fastrsync's no-op speed comes from
+  bulk stat, so the no-op count can't drop much. barqsync's no-op speed comes from
   parallelism.
 - **Copy:** getting under the bar took two fixes found in these traces. An extra
   `copy_file_range` call per file only to see EOF is now skipped. A `fchmod` after every

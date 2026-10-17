@@ -1,5 +1,5 @@
 //! End-to-end local sync tests. Most are differential: the same command runs through
-//! the reference rsync and fastrsync, and both the printed items and the resulting
+//! the reference rsync and barqsync, and both the printed items and the resulting
 //! trees must match.
 
 mod common;
@@ -37,10 +37,10 @@ fn no_trailing_slash_copies_the_directory_itself() {
 fn second_run_is_a_noop() {
     let tmp = tempfile::tempdir().unwrap();
     rich_tree(&tmp.path().join("src"));
-    let first = fastrsync(tmp.path(), &["-a", "src/", "dst"]);
+    let first = barqsync(tmp.path(), &["-a", "src/", "dst"]);
     assert_eq!(first.code, 0, "{}", first.stderr);
     let before = snapshot(&tmp.path().join("dst"), true);
-    let second = fastrsync(tmp.path(), &["-a", "--out-format=%n", "src/", "dst"]);
+    let second = barqsync(tmp.path(), &["-a", "--out-format=%n", "src/", "dst"]);
     assert_eq!(second.code, 0, "{}", second.stderr);
     assert_eq!(second.stdout, "", "nothing should be transferred on a no-op sync");
     assert_eq!(before, snapshot(&tmp.path().join("dst"), true));
@@ -54,7 +54,7 @@ fn incremental_changes_with_delete_match_rsync() {
     let tmp = tempfile::tempdir().unwrap();
     let t = rich_tree(&tmp.path().join("src"));
     for d in ["dr", "df"] {
-        let r = fastrsync(tmp.path(), &["-a", "src/", d]);
+        let r = barqsync(tmp.path(), &["-a", "src/", d]);
         assert_eq!(r.code, 0, "{}", r.stderr);
     }
     // Mutate the source in every way the quick check must notice.
@@ -184,13 +184,13 @@ fn recursive_without_times_matches_rsync() {
 fn single_file_copies_and_renames() {
     let tmp = tempfile::tempdir().unwrap();
     Tree::new(tmp.path()).file("one.txt", "1").dir("into");
-    let r = fastrsync(tmp.path(), &["-a", "one.txt", "renamed.txt"]);
+    let r = barqsync(tmp.path(), &["-a", "one.txt", "renamed.txt"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(fs::read_to_string(tmp.path().join("renamed.txt")).unwrap(), "1");
-    let r = fastrsync(tmp.path(), &["-a", "one.txt", "into"]);
+    let r = barqsync(tmp.path(), &["-a", "one.txt", "into"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(fs::read_to_string(tmp.path().join("into/one.txt")).unwrap(), "1");
-    let r = fastrsync(tmp.path(), &["-a", "one.txt", "newdir/"]);
+    let r = barqsync(tmp.path(), &["-a", "one.txt", "newdir/"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(fs::read_to_string(tmp.path().join("newdir/one.txt")).unwrap(), "1");
 }
@@ -214,7 +214,7 @@ fn read_only_source_directories_are_filled_then_locked() {
     let tmp = tempfile::tempdir().unwrap();
     let t = Tree::new(tmp.path().join("src"));
     t.file("ro/inner/f", "data").chmod("ro/inner", 0o555).chmod("ro", 0o500).settle_mtimes();
-    let r = fastrsync(tmp.path(), &["-a", "src/", "dst"]);
+    let r = barqsync(tmp.path(), &["-a", "src/", "dst"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(fs::read_to_string(tmp.path().join("dst/ro/inner/f")).unwrap(), "data");
     let snap_src = snapshot(&tmp.path().join("src"), true);
@@ -256,9 +256,9 @@ fn inplace_and_fsync_produce_correct_files() {
     let tmp = tempfile::tempdir().unwrap();
     let t = Tree::new(tmp.path().join("src"));
     t.file("f", "first").settle_mtimes();
-    assert_eq!(fastrsync(tmp.path(), &["-a", "src/", "dst"]).code, 0);
+    assert_eq!(barqsync(tmp.path(), &["-a", "src/", "dst"]).code, 0);
     t.file("f", "second version").settle_mtimes();
-    let r = fastrsync(tmp.path(), &["-a", "--inplace", "--fsync", "src/", "dst"]);
+    let r = barqsync(tmp.path(), &["-a", "--inplace", "--fsync", "src/", "dst"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
 }
@@ -275,7 +275,7 @@ fn big_files_with_and_without_cache_hints() {
         let mut args = vec!["-a"];
         args.extend_from_slice(extra);
         args.extend_from_slice(&["src/", dst]);
-        let r = fastrsync(tmp.path(), &args);
+        let r = barqsync(tmp.path(), &args);
         assert_eq!(r.code, 0, "{extra:?}: {}", r.stderr);
         assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join(dst), true));
     }
@@ -286,7 +286,7 @@ fn big_files_with_and_without_cache_hints() {
             let mut args = vec!["-a"];
             args.extend_from_slice(extra);
             args.extend_from_slice(&["src/", dst]);
-            let r = fastrsync(tmp.path(), &args);
+            let r = barqsync(tmp.path(), &args);
             assert_eq!(r.code, 0, "{extra:?}: {}", r.stderr);
             assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join(dst), true));
         }
@@ -297,7 +297,7 @@ fn big_files_with_and_without_cache_hints() {
 fn missing_source_reports_partial_transfer() {
     let tmp = tempfile::tempdir().unwrap();
     Tree::new(tmp.path().join("src")).file("ok", "1");
-    let r = fastrsync(tmp.path(), &["-a", "src", "nope", "dst"]);
+    let r = barqsync(tmp.path(), &["-a", "src", "nope", "dst"]);
     assert_eq!(r.code, 23);
     assert!(r.stderr.contains("nope"), "{}", r.stderr);
     assert!(tmp.path().join("dst/src/ok").exists());
@@ -307,7 +307,7 @@ fn missing_source_reports_partial_transfer() {
 fn no_temp_files_left_behind() {
     let tmp = tempfile::tempdir().unwrap();
     rich_tree(&tmp.path().join("src"));
-    assert_eq!(fastrsync(tmp.path(), &["-a", "src/", "dst"]).code, 0);
+    assert_eq!(barqsync(tmp.path(), &["-a", "src/", "dst"]).code, 0);
     let snap = snapshot(&tmp.path().join("dst"), false);
     let stray: Vec<_> = snap
         .keys()
@@ -331,13 +331,13 @@ fn non_utf8_names_round_trip() {
     for name in [&b"bad-\xff\xfe-1"[..], b"bad-\xff\xfe-2", b"\xc3\x28"] {
         fs::write(src.join(OsStr::from_bytes(name)), name).unwrap();
     }
-    let r = fastrsync_os(tmp.path(), &[OsStr::new("-a"), OsStr::new("src/"), OsStr::new("dst")]);
+    let r = barqsync_os(tmp.path(), &[OsStr::new("-a"), OsStr::new("src/"), OsStr::new("dst")]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_same_tree(&snapshot(&src, true), &snapshot(&tmp.path().join("dst"), true));
 }
 
 /// Build `src` with a file, a directory (holding `x`) and a symlink per name (its target
-/// is the name plus an invalid UTF-8 byte), then compare rsync's and fastrsync's raw
+/// is the name plus an invalid UTF-8 byte), then compare rsync's and barqsync's raw
 /// output under LC_ALL=`locale`, with and without `-8`, for `-rv --delete` (symlinks are
 /// skipped as non-regular files) and `-av --delete` (`name -> target`). Each destination
 /// starts with a stale file per name, so `deleting` lines are covered too.
@@ -369,7 +369,7 @@ fn assert_names_escaped_like_rsync(names: &[&[u8]], locale: &str) {
             }
             args.extend(["src/", "{dst}"]);
             let (r, f) = both_in_locale(tmp.path(), locale, &args, &dr, &df).unwrap();
-            assert_eq!((r.code, f.code), (0, 0), "{args:?}\nrsync: {}\nfastrsync: {}", r.stderr, f.stderr);
+            assert_eq!((r.code, f.code), (0, 0), "{args:?}\nrsync: {}\nbarqsync: {}", r.stderr, f.stderr);
             assert_eq!(shown(r.raw_items()), shown(f.raw_items()), "LC_ALL={locale} {args:?}");
             assert!(
                 !f.raw.iter().any(|&b| b < b' ' && b != b'\n' && b != b'\t'),
@@ -440,7 +440,7 @@ fn error_messages_escape_invalid_utf8_like_rsync() {
     Tree::new(tmp.path().join("src")).file("ok", "1");
     let args = |dst: &'static str| [OsStr::new("-a"), OsStr::new("src/ok"), OsStr::from_bytes(b"src/no\xff"), OsStr::new(dst)];
     for locale in ["C.UTF-8", "C"] {
-        let f = fastrsync_os_in_locale(tmp.path(), locale, &args("dst-f"));
+        let f = barqsync_os_in_locale(tmp.path(), locale, &args("dst-f"));
         assert_eq!(f.code, 23, "LC_ALL={locale}: {}", f.stderr);
         assert!(f.stderr.contains(r#"link_stat "src/no\#377" failed"#), "LC_ALL={locale}: {}", f.stderr);
         if let Some(r) = rsync_os_in_locale(tmp.path(), locale, &args("dst-r")) {

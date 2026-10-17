@@ -43,7 +43,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-pub const MAGIC: [u8; 8] = *b"FASTRSYN";
+pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 pub const VERSION: u32 = 5;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
@@ -424,11 +424,11 @@ impl Conn {
         // Frames are up to ~4 MiB, so these bound memory to a few tens of MiB per side.
         let (tx, wrx) = bounded::<Vec<u8>>(16);
         let (rtx, rx) = bounded::<io::Result<Frame>>(16);
-        let writer = spawn_writer("fastrsync-writer".into(), writer, wrx);
+        let writer = spawn_writer("barqsync-writer".into(), writer, wrx);
         let spare = Arc::new(std::sync::Mutex::new(Some(rtx.clone())));
         let spare2 = spare.clone();
         std::thread::Builder::new()
-            .name("fastrsync-reader".into())
+            .name("barqsync-reader".into())
             .spawn(move || {
                 let _clear = ClearOnDrop(spare2);
                 let mut r = io::BufReader::with_capacity(256 << 10, reader);
@@ -460,7 +460,7 @@ impl Conn {
         }
     }
 
-    /// [`Conn::start`] with tokio tasks instead of threads (`FASTRSYNC_NET_IO=tokio`).
+    /// [`Conn::start`] with tokio tasks instead of threads (`BARQSYNC_NET_IO=tokio`).
     pub fn start_async(
         reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
         writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -521,7 +521,7 @@ impl Conn {
         for (i, s) in streams.into_iter().enumerate() {
             // Shallow queues: N streams × depth × ~4 MiB frames is the memory bound.
             let (tx, wrx) = bounded::<Vec<u8>>(4);
-            self.data_writers.push(Joiner::Thread(spawn_writer(format!("fastrsync-data-{i}"), s, wrx)));
+            self.data_writers.push(Joiner::Thread(spawn_writer(format!("barqsync-data-{i}"), s, wrx)));
             senders.push(Tx::Thread(tx));
         }
         self.out.data = Some(Arc::new(senders));
@@ -534,7 +534,7 @@ impl Conn {
             let rtx = rtx.clone();
             self.data_in += 1;
             std::thread::Builder::new()
-                .name(format!("fastrsync-data-{i}"))
+                .name(format!("barqsync-data-{i}"))
                 .spawn(move || {
                     let mut r = io::BufReader::with_capacity(256 << 10, s);
                     loop {
@@ -665,7 +665,7 @@ mod tests {
         let name = std::ffi::OsString::from_vec(vec![b'a', 0xff, b'\n']);
         let mut sel = Sel { named: true, ..Sel::default() };
         sel.children.insert(b"sub".to_vec(), Sel { contents: true, ..Sel::default() });
-        let opts = crate::cli::Options::parse_from(["fastrsync", "-a", "--partial-dir=.p", "src/", "dst"]).unwrap();
+        let opts = crate::cli::Options::parse_from(["barqsync", "-a", "--partial-dir=.p", "src/", "dst"]).unwrap();
         let sig = crate::delta::cdc::signature(&[5u8; 300_000], &crate::delta::Params::DEFAULT);
         vec![
             Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender: false, opts: Box::new(opts) },

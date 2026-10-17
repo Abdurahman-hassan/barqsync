@@ -2,7 +2,7 @@
 # Run the Linux verification suite in a privileged Podman (or Docker) container.
 #
 #   bench/net/container.sh build                 build the image (once)
-#   bench/net/container.sh net [profiles...]     rsync vs fastrsync over real ssh, tc-shaped
+#   bench/net/container.sh net [profiles...]     rsync vs barqsync over real ssh, tc-shaped
 #   bench/net/container.sh syscalls              strace -c syscall counts
 #   bench/net/container.sh flamegraph [workload] perf + inferno flamegraph
 #   bench/net/container.sh test                  cargo test + clippy on Linux
@@ -13,7 +13,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 ENGINE=${ENGINE:-$(command -v podman || command -v /opt/podman/bin/podman || command -v docker)}
-IMAGE=fastrsync-bench
+IMAGE=barqsync-bench
 cmd=${1:-help}
 shift || true
 
@@ -22,7 +22,7 @@ run() {
   # small-file writes erratic, which would measure the VM's disk instead of the network.
   "$ENGINE" run --rm --privileged --security-opt seccomp=unconfined \
     --tmpfs /bench:rw,size=2g --tmpfs /dst:rw,size=2g \
-    -v "$ROOT":/work -w /work -v fastrsync-target:/target -e CARGO_TARGET_DIR=/target \
+    -v "$ROOT":/work -w /work -v barqsync-target:/target -e CARGO_TARGET_DIR=/target \
     -e RUNS="${RUNS:-3}" -e SCALE="${SCALE:-1}" "$@"
 }
 

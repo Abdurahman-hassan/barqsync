@@ -9,13 +9,13 @@
 # command per round) because big sequential writes slow down as the SSD's write cache
 # fills, which would favour whichever command ran first. Remote runs go through a local
 # fake-ssh shim: they measure signatures, matching and the protocol, not a network.
-# Env: FASTRSYNC=/path/to/fastrsync  RUNS=3  DATASETS="B E"
+# Env: BARQSYNC=/path/to/barqsync  RUNS=3  DATASETS="B E"
 set -euo pipefail
 
 DIR=${1:?usage: bench/delta_modes.sh BENCH_DIR [local|remote|all]}
 WHICH=${2:-all}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-FR=${FASTRSYNC:-$ROOT/target/release/fastrsync}
+FR=${BARQSYNC:-$ROOT/target/release/barqsync}
 RUNS=${RUNS:-3}
 OUT=$ROOT/bench/results
 mkdir -p "$OUT"
@@ -30,7 +30,7 @@ report=$OUT/delta-modes-$tag.md
 {
   echo "# --delta=blocks vs --delta=cdc ($tag)"
   echo
-  echo "$(uname -sm), $(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) cpus, $RUNS interleaved runs, warm cache; fastrsync $("$FR" --version)"
+  echo "$(uname -sm), $(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) cpus, $RUNS interleaved runs, warm cache; barqsync $("$FR" --version)"
   echo
   echo "| Dataset | Where | Command | Mean (s) | Min (s) | Max (s) | Literal | Matched |"
   echo "|---|---|---|---:|---:|---:|---:|---:|"

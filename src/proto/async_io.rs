@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 static RT: LazyLock<Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_name("fastrsync-net")
+        .thread_name("barqsync-net")
         .enable_all()
         .build()
         .expect("start the network runtime")
@@ -35,7 +35,7 @@ pub fn rt() -> &'static Runtime {
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// `--net-io=tokio` (hidden; `FASTRSYNC_NET_IO`): drive the ssh pipe and TCP streams from
+/// `--net-io=tokio` (hidden; `BARQSYNC_NET_IO`): drive the ssh pipe and TCP streams from
 /// tokio tasks. The client passes it on to the server's command line.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);

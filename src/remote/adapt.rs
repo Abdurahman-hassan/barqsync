@@ -14,7 +14,7 @@
 //!   zstd level 1 from 1 Gbit/s, 3 from 100 Mbit/s, 6 below, stepped down while compressing
 //!   can't keep up with the link.
 //!
-//! `-W` / `--no-whole-file` fix the routing and skip the probe; `FASTRSYNC_TEST_LINK_BPS`
+//! `-W` / `--no-whole-file` fix the routing and skip the probe; `BARQSYNC_TEST_LINK_BPS`
 //! replaces it (tests).
 
 use super::{Stop, recv_until};
@@ -70,7 +70,7 @@ impl LinkInfo {
 /// Sender side: measure the link and tell the receiver. Output the receiver forwards
 /// meanwhile is printed.
 pub(crate) fn probe(conn: &Conn, out: &Output) -> Result<LinkInfo, Stop> {
-    let forced = std::env::var("FASTRSYNC_TEST_LINK_BPS").ok().and_then(|v| v.parse().ok());
+    let forced = std::env::var("BARQSYNC_TEST_LINK_BPS").ok().and_then(|v| v.parse().ok());
     let link = match forced {
         Some(bps) => LinkInfo { bps, rtt_us: 0 },
         None => {

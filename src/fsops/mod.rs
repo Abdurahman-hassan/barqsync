@@ -157,11 +157,11 @@ pub fn read_dir_meta(dir: &Path) -> io::Result<Vec<DirEnt>> {
     read_dir_stat(dir)
 }
 
-/// `FASTRSYNC_NO_BULK=1` forces the per-entry `fstatat` path (for benchmarking).
+/// `BARQSYNC_NO_BULK=1` forces the per-entry `fstatat` path (for benchmarking).
 #[cfg(target_os = "macos")]
 fn bulk_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FASTRSYNC_NO_BULK").is_some())
+    *OFF.get_or_init(|| std::env::var_os("BARQSYNC_NO_BULK").is_some())
 }
 
 /// `readdir` + one `fstatat` per entry.
@@ -232,7 +232,7 @@ static SIGNALS: AtomicU32 = AtomicU32::new(0);
 pub fn on_interrupt(code: i32) {
     if SIGNALS.fetch_add(1, Ordering::SeqCst) == 0 {
         INTERRUPTED.store(true, Ordering::SeqCst);
-        eprintln!("\nfastrsync: interrupted, finishing in-flight files (Ctrl-C again to force)");
+        eprintln!("\nbarqsync: interrupted, finishing in-flight files (Ctrl-C again to force)");
     } else {
         cleanup_temps();
         std::process::exit(code);

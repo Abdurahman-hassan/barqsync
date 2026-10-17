@@ -27,7 +27,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Name in the certificate. Never resolved: the client checks the fingerprint instead.
-pub(crate) const CERT_NAME: &str = "fastrsync.invalid";
+pub(crate) const CERT_NAME: &str = "barqsync.invalid";
 /// Per-connection limit for the TCP connect, TLS handshake and token exchange.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -56,7 +56,7 @@ pub(crate) fn listen_ip() -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
-/// An authenticated data stream: blocking, or driven by tokio (`FASTRSYNC_NET_IO=tokio`).
+/// An authenticated data stream: blocking, or driven by tokio (`BARQSYNC_NET_IO=tokio`).
 pub enum DataStream {
     Sync(Box<dyn Stream>),
     Async(Box<dyn AsyncStream>),
@@ -101,7 +101,7 @@ pub fn listen(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
         let (accepted, stop) = (accepted.clone(), stop.clone());
-        std::thread::Builder::new().name("fastrsync-accept".into()).spawn(move || {
+        std::thread::Builder::new().name("barqsync-accept".into()).spawn(move || {
             while !stop.load(Ordering::SeqCst) && accepted.0.lock().unwrap().len() < max {
                 match listener.accept() {
                     Ok((sock, _)) => {
@@ -117,7 +117,7 @@ pub fn listen(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
         })?
     };
     // A test hook: advertise a different (e.g. unreachable) address to exercise fallback.
-    let advertised = std::env::var("FASTRSYNC_TEST_STREAM_ADDR").unwrap_or_else(|_| addr.to_string());
+    let advertised = std::env::var("BARQSYNC_TEST_STREAM_ADDR").unwrap_or_else(|_| addr.to_string());
     Ok((StreamOffer { addr: advertised, fingerprint, token }, Acceptor { accepted, stop, thread: Some(thread) }))
 }
 
@@ -243,7 +243,7 @@ pub fn connect(offer: &StreamOffer, n: usize) -> Vec<DataStream> {
 }
 
 // ---------------------------------------------------------------------------
-// The same over tokio (`FASTRSYNC_NET_IO=tokio`)
+// The same over tokio (`BARQSYNC_NET_IO=tokio`)
 // ---------------------------------------------------------------------------
 
 fn listen_async(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
@@ -296,7 +296,7 @@ fn listen_async(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
             }
         });
     }
-    let advertised = std::env::var("FASTRSYNC_TEST_STREAM_ADDR").unwrap_or_else(|_| addr.to_string());
+    let advertised = std::env::var("BARQSYNC_TEST_STREAM_ADDR").unwrap_or_else(|_| addr.to_string());
     Ok((StreamOffer { addr: advertised, fingerprint, token }, Acceptor { accepted, stop, thread: None }))
 }
 

@@ -6,12 +6,12 @@
 #   bench/transport_modes.sh BENCH_DIR
 #
 # A: 200k x 4 KiB files, fresh push. C: 500k files, 3 changed (metadata-bound).
-# Env: FASTRSYNC=/path/to/fastrsync  RUNS=3
+# Env: BARQSYNC=/path/to/barqsync  RUNS=3
 set -euo pipefail
 
 DIR=${1:?usage: bench/transport_modes.sh BENCH_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-FR=${FASTRSYNC:-$ROOT/target/release/fastrsync}
+FR=${BARQSYNC:-$ROOT/target/release/barqsync}
 RUNS=${RUNS:-3}
 OUT=$ROOT/bench/results
 mkdir -p "$OUT"

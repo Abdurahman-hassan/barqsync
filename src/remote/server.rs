@@ -1,4 +1,4 @@
-//! `fastrsync --server`: the remote end, started by the client over ssh. Everything it
+//! `barqsync --server`: the remote end, started by the client over ssh. Everything it
 //! needs (role, paths, options) arrives in the `Hello` frame on stdin; stdout carries
 //! only protocol frames, so all output is forwarded to the client as `Log` frames.
 
@@ -12,7 +12,7 @@ pub fn run() -> i32 {
     let mut conn = match async_stdio() {
         Some(Ok((r, w))) => Conn::start_async(r, w, false),
         Some(Err(e)) => {
-            eprintln!("fastrsync --server: stdin/stdout: {e}");
+            eprintln!("barqsync --server: stdin/stdout: {e}");
             return exit::IPC;
         }
         None => Conn::start(std::io::stdin(), std::io::stdout(), false),
@@ -28,7 +28,7 @@ pub fn run() -> i32 {
             (server_is_sender, opts)
         }
         _ => {
-            eprintln!("fastrsync --server: expected a fastrsync client handshake on stdin");
+            eprintln!("barqsync --server: expected a barqsync client handshake on stdin");
             return exit::PROTOCOL;
         }
     };
@@ -39,7 +39,7 @@ pub fn run() -> i32 {
         return exit::PROTOCOL;
     }
     if let Err(e) = streams::setup_server(&mut conn, opts.transport, opts.streams, server_is_sender) {
-        eprintln!("fastrsync --server: setting up parallel streams failed: {e}");
+        eprintln!("barqsync --server: setting up parallel streams failed: {e}");
         let _ = conn.msg(Msg::Fatal { msg: format!("parallel stream setup failed: {e}") });
         let _ = conn.finish();
         return exit::PROTOCOL;
@@ -70,7 +70,7 @@ pub fn run() -> i32 {
     code
 }
 
-/// `FASTRSYNC_NET_IO=tokio`: stdin and stdout (duplicated) as non-blocking tokio I/O.
+/// `BARQSYNC_NET_IO=tokio`: stdin and stdout (duplicated) as non-blocking tokio I/O.
 fn async_stdio() -> Option<std::io::Result<(FdIo, FdIo)>> {
     use std::os::fd::{FromRawFd, OwnedFd};
     if !crate::proto::async_io::enabled() {

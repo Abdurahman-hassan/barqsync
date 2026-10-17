@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Benchmark fastrsync against rsync with hyperfine.
+# Benchmark barqsync against rsync with hyperfine.
 #
 #   bench/gen.py  BENCH_DIR A B C      # create datasets first
 #   bench/run.sh  BENCH_DIR [A|B|C|D|all] [--cold]
 #
 # --cold drops the OS page cache before every run (macOS: `sudo purge`,
 # Linux: drop_caches) so disk I/O is measured, not RAM; it needs sudo.
-# Env: RSYNC=/path/to/rsync  FASTRSYNC=/path/to/fastrsync  RUNS=5
+# Env: RSYNC=/path/to/rsync  BARQSYNC=/path/to/barqsync  RUNS=5
 set -euo pipefail
 
 DIR=${1:?usage: bench/run.sh BENCH_DIR [A|B|C|D|all] [--cold]}
 WHICH=${2:-all}
 COLD=${3:-}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-FR=${FASTRSYNC:-$ROOT/target/release/fastrsync}
+FR=${BARQSYNC:-$ROOT/target/release/barqsync}
 RUNS=${RUNS:-5}
 OUT=$ROOT/bench/results
 mkdir -p "$OUT"
@@ -36,7 +36,7 @@ else
 fi
 
 rv=$("$RSYNC" --version); echo "rsync:     $RSYNC (${rv%%$'\n'*})"
-echo "fastrsync: $FR ($("$FR" --version))"
+echo "barqsync: $FR ($("$FR" --version))"
 echo "machine:   $(uname -sm), $(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) cpus, cache: ${COLD:-warm}"
 echo
 
@@ -51,9 +51,9 @@ if [[ "$WHICH" == A || "$WHICH" == all ]]; then
   hyperfine --runs "$RUNS" --warmup 1 \
     --prepare "rm -rf '$DIR/A_dst'$CACHE" \
     -n "rsync -a" "'$RSYNC' -a '$DIR/A_src/' '$DIR/A_dst/'" \
-    -n "fastrsync -a" "'$FR' -a '$DIR/A_src/' '$DIR/A_dst/'" \
+    -n "barqsync -a" "'$FR' -a '$DIR/A_src/' '$DIR/A_dst/'" \
     -n "rsync -a --inplace" "'$RSYNC' -a --inplace '$DIR/A_src/' '$DIR/A_dst/'" \
-    -n "fastrsync -a --inplace" "'$FR' -a --inplace '$DIR/A_src/' '$DIR/A_dst/'" \
+    -n "barqsync -a --inplace" "'$FR' -a --inplace '$DIR/A_src/' '$DIR/A_dst/'" \
     -n "cp -a" "cp -a '$DIR/A_src/' '$DIR/A_dst/'" \
     -n "$CP_FAST_NAME" "$CP_FAST '$DIR/A_src/' '$DIR/A_dst/'" \
     --export-markdown "$OUT/A-$tag.md"
@@ -69,10 +69,10 @@ if [[ "$WHICH" == B || "$WHICH" == all ]]; then
     --prepare "$RESET$CACHE" \
     -n "rsync -a" "'$RSYNC' -a '$DIR/B_src.img' '$DIR/B_work.img'" \
     -n "rsync -a --no-whole-file" "'$RSYNC' -a --no-whole-file '$DIR/B_src.img' '$DIR/B_work.img'" \
-    -n "fastrsync -a" "'$FR' -a '$DIR/B_src.img' '$DIR/B_work.img'" \
-    -n "fastrsync -a --no-whole-file" "'$FR' -a --no-whole-file '$DIR/B_src.img' '$DIR/B_work.img'" \
-    -n "fastrsync -a --no-whole-file --no-clone" "'$FR' -a --no-whole-file --no-clone '$DIR/B_src.img' '$DIR/B_work.img'" \
-    -n "fastrsync -a --no-clone" "'$FR' -a --no-clone '$DIR/B_src.img' '$DIR/B_work.img'" \
+    -n "barqsync -a" "'$FR' -a '$DIR/B_src.img' '$DIR/B_work.img'" \
+    -n "barqsync -a --no-whole-file" "'$FR' -a --no-whole-file '$DIR/B_src.img' '$DIR/B_work.img'" \
+    -n "barqsync -a --no-whole-file --no-clone" "'$FR' -a --no-whole-file --no-clone '$DIR/B_src.img' '$DIR/B_work.img'" \
+    -n "barqsync -a --no-clone" "'$FR' -a --no-clone '$DIR/B_src.img' '$DIR/B_work.img'" \
     --export-markdown "$OUT/B-$tag.md"
   rm -f "$DIR/B_work.img"
 fi
@@ -85,20 +85,20 @@ if [[ "$WHICH" == C || "$WHICH" == all ]]; then
   hyperfine --runs "$RUNS" --warmup 1 \
     --prepare "$MUT$CACHE" \
     -n "rsync -a" "'$RSYNC' -a '$DIR/C_src/' '$DIR/C_dst/'" \
-    -n "fastrsync -a" "'$FR' -a '$DIR/C_src/' '$DIR/C_dst/'" \
+    -n "barqsync -a" "'$FR' -a '$DIR/C_src/' '$DIR/C_dst/'" \
     --export-markdown "$OUT/C-$tag.md"
 fi
 
 if [[ "$WHICH" == D || "$WHICH" == all ]]; then
-  # Remote transfers. With REMOTE=user@host (fastrsync and rsync installed there, both
-  # on PATH or given via REMOTE_FASTRSYNC / REMOTE_RSYNC) this goes over real ssh;
+  # Remote transfers. With REMOTE=user@host (barqsync and rsync installed there, both
+  # on PATH or given via REMOTE_BARQSYNC / REMOTE_RSYNC) this goes over real ssh;
   # otherwise through a local fake-ssh shim, which measures the protocol and the
   # parallelism over a pipe but not a network.
   [[ -d "$DIR/A_src" && -d "$DIR/C_src" ]] || { echo "missing A_src/C_src (run bench/gen.py $DIR A C)" >&2; exit 1; }
   if [[ -n "${REMOTE:-}" ]]; then
-    HOST=$REMOTE; RDIR=${REMOTE_DIR:-/tmp/fastrsync-bench-remote}
+    HOST=$REMOTE; RDIR=${REMOTE_DIR:-/tmp/barqsync-bench-remote}
     RSH_R="-e ssh"; RSH_F="-e ssh"
-    RPATH_R=${REMOTE_RSYNC:+--rsync-path=$REMOTE_RSYNC}; RPATH_F=${REMOTE_FASTRSYNC:+--remote-path=$REMOTE_FASTRSYNC}
+    RPATH_R=${REMOTE_RSYNC:+--rsync-path=$REMOTE_RSYNC}; RPATH_F=${REMOTE_BARQSYNC:+--remote-path=$REMOTE_BARQSYNC}
     CLEAN="ssh $HOST rm -rf '$RDIR/D_dst'"
   else
     HOST=fakehost; RDIR=$DIR
@@ -111,8 +111,8 @@ if [[ "$WHICH" == D || "$WHICH" == all ]]; then
   hyperfine --runs "$RUNS" --warmup 1 \
     --prepare "$CLEAN$CACHE" \
     -n "rsync -a (remote)" "'$RSYNC' -a $RSH_R $RPATH_R '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
-    -n "fastrsync -a (remote)" "'$FR' -a $RSH_F $RPATH_F '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
-    -n "fastrsync -a --streams 4 (remote)" "'$FR' -a --streams 4 $RSH_F $RPATH_F '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
+    -n "barqsync -a (remote)" "'$FR' -a $RSH_F $RPATH_F '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
+    -n "barqsync -a --streams 4 (remote)" "'$FR' -a --streams 4 $RSH_F $RPATH_F '$DIR/A_src/' $HOST:'$RDIR/D_dst/'" \
     --export-markdown "$OUT/D1-$tag.md"
   echo "== D2: remote push, near no-op of C ($HOST)"
   eval "$CLEAN"
@@ -121,8 +121,8 @@ if [[ "$WHICH" == D || "$WHICH" == all ]]; then
   hyperfine --runs "$RUNS" --warmup 1 \
     --prepare "$MUT$CACHE" \
     -n "rsync -a (remote)" "'$RSYNC' -a $RSH_R $RPATH_R '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
-    -n "fastrsync -a (remote)" "'$FR' -a $RSH_F $RPATH_F '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
-    -n "fastrsync -a --streams 4 (remote)" "'$FR' -a --streams 4 $RSH_F $RPATH_F '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
+    -n "barqsync -a (remote)" "'$FR' -a $RSH_F $RPATH_F '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
+    -n "barqsync -a --streams 4 (remote)" "'$FR' -a --streams 4 $RSH_F $RPATH_F '$DIR/C_src/' $HOST:'$RDIR/D_dst/'" \
     --export-markdown "$OUT/D2-$tag.md"
   eval "$CLEAN"
 fi

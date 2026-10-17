@@ -128,11 +128,11 @@ fn hard_links_match_rsync_locally() {
     assert_same_tree(&snapshot(&tmp.path().join("dr"), true), &snapshot(&tmp.path().join("df"), true));
 
     // A second run changes nothing; a broken link is repaired.
-    let again = fastrsync(tmp.path(), &["-aHi", "src/", "df"]);
+    let again = barqsync(tmp.path(), &["-aHi", "src/", "df"]);
     assert_eq!(again.items(), Vec::<String>::new());
     fs::remove_file(tmp.path().join("df/dir2/h3")).unwrap();
     fs::write(tmp.path().join("df/dir2/h3"), "different content").unwrap();
-    let fix = fastrsync(tmp.path(), &["-aHi", "src/", "df"]);
+    let fix = barqsync(tmp.path(), &["-aHi", "src/", "df"]);
     assert_eq!(fix.code, 0, "{}", fix.stderr);
     assert!(fix.items().iter().any(|l| l.starts_with("hf") && l.contains("dir2/h3 => ")), "{:?}", fix.items());
     assert_eq!(link_groups(&tmp.path().join("df")), groups);
@@ -143,7 +143,7 @@ fn hard_links_over_the_wire() {
     let tmp = tempfile::tempdir().unwrap();
     hardlink_tree(&tmp.path().join("src"));
     for (args, dst) in [(["-aH", "src/", "{host}pushed"], "pushed"), (["-aH", "{host}src/", "pulled"], "pulled")] {
-        let f = fastrsync_remote(tmp.path(), &args);
+        let f = barqsync_remote(tmp.path(), &args);
         assert_eq!(f.code, 0, "{}", f.stderr);
         assert_eq!(link_groups(&tmp.path().join(dst)), link_groups(&tmp.path().join("src")));
         assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join(dst), true));
@@ -154,7 +154,7 @@ fn hard_links_over_the_wire() {
 fn without_hard_links_flag_names_are_separate_files() {
     let tmp = tempfile::tempdir().unwrap();
     hardlink_tree(&tmp.path().join("src"));
-    assert_eq!(fastrsync(tmp.path(), &["-a", "src/", "df"]).code, 0);
+    assert_eq!(barqsync(tmp.path(), &["-a", "src/", "df"]).code, 0);
     assert!(link_groups(&tmp.path().join("df")).is_empty());
 }
 
@@ -167,7 +167,7 @@ fn progress_reports_final_totals() {
     }
     for flag in ["--progress", "--info=progress2", "-P"] {
         let dst = format!("dst{flag}");
-        let f = fastrsync(tmp.path(), &["-a", flag, "src/", &dst]);
+        let f = barqsync(tmp.path(), &["-a", flag, "src/", &dst]);
         assert_eq!(f.code, 0, "{}", f.stderr);
         let last = f.stdout.lines().last().unwrap_or("").trim_start_matches('\r').to_string();
         assert!(last.contains("50,000 100%"), "{flag}: {last:?}");

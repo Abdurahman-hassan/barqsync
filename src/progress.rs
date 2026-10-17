@@ -80,7 +80,7 @@ impl Reporter {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stop2 = stop.clone();
         let thread = std::thread::Builder::new()
-            .name("fastrsync-progress".into())
+            .name("barqsync-progress".into())
             .spawn(move || {
                 let (lock, cvar) = &*stop2;
                 let mut stopped = lock.lock().unwrap();

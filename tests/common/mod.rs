@@ -1,4 +1,4 @@
-//! Test helpers: tree builders, snapshots, and running fastrsync / reference rsync.
+//! Test helpers: tree builders, snapshots, and running barqsync / reference rsync.
 
 #![allow(dead_code)]
 
@@ -208,14 +208,14 @@ pub fn assert_same_tree(a: &BTreeMap<Vec<u8>, Node>, b: &BTreeMap<Vec<u8>, Node>
         match b.get(k) {
             None => msg += &format!("  only in rsync:     {} {:?}\n", String::from_utf8_lossy(k), v),
             Some(w) if w != v => {
-                msg += &format!("  {}:\n    rsync:     {:?}\n    fastrsync: {:?}\n", String::from_utf8_lossy(k), v, w)
+                msg += &format!("  {}:\n    rsync:     {:?}\n    barqsync: {:?}\n", String::from_utf8_lossy(k), v, w)
             }
             _ => {}
         }
     }
     for (k, v) in b {
         if !a.contains_key(k) {
-            msg += &format!("  only in fastrsync: {} {:?}\n", String::from_utf8_lossy(k), v);
+            msg += &format!("  only in barqsync: {} {:?}\n", String::from_utf8_lossy(k), v);
         }
     }
     panic!("{msg}");
@@ -273,24 +273,24 @@ pub fn run(cmd: &mut Command, cwd: &Path) -> RunOut {
 }
 
 /// Locale (LC_ALL) for both tools in differential runs. Under C/POSIX, the default in
-/// containers and CI, glibc rsync and fastrsync on Linux escape non-ASCII names as
+/// containers and CI, glibc rsync and barqsync on Linux escape non-ASCII names as
 /// `\#ooo`; UTF-8 keeps them readable. Tests of that escaping pick their own locale.
 pub const TEST_LOCALE: &str = "C.UTF-8";
 
-pub fn fastrsync(cwd: &Path, args: &[&str]) -> RunOut {
-    fastrsync_in_locale(cwd, TEST_LOCALE, args)
+pub fn barqsync(cwd: &Path, args: &[&str]) -> RunOut {
+    barqsync_in_locale(cwd, TEST_LOCALE, args)
 }
 
-pub fn fastrsync_in_locale(cwd: &Path, locale: &str, args: &[&str]) -> RunOut {
-    run(Command::new(env!("CARGO_BIN_EXE_fastrsync")).env("LC_ALL", locale).args(args), cwd)
+pub fn barqsync_in_locale(cwd: &Path, locale: &str, args: &[&str]) -> RunOut {
+    run(Command::new(env!("CARGO_BIN_EXE_barqsync")).env("LC_ALL", locale).args(args), cwd)
 }
 
-pub fn fastrsync_os(cwd: &Path, args: &[&OsStr]) -> RunOut {
-    fastrsync_os_in_locale(cwd, TEST_LOCALE, args)
+pub fn barqsync_os(cwd: &Path, args: &[&OsStr]) -> RunOut {
+    barqsync_os_in_locale(cwd, TEST_LOCALE, args)
 }
 
-pub fn fastrsync_os_in_locale(cwd: &Path, locale: &str, args: &[&OsStr]) -> RunOut {
-    run(Command::new(env!("CARGO_BIN_EXE_fastrsync")).env("LC_ALL", locale).args(args), cwd)
+pub fn barqsync_os_in_locale(cwd: &Path, locale: &str, args: &[&OsStr]) -> RunOut {
+    run(Command::new(env!("CARGO_BIN_EXE_barqsync")).env("LC_ALL", locale).args(args), cwd)
 }
 
 /// Reference rsync (3.x, not openrsync). `RSYNC=/path` overrides discovery.
@@ -325,8 +325,8 @@ pub fn rsync_os_in_locale(cwd: &Path, locale: &str, args: &[&OsStr]) -> Option<R
     Some(run(Command::new(r).env("LC_ALL", locale).args(args), cwd))
 }
 
-/// Run the same arguments through rsync and fastrsync, substituting `{dst}`
-/// with a per-tool destination. Returns (rsync, fastrsync) results, or None
+/// Run the same arguments through rsync and barqsync, substituting `{dst}`
+/// with a per-tool destination. Returns (rsync, barqsync) results, or None
 /// when no reference rsync is installed.
 pub fn both(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
     both_in_locale(cwd, TEST_LOCALE, args, dst_r, dst_f)
@@ -339,7 +339,7 @@ pub fn both_in_locale(cwd: &Path, locale: &str, args: &[&str], dst_r: &str, dst_
     let ra = sub(dst_r);
     let fa = sub(dst_f);
     let r = rsync_in_locale(cwd, locale, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
-    let f = fastrsync_in_locale(cwd, locale, &fa.iter().map(String::as_str).collect::<Vec<_>>());
+    let f = barqsync_in_locale(cwd, locale, &fa.iter().map(String::as_str).collect::<Vec<_>>());
     Some((r, f))
 }
 
@@ -392,13 +392,13 @@ pub fn fake_ssh(dir: &Path) -> PathBuf {
     p
 }
 
-/// Run `args` through rsync and fastrsync as a remote transfer via [`fake_ssh`].
+/// Run `args` through rsync and barqsync as a remote transfer via [`fake_ssh`].
 /// `{dst}` becomes the per-tool name and `{host}` the `fakehost:` prefix.
 pub fn both_remote(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
     both_remote_env(cwd, args, dst_r, dst_f, &[])
 }
 
-/// [`both_remote`] with extra environment for fastrsync.
+/// [`both_remote`] with extra environment for barqsync.
 pub fn both_remote_env(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str, env: &[(&str, &str)]) -> Option<(RunOut, RunOut)> {
     let rsync_bin = reference_rsync()?;
     let shim = fake_ssh(cwd);
@@ -408,10 +408,10 @@ pub fn both_remote_env(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str, env:
     };
     let mut ra = vec!["-e".to_string(), shim.to_string(), format!("--rsync-path={}", rsync_bin.display())];
     ra.extend(sub(dst_r));
-    let mut fa = vec!["-e".to_string(), shim.to_string(), format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync"))];
+    let mut fa = vec!["-e".to_string(), shim.to_string(), format!("--remote-path={}", env!("CARGO_BIN_EXE_barqsync"))];
     fa.extend(sub(dst_f));
     let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fastrsync"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_barqsync"));
     cmd.env("LC_ALL", TEST_LOCALE).args(&fa);
     for (k, v) in env {
         cmd.env(k, v);
@@ -453,8 +453,8 @@ rm -f "$fifo"
     p
 }
 
-/// [`both_remote`] through a given remote-shell stand-in. fastrsync stays on the ssh
-/// pipe with the fixed strategy (whatever `FASTRSYNC_TRANSPORT` / `FASTRSYNC_STRATEGY`
+/// [`both_remote`] through a given remote-shell stand-in. barqsync stays on the ssh
+/// pipe with the fixed strategy (whatever `BARQSYNC_TRANSPORT` / `BARQSYNC_STRATEGY`
 /// say), so the shim sees all of its traffic and no link probe.
 pub fn both_remote_via(cwd: &Path, shim: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> Option<(RunOut, RunOut)> {
     let rsync_bin = reference_rsync()?;
@@ -464,25 +464,25 @@ pub fn both_remote_via(cwd: &Path, shim: &Path, args: &[&str], dst_r: &str, dst_
     };
     let mut ra = vec!["-e".to_string(), shim.to_string(), format!("--rsync-path={}", rsync_bin.display())];
     ra.extend(sub(dst_r));
-    let mut fa = vec!["-e".to_string(), shim.to_string(), format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync"))];
+    let mut fa = vec!["-e".to_string(), shim.to_string(), format!("--remote-path={}", env!("CARGO_BIN_EXE_barqsync"))];
     fa.extend(sub(dst_f));
     let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>())?;
     let f = run(
-        Command::new(env!("CARGO_BIN_EXE_fastrsync"))
+        Command::new(env!("CARGO_BIN_EXE_barqsync"))
             .env("LC_ALL", TEST_LOCALE)
-            .env("FASTRSYNC_TRANSPORT", "ssh")
-            .env("FASTRSYNC_STRATEGY", "fixed")
+            .env("BARQSYNC_TRANSPORT", "ssh")
+            .env("BARQSYNC_STRATEGY", "fixed")
             .args(&fa),
         cwd,
     );
     Some((r, f))
 }
 
-/// fastrsync alone as a remote transfer via [`fake_ssh`] (`{host}` = `fakehost:`).
-pub fn fastrsync_remote(cwd: &Path, args: &[&str]) -> RunOut {
+/// barqsync alone as a remote transfer via [`fake_ssh`] (`{host}` = `fakehost:`).
+pub fn barqsync_remote(cwd: &Path, args: &[&str]) -> RunOut {
     let shim = fake_ssh(cwd);
     let mut fa = vec!["-e".to_string(), shim.to_str().unwrap().to_string()];
-    fa.push(format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync")));
+    fa.push(format!("--remote-path={}", env!("CARGO_BIN_EXE_barqsync")));
     fa.extend(args.iter().map(|a| a.replace("{host}", "fakehost:")));
-    fastrsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>())
+    barqsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>())
 }

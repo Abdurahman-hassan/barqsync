@@ -1,6 +1,6 @@
 //! `--scanner=jwalk` (the original plan's scan + index + queues) end to end: the same
 //! commands must leave the same trees and print the same items as rsync. The whole
-//! suite also runs under this scanner with `FASTRSYNC_SCANNER=jwalk cargo test`.
+//! suite also runs under this scanner with `BARQSYNC_SCANNER=jwalk cargo test`.
 
 mod common;
 
@@ -9,17 +9,17 @@ use std::fs;
 
 const J: &str = "--scanner=jwalk";
 
-/// [`both`] with `--scanner=jwalk` for fastrsync only.
+/// [`both`] with `--scanner=jwalk` for barqsync only.
 fn both_j(cwd: &std::path::Path, args: &[&str]) -> (RunOut, RunOut) {
     let sub = |d: &str| -> Vec<String> { args.iter().map(|a| a.replace("{dst}", d)).collect() };
     let ra = sub("dr");
     let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
     let mut fa = vec![J.to_string()];
     fa.extend(sub("df"));
-    (r, fastrsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>()))
+    (r, barqsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>()))
 }
 
-/// [`both_remote`] with `--scanner=jwalk` for fastrsync only (it reaches the receiver
+/// [`both_remote`] with `--scanner=jwalk` for barqsync only (it reaches the receiver
 /// through the options the client sends).
 fn both_remote_j(cwd: &std::path::Path, args: &[&str]) -> (RunOut, RunOut) {
     let shim = fake_ssh(cwd);
@@ -29,7 +29,7 @@ fn both_remote_j(cwd: &std::path::Path, args: &[&str]) -> (RunOut, RunOut) {
     let r = rsync(cwd, &ra.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
     let mut fa = vec![J.to_string()];
     fa.extend(args.iter().map(|a| a.replace("{dst}", "df")));
-    (r, fastrsync_remote(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>()))
+    (r, barqsync_remote(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>()))
 }
 
 /// Mutate a synced copy of [`rich_tree`] in every way the engine must notice.
@@ -74,7 +74,7 @@ fn fresh_copy_and_incremental_sync_match_rsync() {
     let (r, f) = both_j(tmp.path(), &["-ai", "--delete", "src/", "{dst}"]);
     check(tmp.path(), &r, &f, true);
     // Nothing left to do.
-    let f = fastrsync(tmp.path(), &["-ai", "--delete", J, "src/", "df"]);
+    let f = barqsync(tmp.path(), &["-ai", "--delete", J, "src/", "df"]);
     assert_eq!((f.code, f.items()), (0, Vec::<String>::new()), "{}", f.stderr);
 }
 
@@ -151,7 +151,7 @@ fn many_directories_and_files() {
     t.settle_mtimes();
     for scanner in ["--scanner=jwalk", "--scanner=dirtask"] {
         let dst = format!("dst-{scanner}");
-        let f = fastrsync(tmp.path(), &["-a", scanner, "src/", &dst]);
+        let f = barqsync(tmp.path(), &["-a", scanner, "src/", &dst]);
         assert_eq!(f.code, 0, "{}", f.stderr);
         assert_same_tree(&snapshot(&tmp.path().join("src"), false), &snapshot(&tmp.path().join(&dst), false));
     }

@@ -852,7 +852,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
     engine.remote = Some(state);
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
-        .thread_name(|i| format!("fastrsync-recv-{i}"))
+        .thread_name(|i| format!("barqsync-recv-{i}"))
         .stack_size(WORKER_STACK)
         .build()
     {

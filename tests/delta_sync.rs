@@ -85,7 +85,7 @@ fn check_mode(extra: &[&str]) {
     let mut args = vec!["-a", "--no-whole-file", "--stats"];
     args.extend_from_slice(extra);
     args.extend_from_slice(&["src/", "df"]);
-    let f = fastrsync(tmp.path(), &args);
+    let f = barqsync(tmp.path(), &args);
     assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
 
     // Byte-exact result, attributes included.
@@ -146,7 +146,7 @@ fn cdc_delta_rebuild_without_clones() {
 fn whole_file_is_still_the_local_default() {
     let tmp = tempfile::tempdir().unwrap();
     setup(tmp.path(), &["df"]);
-    let f = fastrsync(tmp.path(), &["-a", "--stats", "src/", "df"]);
+    let f = barqsync(tmp.path(), &["-a", "--stats", "src/", "df"]);
     assert_eq!(f.code, 0, "{}", f.stderr);
     assert_eq!(stat_bytes(&f.stdout, "Matched data: "), 0);
 }

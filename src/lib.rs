@@ -1,4 +1,4 @@
-//! fastrsync: a parallel, rsync-compatible file synchronizer.
+//! barqsync: a parallel, rsync-compatible file synchronizer.
 
 pub mod checksum;
 pub mod chmod;
@@ -43,11 +43,11 @@ pub fn run(opts: Options) -> i32 {
     fsops::cache::set_enabled(opts.drop_cache);
     let paths = &opts.paths;
     if paths.len() < 2 {
-        eprintln!("fastrsync: need at least one SRC and a DEST (listing mode is not supported)");
+        eprintln!("barqsync: need at least one SRC and a DEST (listing mode is not supported)");
         return exit::SYNTAX;
     }
     if opts.files_from.is_some() && paths.len() != 2 {
-        eprintln!("fastrsync: --files-from takes exactly one SRC and a DEST");
+        eprintln!("barqsync: --files-from takes exactly one SRC and a DEST");
         return exit::SYNTAX;
     }
     let (sources, dest) = paths.split_at(paths.len() - 1);

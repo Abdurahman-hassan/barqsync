@@ -6,13 +6,13 @@
 #
 # A: 200k x 4 KiB files, fresh copy. C: 500k x 1 KiB files, near no-op (3 files changed),
 # also with --delete. Remote runs go through a local fake-ssh shim (the receiver scans
-# the destination). Env: FASTRSYNC=/path/to/fastrsync  RUNS=5
+# the destination). Env: BARQSYNC=/path/to/barqsync  RUNS=5
 set -euo pipefail
 
 DIR=${1:?usage: bench/scanner_modes.sh BENCH_DIR [local|remote|all]}
 WHICH=${2:-all}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-FR=${FASTRSYNC:-$ROOT/target/release/fastrsync}
+FR=${BARQSYNC:-$ROOT/target/release/barqsync}
 RUNS=${RUNS:-5}
 OUT=$ROOT/bench/results
 mkdir -p "$OUT"

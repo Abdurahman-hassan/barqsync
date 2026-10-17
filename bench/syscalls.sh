@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Syscall counts (original plan §8, step 3): `strace -c -f` for rsync vs fastrsync.
-# The plan's bar: fastrsync should make at least 50% fewer syscalls than `rsync -a`.
+# Syscall counts (original plan §8, step 3): `strace -c -f` for rsync vs barqsync.
+# The plan's bar: barqsync should make at least 50% fewer syscalls than `rsync -a`.
 # Linux only; run inside the container: bench/net/container.sh syscalls
 set -euo pipefail
 SCALE=${SCALE:-1}
@@ -9,7 +9,7 @@ OUT=/work/bench/results
 mkdir -p "$OUT" "$W"
 tag=$(date +%Y%m%d-%H%M%S)
 REPORT="$OUT/syscalls-$tag.md"
-FR=/target/release/fastrsync
+FR=/target/release/barqsync
 cargo build --release -q
 
 python3 - "$W" "$SCALE" <<'EOF'
@@ -42,7 +42,7 @@ top() {
 {
   echo "# Syscall counts ($tag)"
   echo
-  echo "| Workload | rsync | fastrsync | fastrsync / rsync |"
+  echo "| Workload | rsync | barqsync | barqsync / rsync |"
   echo "|---|---:|---:|---:|"
 } > "$REPORT"
 

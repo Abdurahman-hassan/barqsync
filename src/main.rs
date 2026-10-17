@@ -1,5 +1,5 @@
-use fastrsync::cli::Options;
-use fastrsync::{exit, fsops};
+use barqsync::cli::Options;
+use barqsync::{exit, fsops};
 
 fn main() {
     let opts = match Options::parse_from(std::env::args_os()) {
@@ -11,11 +11,11 @@ fn main() {
                 std::process::exit(code);
             }
             Err(e) => {
-                eprintln!("fastrsync: {e:#}");
+                eprintln!("barqsync: {e:#}");
                 std::process::exit(exit::SYNTAX);
             }
         },
     };
     let _ = ctrlc::set_handler(|| fsops::on_interrupt(exit::SIGNAL));
-    std::process::exit(fastrsync::run(opts));
+    std::process::exit(barqsync::run(opts));
 }

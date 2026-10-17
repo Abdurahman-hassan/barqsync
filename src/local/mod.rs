@@ -158,7 +158,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // so nesting gets deep with many directories (5000 overflowed the 2 MiB default).
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
-        .thread_name(|i| format!("fastrsync-{i}"))
+        .thread_name(|i| format!("barqsync-{i}"))
         .stack_size(crate::remote::WORKER_STACK)
         .build()
     {

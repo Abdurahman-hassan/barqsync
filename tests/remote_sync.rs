@@ -41,7 +41,7 @@ fn incremental_push_with_delete_matches_rsync() {
     let tmp = tempfile::tempdir().unwrap();
     let t = rich_tree(&tmp.path().join("src"));
     for d in ["dr", "df"] {
-        assert_eq!(fastrsync(tmp.path(), &["-a", "src/", d]).code, 0);
+        assert_eq!(barqsync(tmp.path(), &["-a", "src/", d]).code, 0);
     }
     t.file("a.txt", "ALPHA\n")
         .file("sub/b.txt", "bravo-appended")
@@ -142,7 +142,7 @@ fn delta_over_the_wire() {
             } else {
                 args.extend_from_slice(&["src/", "{host}dst"]);
             }
-            let f = fastrsync_remote(tmp.path(), &args);
+            let f = barqsync_remote(tmp.path(), &args);
             assert_eq!(f.code, 0, "{extra:?} pull={pull}\n{}\n{}", f.stdout, f.stderr);
             let mut want = snapshot(&tmp.path().join("src"), true);
             let got = snapshot(&tmp.path().join("dst"), true);
@@ -160,7 +160,7 @@ fn delta_over_the_wire() {
 fn whole_file_flag_disables_remote_delta() {
     let tmp = tempfile::tempdir().unwrap();
     delta_fixture(tmp.path());
-    let f = fastrsync_remote(tmp.path(), &["-a", "-W", "--stats", "src/", "{host}dst"]);
+    let f = barqsync_remote(tmp.path(), &["-a", "-W", "--stats", "src/", "{host}dst"]);
     assert_eq!(f.code, 0, "{}", f.stderr);
     assert_eq!(stat_bytes(&f.stdout, "Matched data: "), 0);
     let mut want = snapshot(&tmp.path().join("src"), true);
@@ -187,7 +187,7 @@ fn many_small_files_are_packed() {
         }
         let target = format!("{{host}}{dst}");
         args.extend_from_slice(&["src/", &target]);
-        let f = fastrsync_remote(tmp.path(), &args);
+        let f = barqsync_remote(tmp.path(), &args);
         assert_eq!(f.code, 0, "{}", f.stderr);
         assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join(dst), true));
     }
@@ -197,10 +197,10 @@ fn many_small_files_are_packed() {
 fn single_file_to_new_remote_name() {
     let tmp = tempfile::tempdir().unwrap();
     Tree::new(tmp.path()).file("one.txt", "1").dir("into");
-    let r = fastrsync_remote(tmp.path(), &["-a", "one.txt", "{host}renamed.txt"]);
+    let r = barqsync_remote(tmp.path(), &["-a", "one.txt", "{host}renamed.txt"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(fs::read_to_string(tmp.path().join("renamed.txt")).unwrap(), "1");
-    let r = fastrsync_remote(tmp.path(), &["-a", "{host}one.txt", "into/"]);
+    let r = barqsync_remote(tmp.path(), &["-a", "{host}one.txt", "into/"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(fs::read_to_string(tmp.path().join("into/one.txt")).unwrap(), "1");
 }
@@ -209,12 +209,12 @@ fn single_file_to_new_remote_name() {
 fn missing_source_is_a_partial_transfer() {
     let tmp = tempfile::tempdir().unwrap();
     Tree::new(tmp.path().join("src")).file("ok", "1");
-    let r = fastrsync_remote(tmp.path(), &["-a", "src", "nope", "{host}dst"]);
+    let r = barqsync_remote(tmp.path(), &["-a", "src", "nope", "{host}dst"]);
     assert_eq!(r.code, 23, "{}", r.stderr);
     assert!(r.stderr.contains("nope"), "{}", r.stderr);
     assert!(tmp.path().join("dst/src/ok").exists());
     // Pull: the error happens on the server and is forwarded to the client.
-    let r = fastrsync_remote(tmp.path(), &["-a", "{host}src", "{host}nope", "dst2"]);
+    let r = barqsync_remote(tmp.path(), &["-a", "{host}src", "{host}nope", "dst2"]);
     assert_eq!(r.code, 23, "{}", r.stderr);
     assert!(r.stderr.contains("nope"), "{}", r.stderr);
     assert!(tmp.path().join("dst2/src/ok").exists());
@@ -225,21 +225,21 @@ fn bad_remote_path_fails_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     Tree::new(tmp.path().join("src")).file("a", "1");
     let shim = fake_ssh(tmp.path());
-    let r = fastrsync(
+    let r = barqsync(
         tmp.path(),
-        &["-a", "-e", shim.to_str().unwrap(), "--remote-path=/nonexistent/fastrsync", "src/", "fakehost:dst"],
+        &["-a", "-e", shim.to_str().unwrap(), "--remote-path=/nonexistent/barqsync", "src/", "fakehost:dst"],
     );
     assert_ne!(r.code, 0);
     assert!(r.stderr.contains("connection unexpectedly closed"), "{}", r.stderr);
 }
 
-/// fastrsync through the fake ssh with extra environment (inherited by the server).
+/// barqsync through the fake ssh with extra environment (inherited by the server).
 fn remote_with_env(cwd: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> RunOut {
     let shim = fake_ssh(cwd);
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_fastrsync"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_barqsync"));
     cmd.arg("-e")
         .arg(&shim)
-        .arg(format!("--remote-path={}", env!("CARGO_BIN_EXE_fastrsync")))
+        .arg(format!("--remote-path={}", env!("CARGO_BIN_EXE_barqsync")))
         .args(args.iter().map(|a| a.replace("{host}", "fakehost:")))
         .env_remove("SSH_CONNECTION");
     for (k, v) in env {
@@ -285,7 +285,7 @@ fn parallel_streams_fall_back_to_ssh() {
     let f = remote_with_env(
         tmp.path(),
         &["-av", "--transport", "tcp", "--streams", "3", "src/", "{host}dst"],
-        &[("FASTRSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")],
+        &[("BARQSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")],
     );
     assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
     assert!(f.stdout.contains("using the ssh connection"), "{}", f.stdout);
@@ -329,7 +329,7 @@ fn quic_falls_back_to_ssh() {
     let f = remote_with_env(
         tmp.path(),
         &["-av", "--transport", "quic", "src/", "{host}dst"],
-        &[("FASTRSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")],
+        &[("BARQSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")],
     );
     assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
     assert!(f.stdout.contains("QUIC: could not connect") && f.stdout.contains("using the ssh connection"), "{}", f.stdout);
@@ -350,7 +350,7 @@ fn adaptive_strategy_routes_by_link_speed() {
             } else {
                 args.extend_from_slice(&["src/", "{host}dst"]);
             }
-            let f = remote_with_env(tmp.path(), &args, &[("FASTRSYNC_TEST_LINK_BPS", bps)]);
+            let f = remote_with_env(tmp.path(), &args, &[("BARQSYNC_TEST_LINK_BPS", bps)]);
             assert_eq!(f.code, 0, "{bps} pull={pull}\n{}\n{}", f.stdout, f.stderr);
             let matched = stat_bytes(&f.stdout, "Matched data: ");
             // 10 Gbit/s: files under 32 MiB go whole; 20 Mbit/s: as deltas.
@@ -390,7 +390,7 @@ fn whole_file_flags_override_the_adaptive_strategy() {
         let f = remote_with_env(
             tmp.path(),
             &["-avv", "--stats", "--strategy", "adaptive", flag, "src/", "{host}dst"],
-            &[("FASTRSYNC_TEST_LINK_BPS", "10000000000")],
+            &[("BARQSYNC_TEST_LINK_BPS", "10000000000")],
         );
         assert_eq!(f.code, 0, "{flag}\n{}\n{}", f.stdout, f.stderr);
         assert!(!f.stdout.lines().any(|l| l.starts_with("link: ")), "{flag}: no probe expected: {}", f.stdout);
@@ -412,7 +412,7 @@ fn io_uring_pack_writes_match_rsync() {
         }
     }
     t.file("empty", "").chmod("d00/f000", 0o600).chmod("d01/f001", 0o4755).settle_mtimes();
-    let (r, f) = both_remote_env(tmp.path(), &["-ai", "src/", "{host}{dst}"], "dr", "df", &[("FASTRSYNC_IO_URING", "1")]).unwrap();
+    let (r, f) = both_remote_env(tmp.path(), &["-ai", "src/", "{host}{dst}"], "dr", "df", &[("BARQSYNC_IO_URING", "1")]).unwrap();
     assert_eq!(f.code, 0, "{}", f.stderr);
     assert_eq!(normalize(r.items(), "dr", "D"), normalize(f.items(), "df", "D"));
     assert_same_tree(&snapshot(&tmp.path().join("dr"), true), &snapshot(&tmp.path().join("df"), true));
@@ -421,7 +421,7 @@ fn io_uring_pack_writes_match_rsync() {
     for d in ["dr", "df"] {
         Tree::new(tmp.path().join(d)).file("d05/f005", "stale");
     }
-    let (r, f) = both_remote_env(tmp.path(), &["-ai", "src/", "{host}{dst}"], "dr", "df", &[("FASTRSYNC_IO_URING", "1")]).unwrap();
+    let (r, f) = both_remote_env(tmp.path(), &["-ai", "src/", "{host}{dst}"], "dr", "df", &[("BARQSYNC_IO_URING", "1")]).unwrap();
     assert_eq!(f.code, 0, "{}", f.stderr);
     assert_eq!(normalize(r.items(), "dr", "D"), normalize(f.items(), "df", "D"));
     assert_same_tree(&snapshot(&tmp.path().join("dr"), true), &snapshot(&tmp.path().join("df"), true));

@@ -1,4 +1,4 @@
-//! The less common rsync flags, each run through the reference rsync and fastrsync
+//! The less common rsync flags, each run through the reference rsync and barqsync
 //! (locally, and over the fake ssh for the ones that involve the protocol): the printed
 //! items, exit codes and resulting trees must match.
 
@@ -16,7 +16,7 @@ type Snap = BTreeMap<Vec<u8>, Node>;
 fn same_output(r: &RunOut, f: &RunOut, names: &[(&str, &str)], what: &str) {
     assert_eq!(
         r.code, f.code,
-        "{what}: exit codes differ\n--- rsync stderr:\n{}\n--- fastrsync stderr:\n{}\n--- fastrsync stdout:\n{}",
+        "{what}: exit codes differ\n--- rsync stderr:\n{}\n--- barqsync stderr:\n{}\n--- barqsync stdout:\n{}",
         r.stderr, f.stderr, f.stdout
     );
     let norm = |out: &RunOut, rsync_side: bool| {
@@ -32,7 +32,7 @@ fn same_output(r: &RunOut, f: &RunOut, names: &[(&str, &str)], what: &str) {
         }
         items
     };
-    assert_eq!(norm(r, true), norm(f, false), "{what}: items differ\nfastrsync stderr: {}", f.stderr);
+    assert_eq!(norm(r, true), norm(f, false), "{what}: items differ\nbarqsync stderr: {}", f.stderr);
 }
 
 fn snap(p: &Path, with_root: bool) -> Snap {
@@ -69,10 +69,10 @@ fn rewrite_keeping_mtime(p: &Path, content: &[u8]) {
     set_mtime(p, m);
 }
 
-/// Copy `src/` to each destination with fastrsync -a (identical starting points).
+/// Copy `src/` to each destination with barqsync -a (identical starting points).
 fn seed(cwd: &Path, src: &str, dsts: &[&str]) {
     for d in dsts {
-        let r = fastrsync(cwd, &["-a", src, d]);
+        let r = barqsync(cwd, &["-a", src, d]);
         assert_eq!(r.code, 0, "{}", r.stderr);
     }
 }
@@ -231,7 +231,7 @@ fn partial_dir_files_are_used_and_removed_like_rsync() {
 
     let args = ["-ai", "--partial-dir=.rsync-partial", "--delete", "--stats", "src/", "{host}{dst}"];
     // The delta basis is the point here; keep adaptive routing from sending it whole.
-    let (r, f) = both_remote_env(tmp.path(), &args, "pr", "pf", &[("FASTRSYNC_STRATEGY", "fixed")]).unwrap();
+    let (r, f) = both_remote_env(tmp.path(), &args, "pr", "pf", &[("BARQSYNC_STRATEGY", "fixed")]).unwrap();
     same_output(&r, &f, &[], "push --partial-dir");
     assert_same_tree(&snap_partial(&tmp.path().join("pr")), &snap_partial(&tmp.path().join("pf")));
     let matched = f.stdout.lines().find(|l| l.starts_with("Matched data")).unwrap_or_default().to_string();
@@ -401,7 +401,7 @@ fn files_from_matches_rsync() {
         assert_same_tree(&snap(&tmp.path().join(&dr), with_root), &snap(&tmp.path().join(&df), with_root));
     }
     // Exactly one source is allowed.
-    let f = fastrsync(tmp.path(), &["-a", "--files-from=list", "src", "src", "x"]);
+    let f = barqsync(tmp.path(), &["-a", "--files-from=list", "src", "src", "x"]);
     assert_eq!(f.code, 1);
 }
 

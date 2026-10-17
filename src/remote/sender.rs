@@ -501,7 +501,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
 
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
-        .thread_name(|i| format!("fastrsync-send-{i}"))
+        .thread_name(|i| format!("barqsync-send-{i}"))
         .stack_size(WORKER_STACK)
         .build()
     {
