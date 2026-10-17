@@ -9,6 +9,8 @@
 //! Locally the listing comes from `readdir` and files are copied in parallel. As a
 //! remote receiver (see `remote::receiver`), listings arrive as `DirBatch` frames,
 //! subdirectories wait for their batch, and changed files are requested from the sender.
+//! With `--scanner=jwalk` (see `local::pipeline`), listings come from a parallel tree
+//! scan, destination entries from a pre-scanned index, and files go through queues.
 
 use super::Root;
 use crate::cli::Options;
@@ -30,7 +32,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub struct Engine<'a> {
     pub opts: &'a Options,
@@ -51,6 +53,10 @@ pub struct Engine<'a> {
     pub(crate) alt_dirs: Vec<PathBuf>,
     /// `--backup-dir`, resolved against `dest_root`.
     pub(crate) backup_root: Option<PathBuf>,
+    /// `--scanner=jwalk`, local transfers: the scan feed and the transfer queues.
+    pub(crate) pipeline: Option<super::pipeline::Pipeline>,
+    /// `--scanner=jwalk`: destination entries scanned ahead (local and remote receiver).
+    pub(crate) dst_index: Option<Arc<crate::scan::DstIndex>>,
 }
 
 pub(crate) struct DirJob {
@@ -76,6 +82,8 @@ pub(crate) struct Ctx<'p> {
     dst: &'p Path,
     /// Open handle on `dst` for `fstatat` (cheaper than resolving full paths).
     dst_handle: Option<&'p fsops::DirHandle>,
+    /// `--scanner=jwalk`: `dst`'s entries from the destination index (no `fstatat`).
+    dst_metas: Option<&'p HashMap<OsString, Meta>>,
     rel: &'p [u8],
     root: u16,
     depth: usize,
@@ -178,6 +186,8 @@ impl<'a> Engine<'a> {
             dest_root: PathBuf::from("."),
             alt_dirs: Vec::new(),
             backup_root: None,
+            pipeline: None,
+            dst_index: None,
         }
     }
 
@@ -255,7 +265,10 @@ impl<'a> Engine<'a> {
                     Err(e) => return self.err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
                 };
                 let job = self.root_job(src.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh);
-                s.spawn(move |s| self.process_dir(s, job));
+                match &self.pipeline {
+                    Some(p) => p.expect_dir(s, self, job),
+                    None => s.spawn(move |s| self.process_dir(s, job)),
+                }
             }
             Root::Items { src_dir, dst_dir, items } => {
                 let mut ents = Vec::with_capacity(items.len());
@@ -365,6 +378,7 @@ impl<'a> Engine<'a> {
             src: src_dir,
             dst: dst_dir,
             dst_handle: None,
+            dst_metas: None,
             rel: b"",
             root,
             depth: 0,
@@ -383,6 +397,9 @@ impl<'a> Engine<'a> {
         if let Some(r) = &self.remote {
             return r.request(self, wire_dir, files);
         }
+        if let Some(p) = &self.pipeline {
+            return files.into_iter().for_each(|f| p.queue_file(f));
+        }
         match files.len() {
             0 => {}
             1 => self.transfer_file(&files[0]),
@@ -394,7 +411,8 @@ impl<'a> Engine<'a> {
     // Directories
     // -----------------------------------------------------------------------
 
-    fn process_dir<'s>(&'s self, s: &Scope<'s>, job: DirJob) {
+    /// Read a directory and sync it.
+    pub(crate) fn process_dir<'s>(&'s self, s: &Scope<'s>, job: DirJob) {
         if fsops::interrupted() {
             return;
         }
@@ -409,6 +427,16 @@ impl<'a> Engine<'a> {
             },
         };
         let entries = src_ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
+        self.process_listing(s, job, entries);
+    }
+
+    /// `--scanner=jwalk`: sync a directory with its listing from the scan.
+    pub(crate) fn process_scanned<'s>(&'s self, s: &Scope<'s>, job: DirJob, ents: Vec<DirEnt>) {
+        if fsops::interrupted() {
+            return;
+        }
+        let ents = self.adjust_listing(&job.src, ents);
+        let entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
         self.process_listing(s, job, entries);
     }
 
@@ -427,8 +455,13 @@ impl<'a> Engine<'a> {
                 .filter(|(_, e, _)| !self.filter.is_excluded(&join_rel(&job.rel, &e.name), e.meta.kind == Kind::Dir))
                 .collect()
         };
+        let mut dst_metas = None;
         let dst_map = if job.dst_is_new {
             HashMap::new()
+        } else if let Some(m) = self.dst_index.as_ref().and_then(|ix| ix.take(&job.dst)) {
+            let kinds = m.iter().map(|(n, m)| (n.clone(), m.kind)).collect();
+            dst_metas = Some(m);
+            kinds
         } else {
             match fsops::read_dir_kinds(&job.dst) {
                 Ok(m) => m,
@@ -443,11 +476,12 @@ impl<'a> Engine<'a> {
         if self.opts.delete && !job.dst_is_new && select::may_delete(job.sel) {
             changed |= self.delete_extraneous(job, &entries, &dst_map);
         }
-        let dst_handle = if job.dst_is_new { None } else { fsops::DirHandle::open(&job.dst).ok() };
+        let dst_handle = if job.dst_is_new || dst_metas.is_some() { None } else { fsops::DirHandle::open(&job.dst).ok() };
         let ctx = Ctx {
             src: &job.src,
             dst: &job.dst,
             dst_handle: dst_handle.as_ref(),
+            dst_metas: dst_metas.as_ref(),
             rel: &job.rel,
             root: job.root,
             depth: job.depth,
@@ -768,8 +802,22 @@ impl<'a> Engine<'a> {
                             if let Some(d) = &dst_meta {
                                 self.out.item(&rel, Kind::File, Link::None, self.attr_change(&e.meta, d, false), false);
                             }
-                            if !self.dry() && self.fix_attrs(&dst_path, &e.meta, a) {
-                                self.source_done(ctx.root, &src_path, &rel, &e.meta);
+                            if !self.dry() {
+                                match &self.pipeline {
+                                    Some(p) => p.queue_attrs(super::pipeline::AttrJob {
+                                        root: ctx.root,
+                                        src_path,
+                                        dst_path,
+                                        rel,
+                                        meta: e.meta,
+                                        diff: a,
+                                    }),
+                                    None => {
+                                        if self.fix_attrs(&dst_path, &e.meta, a) {
+                                            self.source_done(ctx.root, &src_path, &rel, &e.meta);
+                                        }
+                                    }
+                                }
                             }
                         }
                         FileAction::Transfer => {
@@ -954,6 +1002,8 @@ impl<'a> Engine<'a> {
             r.expect_dir(s, self, job);
         } else if self.opts.one_file_system && meta.dev != root_dev {
             self.push_fixup(&job, false);
+        } else if let Some(p) = &self.pipeline {
+            p.expect_dir(s, self, job);
         } else {
             s.spawn(move |s| self.process_dir(s, job));
         }
@@ -1078,6 +1128,13 @@ impl<'a> Engine<'a> {
     }
 
     /// Returns whether the attributes were set.
+    /// Queue A: a metadata-only fix.
+    pub(crate) fn attr_job(&self, j: super::pipeline::AttrJob) {
+        if self.fix_attrs(&j.dst_path, &j.meta, j.diff) {
+            self.source_done(j.root, &j.src_path, &j.rel, &j.meta);
+        }
+    }
+
     fn fix_attrs(&self, path: &Path, src: &Meta, a: AttrDiff) -> bool {
         let r = (|| {
             if a.owner {
@@ -1133,7 +1190,7 @@ impl<'a> Engine<'a> {
         (mode, self.rules.wanted_uid(src), self.rules.wanted_gid(src))
     }
 
-    fn transfer_file(&self, job: &FileJob) {
+    pub(crate) fn transfer_file(&self, job: &FileJob) {
         if fsops::interrupted() {
             return;
         }
@@ -1345,6 +1402,9 @@ impl<'a> Engine<'a> {
 
 impl Ctx<'_> {
     fn lstat_dst(&self, name: &OsStr, path: &Path) -> io::Result<Meta> {
+        if let Some(m) = self.dst_metas {
+            return m.get(name).copied().ok_or_else(|| io::ErrorKind::NotFound.into());
+        }
         match self.dst_handle {
             Some(h) => h.lstat(name),
             None => fsops::lstat(path),

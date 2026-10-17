@@ -22,6 +22,7 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M7 | common rsync flags: `-c -S -R -d -L -k -K -b -O`, `--partial(-dir)`, `--files-from`, `--existing`, `--max/min-size`, `--link/compare-dest`, `--numeric-ids`, `--chmod`, `--remove-source-files`; page-cache hints | done |
 | M8 | verification harness: Linux container with sshd and `tc netem` link profiles, `strace -c`, flamegraphs, `cp` baselines | done |
 | M9 | the original plan's delta design as `--delta=cdc` (FastCDC throughout, xxh3 + BLAKE3, mmap); measured slower, so `blocks` stays the default | done |
+| M10 | the original plan's scanner as `--scanner=jwalk` (jwalk + DashMap index + queues A–D); measured slower, so `dirtask` stays the default | done |
 
 The test suite passes on macOS (APFS) and Linux (aarch64 container, compared against rsync 3.2.7).
 
@@ -234,7 +235,7 @@ better for `cdc` on small shifted ones, because mapped pages fault in cheaply th
 | B | local, `--no-clone` | **4.4–5.3 s** | 6.5–6.8 s |
 | B | remote (fake ssh) | **2.1–2.8 s** | 2.7–3.0 s |
 | E (512 MiB) | local, copy + patch | 0.7–1.3 s | **0.5–0.6 s** |
-| E | local, `--no-clone` | 0.7–0.9 s | **0.4–0.4 s** |
+| E | local, `--no-clone` | 0.7–0.9 s | **0.37–0.43 s** |
 | E | remote (fake ssh) | 0.7–0.8 s | 0.7–0.9 s |
 
 `cdc` wins where a shifted file fits in RAM, most clearly when it is rebuilt without clones. There it hashes
@@ -242,6 +243,51 @@ each file once, while `blocks` first tries aligned blocks and only then falls ba
 Those wins are under a second; the losses on big files are tens of seconds.
 Following the defaults rule (the faster design stays the default), `--delta=blocks` remains the
 default and `--delta=cdc` stays selectable.
+
+## Scanner: `--scanner=dirtask|jwalk`
+
+`--scanner=jwalk` runs the original plan's four-stage pipeline instead of one task per
+directory:
+
+1. **Scan.** `jwalk` walks the source tree on its own rayon pool. A `process_read_dir` hook
+   stats each directory's children through a directory handle (`statx` on Linux, `fstatat` on
+   macOS; directories of 512+ entries on 8 threads), prunes excluded subdirectories and `-x`
+   mount points, and hands the listing on as soon as the directory is read. The destination
+   tree is scanned at the same time into a `DashMap` index of directory → entries.
+2. **Diff.** A listing is processed once its directory exists on the destination side (its
+   parent creates it first), against the destination entries from the index, so there is no
+   per-file `lstat`. Directories, symlinks and specials are handled inline in scan order;
+   `--delete` runs per directory. Files are classified into queues: A metadata-only, B small
+   (≤ 128 KiB), C large and new, D large and changed.
+3. **Transfer.** A pool of worker threads per queue (2 / threads / threads÷2 / threads÷4).
+4. **Commit.** Temp file + rename per file, as before; hard links and directory attributes
+   once everything is written.
+
+A directory the scan never lists (reached through a symlink with `-L`/`-k`, kept by `-K`, or
+unreadable) is read directly once the scan is over. As a remote receiver, the destination is
+indexed the same way while the sender's listings arrive. `-R`/`--files-from` and non-recursive
+transfers always use `dirtask`. The macOS `getattrlistbulk` path has no hook in jwalk, so the
+jwalk scanner doesn't use it.
+
+Measured with `bench/scanner_modes.sh` (5 runs; macOS: APFS, full datasets; Linux: the
+aarch64 container on tmpfs, datasets at `--scale 0.25`):
+
+| Workload | macOS dirtask | macOS jwalk | Linux dirtask | Linux jwalk |
+| --- | ---: | ---: | ---: | ---: |
+| A: fresh copy (200k / 50k files), local | **18.1 s** | 19.7 s | **113 ms** | 184 ms |
+| C: 3 changed of 500k / 125k files, local | **2.93 s** | 3.26 s | **42 ms** | 87 ms |
+| C with `--delete`, local | **2.97 s** | 3.29 s | **42 ms** | 75 ms |
+| A, remote (fake ssh) | 19.4 s | 18.5 s (±1.8) | 305 ms | 301 ms |
+| C, remote (fake ssh, 10 runs on macOS) | 3.10 s | **2.88 s** | **80 ms** | 91 ms |
+
+`dirtask` wins locally on both systems: it reads each directory's entries and attributes in
+one pass (`getattrlistbulk` on macOS), stats in parallel within big directories, and starts
+copying a directory's files as soon as it is listed. jwalk's pool, the index and the queues
+add hand-offs without saving any syscalls. jwalk only won the macOS remote no-op (7%), where
+the receiver indexes the destination while the sender's listings are still arriving. So
+`dirtask` stays the default and `--scanner=jwalk` stays selectable. jwalk did use half the
+memory on the fresh copy (92 vs 186 MiB), because its queues are bounded.
+
 
 ## Layout
 
@@ -257,6 +303,8 @@ src/diff.rs         quick check (size + mtime, --modify-window, -u, --size-only,
 src/fsops/          readdir + fstatat, temp names, clone/copy, utimensat, mknod, page-cache hints
 src/local/          planner (SRC... DEST → roots) and the parallel per-directory engine;
                     flags.rs: link/compare-dest, backups, partial, sparse, -L/-k, removals
+                    pipeline.rs: --scanner=jwalk feed, transfer queues A-D
+src/scan.rs         --scanner=jwalk tree scan (jwalk hook) and the destination index
 src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild);
                     cdc.rs: --delta=cdc (stitched parallel FastCDC, xxh3 + BLAKE3, mmap)
 src/proto/          wire frames (postcard + raw data, optional zstd), reader/writer threads
@@ -278,7 +326,8 @@ cargo test
 The delta engine also has property tests (random insert/delete/overwrite/append/truncate
 sequences; every delta must rebuild the new file exactly via both rebuild and clone+patch).
 `PROPTEST_CASES=5000 cargo test --release delta` runs a longer sweep.
-`FASTRSYNC_DELTA=cdc cargo test` runs the whole suite with `--delta=cdc` as the default.
+`FASTRSYNC_DELTA=cdc cargo test` runs the whole suite with `--delta=cdc` as the default, and
+`FASTRSYNC_SCANNER=jwalk cargo test` with `--scanner=jwalk`.
 
 The integration tests run each scenario through the reference rsync 3.x as well (found at
 `/opt/homebrew/bin/rsync`, `/usr/local/bin/rsync` or `/usr/bin/rsync`, or set

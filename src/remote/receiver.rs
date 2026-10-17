@@ -21,6 +21,8 @@ use crate::local::exec::{DirJob, Engine, FileJob, finish_temp, split_dst};
 use crate::output::{Output, Stats, StatsSnapshot, path_msg};
 use crate::paths::{split_source, wants_contents};
 use crate::proto::{Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
+use crate::scan::{DstIndex, Scanner};
+use std::sync::Arc;
 use rayon::Scope;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -732,6 +734,9 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
         root.items.iter_mut().for_each(|e| ids.apply(&mut e.meta));
     }
     let mut engine = Engine::new(opts, filter, out);
+    // --scanner=jwalk indexes the destination while listings arrive, if it existed
+    // before this run (a directory created now is being filled at the same time).
+    let index_dest = opts.scanner == Scanner::Jwalk && opts.recursive && fs::metadata(dest).is_ok_and(|m| m.is_dir());
     let slots = match plan_dest(&mut engine, &roots, dest, out) {
         Ok(s) => s,
         Err(code) => {
@@ -749,6 +754,16 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
         Ok(p) => p,
         Err(e) => return fail(exit::IPC, format!("failed to start worker threads: {e}")),
     };
+    let dst_scan = index_dest.then(|| {
+        let index = Arc::new(DstIndex::default());
+        engine.dst_index = Some(Arc::clone(&index));
+        let (top, threads, scan) = (PathBuf::from(dest), opts.threads, Arc::clone(&index));
+        let handle = std::thread::spawn(move || {
+            scan.scan(&top, b"", threads);
+            scan.finish();
+        });
+        (index, handle)
+    });
 
     let engine = &engine;
     let remote = engine.remote.as_ref().unwrap();
@@ -835,6 +850,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
         })
     });
 
+    if let Some((index, scan)) = dst_scan {
+        index.cancel();
+        let _ = scan.join();
+    }
     if let Some(code) = failure {
         remote.abandon(engine);
         fsops::cleanup_temps();

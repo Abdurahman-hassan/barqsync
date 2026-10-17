@@ -15,6 +15,7 @@ pub mod paths;
 pub mod progress;
 pub mod proto;
 pub mod remote;
+pub mod scan;
 pub mod select;
 
 use cli::Options;

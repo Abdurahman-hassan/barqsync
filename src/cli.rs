@@ -2,6 +2,7 @@
 
 use crate::chmod::ChmodRule;
 use crate::delta::DeltaMode;
+use crate::scan::Scanner;
 use crate::filter::{RuleSpec, read_rules_file};
 use anyhow::{Context, Result, bail};
 use std::os::unix::ffi::OsStrExt;
@@ -135,6 +136,9 @@ pub struct Cli {
     /// Always use the delta-transfer algorithm
     #[arg(long = "no-whole-file", overrides_with = "whole_file")]
     no_whole_file: bool,
+    /// Directory scanner: one task per directory, or a jwalk tree scan feeding queues
+    #[arg(long, value_enum, value_name = "MODE", default_value_t, env = "FASTRSYNC_SCANNER", hide_env = true)]
+    scanner: Scanner,
     /// Delta design: aligned blocks with a FastCDC fallback, or FastCDC throughout
     #[arg(long, value_enum, value_name = "MODE", default_value_t, env = "FASTRSYNC_DELTA", hide_env = true)]
     delta: DeltaMode,
@@ -287,6 +291,7 @@ pub struct Options {
     pub whole_file: Option<bool>,
     /// The receiver's choice decides a remote transfer (its signature type says which).
     pub delta: DeltaMode,
+    pub scanner: Scanner,
     pub inplace: bool,
     pub fsync: bool,
     pub no_clone: bool,
@@ -413,6 +418,7 @@ impl Options {
                 None
             },
             delta: c.delta,
+            scanner: c.scanner,
             inplace: c.inplace,
             fsync: c.fsync,
             no_clone: c.no_clone,

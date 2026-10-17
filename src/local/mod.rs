@@ -2,6 +2,7 @@
 
 pub mod exec;
 pub mod flags;
+pub mod pipeline;
 
 use crate::cli::Options;
 use crate::entry::Kind;
@@ -16,6 +17,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// One unit of transfer derived from a SRC argument.
@@ -152,9 +154,12 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
 
     let mut engine = Engine::new(opts, filter, out);
     engine.set_dest(&plan.dest_root);
+    // A directory task waiting in `par_iter` runs other directories' tasks on its stack,
+    // so nesting gets deep with many directories (5000 overflowed the 2 MiB default).
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
         .thread_name(|i| format!("fastrsync-{i}"))
+        .stack_size(crate::remote::WORKER_STACK)
         .build()
     {
         Ok(p) => p,
@@ -163,18 +168,39 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
             return exit::IPC;
         }
     };
+    // --scanner=jwalk needs whole trees to walk: not with -R/--files-from or without -r.
+    let queues = (opts.scanner == crate::scan::Scanner::Jwalk && opts.recursive && !opts.relative).then(|| {
+        let (p, rx) = pipeline::Pipeline::new(opts.threads);
+        engine.dst_index = Some(Arc::clone(&p.index));
+        engine.pipeline = Some(p);
+        rx
+    });
     let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));
-    pool.install(|| {
-        for (i, root) in plan.roots.iter().enumerate() {
-            // Only the first root may assume a freshly created destination is empty.
-            let fresh = plan.dest_created && i == 0;
-            rayon::scope(|s| engine.run_root(s, root, plan.dest_exists, fresh));
+    let engine = &engine;
+    std::thread::scope(|ts| {
+        if let (Some(p), Some(rx)) = (&engine.pipeline, queues) {
+            p.run_workers(ts, engine, rx);
         }
-        if !fsops::interrupted() {
-            engine.link_followers();
-            engine.apply_fixups();
+        pool.install(|| {
+            for (i, root) in plan.roots.iter().enumerate() {
+                // Only the first root may assume a freshly created destination is empty.
+                let fresh = plan.dest_created && i == 0;
+                match &engine.pipeline {
+                    Some(p) => pipeline::run_root(engine, p, root, plan.dest_exists, fresh),
+                    None => rayon::scope(|s| engine.run_root(s, root, plan.dest_exists, fresh)),
+                }
+            }
+        });
+        if let Some(p) = &engine.pipeline {
+            p.close();
         }
     });
+    if !fsops::interrupted() {
+        pool.install(|| {
+            engine.link_followers();
+            engine.apply_fixups();
+        });
+    }
     if let Some(r) = reporter {
         r.finish(out);
     }

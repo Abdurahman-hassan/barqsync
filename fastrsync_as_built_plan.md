@@ -230,6 +230,20 @@ one file use the same stream, so they stay in order.
 - Measured 4–7× slower than `--delta=blocks` on a 10 GiB file (mmap page faults and page
   cache pressure; hashing itself is not slower), so `blocks` stays the default.
 
+### M10: the plan's scanner as `--scanner=jwalk` (branch `m10-jwalk-scanner`)
+
+- Stage 1 `jwalk` scan with a `process_read_dir` hook (stat via a directory handle, prune
+  excluded dirs and `-x` mounts), the destination scanned concurrently into a `DashMap`
+  index, listings matched to directory jobs as they arrive, queues A–D with a worker pool
+  each. The remote receiver indexes its destination the same way.
+- Measured slower locally on macOS (9–11%) and Linux (1.6–2.1×); faster only for a macOS
+  remote no-op (7%). `dirtask` stays the default.
+- Found on the way: a fresh local copy of 5000 sibling directories overflowed the 2 MiB
+  rayon worker stacks once the per-entry code grew (a task waiting in `par_iter` runs other
+  directories' tasks on its stack). Local workers now get 32 MiB stacks, like the remote ones.
+- jwalk's workers block inside rayon's `par_bridge`, so the hook must not use rayon itself
+  (a nested `par_iter` there deadlocked); big directories are stat'ed on plain threads.
+
 ### Testing
 
 - **Coverage:** 79 tests on macOS and 81 on Linux (aarch64 container, glibc rsync 3.2.7).
@@ -316,36 +330,18 @@ Measurements that shaped the design:
 
 ## 10. Still open
 
-**Started in separate sessions, both stopped at a usage limit** (status on 2026-10-17):
+Being built now, in this order (approved plan "M7–M14"); each one is benchmarked against the
+current design and the faster one stays the default:
 
-- **Common rsync flags** for drop-in use: `-c`, `-S`, `--partial`, `-R`, `--files-from`,
-  `--backup`, `--link-dest`, `-L/-k/-K`, `--numeric-ids`, `--chmod`, and others.
-  - Stopped before writing any code; branch `feat/gallant-sanderson-bf6749` is still at
-    `polish-m6`.
-  - Saved: notes on how rsync behaves for each flag, and the agreed design
-    (`rsync-flags-handover.md` in the shared notes).
-- **Page-cache hints** (original Phase 4.2): `F_NOCACHE` on macOS, `posix_fadvise` on Linux.
-  - Implemented as WIP commit `b192e09` on `feat/zen-lamport-e84742`.
-  - First interleaved round, delta rebuild without clones: 16.3 s with hints vs 19.1 s
-    without. A file that was cached before the sync stayed 92% cached with hints, and was
-    evicted completely without them.
-  - Still to do: full benchmarks, clippy, the Linux run, tests and README.
+- **M10** jwalk + DashMap scanner with queues A–D (`--scanner`).
+- **M11** tokio + rkyv (`--wire`) + QUIC (`--transport quic|tcp|ssh`).
+- **M12** adaptive strategy: link probe, size routing, pack compression, adaptive zstd level.
+- **M13** io_uring on Linux (`--io-uring`).
+- **M14** full verification (every transport and link profile, cold cache, the real Intel Mac)
+  and these documents.
 
-**Not built: decisions for you**
-
-1. **QUIC transport** (original Phase 3, quinn over UDP). It would be an option next to
-   `--streams`, falling back to ssh when UDP is blocked.
-2. **io_uring backend** on Linux (original Phase 4.1): batched open/write/close of small
-   files on the receiver.
-3. **Adaptive strategy** (original §4): choose whole-file vs delta by measured link speed,
-   compress small-file packs by default, and adapt the zstd level.
-4. **Verification protocol** (original §8):
-   - `tc` network emulation and `strace` syscall counts in the Linux container;
-   - flamegraphs and a `cp -r` comparison;
-   - cold-cache runs (`bench/run.sh DIR all --cold` needs your `sudo`);
-   - real ssh and real-network runs (`REMOTE=user@host bench/run.sh DIR D`).
-5. **Design fidelity:** keep the replacements in §9 (recommended), or rework them to match the
-   original plan exactly.
+The real second machine (Intel MacBook Pro at 192.168.1.13) needs key-based ssh first:
+`ssh-copy-id -i ~/.ssh/id_ed25519.pub a.hamdy@192.168.1.13`.
 
 Also still missing from rsync's feature set: xattrs and ACLs (`-X`, `-A`), daemon mode
 (`rsync://`), and the single-argument listing mode.
