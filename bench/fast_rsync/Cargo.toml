@@ -1,0 +1,20 @@
+[package]
+name = "frbench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "fast_rsync vs barqsync comparison harness (see fast_rsync_comparison.md)"
+
+# Standalone: not part of the barqsync package or a workspace.
+[workspace]
+
+[dependencies]
+fast_rsync = "=0.2.0"
+blake3 = { version = "1.8", features = ["rayon"] }
+rayon = "1.12"
+barqsync = { path = "../.." }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
