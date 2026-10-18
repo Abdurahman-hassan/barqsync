@@ -249,7 +249,7 @@ one file use the same stream, so they stay in order.
 ### M8: verification harness (part of `m7-integrated`)
 
 - Linux container with sshd and `tc netem` profiles (lan, wan, lossy), `strace -c` counts,
-  perf flamegraphs, `cp` baselines; see the README's benchmark section.
+  perf flamegraphs, `cp` baselines; see `IMPLEMENTATION.md`, Benchmarks.
 
 ### M9: the plan's delta design as `--delta=cdc` (branch `m9-delta-cdc`)
 
@@ -426,7 +426,7 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
 ## 10. Still open
 
 - **A fast real link.** The Intel MacBook Pro was tested over Tailscale across the internet
-  (real-host tests pass; 1.1–1.5× rsync on a ~4 Mbit/s link, see the README), but not on a
+  (real-host tests pass; 1.1–1.5× rsync on a ~4 Mbit/s link, see `IMPLEMENTATION.md`), but not on a
   LAN, and TCP/QUIC there need its firewall to allow the binary.
 - **Cold-cache runs** (`bench/run.sh DIR all --cold`) need `sudo purge` on macOS.
 - **NFS** isn't covered (no server).

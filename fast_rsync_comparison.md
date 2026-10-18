@@ -460,7 +460,7 @@ every dataset but `append`, where they are equal.
 - **Local deltas:** a 1 GiB file with 50 × 1 MiB overwritten, synced locally with
   `--no-whole-file`, took the same time before and after (medians 1.82 and 1.85 s over 6
   alternating runs, VM noise 0.7–4.2 s) with 5% less literal data.
-- **README's 6 MiB examples,** re-measured on the same files with both builds: 4 KiB
+- **The 6 MiB examples** (`IMPLEMENTATION.md`, Delta transfer), re-measured on the same files with both builds: 4 KiB
   overwritten 64 KiB → 8 KiB, 777 bytes inserted 57.6 → 8.0 KB, 12 KB removed 344.7 → 4.6 KB,
   appends and truncation unchanged.
 - **Tests:** 152 pass (4 new: the sizing rule, chunk-size validation, a grown file with

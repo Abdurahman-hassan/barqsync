@@ -1,6 +1,6 @@
 [package]
 name = "barqsync"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.92"
 description = "A parallel, rsync-compatible file synchronizer: local, over ssh, TLS-over-TCP streams or QUIC (macOS and Linux)"
@@ -10,7 +10,7 @@ repository = "https://github.com/Abdurahman-hassan/barqsync"
 readme = "README.md"
 keywords = ["rsync", "sync", "backup", "file-transfer", "quic"]
 categories = ["command-line-utilities", "filesystem", "network-programming"]
-exclude = ["bench/results/*", "rust_rsync_replacement_master_plan.md", ".gitignore"]
+exclude = ["bench/results/*", "docs/*", "rust_rsync_replacement_master_plan.md", ".gitignore"]
 
 [dependencies]
 anyhow = "1.0.104"
