@@ -605,5 +605,6 @@ but `append` (equal), and signatures of the same order as fast_rsync's.
   second boundary fell between creating the two trees. With a 1.1 s pause between them it
   failed every time; with `Tree::same_mtimes` giving those files one time it passes, and 400
   parallel runs went from 1 failure to 0.
-- **macOS** was not re-tested: the Mac is on a Tailscale network the benchmark VM can't
-  reach.
+- **macOS:** the test suite passes there too (154 tests on APFS; three tests are
+  Linux-only). The transfer benchmarks are from the Linux VM only: the Mac is on a Tailscale
+  network the VM can't reach.

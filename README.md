@@ -30,9 +30,9 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M15 | delta block and chunk sizes scale with the file (4–64 KiB); a remote file that changed size got both signatures and a merged delta (protocol 6): 1.4–7.5× faster on small or scattered edits, but 4–22% slower on large appends and in-place runs, so M16 replaced the signature scheme | done |
 | M16 | two-level delta: the coarse signatures of 0.1.1, refined on demand with one round trip where the coarse delta left enough literal data (protocol 7). Over 100 Mbit: as fast as 0.1.1 on appends, in-place runs and small files, 1.3–7.6× faster on everything else (a growing SQLite database 16.7 → 3.2 s, rsync 9.4 s), faster than rsync on 7 of 8 datasets; see [Two-level delta](#two-level-delta-m16). Also fixed a racy test fixture | done |
 
-The test suite passes on macOS (APFS; 145 tests at M14, also built as x86_64 and run under
-Rosetta) and Linux (148 tests at M14 in an aarch64 container, 157 at M16 on an x86_64 VM),
-compared against rsync 3.2.7. macOS was not re-run for M15 and M16.
+The test suite passes on macOS (APFS; 154 tests at M16, 145 at M14, when it was also built as
+x86_64 and run under Rosetta) and Linux (157 tests at M16 on an x86_64 VM, 148 at M14 in an
+aarch64 container), compared against rsync 3.2.7. Three tests are Linux-only.
 
 ## Install
 

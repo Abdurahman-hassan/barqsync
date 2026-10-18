@@ -326,13 +326,14 @@ one file use the same stream, so they stay in order.
   tool and compared their mtimes, which differed when a second boundary fell between the two
   trees (`keep_dirlinks_matches_rsync` failed 1 in 400 runs). `Tree::same_mtimes` gives them
   one time; 0 in 400.
-- The macOS benchmarks (A–D) were not re-run, and the Mac was out of reach from the VM.
+- The test suite passes on macOS (154 tests, APFS). The macOS benchmarks (A–D) were not
+  re-run: the transfer measurements above are from the Linux VM.
 
 ### Testing
 
 - **Coverage:** 145 tests on macOS (arm64, and x86_64 under Rosetta: BLAKE3/zstd x86 SIMD
   paths, `getattrlistbulk` on Intel builds) and 148 on Linux (aarch64 container, glibc rsync
-  3.2.7) at M14; 157 on Linux (x86_64 VM, rsync 3.2.7) at M16, macOS not re-run. The
+  3.2.7) at M14; at M16, 157 on Linux (x86_64 VM, rsync 3.2.7) and 154 on macOS. The
   whole suite also runs with each alternative design as the default
   (`BARQSYNC_DELTA`, `_SCANNER`, `_TRANSPORT`, `_WIRE`, `_STRATEGY`, `_NET_IO`, `_IO_URING`).
 - **Differential tests:** most tests run the same command through rsync and barqsync and
