@@ -13,8 +13,9 @@ them, and sends only the parts of a file that changed.
 - **Same commands as rsync:** `-avz`, `--delete`, `--exclude`, `-e ssh`, `--link-dest` and
   most other everyday flags.
 - **2–5× faster on big trees:** directories are scanned and files copied in parallel.
-- **Small updates stay small:** a changed file is compared in 64 KiB blocks, then 4 KiB pieces
-  where it differs. A SQLite database after 8,000 changes sends 30 MB; rsync sends 104 MB.
+- **Small updates stay small:** a changed file is compared in 64 KiB blocks, then in smaller
+  pieces where it differs (4 KiB up to 256 MiB, larger for larger files). A SQLite database
+  after 8,000 changes sends 30 MB; rsync sends 104 MB.
 - **Made for real networks:** ssh by default, parallel TLS streams or QUIC for long or lossy
   links.
 
@@ -92,10 +93,13 @@ the listings, requests and data are pipelined, so the transfer starts before the
 
 ## Small changes, small transfers
 
-![A file is checked in 64 KiB blocks; only the two blocks that differ are checked again in 4 KiB pieces, and only the two changed pieces are sent: 8 KiB instead of 128 KiB](docs/images/two-level-delta.svg)
+![A 256 MiB file is checked in 64 KiB blocks; only the two blocks that differ are checked again in 4 KiB pieces, and only the two changed pieces are sent: 8 KiB instead of 128 KiB](docs/images/two-level-delta.svg)
 
 When the other side already has an older copy of a file, barqsync first compares cheap
-64 KiB fingerprints, then takes a closer look only where they differ. Every reused piece is
+64 KiB fingerprints, then takes a closer look only where they differ. The closer look uses
+4 KiB pieces for files up to 256 MiB and larger ones for larger files (8 KiB up to 1 GiB,
+16 KiB up to 4 GiB, 32 KiB up to 16 GiB), so its cost stays small; above 16 GiB the 64 KiB
+comparison is the final one. Every reused piece is
 verified with BLAKE3, so nothing is assumed to match. Over a network, an appended log or a
 rewritten file skips the closer look, so it costs no more than a plain comparison.
 
