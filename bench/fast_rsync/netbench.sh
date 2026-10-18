@@ -11,9 +11,9 @@
 #
 # Each run resets the destination to the old copy, times the push, counts the bytes that
 # cross veth0 (tx = client to server, rx = server to client) and checks the result with
-# diff -r. PROFILES, WORKLOADS, TOOLS and RUNS pick a subset. TOOLS may include
-# barqsync-old: another barqsync build installed as barqsync-old on both ends, to compare
-# two versions in one session.
+# diff -r. PROFILES, WORKLOADS, TOOLS and RUNS pick a subset. TOOLS may include other
+# barqsync builds installed as barqsync-NAME on both ends (e.g. barqsync-0.1.1), to compare
+# versions in one session.
 set -uo pipefail
 OUT=$1
 PROFILES=${PROFILES:-lan wan}
@@ -51,7 +51,7 @@ for prof in $PROFILES; do
         case $t in
           frsync) cmd=(frsync -e ssh "$src" "$HOST:$W/dst") ;;
           barqsync) cmd=(barqsync -a -e ssh "$src/" "$HOST:$W/dst/") ;;
-          barqsync-old) cmd=(barqsync-old -a -e ssh --remote-path="$(command -v barqsync-old)" "$src/" "$HOST:$W/dst/") ;;
+          barqsync-*) cmd=("$t" -a -e ssh --remote-path="$(command -v "$t")" "$src/" "$HOST:$W/dst/") ;;
           rsync) cmd=(rsync -a -e ssh "$src/" "$HOST:$W/dst/") ;;
         esac
         tx0=$(ctr tx_bytes); rx0=$(ctr rx_bytes)

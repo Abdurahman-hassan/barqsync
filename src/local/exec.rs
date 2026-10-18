@@ -1299,8 +1299,7 @@ impl<'a> Engine<'a> {
             (cdc::local_delta(maps.0.bytes(), maps.1.bytes(), &delta::Params::DEFAULT), &maps.0, &maps.1)
         } else {
             reads = (delta::ReadOnce::new(&new, job.meta.size), delta::ReadOnce::new(&basis, basis_size));
-            let p = delta::Params::for_size(basis_size);
-            (delta::local_delta(&reads.0, job.meta.size, &reads.1, basis_size, &p)?, &reads.0, &reads.1)
+            (delta::local_delta(&reads.0, job.meta.size, &reads.1, basis_size, &delta::Params::DEFAULT)?, &reads.0, &reads.1)
         };
         if d.matched_bytes() == 0 {
             return Ok(false);

@@ -74,7 +74,7 @@ fn excludes_and_dry_run_match_rsync() {
         .file("src/main.c", "m")
         .settle_mtimes();
     for d in ["dr", "df"] {
-        Tree::new(tmp.path().join(d)).file("drop.log", "old").file("stale", "s");
+        Tree::new(tmp.path().join(d)).file("drop.log", "old").file("stale", "s").same_mtimes(BASE_TIME + 800_000);
     }
     let before = snapshot(&tmp.path().join("df"), true);
     let args = ["-avn", "--delete", "--include=keep.log", "--exclude=*.log", "--exclude=/build", "src/", "{host}{dst}"];

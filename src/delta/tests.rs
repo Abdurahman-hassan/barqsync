@@ -5,6 +5,9 @@ use std::io::Write;
 
 /// Tiny sizes so property tests exercise many blocks, segments and chunks quickly.
 const P: Params = Params { block_size: 256, segment: 4096, cdc_min: 64, cdc_avg: 256, cdc_max: 1024, cdc_region: 4096 };
+/// A coarse first pass and the fine sizes that refine it, small enough for the same tests.
+const COARSE: Params = Params { block_size: 1024, segment: 8192, cdc_min: 256, cdc_avg: 1024, cdc_max: 4096, cdc_region: 8192 };
+const FINE: Params = Params { block_size: 128, segment: 8192, cdc_min: 64, cdc_avg: 256, cdc_max: 1024, cdc_region: 8192 };
 
 fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
     let mut x = seed | 1;
@@ -102,8 +105,6 @@ proptest! {
         }
         let (bn, bb) = (block_signature(&new, new.len() as u64, &P).unwrap(), block_signature(&basis, basis.len() as u64, &P).unwrap());
         let (cn, cb) = (chunk_signature(&new, new.len() as u64, &P).unwrap(), chunk_signature(&basis, basis.len() as u64, &P).unwrap());
-        // One read for both signatures gives the same signatures.
-        prop_assert_eq!(&signatures(&new, new.len() as u64, &P).unwrap(), &(bn.clone(), cn.clone()));
         let (blocks, chunks) = (diff_blocks(&bn, &bb), diff_chunks(&cn, &cb));
         let merged = merge_in_place(&chunks, &blocks);
         prop_assert!(merged.literal_bytes() <= blocks.literal_bytes().min(chunks.literal_bytes()));
@@ -113,6 +114,95 @@ proptest! {
             prop_assert_eq!(&rebuild(&d, &basis, &new, true), &new);
         }
     }
+
+    #[test]
+    fn refined_deltas_reproduce_the_new_file_with_less_literal_data(
+        len in 0..60_000usize,
+        seed in any::<u64>(),
+        edits in prop::collection::vec(edit_strategy(), 0..6),
+        by_content in any::<bool>(),
+    ) {
+        let basis = pseudo_random(len, seed);
+        let mut new = basis.clone();
+        for e in &edits {
+            apply_edit(&mut new, e);
+        }
+        let (n, b) = (new.len() as u64, basis.len() as u64);
+        let coarse = if n == b && !by_content {
+            diff_blocks(&block_signature(&new, n, &COARSE).unwrap(), &block_signature(&basis, b, &COARSE).unwrap())
+        } else {
+            diff_chunks(&chunk_signature(&new, n, &COARSE).unwrap(), &chunk_signature(&basis, b, &COARSE).unwrap())
+        };
+        let gaps: Vec<_> = refine::gaps(&coarse, b).into_iter().filter(|g| g.basis_len > 0).collect();
+        let refined = refine::local(&coarse, &new, n, &basis, b, &FINE, &gaps).unwrap();
+        check_delta(&refined, &new, &basis);
+        prop_assert!(refined.literal_bytes() <= coarse.literal_bytes());
+        prop_assert_eq!(&rebuild(&refined, &basis, &new, false), &new);
+        prop_assert_eq!(&rebuild(&refined, &basis, &new, true), &new);
+    }
+}
+
+#[test]
+fn gaps_pair_literal_runs_with_their_basis_stretches() {
+    let d = Delta {
+        size: 200,
+        ops: vec![
+            Op::Copy { off: 0, basis_off: 0, len: 100 },
+            Op::Literal { off: 100, len: 50 },
+            Op::Copy { off: 150, basis_off: 120, len: 30 },
+            Op::Literal { off: 180, len: 20 },
+        ],
+    };
+    let g = refine::gaps(&d, 210);
+    assert_eq!(g, [refine::Gap { off: 100, len: 50, basis_off: 100, basis_len: 20 }, refine::Gap { off: 180, len: 20, basis_off: 150, basis_len: 60 }]);
+    // A literal at the start reaches back to the basis start; one with no basis room has none.
+    let d = Delta { size: 10, ops: vec![Op::Literal { off: 0, len: 4 }, Op::Copy { off: 4, basis_off: 0, len: 6 }] };
+    assert_eq!(refine::gaps(&d, 6), [refine::Gap { off: 0, len: 4, basis_off: 0, basis_len: 0 }]);
+}
+
+#[test]
+fn refinement_requests_are_checked_and_bad_answers_ignored() {
+    use refine::Grain;
+    for size in [1 << 20, 256 << 20, 4 << 30] {
+        let p = Params::for_size(size);
+        assert_eq!(Grain::of(&p).params(), Some(Params { segment: Params::DEFAULT.segment, cdc_region: Params::DEFAULT.cdc_region, ..p }));
+    }
+    let good = Grain::of(&Params::for_size(1 << 20));
+    for bad in [Grain { block: 0, ..good }, Grain { block: 100, ..good }, Grain { block: 3000, ..good }, Grain { block: 128 << 10, ..good }, Grain { min: 0, ..good }] {
+        assert_eq!(bad.params(), None, "{bad:?}");
+    }
+    // An answer of the wrong shape leaves the coarse delta as it was.
+    let basis = pseudo_random(300_000, 14);
+    let mut new = basis.clone();
+    new[100_000..100_010].fill(1);
+    let coarse = diff_blocks(&block_signature(&new, 300_000, &Params::DEFAULT).unwrap(), &block_signature(&basis, 300_000, &Params::DEFAULT).unwrap());
+    let fine = Params::for_size(300_000);
+    let gaps = refine::plan(&coarse, 300_000, Params::DEFAULT.block_size, &fine).unwrap();
+    let ours = refine::new_side(&new, 300_000, 300_000, &fine, &gaps).unwrap();
+    assert_eq!(refine::combine(&coarse, 300_000, &fine, &gaps, &ours, &[]), coarse);
+    let theirs = vec![refine::GapSig::default(); gaps.len()];
+    assert_eq!(refine::combine(&coarse, 300_000, &fine, &gaps, &ours, &theirs).literal_bytes(), coarse.literal_bytes());
+}
+
+#[test]
+fn a_rewritten_file_is_not_refined() {
+    let (basis, new) = (pseudo_random(1 << 20, 16), pseudo_random(1 << 20, 1016));
+    let p = Params::DEFAULT;
+    let coarse = diff_blocks(&block_signature(&new, 1 << 20, &p).unwrap(), &block_signature(&basis, 1 << 20, &p).unwrap());
+    assert_eq!(coarse.matched_bytes(), 0);
+    assert_eq!(refine::plan(&coarse, 1 << 20, p.block_size, &Params::for_size(1 << 20)), None);
+}
+
+#[test]
+fn an_append_is_not_refined() {
+    // Only the basis's last chunk differs (its cut moved): not worth a round trip.
+    let basis = pseudo_random(8 << 20, 15);
+    let mut new = basis.clone();
+    new.extend(pseudo_random(500_000, 1015));
+    let p = Params::DEFAULT;
+    let coarse = diff_chunks(&chunk_signature(&new, new.len() as u64, &p).unwrap(), &chunk_signature(&basis, basis.len() as u64, &p).unwrap());
+    assert!(coarse.literal_bytes() < 500_000 + p.cdc_max as u64);
+    assert_eq!(refine::plan(&coarse, basis.len() as u64, p.cdc_avg, &Params::for_size(basis.len() as u64)), None);
 }
 
 #[test]
@@ -165,8 +255,8 @@ fn chunk_signature_carries_its_chunk_sizes() {
 
 #[test]
 fn grown_file_with_scattered_edits_costs_only_its_changed_blocks() {
-    // A database-like file: small edits all over, then growth at the end. Chunks alone
-    // lose the chunks around every edit; merged with aligned blocks only the touched
+    // A database-like file: small edits all over, then growth at the end. Coarse chunks
+    // lose the chunks around every edit; refined with fine aligned blocks only the touched
     // blocks and the tail are literal.
     let basis = pseudo_random(8 << 20, 12);
     let mut new = basis.clone();
@@ -175,16 +265,20 @@ fn grown_file_with_scattered_edits_costs_only_its_changed_blocks() {
         new[off..off + 100].copy_from_slice(&pseudo_random(100, i as u64));
     }
     new.extend(pseudo_random(50_000, 1001));
-    let p = Params::for_size(basis.len() as u64);
-    let (bb, cb) = signatures(&basis, basis.len() as u64, &p).unwrap();
-    let (bn, cn) = signatures(&new, new.len() as u64, &p).unwrap();
-    let (chunks, blocks) = (diff_chunks(&cn, &cb), diff_blocks(&bn, &bb));
-    let merged = merge_in_place(&chunks, &blocks);
-    check_delta(&merged, &new, &basis);
-    assert!(merged.is_in_place());
+    let (n, b) = (new.len() as u64, basis.len() as u64);
+    let coarse = diff_chunks(&chunk_signature(&new, n, &Params::DEFAULT).unwrap(), &chunk_signature(&basis, b, &Params::DEFAULT).unwrap());
+    let p = Params::for_size(b);
+    let gaps = refine::plan(&coarse, b, Params::DEFAULT.cdc_avg, &p).expect("worth refining");
+    let refined = refine::local(&coarse, &new, n, &basis, b, &p, &gaps).unwrap();
+    check_delta(&refined, &new, &basis);
+    assert!(refined.is_in_place());
     let most = 40 * 2 * p.block_size as u64 + 50_000 + p.block_size as u64;
-    assert!(merged.literal_bytes() <= most, "merged literal {} > {most}", merged.literal_bytes());
-    assert!(merged.literal_bytes() < chunks.literal_bytes(), "merging must beat chunks alone here");
+    assert!(refined.literal_bytes() <= most, "refined literal {} > {most}", refined.literal_bytes());
+    assert!(refined.literal_bytes() * 4 < coarse.literal_bytes(), "refining must beat coarse chunks here");
+    // local_delta (coarse blocks here, since most of them match) refines just as well.
+    let local = local_delta(&new, n, &basis, b, &Params::DEFAULT).unwrap();
+    check_delta(&local, &new, &basis);
+    assert!(local.literal_bytes() <= most, "local literal {} > {most}", local.literal_bytes());
 }
 
 #[test]

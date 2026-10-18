@@ -11,7 +11,7 @@ for r in rows:
 # Tools and datasets in the order they first appear.
 tools = list(dict.fromkeys(r["tool"] for r in rows))
 wls = list(dict.fromkeys(r["workload"] for r in rows))
-NAMES = {"frsync": "fast_rsync (frsync)", "barqsync": "barqsync", "barqsync-old": "barqsync (before)", "rsync": "rsync"}
+NAMES = {"frsync": "fast_rsync (frsync)", "barqsync": "barqsync", "rsync": "rsync"}
 fails = [r for r in rows if r["ok"] != "OK"]
 print(f"runs: {len(rows)}, failed verification: {len(fails)}\n")
 for prof in ["lan", "wan"]:
