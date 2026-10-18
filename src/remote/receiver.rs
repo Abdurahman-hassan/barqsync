@@ -64,6 +64,8 @@ struct Incoming {
     held: (u64, Vec<u8>),
     /// How much of the file, from offset 0, holds received data (kept by `--partial`).
     prefix: Prefix,
+    /// Bytes already counted for progress: copied ranges, and data as it arrives.
+    counted: u64,
 }
 
 impl Incoming {
@@ -424,6 +426,7 @@ impl RemoteState {
             hint,
             held: (0, Vec::new()),
             prefix: Prefix::default(),
+            counted: 0,
         };
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
@@ -487,7 +490,9 @@ impl RemoteState {
             hint,
             held: (0, Vec::new()),
             prefix: Prefix::with_copies(&d.ops),
+            counted: matched,
         };
+        crate::progress::bytes(matched);
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
     }
@@ -503,6 +508,8 @@ impl RemoteState {
                     inc.write(off, bytes)?;
                 }
                 inc.prefix.data(off, bytes.len() as u64);
+                inc.counted += bytes.len() as u64;
+                crate::progress::bytes(bytes.len() as u64);
                 Ok(())
             }
             // The file failed to open on our side; its error was already reported.
@@ -523,7 +530,7 @@ impl RemoteState {
             return;
         }
         let dst = inc.job.dst_path.clone();
-        crate::progress::done(inc.job.meta.size);
+        crate::progress::done(inc.job.meta.size.saturating_sub(inc.counted));
         let (path, registered) = (inc.path.clone(), inc.registered);
         let (job, r) = self.finish(eng, inc);
         let r = if registered { finish_temp(&path, r) } else { r };

@@ -254,11 +254,16 @@ impl Sender<'_> {
                         Some(sig) => self.send_delta(id, &path, sig),
                         None => self.send_whole(id, &path),
                     };
-                    if let Err(e) = r {
-                        self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
-                        self.send(Msg::FileEnd { id, ok: false });
-                    }
-                    crate::progress::done(size);
+                    // Sent bytes were counted as they went; a failed file counts no more.
+                    let rest = match r {
+                        Ok(sent) => size.saturating_sub(sent),
+                        Err(e) => {
+                            self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
+                            self.send(Msg::FileEnd { id, ok: false });
+                            0
+                        }
+                    };
+                    crate::progress::done(rest);
                 }
                 self.pending_files.fetch_sub(1, SeqCst);
                 self.check_done();
@@ -300,27 +305,30 @@ impl Sender<'_> {
             let mut buf = vec![0u8; n];
             f.read_exact_at(&mut buf, off + pos)?;
             self.out_frames.send(Frame::Data { id, off: off + pos, bytes: buf })?;
+            crate::progress::bytes(n as u64);
             pos += n as u64;
         }
         Ok(())
     }
 
-    fn send_whole(&self, id: u64, path: &Path) -> io::Result<()> {
+    /// The sending functions return the size of the file as sent, all of it counted for
+    /// progress by then.
+    fn send_whole(&self, id: u64, path: &Path) -> io::Result<u64> {
         let f = File::open(path)?;
         self.send_whole_file(id, &f)
     }
 
-    fn send_whole_file(&self, id: u64, f: &File) -> io::Result<()> {
+    fn send_whole_file(&self, id: u64, f: &File) -> io::Result<u64> {
         let size = f.metadata()?.len();
         self.send(Msg::FileBegin { id, size });
         self.send_range(&ReadOnce::new(f, size), id, 0, size)?;
         self.send(Msg::FileEnd { id, ok: true });
-        Ok(())
+        Ok(size)
     }
 
     /// Diff the source file against the receiver's basis signature and send only the
     /// ranges it doesn't have.
-    fn send_delta(&self, id: u64, path: &Path, sig: Sig) -> io::Result<()> {
+    fn send_delta(&self, id: u64, path: &Path, sig: Sig) -> io::Result<u64> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
         if let Sig::Cdc(basis) = &sig {
@@ -367,21 +375,23 @@ impl Sender<'_> {
         Ok(refine::combine(&d, basis_size, &p, &gaps, &ours?, &theirs))
     }
 
-    /// Send a delta: the copy ops up front, then the literal ranges read from `src`.
-    fn send_ops(&self, id: u64, file: &File, d: &Delta, src: &dyn ReadAt) -> io::Result<()> {
+    /// Send a delta: the copy ops up front, then the literal ranges read from `src`. The
+    /// copied ranges count for progress at once, as rsync counts matched data.
+    fn send_ops(&self, id: u64, file: &File, d: &Delta, src: &dyn ReadAt) -> io::Result<u64> {
         if d.matched_bytes() == 0 {
             return self.send_whole_file(id, file);
         }
         let size = d.size;
         let copies: Vec<Op> = d.ops.iter().copied().filter(|o| matches!(o, Op::Copy { .. })).collect();
         self.send(Msg::DeltaBegin { id, size, copies });
+        crate::progress::bytes(d.matched_bytes());
         for op in &d.ops {
             if let Op::Literal { off, len } = *op {
                 self.send_range(src, id, off, len)?;
             }
         }
         self.send(Msg::FileEnd { id, ok: true });
-        Ok(())
+        Ok(size)
     }
 }
 
