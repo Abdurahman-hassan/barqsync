@@ -102,7 +102,12 @@ proptest! {
         }
         let (bn, bb) = (block_signature(&new, new.len() as u64, &P).unwrap(), block_signature(&basis, basis.len() as u64, &P).unwrap());
         let (cn, cb) = (chunk_signature(&new, new.len() as u64, &P).unwrap(), chunk_signature(&basis, basis.len() as u64, &P).unwrap());
-        for d in [diff_blocks(&bn, &bb), diff_chunks(&cn, &cb)] {
+        // One read for both signatures gives the same signatures.
+        prop_assert_eq!(&signatures(&new, new.len() as u64, &P).unwrap(), &(bn.clone(), cn.clone()));
+        let (blocks, chunks) = (diff_blocks(&bn, &bb), diff_chunks(&cn, &cb));
+        let merged = merge_in_place(&chunks, &blocks);
+        prop_assert!(merged.literal_bytes() <= blocks.literal_bytes().min(chunks.literal_bytes()));
+        for d in [blocks, chunks, merged] {
             check_delta(&d, &new, &basis);
             prop_assert_eq!(&rebuild(&d, &basis, &new, false), &new);
             prop_assert_eq!(&rebuild(&d, &basis, &new, true), &new);
@@ -133,6 +138,53 @@ fn insert_at_start_defeats_blocks_but_not_cdc() {
     let cdc = diff_chunks(&chunk_signature(&new, new.len() as u64, &p).unwrap(), &chunk_signature(&basis, basis.len() as u64, &p).unwrap());
     assert!(cdc.matched_bytes() as f64 > 0.9 * new.len() as f64, "cdc matched {} of {}", cdc.matched_bytes(), new.len());
     check_delta(&cdc, &new, &basis);
+}
+
+#[test]
+fn block_and_chunk_sizes_scale_with_the_file() {
+    let unit = |size: u64| Params::for_size(size).block_size >> 10;
+    assert_eq!([unit(0), unit(4 << 20), unit(256 << 20)], [4, 4, 4]);
+    assert_eq!([unit(1 << 30), unit(4 << 30), unit(16 << 30), unit(17 << 30), unit(1 << 40)], [8, 16, 32, 64, 64]);
+    let p = Params::for_size(256 << 20);
+    assert_eq!((p.cdc_min, p.cdc_avg, p.cdc_max), (2 << 10, 4 << 10, 8 << 10));
+    assert_eq!(p.segment % p.block_size, 0);
+}
+
+#[test]
+fn chunk_signature_carries_its_chunk_sizes() {
+    let data = pseudo_random(100_000, 11);
+    let sig = chunk_signature(&data, data.len() as u64, &P).unwrap();
+    assert_eq!(sig.params(Params::DEFAULT), Some(Params { cdc_min: 64, cdc_avg: 256, cdc_max: 1024, ..Params::DEFAULT }));
+    assert_eq!(sig.iter().map(|(_, len, _)| len as u64).sum::<u64>(), data.len() as u64);
+    // Sizes FastCDC would reject (or panic on) are refused.
+    for (min, avg, max) in [(0, 256, 1024), (64, 0, 1024), (64, 256, 0), (512, 256, 1024), (64, 2048, 1024), (64, 256, u32::MAX)] {
+        let bad = ChunkSig { min, avg, max, ..sig.clone() };
+        assert_eq!(bad.params(Params::DEFAULT), None, "{min}/{avg}/{max}");
+    }
+}
+
+#[test]
+fn grown_file_with_scattered_edits_costs_only_its_changed_blocks() {
+    // A database-like file: small edits all over, then growth at the end. Chunks alone
+    // lose the chunks around every edit; merged with aligned blocks only the touched
+    // blocks and the tail are literal.
+    let basis = pseudo_random(8 << 20, 12);
+    let mut new = basis.clone();
+    for i in 0..40 {
+        let off = i * 200_000 + 1_234;
+        new[off..off + 100].copy_from_slice(&pseudo_random(100, i as u64));
+    }
+    new.extend(pseudo_random(50_000, 1001));
+    let p = Params::for_size(basis.len() as u64);
+    let (bb, cb) = signatures(&basis, basis.len() as u64, &p).unwrap();
+    let (bn, cn) = signatures(&new, new.len() as u64, &p).unwrap();
+    let (chunks, blocks) = (diff_chunks(&cn, &cb), diff_blocks(&bn, &bb));
+    let merged = merge_in_place(&chunks, &blocks);
+    check_delta(&merged, &new, &basis);
+    assert!(merged.is_in_place());
+    let most = 40 * 2 * p.block_size as u64 + 50_000 + p.block_size as u64;
+    assert!(merged.literal_bytes() <= most, "merged literal {} > {most}", merged.literal_bytes());
+    assert!(merged.literal_bytes() < chunks.literal_bytes(), "merging must beat chunks alone here");
 }
 
 #[test]
@@ -177,7 +229,7 @@ proptest! {
             prop_assert_eq!(&in_pool(threads, || cdc::chunks(&data, &p)), &want, "threads {}", threads);
             // The blocks design's CDC fallback cuts at the same places.
             let sig = in_pool(threads, || chunk_signature(&data, data.len() as u64, &p).unwrap());
-            let got: Vec<(u64, u32)> = sig.chunks.iter().map(|c| (c.off, c.len)).collect();
+            let got: Vec<(u64, u32)> = sig.iter().map(|(off, len, _)| (off, len)).collect();
             prop_assert_eq!(&got, &want, "chunk_signature, threads {}", threads);
         }
     }

@@ -8,14 +8,16 @@ rows = list(csv.DictReader(open(net), delimiter="\t"))
 cell = defaultdict(list)
 for r in rows:
     cell[(r["profile"], r["workload"], r["tool"])].append(r)
-tools = ["frsync", "barqsync", "rsync"]
-wls = ["inplace", "shift", "append", "mid", "sqlite"]
+# Tools and datasets in the order they first appear.
+tools = list(dict.fromkeys(r["tool"] for r in rows))
+wls = list(dict.fromkeys(r["workload"] for r in rows))
+NAMES = {"frsync": "fast_rsync (frsync)", "barqsync": "barqsync", "barqsync-old": "barqsync (before)", "rsync": "rsync"}
 fails = [r for r in rows if r["ok"] != "OK"]
 print(f"runs: {len(rows)}, failed verification: {len(fails)}\n")
 for prof in ["lan", "wan"]:
     print(f"### {prof}: wall time, median (min–max) of runs\n")
-    print("| workload | fast_rsync (frsync) | barqsync | rsync 3.2 |")
-    print("|---|---:|---:|---:|")
+    print("| workload | " + " | ".join(NAMES.get(t, t) for t in tools) + " |")
+    print("|---|" + "---:|" * len(tools))
     for wl in wls:
         out = []
         meds = {}
@@ -30,8 +32,8 @@ for prof in ["lan", "wan"]:
         print(f"| {wl} | " + " | ".join(out) + " |")
     print()
 print("### Bytes on the link (veth counters, incl. ssh/TCP overhead), median of all runs\n")
-print("| workload | fast_rsync up / down | barqsync up / down | rsync up / down |")
-print("|---|---:|---:|---:|")
+print("| workload | " + " | ".join(NAMES.get(t, t) + " up / down" for t in tools) + " |")
+print("|---|" + "---:|" * len(tools))
 for wl in wls:
     out = []
     for t in tools:
@@ -58,8 +60,8 @@ for line in open(engine):
 print("### In-process engine, one file pair, median of 3 runs (4 cores)\n")
 print("| workload | engine | block | signature | delta | sig ms | diff ms | apply ms | verify ms | total ms |")
 print("|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
-for wl in ["inplace", "shift", "append", "sqlite", "mid"]:
-    for e in ["fast_rsync", "barqsync"]:
+for wl in dict.fromkeys(w for w, _ in eng):
+    for e in dict.fromkeys(e for _, e in eng):
         d = eng[(wl, e)]
         if not d: continue
         med = lambda k: st.median(float(x) for x in d[k])

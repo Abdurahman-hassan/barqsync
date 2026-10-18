@@ -526,7 +526,9 @@ dependencies = [
  "barqsync",
  "blake3",
  "fast_rsync",
+ "postcard",
  "rayon",
+ "serde",
 ]
 
 [[package]]

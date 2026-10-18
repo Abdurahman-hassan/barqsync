@@ -12,6 +12,8 @@ description = "fast_rsync vs barqsync comparison harness (see fast_rsync_compari
 fast_rsync = "=0.2.0"
 blake3 = { version = "1.8", features = ["rayon"] }
 rayon = "1.12"
+postcard = { version = "1.1", features = ["use-std"] }
+serde = "1"
 barqsync = { path = "../.." }
 
 [profile.release]

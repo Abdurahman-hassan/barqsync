@@ -328,16 +328,24 @@ impl Sender<'_> {
             };
         }
         let f = ReadOnce::new(&file, size);
+        // Hash this file with the receiver's block and chunk sizes; refuse sizes that make
+        // no sense (they come from the other side) by sending the file whole.
+        let aligned = |bs: u32| {
+            let bs = bs as usize;
+            (bs > 0).then(|| Params { block_size: bs, segment: (Params::DEFAULT.segment / bs).max(1) * bs, ..Params::DEFAULT })
+        };
         let d = match sig {
             Sig::Blocks(basis) => {
-                let bs = basis.block_size as usize;
-                if bs == 0 {
-                    return self.send_whole_file(id, &file);
-                }
-                let p = Params { block_size: bs, segment: (Params::DEFAULT.segment / bs).max(1) * bs, ..Params::DEFAULT };
+                let Some(p) = aligned(basis.block_size) else { return self.send_whole_file(id, &file) };
                 delta::diff_blocks(&delta::block_signature(&f, size, &p)?, &basis)
             }
-            Sig::Chunks(basis) => delta::diff_chunks(&delta::chunk_signature(&f, size, &Params::DEFAULT)?, &basis),
+            Sig::Both(blocks, chunks) => {
+                let Some(p) = aligned(blocks.block_size).and_then(|p| chunks.params(p)) else {
+                    return self.send_whole_file(id, &file);
+                };
+                let (nb, nc) = delta::signatures(&f, size, &p)?;
+                delta::merge_in_place(&delta::diff_chunks(&nc, &chunks), &delta::diff_blocks(&nb, &blocks))
+            }
             Sig::Cdc(_) => unreachable!(),
         };
         self.send_ops(id, &file, &d, &f)

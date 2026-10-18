@@ -699,9 +699,9 @@ impl RemoteState {
 }
 
 /// Signature of the destination file to send along with a request, so the sender can
-/// reply with a delta: aligned blocks when the size is unchanged (in-place edits),
-/// content-defined chunks when it changed (inserts, deletes, appends). `--delta=cdc`
-/// always sends content-defined chunks.
+/// reply with a delta: aligned blocks when the size is unchanged (in-place edits), aligned
+/// blocks and content-defined chunks in one read when it changed (inserts, deletes,
+/// appends, a database that grew). `--delta=cdc` always sends its own chunks.
 fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<Sig> {
     let d = match &job.basis {
         Some(p) => fsops::lstat(p).ok()?,
@@ -716,11 +716,11 @@ fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<Sig> {
         return Some(Sig::Cdc(cdc::signature(m.bytes(), &delta::Params::DEFAULT)));
     }
     let f = ReadOnce::new(&f, d.size);
-    let p = delta::Params::DEFAULT;
+    let p = delta::Params::for_size(d.size);
     if job.meta.size == d.size {
         delta::block_signature(&f, d.size, &p).ok().map(Sig::Blocks)
     } else {
-        delta::chunk_signature(&f, d.size, &p).ok().map(Sig::Chunks)
+        delta::signatures(&f, d.size, &p).ok().map(|(b, c)| Sig::Both(b, c))
     }
 }
 

@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -78,12 +78,14 @@ pub struct RootInfo {
 }
 
 /// The receiver's basis-file signature, chosen by the receiver: aligned blocks when the
-/// file kept its size (in-place edits), content-defined chunks when it changed size.
+/// file kept its size (in-place edits), aligned blocks and content-defined chunks when it
+/// changed size (the sender merges both deltas, so data that stayed in place and data
+/// that moved both match). Sizes follow [`crate::delta::Params::for_size`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Sig {
     Blocks(BlockSig),
-    Chunks(ChunkSig),
+    Both(BlockSig, ChunkSig),
     /// `--delta=cdc`: FastCDC chunks with xxh3 and BLAKE3 hashes.
     Cdc(CdcSig),
 }
@@ -667,6 +669,9 @@ mod tests {
         sel.children.insert(b"sub".to_vec(), Sel { contents: true, ..Sel::default() });
         let opts = crate::cli::Options::parse_from(["barqsync", "-a", "--partial-dir=.p", "src/", "dst"]).unwrap();
         let sig = crate::delta::cdc::signature(&[5u8; 300_000], &crate::delta::Params::DEFAULT);
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let p = crate::delta::Params::for_size(data.len() as u64);
+        let (blocks, chunks) = crate::delta::signatures(&data, data.len() as u64, &p).unwrap();
         vec![
             Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender: false, opts: Box::new(opts) },
             Msg::Roots(vec![RootInfo { contents: true, meta: Some(meta), items: Vec::new(), sel: Some(sel) }]),
@@ -678,6 +683,7 @@ mod tests {
                 sums: vec![Some([1; 16])],
             },
             Msg::Need { dir: 2, files: vec![NeedReq { idx: 0, sig: Some(Sig::Cdc(sig)) }] },
+            Msg::Need { dir: 3, files: vec![NeedReq { idx: 1, sig: Some(Sig::Both(blocks, chunks)) }] },
             Msg::SmallPack { files: vec![(file_id(2, 0), 3)], blob: b"abc".to_vec() },
         ]
     }

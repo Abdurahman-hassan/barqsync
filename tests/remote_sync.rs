@@ -156,6 +156,36 @@ fn delta_over_the_wire() {
     }
 }
 
+/// A database-like file that grew, with small edits all over it: the receiver sends
+/// aligned blocks and chunks, the sender merges both deltas, and only the touched 4 KiB
+/// blocks and the new tail travel (content-defined chunks alone would send the chunks
+/// around every edit).
+#[test]
+fn resized_file_with_scattered_edits_sends_only_changed_blocks() {
+    let base = noise(16 << 20, 21);
+    let mut grown = base.clone();
+    for i in 0..64 {
+        let off = i * 250_000 + 777;
+        grown[off..off + 64].copy_from_slice(&noise(64, 100 + i as u64));
+    }
+    grown.extend(noise(100_000, 22));
+    for pull in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        Tree::new(tmp.path().join("dst")).file("app.db", &base).settle_mtimes();
+        let new = Tree::new(tmp.path().join("src"));
+        new.file("app.db", &grown).settle_mtimes();
+        new.mtime("app.db", BASE_TIME + 900_003);
+        let mut args = vec!["-a", "--stats", "--strategy", "fixed"];
+        args.extend_from_slice(if pull { &["{host}src/", "dst"] } else { &["src/", "{host}dst"] });
+        let f = barqsync_remote(tmp.path(), &args);
+        assert_eq!(f.code, 0, "pull={pull}\n{}\n{}", f.stdout, f.stderr);
+        assert_eq!(fs::read(tmp.path().join("dst/app.db")).unwrap(), grown, "pull={pull}");
+        let literal = stat_bytes(&f.stdout, "Literal data: ");
+        let most = 64 * 2 * 4096 + 100_000 + 4096;
+        assert!(literal <= most, "pull={pull}: literal {literal} > {most}");
+    }
+}
+
 #[test]
 fn whole_file_flag_disables_remote_delta() {
     let tmp = tempfile::tempdir().unwrap();

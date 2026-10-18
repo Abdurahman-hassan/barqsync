@@ -1,5 +1,7 @@
 # Datasets for the fast_rsync comparison (fast_rsync_comparison.md), each an old/ and a new/
-# directory: inplace, shift, append, mid, sqlite. Seeded, so reruns produce identical files.
+# directory: inplace, shift, append, mid, sqlite (the first comparison), and tar, csv,
+# scatter (added to choose barqsync's block and chunk sizes). Seeded, so reruns produce
+# identical files.
 #   python3 -I gen.py OUT_DIR
 import os, random, sqlite3, shutil, sys
 W = sys.argv[1]
@@ -62,3 +64,41 @@ c.executemany("INSERT INTO users VALUES (?,?,?,?,?)", (row(400_000 + i) for i in
 for _ in range(1000):
     c.execute("DELETE FROM users WHERE id=?", (r.randrange(400_000),))
 c.commit(); c.close()
+
+# Extra datasets, used to choose the block and chunk sizes (not part of the first comparison).
+vocab_rng = random.Random(60)
+vocab = [''.join(vocab_rng.choice('abcdefghijklmnopqrstuvwxyz_') for _ in range(vocab_rng.randint(2, 12))) for _ in range(3000)]
+
+# 6. tar: an archive of a 4,000-file text tree; 50 files get 1-10 lines inserted
+import io, tarfile
+r = random.Random(6); o, n = pair("tar")
+tree = {f"src/m{i // 100:02d}/f{i:04d}.rs": [" ".join(r.choices(vocab, k=r.randint(3, 12))) for _ in range(r.randint(20, 400))]
+        for i in range(4000)}
+def write_tar(path):
+    with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as t:
+        for name in sorted(tree):
+            data = ("\n".join(tree[name]) + "\n").encode()
+            ti = tarfile.TarInfo(name); ti.size = len(data); ti.mtime = 1_000_000_000; ti.mode = 0o644
+            t.addfile(ti, io.BytesIO(data))
+write_tar(f"{o}/src.tar")
+for name in r.sample(sorted(tree), 50):
+    lines = tree[name]; pos = r.randrange(len(lines) + 1)
+    lines[pos:pos] = [" ".join(r.choices(vocab, k=8)) for _ in range(r.randint(1, 10))]
+write_tar(f"{n}/src.tar")
+
+# 7. csv: ~64 MB of rows; 300 rows rewritten with fields of a different length
+r = random.Random(7); o, n = pair("csv")
+def csv_row(i):
+    return f"{i},{r.choice(vocab)} {r.choice(vocab)},{r.choice(vocab)}@example.com,{r.randint(0, 10**9)},{r.random():.6f}\n"
+rows = [csv_row(i) for i in range(1_250_000)]
+open(f"{o}/data.csv", "w").write("".join(rows))
+for i in r.sample(range(len(rows)), 300):
+    rows[i] = csv_row(i)
+open(f"{n}/data.csv", "w").write("".join(rows))
+
+# 8. scatter: 256 MiB, 3,000 writes of 64 bytes in place (a fixed-size database or image)
+r = random.Random(8); o, n = pair("scatter")
+d = rnd(r, 256 * MiB); open(f"{o}/scatter.img", "wb").write(d)
+for _ in range(3000):
+    off = r.randrange(0, len(d) - 64); d[off:off + 64] = r.randbytes(64)
+open(f"{n}/scatter.img", "wb").write(d)

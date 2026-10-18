@@ -4,15 +4,21 @@
 //!
 //! fast_rsync: MD4 signature of OLD (rsync's sqrt block size, 8-byte strong hash), rolling
 //! diff of NEW against it, apply in memory, BLAKE3 check of the result.
-//! barqsync: what its remote push does: the receiver's basis signature (aligned blocks if
-//! the size is unchanged, FastCDC chunks otherwise), the sender's signature of NEW and the
-//! signature diff, then the rebuild into a file.
+//! barqsync: what its remote push does: the receiver's basis signature with block and chunk
+//! sizes scaled to the file (aligned blocks if the size is unchanged, blocks and FastCDC
+//! chunks otherwise), the sender's signatures of NEW, the diff (both deltas merged when the
+//! size changed), then the rebuild into a file.
 //! Prints one tab-separated line per engine.
 
 use barqsync::delta::{self, Params, ReadAt};
 use fast_rsync::{Signature, SignatureOptions, apply_limited, diff};
 use std::fs::{self, File};
 use std::time::Instant;
+
+/// Postcard-encoded length, as barqsync sends it.
+fn wire<T: serde::Serialize>(v: &T) -> usize {
+    postcard::to_allocvec(v).unwrap().len()
+}
 
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
@@ -53,26 +59,29 @@ fn main() {
     drop((out, idx));
 
     // barqsync
-    let p = Params::DEFAULT;
+    let p = Params::for_size(old.len() as u64);
     let (of, nf) = (File::open(old_path).unwrap(), File::open(new_path).unwrap());
     let same = old.len() == new.len();
     let t = Instant::now();
     let (bsig, csig) = if same {
-        (Some(delta::block_signature(&of, old.len() as u64, &p).unwrap()), None)
+        (delta::block_signature(&of, old.len() as u64, &p).unwrap(), None)
     } else {
-        (None, Some(delta::chunk_signature(&of, old.len() as u64, &p).unwrap()))
+        let (b, c) = delta::signatures(&of, old.len() as u64, &p).unwrap();
+        (b, Some(c))
     };
     let t_sig = ms(t);
     let t = Instant::now();
-    let dl = match (&bsig, &csig) {
-        (Some(b), _) => delta::diff_blocks(&delta::block_signature(&nf, new.len() as u64, &p).unwrap(), b),
-        (_, Some(c)) => delta::diff_chunks(&delta::chunk_signature(&nf, new.len() as u64, &p).unwrap(), c),
-        _ => unreachable!(),
+    let dl = match &csig {
+        None => delta::diff_blocks(&delta::block_signature(&nf, new.len() as u64, &p).unwrap(), &bsig),
+        Some(c) => {
+            let (nb, nc) = delta::signatures(&nf, new.len() as u64, &p).unwrap();
+            delta::merge_in_place(&delta::diff_chunks(&nc, c), &delta::diff_blocks(&nb, &bsig))
+        }
     };
     let t_diff = ms(t);
-    // Rough wire size of the signature (postcard varints make the real one a bit smaller).
-    let sig_bytes = bsig.as_ref().map_or(0, |b| b.hashes.len() * 16) + csig.as_ref().map_or(0, |c| c.chunks.len() * 28);
-    let ops_bytes = dl.ops.len() * 20;
+    // Wire sizes (postcard, as barqsync sends them).
+    let sig_bytes = wire(&bsig) + csig.as_ref().map_or(0, wire);
+    let ops_bytes = wire(&dl.ops);
     let out_path = format!("{new_path}.engine-out");
     let _ = fs::remove_file(&out_path);
     let t = Instant::now();
@@ -85,8 +94,9 @@ fn main() {
     fs::remove_file(&out_path).unwrap();
     println!(
         "barqsync\tmode={}\tsig_bytes={sig_bytes}\tdelta_bytes={}\tsig_ms={t_sig:.1}\tdiff_ms={t_diff:.1}\tapply_ms={t_apply:.1}\tverify_ms=0.0\ttotal_ms={:.1}",
-        if same { "blocks" } else { "chunks" },
+        format!("{}K-{}", p.block_size >> 10, if same { "blocks" } else { "both" }),
         dl.literal_bytes() as usize + ops_bytes,
         t_sig + t_diff + t_apply
     );
 }
+
