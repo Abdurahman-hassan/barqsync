@@ -254,16 +254,18 @@ impl Sender<'_> {
                         Some(sig) => self.send_delta(id, &path, sig),
                         None => self.send_whole(id, &path),
                     };
-                    // Sent bytes were counted as they went; a failed file counts no more.
-                    let rest = match r {
-                        Ok(sent) => size.saturating_sub(sent),
+                    match r {
+                        // Sent bytes were counted as they went.
+                        Ok(sent) => crate::progress::done(size.saturating_sub(sent)),
+                        // A failed file doesn't count as transferred; after Ctrl-C the
+                        // closed connection is expected, not worth a message.
                         Err(e) => {
-                            self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
+                            if !fsops::interrupted() {
+                                self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
+                            }
                             self.send(Msg::FileEnd { id, ok: false });
-                            0
                         }
-                    };
-                    crate::progress::done(rest);
+                    }
                 }
                 self.pending_files.fetch_sub(1, SeqCst);
                 self.check_done();
@@ -575,7 +577,9 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
                         out.error(format!("protocol error: unexpected {other:?}"));
                         break Err(exit::PROTOCOL);
                     }
+                    // After Ctrl-C, which also stops ssh, a closed connection is expected.
                     Err(Stop::Interrupted) => break Err(exit::SIGNAL),
+                    Err(Stop::Io(_)) if fsops::interrupted() => break Err(exit::SIGNAL),
                     Err(Stop::Io(e)) => {
                         out.error(format!("connection error: {e}"));
                         break Err(exit::PROTOCOL);
