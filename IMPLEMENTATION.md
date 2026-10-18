@@ -1,7 +1,7 @@
 # barqsync: implementation notes
 
 The detailed notes behind barqsync: milestone status, every supported option, how each part
-works, and the measurements that shaped it. Until 0.2.0 this was the README;
+works, and the measurements that shaped it. Through 0.2.0 this was the README;
 [README.md](README.md) is now a short overview.
 
 A parallel, rsync-compatible file synchronizer written in Rust.

@@ -1,6 +1,6 @@
 [package]
 name = "barqsync"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.92"
 description = "A parallel, rsync-compatible file synchronizer: local, over ssh, TLS-over-TCP streams or QUIC (macOS and Linux)"
