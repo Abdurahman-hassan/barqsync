@@ -138,12 +138,16 @@ crate underneath it, for explicit batching).
 1. **Aligned blocks first.** Both files are hashed in parallel. This is the best case
    for in-place edits and appends: VM images, databases, logs.
 2. **FastCDC when blocks are not enough.** Used when under half the bytes matched (locally)
-   or the size changed (remotely): chunks inside 4 MiB segments, which keeps chunking
-   deterministic and parallel. The chunk delta is merged with the block delta, so ranges
-   that stayed in place match block by block and moved ranges match by content.
-3. **Sizes scale with the file** (M15): blocks of a quarter of √size as a power of two,
-   4 KiB to 64 KiB (4 KiB up to 256 MiB); chunks average the block size (half to twice it).
-   Until M15: 64 KiB blocks and 16/32/64 KiB chunks.
+   or the size changed (remotely): 16/32/64 KiB chunks inside 4 MiB segments, which keeps
+   chunking deterministic and parallel. Locally the chunk delta is merged with the block
+   delta, so ranges that stayed in place match block by block and moved ranges by content.
+3. **Refinement** (M16, `delta::refine`): the literal runs of that coarse delta are refined
+   with fine sizes (`Params::for_size`: a quarter of √size as a power of two, 4 KiB to
+   64 KiB, 4 KiB up to 256 MiB). For each run, the basis stretch between the same matched
+   neighbours is signed again: blocks on the basis's grid, compared at the run's offset
+   shift, plus chunks where the two stretches differ in length. Remotely this costs one round
+   trip and is skipped when the runs hold under 64 KiB of basis data (an append) or nothing
+   matched at all (a rewritten file).
 4. **Apply:**
    - **Clone + patch** when ranges kept their offsets: only changed ranges are written.
    - **Rebuild** otherwise: parallel reads, sequential writes. Scattered writes into a sparse
@@ -176,16 +180,19 @@ one file use the same stream, so they stay in order.
   - **Kind 0:** a control message, postcard-encoded. Messages: `Hello`, `HelloAck`, `Roots`,
     `DirBatch`, `Need`, `FileBegin`, `DeltaBegin`, `FileEnd`, `SmallPack`, `ScanDone`,
     `SenderDone`, `ReceiverDone`, `Log`, `Fatal`, `StreamOffer`, `StreamUnavailable`,
-    `StreamsReady`, `StreamEnd`.
+    `StreamsReady`, `StreamEnd`, `Refine`, `Refined`.
   - **Kind 1:** raw file `Data` (`id`, `offset`, bytes).
   - **Flag `0x80`:** zstd-compressed body (`-z`), compressed on the producing thread, so
     compression runs in parallel.
 - **File ids:** `directory id << 32 | index in its listing`.
-- **Basis signatures** (sizes from the basis file's size, carried in the signature):
-  - aligned-block BLAKE3-128 hashes when the file size is unchanged;
-  - aligned-block and FastCDC chunk hashes, computed in one read, when it changed; chunk
-    entries carry only a length and a hash (offsets are implied). Protocol version 6 since
-    M15; version 5 peers are refused with "protocol version mismatch".
+- **Basis signatures** (coarse, in `Need`):
+  - aligned-block BLAKE3-128 hashes (64 KiB) when the file size is unchanged;
+  - FastCDC chunk hashes (16/32/64 KiB) when it changed; the signature carries its chunk
+    sizes, and chunk entries only a length and a hash (offsets are implied).
+- **Refinement** (M16): before `DeltaBegin`, the sender may send `Refine` (basis stretches and
+  fine sizes, checked by the receiver); the receiver answers `Refined` with one fine
+  signature per stretch, or none, and the sender keeps the coarse delta. Protocol version 7;
+  older peers are refused with "protocol version mismatch".
 - **Threads:** each side has a dedicated reader thread and writer thread, so neither side can
   deadlock waiting for the other to drain the pipe.
 
@@ -303,14 +310,30 @@ one file use the same stream, so they stay in order.
   sender) and drops chunk offsets. Protocol version 6.
 - Over 100 Mbit / 20 ms: 1.4–7.5× faster on small or scattered edits (SQLite 16.7 → 3.2 s,
   rsync 9.4 s); 4–22% slower on 256 MiB appends and in-place runs, which pay for the larger
-  signature (1–2 MB per 256 MiB) without gaining from it. The macOS benchmarks (A–D) were not
-  re-run; a 10 GiB file now uses 32 KiB blocks.
+  signature (1–2 MB per 256 MiB) without gaining from it. Replaced by M16's two-level
+  delta; `Params::for_size` and the merge stayed.
+
+### M16: two-level delta (branch `ccr-2f85cd18-jxdmlm`)
+
+- The coarse signatures of 0.1.1 again, and `delta::refine` for what they leave literal:
+  `Refine` / `Refined` (one round trip, while the sender hashes its side), skipped below
+  64 KiB of basis data. Local deltas refine the same way without the threshold. Protocol 7.
+- Over 100 Mbit / 20 ms, against 0.1.1: `append` 1.30 → 1.29 s, `inplace` 1.24 → 1.24 s,
+  `shift` 1.00 → 0.75 s, `sqlite` 16.7 → 3.2 s, `scatter` 12.4 → 1.6 s; faster than rsync on
+  7 of 8 datasets (all but 40 × 4 MiB files with 1 KiB edits: 0.73 against 0.69 s).
+  Signatures 0.06–0.9 MB (M15: 0.4–2.0 MB). Details in `fast_rsync_comparison.md` §10.
+- Fixed a racy fixture: four differential tests created destination-only files once per
+  tool and compared their mtimes, which differed when a second boundary fell between the two
+  trees (`keep_dirlinks_matches_rsync` failed 1 in 400 runs). `Tree::same_mtimes` gives them
+  one time; 0 in 400.
+- The macOS benchmarks (A–D) were not re-run, and the Mac was out of reach from the VM.
 
 ### Testing
 
 - **Coverage:** 145 tests on macOS (arm64, and x86_64 under Rosetta: BLAKE3/zstd x86 SIMD
   paths, `getattrlistbulk` on Intel builds) and 148 on Linux (aarch64 container, glibc rsync
-  3.2.7) at M14; 152 on Linux (x86_64 VM, rsync 3.2.7) at M15, macOS not re-run. The whole suite also runs with each alternative design as the default
+  3.2.7) at M14; 157 on Linux (x86_64 VM, rsync 3.2.7) at M16, macOS not re-run. The
+  whole suite also runs with each alternative design as the default
   (`BARQSYNC_DELTA`, `_SCANNER`, `_TRANSPORT`, `_WIRE`, `_STRATEGY`, `_NET_IO`, `_IO_URING`).
 - **Differential tests:** most tests run the same command through rsync and barqsync and
   require identical printed items and identical trees (content, mode, mtime, symlink targets,
@@ -318,8 +341,8 @@ one file use the same stream, so they stay in order.
 - **Remote tests:** run through a fake ssh that starts the server locally, against rsync over
   the same shim.
 - **Delta property test:** random insert/delete/overwrite/append/truncate sequences, checked
-  with up to 5000 cases. Every delta must rebuild the file exactly, and a merged delta must
-  have no more literal data than the block or the chunk delta it came from.
+  with up to 5000 cases. Every delta must rebuild the file exactly; a merged or refined
+  delta must also have no more literal data than the delta it came from.
 
 ---
 
@@ -411,9 +434,6 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
 - **Worth trying next:** making QUIC the default where UDP is known to work (it is 2–4×
   faster on lossy links), and a cheaper probe so `--strategy adaptive` stops costing 4–22%
   on incompressible data.
-- **Signature cost since M15:** a resized file's two signatures cost about 0.8% of its size
-  and make 256 MiB appends 17–22% slower. A coarse first signature with a second round trip
-  for the blocks that differ would avoid most of it, at the price of a protocol change.
-- **A rare failure of `keep_dirlinks_matches_rsync`** with `BARQSYNC_TRANSPORT=tcp`: 2 of 25
-  full-suite runs had a failure (identified once as this test), and 1 of 110 runs of the test
-  alone. It syncs only tiny files (no delta). Its message has not been captured yet.
+- **The refinement threshold is fixed** (64 KiB of basis data per file). With
+  `--strategy adaptive` the measured round trip could set it: a smaller gap is worth
+  refining on a LAN, not on a long link.

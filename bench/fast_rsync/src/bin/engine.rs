@@ -79,7 +79,7 @@ fn main() {
     // Refinement: the request and both sides' fine signatures, as over the wire.
     let unit = if same { p.block_size } else { p.cdc_avg };
     let fine = Params::for_size(os);
-    let (dl, refine_bytes) = match refine::plan(&coarse, os, unit, &fine) {
+    let (dl, refine_bytes) = match refine::plan(&coarse, os, unit, &fine, refine::REFINE_MIN) {
         Some(gaps) => {
             let reqs: Vec<refine::GapReq> = gaps.iter().map(refine::Gap::request).collect();
             let theirs = refine::basis_sigs(&of, os, &fine, &reqs).unwrap();

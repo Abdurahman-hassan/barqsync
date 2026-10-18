@@ -177,7 +177,7 @@ fn refinement_requests_are_checked_and_bad_answers_ignored() {
     new[100_000..100_010].fill(1);
     let coarse = diff_blocks(&block_signature(&new, 300_000, &Params::DEFAULT).unwrap(), &block_signature(&basis, 300_000, &Params::DEFAULT).unwrap());
     let fine = Params::for_size(300_000);
-    let gaps = refine::plan(&coarse, 300_000, Params::DEFAULT.block_size, &fine).unwrap();
+    let gaps = refine::plan(&coarse, 300_000, Params::DEFAULT.block_size, &fine, refine::REFINE_MIN).unwrap();
     let ours = refine::new_side(&new, 300_000, 300_000, &fine, &gaps).unwrap();
     assert_eq!(refine::combine(&coarse, 300_000, &fine, &gaps, &ours, &[]), coarse);
     let theirs = vec![refine::GapSig::default(); gaps.len()];
@@ -190,7 +190,7 @@ fn a_rewritten_file_is_not_refined() {
     let p = Params::DEFAULT;
     let coarse = diff_blocks(&block_signature(&new, 1 << 20, &p).unwrap(), &block_signature(&basis, 1 << 20, &p).unwrap());
     assert_eq!(coarse.matched_bytes(), 0);
-    assert_eq!(refine::plan(&coarse, 1 << 20, p.block_size, &Params::for_size(1 << 20)), None);
+    assert_eq!(refine::plan(&coarse, 1 << 20, p.block_size, &Params::for_size(1 << 20), 0), None);
 }
 
 #[test]
@@ -202,7 +202,7 @@ fn an_append_is_not_refined() {
     let p = Params::DEFAULT;
     let coarse = diff_chunks(&chunk_signature(&new, new.len() as u64, &p).unwrap(), &chunk_signature(&basis, basis.len() as u64, &p).unwrap());
     assert!(coarse.literal_bytes() < 500_000 + p.cdc_max as u64);
-    assert_eq!(refine::plan(&coarse, basis.len() as u64, p.cdc_avg, &Params::for_size(basis.len() as u64)), None);
+    assert_eq!(refine::plan(&coarse, basis.len() as u64, p.cdc_avg, &Params::for_size(basis.len() as u64), refine::REFINE_MIN), None);
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn grown_file_with_scattered_edits_costs_only_its_changed_blocks() {
     let (n, b) = (new.len() as u64, basis.len() as u64);
     let coarse = diff_chunks(&chunk_signature(&new, n, &Params::DEFAULT).unwrap(), &chunk_signature(&basis, b, &Params::DEFAULT).unwrap());
     let p = Params::for_size(b);
-    let gaps = refine::plan(&coarse, b, Params::DEFAULT.cdc_avg, &p).expect("worth refining");
+    let gaps = refine::plan(&coarse, b, Params::DEFAULT.cdc_avg, &p, refine::REFINE_MIN).expect("worth refining");
     let refined = refine::local(&coarse, &new, n, &basis, b, &p, &gaps).unwrap();
     check_delta(&refined, &new, &basis);
     assert!(refined.is_in_place());

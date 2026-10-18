@@ -27,11 +27,12 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M12 | adaptive strategy (`--strategy adaptive`): link probe, whole-vs-delta routing by link speed, pack compression with link-based zstd levels, `--compress-level`; up to 7.6× on compressible data, slower on incompressible, so `fixed` stays the default | done |
 | M13 | io_uring batches for received small files (`--io-uring`, Linux): 24% fewer syscalls, no faster, so opt-in; found on the way: skipping a redundant truncate made small-file pushes onto XFS 3.2× faster | done |
 | M14 | full verification: local A/B/C/D vs rsync and `cp`, Linux syscall counts and flamegraphs, every transport and strategy over lan/wan/lossy links; README and as-built plan updated | done |
-| M15 | delta block and chunk sizes scale with the file (4–64 KiB); a remote file that changed size gets both signatures and a merged delta; protocol version 6. Over 100 Mbit: 1.4–7.5× faster on small or scattered edits (a growing SQLite database 16.7 → 3.2 s, rsync 9.4 s), 4–22% slower on large appends, in-place runs and (on 1 Gbit) shifted data; see [Block and chunk sizes](#block-and-chunk-sizes-m15) | done |
+| M15 | delta block and chunk sizes scale with the file (4–64 KiB); a remote file that changed size got both signatures and a merged delta (protocol 6): 1.4–7.5× faster on small or scattered edits, but 4–22% slower on large appends and in-place runs, so M16 replaced the signature scheme | done |
+| M16 | two-level delta: the coarse signatures of 0.1.1, refined on demand with one round trip where the coarse delta left enough literal data (protocol 7). Over 100 Mbit: as fast as 0.1.1 on appends, in-place runs and small files, 1.3–7.6× faster on everything else (a growing SQLite database 16.7 → 3.2 s, rsync 9.4 s), faster than rsync on 7 of 8 datasets; see [Two-level delta](#two-level-delta-m16). Also fixed a racy test fixture | done |
 
 The test suite passes on macOS (APFS; 145 tests at M14, also built as x86_64 and run under
-Rosetta) and Linux (148 tests at M14 in an aarch64 container, 152 at M15 on an x86_64 VM),
-compared against rsync 3.2.7. macOS was not re-run for M15.
+Rosetta) and Linux (148 tests at M14 in an aarch64 container, 157 at M16 on an x86_64 VM),
+compared against rsync 3.2.7. macOS was not re-run for M15 and M16.
 
 ## Install
 
@@ -151,9 +152,9 @@ sender, and both sides run the same code:
   arrives, so the transfer starts before the scan ends.
 - **One round trip per directory, not per file.** For each listing the receiver answers with
   one request naming the files it needs. For files it already has an older copy of, the
-  request carries a basis signature: aligned blocks when the size is unchanged, aligned
-  blocks and FastCDC chunks otherwise (the sender merges both deltas). Block and chunk sizes
-  scale with the file (see [Delta transfer](#delta-transfer)).
+  request carries a coarse basis signature: aligned blocks when the size is unchanged,
+  FastCDC chunks otherwise. Where the coarse delta leaves enough data unmatched, the sender
+  asks for fine signatures of just those parts (see [Delta transfer](#delta-transfer)).
 - **Small files are packed.** Files up to 128 KiB travel many-per-frame in ~4 MiB packs and
   are written by the receiver's thread pool.
 - **Deltas over the wire.** Changed files come back as copy ranges plus only the missing
@@ -346,29 +347,28 @@ from the old destination file plus only the ranges that differ:
 1. **Aligned blocks first.** Both files are hashed in parallel in blocks at the same
    offsets. This is ideal for in-place changes and appends (VM images, databases, logs).
 2. **FastCDC for moved data.** If under half the bytes matched (locally), or the file changed
-   size (remotely, where neither side has both files), both files are also chunked by
-   content, so inserted or deleted bytes only cost the chunks around them. The chunk delta is
-   merged with the block delta: a range that stayed in place matches block by block even
-   when its chunk changed, so a database that grew costs only its changed blocks. Chunking
-   runs in parallel over 4 MiB segments, joined so the cuts are exactly those of one
+   size (remotely, where neither side has both files), both files are chunked by content
+   (16/32/64 KiB chunks), so inserted or deleted bytes only cost the chunks around them.
+   Chunking runs in parallel over 4 MiB segments, joined so the cuts are exactly those of one
    sequential pass (see [`--delta=cdc`](#--deltacdc-the-original-plans-design)).
-3. **Clone + patch.** When matched ranges keep their offsets, the old file is cloned (APFS
+3. **Refinement.** These first signatures are coarse (64 KiB blocks, 32 KiB chunks), so they
+   cost little whatever the file. What the coarse delta leaves literal is refined with fine
+   sizes, a quarter of √size (4 KiB up to 256 MiB, 64 KiB beyond 16 GiB): for each literal
+   run, the basis stretch between the same matched neighbours is signed again, with blocks on
+   the basis's grid compared at the run's offset shift, and with chunks where the two
+   stretches differ in length. Remotely that is one more round trip, taken only when the runs
+   hold 64 KiB of basis data or more, so an append, whose only mismatch is the basis's last
+   chunk, never pays for it. See [Two-level delta](#two-level-delta-m16).
+4. **Clone + patch.** When matched ranges keep their offsets, the old file is cloned (APFS
    `fclonefileat`, Linux `FICLONE`) and only the changed ranges are written. Otherwise the
    new file is rebuilt in parallel. With `--inplace`, changes go straight into the destination.
-
-**Block and chunk sizes follow the file**: a quarter of √size, rounded up to a power of two
-between 4 KiB and 64 KiB (4 KiB up to 256 MiB, 16 KiB at 4 GiB, 64 KiB beyond 16 GiB).
-Chunks average the block size, from half to twice it. A block signature costs 16 bytes per
-block, under 0.4% of the file. Until M15 sizes were fixed at 64 KiB blocks and 32 KiB chunks,
-which made small scattered edits expensive; see
-[Block and chunk sizes](#block-and-chunk-sizes-m15).
 
 Blocks and chunks are matched by BLAKE3 (128-bit), so every reused range is cryptographically
 verified. That replaces the originally planned xxh3 + whole-file check, because a whole-file
 check would have to re-read the entire output and cancel out clone+patch. BLAKE3 per block runs
 at ~12.6 GB/s on all cores of an M-series Mac, faster than the SSD.
 
-| Change to a 6 MiB file | bytes written, until M15 | bytes written now |
+| Change to a 6 MiB file | bytes written, 0.1.1 | bytes written now |
 | --- | ---: | ---: |
 | 4 KiB overwritten in place (not block-aligned) | 64 KiB | 8 KiB |
 | 300 KB appended | 300 KB | 300 KB |
@@ -380,44 +380,43 @@ at ~12.6 GB/s on all cores of an M-series Mac, faster than the SSD.
 insert or delete, the chunk boundaries of the two files fall back into step within a few
 chunks. Files of 128 KiB or less are always sent whole.
 
-### Block and chunk sizes (M15)
+### Two-level delta (M16)
 
 Comparing barqsync with [fast_rsync](https://crates.io/crates/fast_rsync) and rsync on real
 transfers ([`fast_rsync_comparison.md`](fast_rsync_comparison.md)) showed that fixed 64 KiB
 blocks and 32 KiB chunks made small or scattered edits expensive: a SQLite database that grew
-by 3 MB after 8,000 SQL changes sent 193 MB, where rsync sent 104 MB. Two changes fixed that:
+by 3 MB after 8,000 SQL changes sent 193 MB, where rsync sent 104 MB.
 
-- **Sizes scale with the file** (`Params::for_size`): a quarter of √size, so 4 KiB for
-  everything up to 256 MiB. The receiver picks them from its basis file and the signature
-  carries them, so the sender hashes its file the same way.
-- **A remote file that changed size gets both signatures**, aligned blocks and chunks from one
-  read, and the sender merges the two deltas. Before, a changed size meant chunks only, which
-  lost the in-place structure of databases and images that grow at the end. Chunk entries no
-  longer carry their offset, which the lengths imply. Protocol version 6; older peers are
-  refused with "protocol version mismatch".
+- **M15** made the sizes fine (4 KiB) for every delta and sent a resized file both signatures.
+  That fixed the database, but every changed file now paid for a fine signature (1–2 MB per
+  256 MiB, back to the sender) and a second hashing pass, needed or not: appends and in-place
+  runs got 4–22% slower.
+- **M16** keeps 0.1.1's coarse first signature and refines only what it leaves literal. The
+  sender sends `Refine` with the basis stretches between matched ranges and the fine sizes;
+  the receiver answers `Refined` with their fine signatures; meanwhile the sender hashes its
+  own side. Signatures now cost what the change needs: 0.06–0.9 MB here, against 0.04–0.6 MB
+  in 0.1.1 and 0.4–2.0 MB in M15. Protocol version 7; older peers are refused with
+  "protocol version mismatch".
 
-Pushes over ssh to a 100 Mbit link with a 20 ms round trip (median of 3 runs, every result
-verified; bytes are data sent, signatures going the other way are extra):
+Pushes over ssh to a 100 Mbit link with a 20 ms round trip (median of 3 runs, all 240 results
+verified; bytes are data sent):
 
-| Dataset | until M15 | M15 | rsync 3.2.7 |
-| --- | ---: | ---: | ---: |
-| scatter: 256 MiB, 3,000 × 64 B overwritten | 12.36 s, 141.8 MB | **1.64 s**, 12.3 MB | 4.46 s, 45.5 MB |
-| sqlite: 250 MB database, 8,000 SQL changes | 16.70 s, 192.8 MB | **3.18 s**, 28.1 MB | 9.38 s, 104.3 MB |
-| csv: 78 MB, 300 rows rewritten | 1.67 s, 14.2 MB | **0.72 s**, 2.1 MB | 0.80 s, 2.6 MB |
-| tar: 54 MB archive, 50 files edited | 0.80 s, 3.8 MB | **0.58 s**, 0.9 MB | 0.63 s, 0.9 MB |
-| shift: 256 MiB, 40 inserts/deletes | 0.98 s, 4.6 MB | 0.98 s, 1.1 MB | **0.88 s**, 1.3 MB |
-| mid: 40 × 4 MiB, 1 KiB changed each | 0.73 s, 2.6 MB | 0.74 s, 0.2 MB | **0.70 s**, 0.5 MB |
-| inplace: 256 MiB, 8 × 1 MiB overwritten | **1.21 s**, 8.4 MB | 1.28 s, 7.9 MB | 1.37 s, 8.1 MB |
-| append: 256 MiB + 8 MiB | **1.32 s**, 8.5 MB | 1.55 s, 8.4 MB | 1.49 s, 8.5 MB |
+| Dataset | 0.1.1 | M15 | M16 | rsync 3.2.7 |
+| --- | ---: | ---: | ---: | ---: |
+| scatter: 256 MiB, 3,000 × 64 B overwritten | 12.38 s, 141.8 MB | 1.64 s, 12.3 MB | **1.63 s**, 12.3 MB | 4.46 s, 45.5 MB |
+| sqlite: 250 MB database, 8,000 SQL changes | 16.71 s, 192.8 MB | **3.17 s**, 28.1 MB | 3.23 s, 30.1 MB | 9.38 s, 104.3 MB |
+| csv: 78 MB, 300 rows rewritten | 1.67 s, 14.2 MB | 0.73 s, 2.1 MB | **0.66 s**, 1.8 MB | 0.80 s, 2.7 MB |
+| tar: 54 MB archive, 50 files edited | 0.79 s, 3.8 MB | 0.58 s, 0.9 MB | **0.56 s**, 0.7 MB | 0.63 s, 0.9 MB |
+| shift: 256 MiB, 40 inserts/deletes | 1.00 s, 4.6 MB | 0.99 s, 1.1 MB | **0.75 s**, 1.0 MB | 0.84 s, 1.3 MB |
+| append: 256 MiB + 8 MiB | 1.30 s, 8.5 MB | 1.56 s, 8.4 MB | **1.29 s**, 8.5 MB | 1.50 s, 8.5 MB |
+| inplace: 256 MiB, 8 × 1 MiB overwritten | **1.24 s**, 8.4 MB | 1.30 s, 7.9 MB | **1.24 s**, 7.9 MB | 1.37 s, 8.1 MB |
+| mid: 40 × 4 MiB, 1 KiB changed each | 0.72 s, 2.6 MB | 0.72 s, 0.2 MB | 0.73 s, 0.2 MB | **0.69 s**, 0.5 MB |
 
-The cost is the signature and the hashing behind it: for a 256 MiB file about 1 MB going
-back to the sender when the size is unchanged and 2 MB when it changed (under 0.6 MB before),
-and both signatures computed on both sides. Large appends and in-place runs pay that without
-gaining anything: 4–22% slower, at most 0.23 s on these files. On 1 Gbit the gains are
-smaller (sqlite 2.09 → 0.91 s, scatter 1.61 → 0.64 s) and the costs similar, shifted data
-included (append 0.55 → 0.67 s, shift 0.55 → 0.66 s). The sizes were chosen by evaluating
-five rules on eight datasets (`bench/fast_rsync/src/bin/rules.rs`,
-`bench/results/fast_rsync-rules-20261018.tsv`). `--delta=cdc` keeps its fixed 16/32/64 KiB
+On 1 Gbit the picture is the same: M16 is level with 0.1.1 on `inplace` (0.52 s) and `append`
+(0.58 s), faster on the rest (`sqlite` 2.07 → 0.88 s, `scatter` 1.67 → 0.66 s, `shift` 0.59 →
+0.53 s), and ahead of rsync except on `mid` (0.45 against 0.41 s). The fine sizes were chosen
+by evaluating five rules on eight datasets (`bench/fast_rsync/src/bin/rules.rs`,
+`bench/results/fast_rsync-rules-20261018.tsv`); `--delta=cdc` keeps its fixed 16/32/64 KiB
 chunks.
 
 ### `--delta=cdc`: the original plan's design

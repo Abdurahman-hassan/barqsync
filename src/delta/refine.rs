@@ -16,7 +16,8 @@
 
 use super::*;
 
-/// Less basis data than this between matched ranges is not worth a round trip.
+/// Less basis data than this between matched ranges is not worth a network round trip
+/// (locally, where there is none, any gap holding a fine block is refined).
 pub const REFINE_MIN: u64 = 64 << 10;
 
 /// Fine block and chunk sizes, sent with a refinement request.
@@ -103,15 +104,16 @@ pub fn gaps(d: &Delta, basis_size: u64) -> Vec<Gap> {
 }
 
 /// The gaps of `d` worth refining with `fine`: those holding at least one fine block of
-/// basis data, if `fine` is finer than `coarse_unit` and the gaps hold [`REFINE_MIN`] or
-/// more basis bytes in all. A file that matched nothing at all (rewritten, compressed,
-/// encrypted) is not refined: it is sent whole, as before.
-pub fn plan(d: &Delta, basis_size: u64, coarse_unit: usize, fine: &Params) -> Option<Vec<Gap>> {
+/// basis data, if `fine` is finer than `coarse_unit` and the gaps hold `min_bytes` or more
+/// basis bytes in all ([`REFINE_MIN`] over the network). A file that matched nothing at
+/// all (rewritten, compressed, encrypted) is not refined: it is sent whole, as before.
+pub fn plan(d: &Delta, basis_size: u64, coarse_unit: usize, fine: &Params, min_bytes: u64) -> Option<Vec<Gap>> {
     if fine.block_size >= coarse_unit || d.matched_bytes() == 0 {
         return None;
     }
     let gaps: Vec<Gap> = gaps(d, basis_size).into_iter().filter(|g| g.basis_len >= fine.block_size as u64).collect();
-    (gaps.iter().map(|g| g.basis_len).sum::<u64>() >= REFINE_MIN).then_some(gaps)
+    let total: u64 = gaps.iter().map(|g| g.basis_len).sum();
+    (total > 0 && total >= min_bytes).then_some(gaps)
 }
 
 /// Start and end of the basis block grid covering `off..off + len`.

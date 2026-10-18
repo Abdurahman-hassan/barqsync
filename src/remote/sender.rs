@@ -357,7 +357,7 @@ impl Sender<'_> {
     /// meanwhile, then combine. One round trip, which an append (nothing to refine) skips.
     fn refine(&self, id: u64, new: &dyn ReadAt, size: u64, basis_size: u64, unit: usize, d: Delta) -> io::Result<Delta> {
         let p = Params::for_size(basis_size);
-        let Some(gaps) = refine::plan(&d, basis_size, unit, &p) else { return Ok(d) };
+        let Some(gaps) = refine::plan(&d, basis_size, unit, &p, refine::REFINE_MIN) else { return Ok(d) };
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.refining.lock().unwrap().insert(id, tx);
         self.send(Msg::Refine { id, grain: Grain::of(&p), gaps: gaps.iter().map(refine::Gap::request).collect() });

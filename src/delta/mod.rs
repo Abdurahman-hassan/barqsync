@@ -497,7 +497,7 @@ pub fn local_delta(new: &dyn ReadAt, new_size: u64, basis: &dyn ReadAt, basis_si
         merge_in_place(&diff_chunks(&nc?, &bc?), &aligned)
     };
     let fine = Params::for_size(basis_size);
-    match refine::plan(&coarse, basis_size, p.block_size.min(p.cdc_avg), &fine) {
+    match refine::plan(&coarse, basis_size, p.block_size.min(p.cdc_avg), &fine, 0) {
         Some(gaps) => refine::local(&coarse, new, new_size, basis, basis_size, &fine, &gaps),
         None => Ok(coarse),
     }
