@@ -26,9 +26,16 @@ pub fn planned(size: u64) {
     PLANNED_FILES.fetch_add(1, Relaxed);
 }
 
-/// A planned file has been written (or sent, on a sending client).
-pub fn done(size: u64) {
-    DONE_BYTES.fetch_add(size, Relaxed);
+/// `n` more bytes of a planned file have been written (or sent), before it is done, so a
+/// big file moves the line while it travels instead of all at once at the end.
+pub fn bytes(n: u64) {
+    DONE_BYTES.fetch_add(n, Relaxed);
+}
+
+/// A planned file has been written (or sent, on a sending client); `rest` is the part of
+/// its size not already counted with [`bytes`] (all of it, for a file written in one go).
+pub fn done(rest: u64) {
+    DONE_BYTES.fetch_add(rest, Relaxed);
     DONE_FILES.fetch_add(1, Relaxed);
 }
 
@@ -50,7 +57,9 @@ fn status(started: Instant, human: bool, last: bool) -> String {
     let (pb, pf) = (PLANNED_BYTES.load(Relaxed), PLANNED_FILES.load(Relaxed));
     let (db, df) = (DONE_BYTES.load(Relaxed), DONE_FILES.load(Relaxed));
     let secs = started.elapsed().as_secs_f64();
-    let pct = (db * 100).checked_div(pb).map_or(if pf == df { 100 } else { 0 }, |p| p.min(100));
+    // Nothing planned yet reads 0%, not 100%, until the scan is over.
+    let all_done = pf == df && (last || pf > 0);
+    let pct = (db * 100).checked_div(pb).map_or(if all_done { 100 } else { 0 }, |p| p.min(100));
     let rate = if secs > 0.0 { (db as f64 / secs) as u64 } else { 0 };
     let t = secs as u64;
     let bytes = if human { human_num(db) } else { grouped(db) };
