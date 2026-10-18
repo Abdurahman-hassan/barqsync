@@ -185,6 +185,24 @@ fn refinement_requests_are_checked_and_bad_answers_ignored() {
 }
 
 #[test]
+fn aligned_local_deltas_refine_below_the_block_size() {
+    // Coarse blocks of 1 KiB, chunks averaging 256 B, fine blocks of 512 B (like a 4-16 GiB
+    // file: 64 KiB blocks, 32 KiB chunks, 32 KiB fine blocks). The aligned pass is taken, so
+    // its unit is the block and the 512 B refinement applies, not the smaller chunk size.
+    let p = Params { block_size: 1024, segment: 8192, cdc_min: 64, cdc_avg: 256, cdc_max: 1024, cdc_region: 8192 };
+    let fine = Params { block_size: 512, ..p };
+    let basis = pseudo_random(64 << 10, 17);
+    let mut new = basis.clone();
+    for i in 0..8 {
+        new[i * 8000 + 100] ^= 0xFF;
+    }
+    let n = new.len() as u64;
+    let d = local_delta_with(&new, n, &basis, n, &p, &fine).unwrap();
+    check_delta(&d, &new, &basis);
+    assert_eq!(d.literal_bytes(), 8 * 512, "one fine block per edit, not one coarse block");
+}
+
+#[test]
 fn a_rewritten_file_is_not_refined() {
     let (basis, new) = (pseudo_random(1 << 20, 16), pseudo_random(1 << 20, 1016));
     let p = Params::DEFAULT;

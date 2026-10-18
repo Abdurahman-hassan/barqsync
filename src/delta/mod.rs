@@ -488,17 +488,22 @@ pub(crate) fn overlay(out: &mut Delta, ops: &[Op], copies: &[(u64, u64, u64)]) {
 /// merge the two deltas ([`merge_in_place`]). Then refine what is still literal with the
 /// file's finer sizes ([`refine`]).
 pub fn local_delta(new: &dyn ReadAt, new_size: u64, basis: &dyn ReadAt, basis_size: u64, p: &Params) -> io::Result<Delta> {
+    local_delta_with(new, new_size, basis, basis_size, p, &Params::for_size(basis_size))
+}
+
+/// [`local_delta`] refined with the given fine sizes.
+pub(crate) fn local_delta_with(new: &dyn ReadAt, new_size: u64, basis: &dyn ReadAt, basis_size: u64, p: &Params, fine: &Params) -> io::Result<Delta> {
     let (ns, bs) = rayon::join(|| block_signature(new, new_size, p), || block_signature(basis, basis_size, p));
     let aligned = diff_blocks(&ns?, &bs?);
-    let coarse = if aligned.matched_bytes() * 2 >= new_size {
-        aligned
+    // The coarse unit is that of the pass taken: refining is worth it below it.
+    let (coarse, unit) = if aligned.matched_bytes() * 2 >= new_size {
+        (aligned, p.block_size)
     } else {
         let (nc, bc) = rayon::join(|| chunk_signature(new, new_size, p), || chunk_signature(basis, basis_size, p));
-        merge_in_place(&diff_chunks(&nc?, &bc?), &aligned)
+        (merge_in_place(&diff_chunks(&nc?, &bc?), &aligned), p.cdc_avg)
     };
-    let fine = Params::for_size(basis_size);
-    match refine::plan(&coarse, basis_size, p.block_size.min(p.cdc_avg), &fine, 0) {
-        Some(gaps) => refine::local(&coarse, new, new_size, basis, basis_size, &fine, &gaps),
+    match refine::plan(&coarse, basis_size, unit, fine, 0) {
+        Some(gaps) => refine::local(&coarse, new, new_size, basis, basis_size, fine, &gaps),
         None => Ok(coarse),
     }
 }
