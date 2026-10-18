@@ -915,7 +915,9 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
                 }
                 let frame = match recv(conn) {
                     Ok(f) => f,
+                    // After Ctrl-C, which also stops ssh, a closed connection is expected.
                     Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
+                    Err(Stop::Io(_)) if fsops::interrupted() => break (0, Some(exit::SIGNAL)),
                     Err(Stop::Io(e)) => {
                         out.error(format!("connection error: {e}"));
                         break (0, Some(exit::PROTOCOL));
