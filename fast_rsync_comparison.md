@@ -4,7 +4,8 @@ An investigation of how barqsync 0.1.1 (this repository at `c18f18d`) compares w
 [fast_rsync](https://crates.io/crates/fast_rsync) 0.2.0, first by reading both crates, then by
 measuring real transfers of the same data over a shaped link, with rsync 3.2.7 as a reference.
 Done on 2026-10-18. The harness is in [`bench/fast_rsync/`](bench/fast_rsync/), the raw results in
-`bench/results/fast_rsync-*-20261018.*`.
+`bench/results/fast_rsync-*-20261018.*`. Sections 1–8 describe barqsync 0.1.1; the fixes they
+led to (milestone M15) and their measurements are in [section 9](#9-after-the-fixes-m15).
 
 ## Summary
 
@@ -24,6 +25,10 @@ Done on 2026-10-18. The harness is in [`bench/fast_rsync/`](bench/fast_rsync/), 
   rsync's 104 MB. With 8 KiB content-defined chunks its upload for inserts and deletes drops
   from 4.6 MB to about 1.4 MB, close to rsync's 1.3 MB (for a 0.7 MB signature instead of 0.2 MB).
 - All 90 measured transfers produced byte-identical destinations.
+- **Update, M15:** both fixes are in. Over 100 Mbit barqsync is now 1.4–7.5× faster than
+  before on small or scattered edits and faster than rsync on 5 of 8 datasets (the database
+  in 3.2 s against rsync's 9.4 s), at a cost of 4–22% on large appends and in-place runs.
+  See [section 9](#9-after-the-fixes-m15).
 
 ## 1. What each crate is
 
@@ -240,11 +245,12 @@ a third of what rsync and fast_rsync send.
 
 1. **Scale the block and chunk size with the file size**, like rsync's √size rule, instead of
    fixed 64 KiB blocks and 32 KiB average chunks. The signature grows (16 B per block), but for
-   the files here it stays under 1.5 MB per 256 MiB, while deltas shrink 3–6×.
+   the files here it stays under 1.5 MB per 256 MiB, while deltas shrink 3–6×. *Done in
+   M15 (section 9).*
 2. **Keep aligned blocks when a file only grew or shrank a little.** Databases, VM images and
    logs keep their existing data in place. Options: aligned blocks over the common length plus
    the tail sent whole, or send both signatures for large files and let the sender take the
-   better diff.
+   better diff. *Done in M15: both signatures, merged rather than picked (section 9).*
 3. **A rolling search is not needed to close the gap.** fast_rsync's byte-by-byte search is
    what makes its diff sequential, and it took 5–24× as long as barqsync's diff here; 8 KiB
    content-defined chunks bring the shift delta to 1.36 MB, against 1.26 MB for fast_rsync,
@@ -254,7 +260,7 @@ a third of what rsync and fast_rsync send.
 5. **For other users:** fast_rsync remains the right choice for a portable, minimal delta
    library or librsync-format compatibility; barqsync is the choice for syncing trees on
    macOS and Linux, and would be the faster one on scattered edits too once (1) and (2) are
-   done.
+   done. *It now is (section 9).*
 
 ## 7. Limitations
 
@@ -288,3 +294,174 @@ medians of 1.52 s and 0.54 s.
 Raw results of this run: `bench/results/fast_rsync-net-20261018.tsv`,
 `bench/results/fast_rsync-engine-20261018.txt` and
 `bench/results/fast_rsync-granularity-20261018.txt`.
+
+Section 9 used all eight datasets, and an older barqsync build installed as `barqsync-old`
+on both ends (for example from a `git worktree` of the previous commit):
+
+```bash
+W8="inplace scatter shift append mid sqlite tar csv"
+WORKLOADS="$W8" TOOLS="frsync barqsync-old barqsync rsync" bench/fast_rsync/netbench.sh net-m15.tsv
+ENGINE_WORKLOADS="inplace scatter shift append sqlite tar csv" bench/fast_rsync/engine.sh > engine-m15.txt
+bench/fast_rsync/target/release/rules OLD NEW [OLD NEW ...] > rules.tsv   # sizing rules
+```
+
+## 9. After the fixes (M15)
+
+Conclusions (1) and (2) are implemented (README,
+[Block and chunk sizes](README.md#block-and-chunk-sizes-m15)):
+
+- **Sizes scale with the file:** `Params::for_size` uses a quarter of √size as a power of two,
+  4 KiB to 64 KiB (4 KiB up to 256 MiB). Chunks average the block size (half to twice it). The
+  receiver picks the sizes from its basis file; the signature carries them.
+- **A remote file that changed size gets both signatures,** aligned blocks and chunks from one
+  read of the basis, and the sender merges the two deltas: every literal range of the chunk
+  delta that the block delta found unchanged in place becomes a copy, so the result never has
+  more literal data than either. The local CDC fallback is merged the same way.
+- Chunk entries drop their offset (implied by the lengths). Protocol version 6: a version 5
+  peer is refused with "protocol version mismatch".
+- `--delta=cdc` is unchanged.
+
+### Choosing the sizes
+
+To avoid tuning on the very datasets being reported, three more were added to `gen.py`:
+`tar` (a 54 MB archive of 4,000 text files, 1–10 lines inserted into 50 of them), `csv` (78 MB,
+300 rows rewritten with fields of another length) and `scatter` (256 MiB, 3,000 writes of 64
+bytes in place). [`rules`](bench/fast_rsync/src/bin/rules.rs) then ran barqsync's own signature,
+diff and merge functions with five sizing rules and measured what would cross the link: the
+postcard-encoded signature plus literal data and ops (`bench/results/fast_rsync-rules-20261018.tsv`).
+Three of the rules, for what barqsync sends (blocks for a same-size file; for a resized one,
+chunks before M15, merged blocks and chunks after):
+
+| Dataset | Fixed 64 KiB / 32 KiB (before) | √size | ¼ √size (chosen) |
+| --- | ---: | ---: | ---: |
+| inplace (same size) | 8.39 MB | **8.26 MB** | 8.95 MB |
+| scatter (same size) | 141.45 MB | 45.61 MB | **13.24 MB** |
+| mid, one 4 MiB file (same size) | 0.07 MB | **0.02 MB** | **0.02 MB** |
+| shift | 4.76 MB | 3.20 MB | **3.22 MB** |
+| append | **8.57 MB** | 8.94 MB | 10.56 MB |
+| sqlite | 192.46 MB | 85.74 MB | **29.97 MB** |
+| tar | 3.85 MB | 1.61 MB | **1.29 MB** |
+| csv | 14.18 MB | 7.78 MB | **2.73 MB** |
+| **Total** | 373.7 MB | 161.2 MB | **70.0 MB** |
+
+¼ √size moves 5.3× less than the fixed sizes in total and stays within 1.7× of the best
+combination of rule and policy (any of the five rules, chunks alone or merged) on every
+dataset. Its losses are the signature: about 1 MB per 256 MiB for
+blocks and 1 MB more for chunks, which `inplace` and `append` pay without gaining from it.
+Sending chunks alone for resized files would save that second megabyte (`shift` 2.17 MB,
+`append` 9.52 MB) but double the database's delta (63.3 MB), so both signatures it is.
+
+### Real transfers
+
+Same link, method and verification as section 3, now with all eight datasets and four tools:
+fast_rsync (`frsync`), barqsync before M15 (installed as `barqsync-old`), barqsync after, and
+rsync. 192 transfers, all byte-identical; raw data in
+`bench/results/fast_rsync-net-m15-20261018.tsv`. Median of 3 runs (min–max), lowest in bold.
+
+**lan (1 Gbit)**
+
+| Dataset | fast_rsync | barqsync before | barqsync M15 | rsync |
+| --- | ---: | ---: | ---: | ---: |
+| inplace | 2.93 s (1.80–3.08) | **0.51 s** (0.48–0.54) | 0.53 s (0.53–0.53) | 0.71 s (0.71–0.72) |
+| scatter | 3.15 s (2.45–3.47) | 1.61 s (1.57–1.62) | **0.64 s** (0.59–0.69) | 1.04 s (1.03–1.05) |
+| shift | 2.25 s (1.50–2.57) | **0.55 s** (0.54–0.58) | 0.66 s (0.63–0.68) | 0.57 s (0.56–0.77) |
+| append | 1.78 s (1.70–2.90) | **0.55 s** (0.54–0.63) | 0.67 s (0.64–0.68) | 0.83 s (0.80–0.91) |
+| mid | **0.40 s** (0.40–0.43) | 0.46 s (0.44–0.46) | 0.48 s (0.47–0.50) | 0.40 s (0.39–0.44) |
+| sqlite | 4.06 s (3.83–4.43) | 2.09 s (2.06–2.12) | **0.91 s** (0.90–0.98) | 1.78 s (1.68–1.94) |
+| tar | 0.52 s (0.50–0.56) | 0.35 s (0.35–0.40) | **0.35 s** (0.34–0.36) | 0.36 s (0.34–0.36) |
+| csv | 0.69 s (0.67–0.71) | 0.50 s (0.48–0.53) | 0.38 s (0.36–0.40) | **0.37 s** (0.37–0.39) |
+
+**wan (100 Mbit, 20 ms RTT)**
+
+| Dataset | fast_rsync | barqsync before | barqsync M15 | rsync |
+| --- | ---: | ---: | ---: | ---: |
+| inplace | 2.71 s (2.42–3.44) | **1.21 s** (1.20–1.24) | 1.28 s (1.26–1.28) | 1.37 s (1.36–1.38) |
+| scatter | 5.95 s (5.95–5.96) | 12.36 s (12.36–12.40) | **1.64 s** (1.64–1.66) | 4.46 s (4.44–4.51) |
+| shift | 1.78 s (1.77–2.17) | 0.98 s (0.97–0.98) | 0.98 s (0.96–0.98) | **0.88 s** (0.88–0.89) |
+| append | 2.50 s (2.47–2.73) | **1.32 s** (1.31–1.32) | 1.55 s (1.52–1.56) | 1.49 s (1.46–1.50) |
+| mid | **0.59 s** (0.57–0.59) | 0.73 s (0.73–0.74) | 0.74 s (0.73–0.78) | 0.70 s (0.70–0.75) |
+| sqlite | 11.65 s (11.64–11.73) | 16.70 s (16.69–16.71) | **3.18 s** (3.17–3.21) | 9.38 s (9.36–9.40) |
+| tar | 0.78 s (0.76–0.79) | 0.80 s (0.79–0.81) | **0.58 s** (0.57–0.58) | 0.63 s (0.63–0.64) |
+| csv | 1.06 s (1.05–1.08) | 1.67 s (1.66–1.69) | **0.72 s** (0.72–0.73) | 0.80 s (0.80–0.81) |
+
+**Bytes on the link**, median over all runs, up (client to server) / down:
+
+| Dataset | fast_rsync | barqsync before | barqsync M15 | rsync |
+| --- | ---: | ---: | ---: | ---: |
+| inplace | 8.02 / 0.22 MB | 8.35 / 0.09 MB | **7.94** / 1.07 MB | 8.10 / 0.14 MB |
+| scatter | 45.44 / 0.29 MB | 141.79 / 0.38 MB | **12.27** / 1.08 MB | 45.53 / 0.23 MB |
+| shift | 1.27 / 0.21 MB | 4.63 / 0.16 MB | **1.06** / 1.98 MB | 1.33 / 0.13 MB |
+| append | 8.42 / 0.22 MB | 8.45 / 0.17 MB | 8.42 / 2.00 MB | 8.50 / 0.14 MB |
+| mid | **0.14** / 1.00 MB | 2.64 / 0.05 MB | 0.22 / 0.66 MB | 0.46 / 0.50 MB |
+| sqlite | 104.21 / 0.40 MB | 192.84 / 0.55 MB | **28.12** / 1.90 MB | 104.32 / 0.36 MB |
+| tar | 0.87 / 0.10 MB | 3.84 / 0.04 MB | **0.86** / 0.40 MB | 0.90 / 0.06 MB |
+| csv | 2.62 / 0.12 MB | 14.18 / 0.08 MB | **2.11** / 0.58 MB | 2.65 / 0.07 MB |
+
+What changed:
+
+- **Against barqsync before:** over 100 Mbit, 7.5× faster on `scatter`, 5.3× on `sqlite`,
+  2.3× on `csv` and 1.4× on `tar`; `shift` and `mid` unchanged; `inplace` 6% and `append` 17%
+  slower. On 1 Gbit the same pattern, with `shift` (+20%) and `append` (+22%) slower: there
+  the extra hashing on both sides shows more than the bytes saved.
+- **Against rsync:** fastest on 5 of 8 datasets over 100 Mbit (the database 2.9× faster,
+  `scatter` 2.7×). rsync stays ahead on `shift` (0.88 s against 0.98 s), `append` (1.49 against
+  1.55 s) and `mid` (0.70 against 0.74 s).
+- **Against fast_rsync:** faster everywhere except `mid`, where fast_rsync's small signatures
+  for 4 MiB files win (0.59 s).
+- **Bytes:** barqsync now uploads the least of the four tools on 6 of 8 datasets and ties on
+  `append`; only fast_rsync's 2 KiB blocks beat it on `mid`. The other direction grew: its
+  signatures are now 0.4–2.0 MB, against 0.06–0.5 MB for rsync, the largest of the four tools
+  everywhere but `mid` (where fast_rsync's are).
+- fast_rsync's times varied more in this run than in the first (`inplace` on lan 1.80–3.08 s
+  against 1.62–1.70 s), most likely the VM's memory behavior again; its byte counts match the
+  first run exactly.
+
+### Delta engines, after
+
+In-process, one file pair, median of 3 runs, 4 cores
+(`bench/results/fast_rsync-engine-m15-20261018.txt`; barqsync signature and ops sizes are now
+the real postcard encoding):
+
+| Dataset | Engine | Unit | Signature | Delta | Total ms |
+| --- | --- | --- | ---: | ---: | ---: |
+| inplace | fast_rsync | 16 KiB blocks | 197 KB | 8.00 MB | 716 |
+| inplace | barqsync | 4 KiB blocks | 1,049 KB | 7.91 MB | **194** |
+| scatter | fast_rsync | 16 KiB blocks | 197 KB | 45.33 MB | 1,144 |
+| scatter | barqsync | 4 KiB blocks | 1,049 KB | **12.19 MB** | **220** |
+| shift | fast_rsync | 16 KiB blocks | 197 KB | 1.26 MB | 608 |
+| shift | barqsync | 4 KiB both | 1,970 KB | **1.04 MB** | **331** |
+| append | fast_rsync | 16 KiB blocks | 197 KB | 8.39 MB | 1,217 |
+| append | barqsync | 4 KiB both | 1,971 KB | 8.39 MB | **345** |
+| sqlite | fast_rsync | 15.5 KiB blocks | 191 KB | 103.96 MB | 2,356 |
+| sqlite | barqsync | 4 KiB both | 1,825 KB | **27.95 MB** | **407** |
+| tar | fast_rsync | 7.2 KiB blocks | 88 KB | 0.86 MB | 145 |
+| tar | barqsync | 4 KiB both | 395 KB | **0.85 MB** | **83** |
+| csv | fast_rsync | 8.6 KiB blocks | 106 KB | 2.60 MB | 220 |
+| csv | barqsync | 4 KiB both | 571 KB | **2.10 MB** | **110** |
+
+barqsync's engine stays 1.7–5.8× faster per file, now with smaller deltas than fast_rsync on
+every dataset but `append`, where they are equal.
+
+### Costs and checks
+
+- **Signature size** is the price: 16 bytes per block plus about 20 per chunk, so 1 MB per
+  256 MiB for a same-size file and 2 MB for a resized one, computed on both sides. A coarse
+  signature first and a second round trip for the blocks that differ would avoid most of it;
+  that is listed as open in the as-built plan.
+- **Local deltas:** a 1 GiB file with 50 × 1 MiB overwritten, synced locally with
+  `--no-whole-file`, took the same time before and after (medians 1.82 and 1.85 s over 6
+  alternating runs, VM noise 0.7–4.2 s) with 5% less literal data.
+- **README's 6 MiB examples,** re-measured on the same files with both builds: 4 KiB
+  overwritten 64 KiB → 8 KiB, 777 bytes inserted 57.6 → 8.0 KB, 12 KB removed 344.7 → 4.6 KB,
+  appends and truncation unchanged.
+- **Tests:** 152 pass (4 new: the sizing rule, chunk-size validation, a grown file with
+  scattered edits in-process and over ssh in both directions; the ssh one sends 3.2 MB on the
+  old code and fails there), the delta property test also checks that merging never adds
+  literal data (4,000 cases run), and `Sig::Both` round-trips through both wire formats. The
+  whole suite also passes with rkyv, QUIC, the tokio I/O layer, `--delta=cdc` and the
+  adaptive strategy as defaults. With TCP streams as the default, one test failed in 2 of 25
+  full runs, identified once as `keep_dirlinks_matches_rsync`; on its own that test failed
+  once in 110 runs with this code and never in 30 with the old. It syncs only tiny files,
+  which never take the delta path.
+- **Compatibility:** 0.1.1 and M15 builds refuse each other with "protocol version mismatch";
+  the next release needs a new version number.

@@ -175,7 +175,8 @@ fn resized_file_with_scattered_edits_sends_only_changed_blocks() {
         let new = Tree::new(tmp.path().join("src"));
         new.file("app.db", &grown).settle_mtimes();
         new.mtime("app.db", BASE_TIME + 900_003);
-        let mut args = vec!["-a", "--stats", "--strategy", "fixed"];
+        // The block design's sizes and merge (--delta=cdc keeps its fixed chunks).
+        let mut args = vec!["-a", "--stats", "--strategy", "fixed", "--delta", "blocks"];
         args.extend_from_slice(if pull { &["{host}src/", "dst"] } else { &["src/", "{host}dst"] });
         let f = barqsync_remote(tmp.path(), &args);
         assert_eq!(f.code, 0, "pull={pull}\n{}\n{}", f.stdout, f.stderr);

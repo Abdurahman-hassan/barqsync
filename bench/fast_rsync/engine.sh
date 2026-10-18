@@ -6,7 +6,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 W=${W:-/bench}
 E=$HERE/target/release/engine
 for run in 1 2 3; do
-  for wl in inplace shift append sqlite; do
+  for wl in ${ENGINE_WORKLOADS:-inplace shift append sqlite}; do
     f=$(ls "$W/data/$wl/new")
     echo "== run $run $wl"
     "$E" "$W/data/$wl/old/$f" "$W/data/$wl/new/$f"

@@ -93,8 +93,9 @@ fn main() {
     assert_eq!(blake3::hash(&fs::read(&out_path).unwrap()), want, "barqsync output differs");
     fs::remove_file(&out_path).unwrap();
     println!(
-        "barqsync\tmode={}\tsig_bytes={sig_bytes}\tdelta_bytes={}\tsig_ms={t_sig:.1}\tdiff_ms={t_diff:.1}\tapply_ms={t_apply:.1}\tverify_ms=0.0\ttotal_ms={:.1}",
-        format!("{}K-{}", p.block_size >> 10, if same { "blocks" } else { "both" }),
+        "barqsync\tmode={}K-{}\tsig_bytes={sig_bytes}\tdelta_bytes={}\tsig_ms={t_sig:.1}\tdiff_ms={t_diff:.1}\tapply_ms={t_apply:.1}\tverify_ms=0.0\ttotal_ms={:.1}",
+        p.block_size >> 10,
+        if same { "blocks" } else { "both" },
         dl.literal_bytes() as usize + ops_bytes,
         t_sig + t_diff + t_apply
     );

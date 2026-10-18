@@ -2,7 +2,7 @@
 //!   rules OLD NEW [OLD NEW ...]
 //! For each rule: the wire size of the receiver's signature (postcard), the literal bytes
 //! and ops of the delta, for aligned blocks, content-defined chunks, and both merged.
-use barqsync::delta::{self, Op, Params};
+use barqsync::delta::{self, Params};
 use std::fs::File;
 use std::time::Instant;
 
@@ -35,7 +35,7 @@ fn main() {
             let (db, dc) = (delta::diff_blocks(&bn, &bo), delta::diff_chunks(&cn, &co));
             let dm = delta::merge_in_place(&dc, &db);
             let ms = t.elapsed().as_secs_f64() * 1e3;
-            let ops = |d: &delta::Delta| wire(&d.ops.iter().copied().collect::<Vec<Op>>());
+            let ops = |d: &delta::Delta| wire(&d.ops);
             println!(
                 "{name}\t{rule}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{ms:.0}",
                 p.block_size,
