@@ -167,7 +167,7 @@ def how_it_works():
 def two_level_delta():
     title = "Only the changed parts travel"
     body = [text(24, 36, title, 17, "ink", 600),
-            text(24, 58, "Updating a file the other side already has an older copy of (a database, an image, a log).", 13, "ink2")]
+            text(24, 58, "Updating a 256 MiB file the other side has an older copy of. Bigger files use bigger pieces.", 13, "ink2")]
     x0, n, bw, g = 184, 8, 50, 2
     changed = {2, 6}
 
@@ -217,7 +217,7 @@ def two_level_delta():
     for i, s in enumerate(notes):
         body.append(text(24, ny + i * 20, s, 12.5, "ink2"))
     h = ny + len(notes) * 20 + 8
-    desc = ("Step 1 hashes 64 KiB blocks; step 2 finds the two that differ; step 3 hashes those two "
+    desc = ("A 256 MiB file. Step 1 hashes 64 KiB blocks; step 2 finds the two that differ; step 3 hashes those two "
             "in 4 KiB pieces; step 4 sends only the two changed pieces: 8 KiB instead of 128 KiB.")
     write("two-level-delta.svg", frame(h, title, desc, body))
 
