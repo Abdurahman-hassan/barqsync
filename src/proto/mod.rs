@@ -28,6 +28,7 @@ use crate::cli::Options;
 use crate::ids::Names;
 use crate::select::Sel;
 use crate::delta::cdc::CdcSig;
+use crate::delta::refine::{GapReq, GapSig, Grain};
 use crate::delta::{BlockSig, ChunkSig, Op};
 use crate::entry::{DirEnt, Meta};
 use crate::output::StatsSnapshot;
@@ -44,7 +45,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 7;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -77,8 +78,9 @@ pub struct RootInfo {
     pub sel: Option<Sel>,
 }
 
-/// The receiver's basis-file signature, chosen by the receiver: aligned blocks when the
-/// file kept its size (in-place edits), content-defined chunks when it changed size.
+/// The receiver's coarse basis-file signature, chosen by the receiver: aligned blocks when
+/// the file kept its size (in-place edits), content-defined chunks when it changed size.
+/// What the coarse delta leaves literal can then be refined (`Refine`, `Refined`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Sig {
@@ -147,6 +149,12 @@ pub enum Msg {
     /// Start a delta-encoded file: `copies` come from the receiver's basis, the
     /// remaining ranges arrive as `Data` frames.
     DeltaBegin { id: u64, size: u64, copies: Vec<Op> },
+    /// Sender → receiver, before `DeltaBegin`: fine signatures wanted for the basis
+    /// stretches the coarse delta left literal (see `delta::refine`).
+    Refine { id: u64, grain: Grain, gaps: Vec<GapReq> },
+    /// Receiver → sender: one fine signature per requested stretch, or none at all if the
+    /// receiver can't refine (the sender then keeps the coarse delta).
+    Refined { id: u64, gaps: Vec<GapSig> },
     FileEnd { id: u64, ok: bool },
     /// Several complete small files: `(id, len)` pairs, contents concatenated in `blob`.
     SmallPack { files: Vec<(u64, u32)>, blob: Vec<u8> },
@@ -667,6 +675,11 @@ mod tests {
         sel.children.insert(b"sub".to_vec(), Sel { contents: true, ..Sel::default() });
         let opts = crate::cli::Options::parse_from(["barqsync", "-a", "--partial-dir=.p", "src/", "dst"]).unwrap();
         let sig = crate::delta::cdc::signature(&[5u8; 300_000], &crate::delta::Params::DEFAULT);
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let p = crate::delta::Params::for_size(data.len() as u64);
+        let chunks = crate::delta::chunk_signature(&data, data.len() as u64, &crate::delta::Params::DEFAULT).unwrap();
+        let reqs = vec![GapReq { off: 4_000, len: 70_000, chunks: true }, GapReq { off: 200_000, len: 9_000, chunks: false }];
+        let fine = crate::delta::refine::basis_sigs(&data, data.len() as u64, &p, &reqs).unwrap();
         vec![
             Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender: false, opts: Box::new(opts) },
             Msg::Roots(vec![RootInfo { contents: true, meta: Some(meta), items: Vec::new(), sel: Some(sel) }]),
@@ -678,6 +691,9 @@ mod tests {
                 sums: vec![Some([1; 16])],
             },
             Msg::Need { dir: 2, files: vec![NeedReq { idx: 0, sig: Some(Sig::Cdc(sig)) }] },
+            Msg::Need { dir: 3, files: vec![NeedReq { idx: 1, sig: Some(Sig::Chunks(chunks)) }] },
+            Msg::Refine { id: file_id(3, 1), grain: Grain::of(&p), gaps: reqs },
+            Msg::Refined { id: file_id(3, 1), gaps: fine },
             Msg::SmallPack { files: vec![(file_id(2, 0), 3)], blob: b"abc".to_vec() },
         ]
     }

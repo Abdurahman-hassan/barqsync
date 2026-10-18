@@ -1,0 +1,72 @@
+== run 1 inplace
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=7995501	sig_ms=67.1	diff_ms=442.1	apply_ms=163.5	verify_ms=21.7	total_ms=694.4
+barqsync	mode=blocks+refine	sig_bytes=98137	delta_bytes=7905435	sig_ms=38.5	diff_ms=39.1	apply_ms=114.0	verify_ms=0.0	total_ms=191.5
+== run 1 scatter
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=45327781	sig_ms=65.4	diff_ms=830.7	apply_ms=160.8	verify_ms=18.5	total_ms=1075.4
+barqsync	mode=blocks+refine	sig_bytes=627931	delta_bytes=12189533	sig_ms=36.0	diff_ms=68.0	apply_ms=172.8	verify_ms=0.0	total_ms=276.7
+== run 1 shift
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=1255402	sig_ms=77.5	diff_ms=378.6	apply_ms=178.4	verify_ms=19.2	total_ms=653.6
+barqsync	mode=chunks+refine	sig_bytes=158292	delta_bytes=952476	sig_ms=63.9	diff_ms=72.6	apply_ms=110.9	verify_ms=0.0	total_ms=247.4
+== run 1 append
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=8388624	sig_ms=82.5	diff_ms=457.7	apply_ms=191.0	verify_ms=19.2	total_ms=750.4
+barqsync	mode=chunks	sig_bytes=121939	delta_bytes=8422740	sig_ms=73.9	diff_ms=62.2	apply_ms=108.0	verify_ms=0.0	total_ms=244.0
+== run 1 sqlite
+fast_rsync	block=15880	sig_bytes=190680	delta_bytes=103962848	sig_ms=90.0	diff_ms=1550.1	apply_ms=402.0	verify_ms=19.9	total_ms=2062.0
+barqsync	mode=chunks+refine	sig_bytes=878937	delta_bytes=29879611	sig_ms=67.1	diff_ms=115.9	apply_ms=201.2	verify_ms=0.0	total_ms=384.2
+== run 1 tar
+fast_rsync	block=7360	sig_bytes=88500	delta_bytes=859716	sig_ms=14.7	diff_ms=81.7	apply_ms=34.3	verify_ms=5.4	total_ms=136.1
+barqsync	mode=chunks+refine	sig_bytes=48974	delta_bytes=716977	sig_ms=16.9	diff_ms=17.4	apply_ms=33.8	verify_ms=0.0	total_ms=68.2
+== run 1 csv
+fast_rsync	block=8808	sig_bytes=105840	delta_bytes=2603560	sig_ms=20.7	diff_ms=129.9	apply_ms=45.9	verify_ms=7.6	total_ms=204.1
+barqsync	mode=chunks+refine	sig_bytes=144977	delta_bytes=1749863	sig_ms=21.6	diff_ms=33.0	apply_ms=53.3	verify_ms=0.0	total_ms=107.9
+== run 1 mid (m000)
+fast_rsync	block=2048	sig_bytes=24588	delta_bytes=2071	sig_ms=1.6	diff_ms=5.6	apply_ms=2.4	verify_ms=0.9	total_ms=10.5
+barqsync	mode=blocks+refine	sig_bytes=1299	delta_bytes=4120	sig_ms=3.5	diff_ms=3.4	apply_ms=4.5	verify_ms=0.0	total_ms=11.4
+== run 2 inplace
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=7995501	sig_ms=109.6	diff_ms=432.0	apply_ms=173.4	verify_ms=16.1	total_ms=731.1
+barqsync	mode=blocks+refine	sig_bytes=98137	delta_bytes=7905435	sig_ms=29.5	diff_ms=28.4	apply_ms=111.9	verify_ms=0.0	total_ms=169.8
+== run 2 scatter
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=45327781	sig_ms=64.7	diff_ms=832.2	apply_ms=193.7	verify_ms=16.1	total_ms=1106.7
+barqsync	mode=blocks+refine	sig_bytes=627931	delta_bytes=12189533	sig_ms=31.3	diff_ms=60.3	apply_ms=160.2	verify_ms=0.0	total_ms=251.9
+== run 2 shift
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=1255402	sig_ms=153.9	diff_ms=419.7	apply_ms=180.5	verify_ms=21.2	total_ms=775.4
+barqsync	mode=chunks+refine	sig_bytes=158292	delta_bytes=952476	sig_ms=66.2	diff_ms=65.6	apply_ms=102.8	verify_ms=0.0	total_ms=234.7
+== run 2 append
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=8388624	sig_ms=59.6	diff_ms=410.6	apply_ms=172.8	verify_ms=21.8	total_ms=664.8
+barqsync	mode=chunks	sig_bytes=121939	delta_bytes=8422740	sig_ms=71.0	diff_ms=66.9	apply_ms=120.9	verify_ms=0.0	total_ms=258.8
+== run 2 sqlite
+fast_rsync	block=15880	sig_bytes=190680	delta_bytes=103962848	sig_ms=65.4	diff_ms=1562.4	apply_ms=705.9	verify_ms=19.2	total_ms=2352.8
+barqsync	mode=chunks+refine	sig_bytes=878937	delta_bytes=29879611	sig_ms=60.2	diff_ms=106.0	apply_ms=213.5	verify_ms=0.0	total_ms=379.7
+== run 2 tar
+fast_rsync	block=7360	sig_bytes=88500	delta_bytes=859716	sig_ms=17.8	diff_ms=83.9	apply_ms=29.8	verify_ms=5.0	total_ms=136.5
+barqsync	mode=chunks+refine	sig_bytes=48974	delta_bytes=716977	sig_ms=19.0	diff_ms=18.3	apply_ms=56.5	verify_ms=0.0	total_ms=93.8
+== run 2 csv
+fast_rsync	block=8808	sig_bytes=105840	delta_bytes=2603560	sig_ms=20.2	diff_ms=147.7	apply_ms=47.3	verify_ms=8.0	total_ms=223.2
+barqsync	mode=chunks+refine	sig_bytes=144977	delta_bytes=1749863	sig_ms=24.1	diff_ms=35.2	apply_ms=46.3	verify_ms=0.0	total_ms=105.6
+== run 2 mid (m000)
+fast_rsync	block=2048	sig_bytes=24588	delta_bytes=2071	sig_ms=1.4	diff_ms=5.7	apply_ms=2.3	verify_ms=0.9	total_ms=10.3
+barqsync	mode=blocks+refine	sig_bytes=1299	delta_bytes=4120	sig_ms=3.7	diff_ms=1.7	apply_ms=3.7	verify_ms=0.0	total_ms=9.1
+== run 3 inplace
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=7995501	sig_ms=83.3	diff_ms=427.8	apply_ms=171.5	verify_ms=22.3	total_ms=704.9
+barqsync	mode=blocks+refine	sig_bytes=98137	delta_bytes=7905435	sig_ms=35.7	diff_ms=32.7	apply_ms=104.9	verify_ms=0.0	total_ms=173.3
+== run 3 scatter
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=45327781	sig_ms=65.2	diff_ms=793.7	apply_ms=155.0	verify_ms=17.4	total_ms=1031.3
+barqsync	mode=blocks+refine	sig_bytes=627931	delta_bytes=12189533	sig_ms=31.3	diff_ms=65.1	apply_ms=156.0	verify_ms=0.0	total_ms=252.4
+== run 3 shift
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=1255402	sig_ms=75.4	diff_ms=323.2	apply_ms=140.0	verify_ms=18.7	total_ms=557.1
+barqsync	mode=chunks+refine	sig_bytes=158292	delta_bytes=952476	sig_ms=63.3	diff_ms=68.3	apply_ms=114.2	verify_ms=0.0	total_ms=245.7
+== run 3 append
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=8388624	sig_ms=80.5	diff_ms=448.2	apply_ms=191.0	verify_ms=25.4	total_ms=745.1
+barqsync	mode=chunks	sig_bytes=121939	delta_bytes=8422740	sig_ms=69.2	diff_ms=65.4	apply_ms=120.9	verify_ms=0.0	total_ms=255.6
+== run 3 sqlite
+fast_rsync	block=15880	sig_bytes=190680	delta_bytes=103962848	sig_ms=68.7	diff_ms=1650.5	apply_ms=153.2	verify_ms=16.4	total_ms=1888.8
+barqsync	mode=chunks+refine	sig_bytes=878937	delta_bytes=29879611	sig_ms=59.8	diff_ms=113.8	apply_ms=173.8	verify_ms=0.0	total_ms=347.5
+== run 3 tar
+fast_rsync	block=7360	sig_bytes=88500	delta_bytes=859716	sig_ms=14.4	diff_ms=71.8	apply_ms=29.8	verify_ms=4.0	total_ms=120.0
+barqsync	mode=chunks+refine	sig_bytes=48974	delta_bytes=716977	sig_ms=15.5	diff_ms=14.5	apply_ms=35.0	verify_ms=0.0	total_ms=65.0
+== run 3 csv
+fast_rsync	block=8808	sig_bytes=105840	delta_bytes=2603560	sig_ms=20.1	diff_ms=125.0	apply_ms=45.4	verify_ms=6.2	total_ms=196.8
+barqsync	mode=chunks+refine	sig_bytes=144977	delta_bytes=1749863	sig_ms=24.6	diff_ms=29.8	apply_ms=40.9	verify_ms=0.0	total_ms=95.3
+== run 3 mid (m000)
+fast_rsync	block=2048	sig_bytes=24588	delta_bytes=2071	sig_ms=1.6	diff_ms=5.5	apply_ms=2.9	verify_ms=0.8	total_ms=10.8
+barqsync	mode=blocks+refine	sig_bytes=1299	delta_bytes=4120	sig_ms=3.8	diff_ms=1.7	apply_ms=3.2	verify_ms=0.0	total_ms=8.7

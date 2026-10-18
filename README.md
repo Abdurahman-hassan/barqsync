@@ -27,9 +27,12 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M12 | adaptive strategy (`--strategy adaptive`): link probe, whole-vs-delta routing by link speed, pack compression with link-based zstd levels, `--compress-level`; up to 7.6× on compressible data, slower on incompressible, so `fixed` stays the default | done |
 | M13 | io_uring batches for received small files (`--io-uring`, Linux): 24% fewer syscalls, no faster, so opt-in; found on the way: skipping a redundant truncate made small-file pushes onto XFS 3.2× faster | done |
 | M14 | full verification: local A/B/C/D vs rsync and `cp`, Linux syscall counts and flamegraphs, every transport and strategy over lan/wan/lossy links; README and as-built plan updated | done |
+| M15 | delta block and chunk sizes scale with the file (4–64 KiB); a remote file that changed size got both signatures and a merged delta (protocol 6): 1.4–7.5× faster on small or scattered edits, but 4–22% slower on large appends and in-place runs, so M16 replaced the signature scheme | done |
+| M16 | two-level delta: the coarse signatures of 0.1.1, refined on demand with one round trip where the coarse delta left enough literal data (protocol 7). Over 100 Mbit: as fast as 0.1.1 on appends, in-place runs and small files, 1.3–7.6× faster on everything else (a growing SQLite database 16.7 → 3.2 s, rsync 9.4 s), faster than rsync on 7 of 8 datasets; see [Two-level delta](#two-level-delta-m16). Also fixed a racy test fixture | done |
 
-The test suite passes on macOS (APFS; 145 tests, also built as x86_64 and run under Rosetta)
-and Linux (aarch64 container, 148 tests, compared against rsync 3.2.7).
+The test suite passes on macOS (APFS; 154 tests at M16, 145 at M14, when it was also built as
+x86_64 and run under Rosetta) and Linux (157 tests at M16 on an x86_64 VM, 148 at M14 in an
+aarch64 container), compared against rsync 3.2.7. Three tests are Linux-only.
 
 ## Install
 
@@ -53,7 +56,8 @@ If `barqsync` is not found after installing, ensure Cargo's binary directory (`~
   ```
 
 macOS and Linux only. For remote transfers, barqsync has to be installed on both machines
-(like rsync), or pointed to with `--remote-path`.
+(like rsync), or pointed to with `--remote-path`, in the same release line: 0.2 changed the
+wire protocol, so 0.2.x and 0.1.x refuse each other ("protocol version mismatch").
 
 ## Build from source
 
@@ -149,8 +153,9 @@ sender, and both sides run the same code:
   arrives, so the transfer starts before the scan ends.
 - **One round trip per directory, not per file.** For each listing the receiver answers with
   one request naming the files it needs. For files it already has an older copy of, the
-  request carries a basis signature: aligned blocks when the size is unchanged, FastCDC
-  chunks otherwise.
+  request carries a coarse basis signature: aligned blocks when the size is unchanged,
+  FastCDC chunks otherwise. Where the coarse delta leaves enough data unmatched, the sender
+  asks for fine signatures of just those parts (see [Delta transfer](#delta-transfer)).
 - **Small files are packed.** Files up to 128 KiB travel many-per-frame in ~4 MiB packs and
   are written by the receiver's thread pool.
 - **Deltas over the wire.** Changed files come back as copy ranges plus only the missing
@@ -340,13 +345,22 @@ path 3.2× faster on XFS (689 → 218 ms), for every transfer, with or without i
 With `--no-whole-file` (and, from M4, by default for remote syncs), a changed file is rebuilt
 from the old destination file plus only the ranges that differ:
 
-1. **Aligned blocks first.** Both files are hashed in parallel in 64 KiB blocks at the same
+1. **Aligned blocks first.** Both files are hashed in parallel in blocks at the same
    offsets. This is ideal for in-place changes and appends (VM images, databases, logs).
-2. **FastCDC fallback.** If under half the bytes matched, both files are re-chunked by
-   content (16/32/64 KiB chunks), so inserted or deleted bytes only cost the chunks around
-   them. Chunking runs in parallel over 4 MiB segments, joined so the cuts are exactly those of
-   one sequential pass (see [`--delta=cdc`](#--deltacdc-the-original-plans-design)).
-3. **Clone + patch.** When matched ranges keep their offsets, the old file is cloned (APFS
+2. **FastCDC for moved data.** If under half the bytes matched (locally), or the file changed
+   size (remotely, where neither side has both files), both files are chunked by content
+   (16/32/64 KiB chunks), so inserted or deleted bytes only cost the chunks around them.
+   Chunking runs in parallel over 4 MiB segments, joined so the cuts are exactly those of one
+   sequential pass (see [`--delta=cdc`](#--deltacdc-the-original-plans-design)).
+3. **Refinement.** These first signatures are coarse (64 KiB blocks, 32 KiB chunks), so they
+   cost little whatever the file. What the coarse delta leaves literal is refined with fine
+   sizes, a quarter of √size (4 KiB up to 256 MiB, 64 KiB beyond 16 GiB): for each literal
+   run, the basis stretch between the same matched neighbours is signed again, with blocks on
+   the basis's grid compared at the run's offset shift, and with chunks where the two
+   stretches differ in length. Remotely that is one more round trip, taken only when the runs
+   hold 64 KiB of basis data or more, so an append, whose only mismatch is the basis's last
+   chunk, never pays for it. See [Two-level delta](#two-level-delta-m16).
+4. **Clone + patch.** When matched ranges keep their offsets, the old file is cloned (APFS
    `fclonefileat`, Linux `FICLONE`) and only the changed ranges are written. Otherwise the
    new file is rebuilt in parallel. With `--inplace`, changes go straight into the destination.
 
@@ -355,17 +369,56 @@ verified. That replaces the originally planned xxh3 + whole-file check, because 
 check would have to re-read the entire output and cancel out clone+patch. BLAKE3 per block runs
 at ~12.6 GB/s on all cores of an M-series Mac, faster than the SSD.
 
-| Change to a 6 MiB file | bytes written |
-| --- | ---: |
-| 4 KiB overwritten in place | 64 KiB |
-| 300 KB appended | 300 KB |
-| 777 bytes inserted at the start | 42 KB |
-| 12 KB removed from the middle | 274 KB |
-| truncated to 4 MiB | 17 B |
+| Change to a 6 MiB file | bytes written, 0.1.1 | bytes written now |
+| --- | ---: | ---: |
+| 4 KiB overwritten in place (not block-aligned) | 64 KiB | 8 KiB |
+| 300 KB appended | 300 KB | 300 KB |
+| 777 bytes inserted at the start | 57.6 KB | 8.0 KB |
+| 12 KB removed from the middle | 344.7 KB | 4.6 KB |
+| truncated to 4 MiB | 0 B | 0 B |
 
-After an insert or delete, the chunk boundaries of the two files fall back into step within a
-few chunks; in the middle-cut case above it took eight. Files of 128 KiB or less are always
-sent whole.
+(Literal data with `--no-whole-file --stats`, the same files for both builds.) After an
+insert or delete, the chunk boundaries of the two files fall back into step within a few
+chunks. Files of 128 KiB or less are always sent whole.
+
+### Two-level delta (M16)
+
+Comparing barqsync with [fast_rsync](https://crates.io/crates/fast_rsync) and rsync on real
+transfers ([`fast_rsync_comparison.md`](fast_rsync_comparison.md)) showed that fixed 64 KiB
+blocks and 32 KiB chunks made small or scattered edits expensive: a SQLite database that grew
+by 3 MB after 8,000 SQL changes sent 193 MB, where rsync sent 104 MB.
+
+- **M15** made the sizes fine (4 KiB) for every delta and sent a resized file both signatures.
+  That fixed the database, but every changed file now paid for a fine signature (1–2 MB per
+  256 MiB, back to the sender) and a second hashing pass, needed or not: appends and in-place
+  runs got 4–22% slower.
+- **M16** keeps 0.1.1's coarse first signature and refines only what it leaves literal. The
+  sender sends `Refine` with the basis stretches between matched ranges and the fine sizes;
+  the receiver answers `Refined` with their fine signatures; meanwhile the sender hashes its
+  own side. Signatures now cost what the change needs: 0.06–0.9 MB here, against 0.04–0.6 MB
+  in 0.1.1 and 0.4–2.0 MB in M15. Protocol version 7; older peers are refused with
+  "protocol version mismatch".
+
+Pushes over ssh to a 100 Mbit link with a 20 ms round trip (median of 3 runs, all 240 results
+verified; bytes are data sent):
+
+| Dataset | 0.1.1 | M15 | M16 | rsync 3.2.7 |
+| --- | ---: | ---: | ---: | ---: |
+| scatter: 256 MiB, 3,000 × 64 B overwritten | 12.38 s, 141.8 MB | 1.64 s, 12.3 MB | **1.63 s**, 12.3 MB | 4.46 s, 45.5 MB |
+| sqlite: 250 MB database, 8,000 SQL changes | 16.71 s, 192.8 MB | **3.17 s**, 28.1 MB | 3.23 s, 30.1 MB | 9.38 s, 104.3 MB |
+| csv: 78 MB, 300 rows rewritten | 1.67 s, 14.2 MB | 0.73 s, 2.1 MB | **0.66 s**, 1.8 MB | 0.80 s, 2.7 MB |
+| tar: 54 MB archive, 50 files edited | 0.79 s, 3.8 MB | 0.58 s, 0.9 MB | **0.56 s**, 0.7 MB | 0.63 s, 0.9 MB |
+| shift: 256 MiB, 40 inserts/deletes | 1.00 s, 4.6 MB | 0.99 s, 1.1 MB | **0.75 s**, 1.0 MB | 0.84 s, 1.3 MB |
+| append: 256 MiB + 8 MiB | 1.30 s, 8.5 MB | 1.56 s, 8.4 MB | **1.29 s**, 8.5 MB | 1.50 s, 8.5 MB |
+| inplace: 256 MiB, 8 × 1 MiB overwritten | **1.24 s**, 8.4 MB | 1.30 s, 7.9 MB | **1.24 s**, 7.9 MB | 1.37 s, 8.1 MB |
+| mid: 40 × 4 MiB, 1 KiB changed each | 0.72 s, 2.6 MB | 0.72 s, 0.2 MB | 0.73 s, 0.2 MB | **0.69 s**, 0.5 MB |
+
+On 1 Gbit the picture is the same: M16 is level with 0.1.1 on `inplace` (0.52 s) and `append`
+(0.58 s), faster on the rest (`sqlite` 2.07 → 0.88 s, `scatter` 1.67 → 0.66 s, `shift` 0.59 →
+0.53 s), and ahead of rsync except on `mid` (0.45 against 0.41 s). The fine sizes were chosen
+by evaluating five rules on eight datasets (`bench/fast_rsync/src/bin/rules.rs`,
+`bench/results/fast_rsync-rules-20261018.tsv`); `--delta=cdc` keeps its fixed 16/32/64 KiB
+chunks.
 
 ### `--delta=cdc`: the original plan's design
 

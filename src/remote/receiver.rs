@@ -9,6 +9,7 @@
 use super::{MAX_PACKS_IN_FLIGHT, Stop, Strategy, WORKER_STACK, adapt, recv};
 use crate::cli::Options;
 use crate::checksum::Sum;
+use crate::delta::refine::{self, GapReq, Grain};
 use crate::delta::{self, Delta, DeltaMode, Op, ReadAt, ReadOnce, apply::apply, cdc};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::ids::IdMap;
@@ -359,6 +360,21 @@ impl RemoteState {
     // File data
     // -----------------------------------------------------------------------
 
+    /// Answer a `Refine`: fine signatures of the requested stretches of the basis file the
+    /// sender is about to send a delta against (its job is still waiting in `needed`).
+    fn refine<'s>(&'s self, s: &Scope<'s>, id: u64, grain: Grain, gaps: Vec<GapReq>) {
+        let basis = self.needed.lock().unwrap().get(&id).map(|job| job.basis_path().to_path_buf());
+        s.spawn(move |_| {
+            let sigs = (|| {
+                let p = grain.params()?;
+                let f = File::open(basis?).ok()?;
+                let size = f.metadata().ok()?.len();
+                refine::basis_sigs(&f, size, &p, &gaps).ok()
+            })();
+            let _ = self.out.msg(Msg::Refined { id, gaps: sigs.unwrap_or_default() });
+        });
+    }
+
     fn take_job(&self, id: u64) -> io::Result<FileJob> {
         self.needed
             .lock()
@@ -698,10 +714,11 @@ impl RemoteState {
     }
 }
 
-/// Signature of the destination file to send along with a request, so the sender can
-/// reply with a delta: aligned blocks when the size is unchanged (in-place edits),
-/// content-defined chunks when it changed (inserts, deletes, appends). `--delta=cdc`
-/// always sends content-defined chunks.
+/// Coarse signature of the destination file to send along with a request, so the sender
+/// can reply with a delta: aligned blocks when the size is unchanged (in-place edits),
+/// content-defined chunks when it changed (inserts, deletes, appends). The sender may then
+/// ask for finer signatures of the parts that didn't match ([`RemoteState::refine`]).
+/// `--delta=cdc` always sends its own chunks.
 fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<Sig> {
     let d = match &job.basis {
         Some(p) => fsops::lstat(p).ok()?,
@@ -910,6 +927,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
                         }
                         Msg::FileBegin { id, size } => remote.file_begin(engine, id, size),
                         Msg::DeltaBegin { id, size, copies } => remote.delta_begin(engine, id, size, copies),
+                        Msg::Refine { id, grain, gaps } => {
+                            remote.refine(s, id, grain, gaps);
+                            Ok(())
+                        }
                         Msg::FileEnd { id, ok } => {
                             remote.file_end(engine, id, ok);
                             Ok(())
