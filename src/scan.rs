@@ -107,7 +107,7 @@ fn stat_child(dir: &DirHandle, name: OsString) -> io::Result<Option<DirEnt>> {
         },
         _ => None,
     };
-    Ok(Some(DirEnt { name, meta, link }))
+    Ok(Some(DirEnt::new(name, meta, link)))
 }
 
 /// The destination tree's metadata, scanned while the source is: directory path ->

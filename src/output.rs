@@ -75,6 +75,10 @@ pub struct Change {
     pub perms: bool,
     pub owner: bool,
     pub group: bool,
+    /// `-A`: ACLs differ (`a`).
+    pub acl: bool,
+    /// `-X`: extended attributes differ (`x`).
+    pub xattr: bool,
 }
 
 impl Change {
@@ -83,7 +87,7 @@ impl Change {
     }
 
     pub fn any_attr(&self) -> bool {
-        self.value || self.size || self.time || self.perms || self.owner || self.group
+        self.value || self.size || self.time || self.perms || self.owner || self.group || self.acl || self.xattr
     }
 
     fn anything(&self) -> bool {
@@ -175,6 +179,11 @@ impl Output {
         self.verbose
     }
 
+    /// Item lines show `%i` change summaries (so attribute differences are worth finding).
+    pub fn itemizes(&self) -> bool {
+        self.format.is_some() && self.has_i
+    }
+
     fn line(&self, bytes: &[u8]) {
         if let Some(f) = &self.forward {
             return f(false, false, bytes);
@@ -229,6 +238,8 @@ impl Output {
             f[5] = set(c.perms, b'p');
             f[6] = set(c.owner, b'o');
             f[7] = set(c.group, b'g');
+            f[9] = set(c.acl, b'a');
+            f[10] = set(c.xattr, b'x');
         }
         f
     }

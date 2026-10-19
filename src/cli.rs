@@ -52,6 +52,12 @@ pub struct Cli {
     /// Preserve owner (super-user only)
     #[arg(short = 'o', long)]
     owner: bool,
+    /// Preserve ACLs (implies --perms)
+    #[arg(short = 'A', long)]
+    acls: bool,
+    /// Preserve extended attributes (twice: also rsync's internal rsync.% ones)
+    #[arg(short = 'X', long, action = ArgAction::Count)]
+    xattrs: u8,
     /// Transform symlinks into the files/directories they point to
     #[arg(short = 'L', long = "copy-links")]
     copy_links: bool,
@@ -285,6 +291,10 @@ pub struct Options {
     pub omit_dir_times: bool,
     pub group: bool,
     pub owner: bool,
+    /// `-A`
+    pub acls: bool,
+    /// Number of `-X` (0: off).
+    pub xattrs: u8,
     pub devices: bool,
     pub specials: bool,
     pub copy_links: bool,
@@ -417,11 +427,14 @@ impl Options {
             recursive: c.recursive || a,
             links: c.links || a,
             hard_links: c.hard_links,
-            perms: c.perms || a,
+            // rsync: -A implies -p.
+            perms: c.perms || a || c.acls,
             times: c.times || a,
             omit_dir_times: c.omit_dir_times || (c.backup && c.backup_dir.is_none()),
             group: c.group || a,
             owner: c.owner || a,
+            acls: c.acls,
+            xattrs: c.xattrs,
             devices: c.devices || c.devices_specials || a,
             specials: c.specials || c.devices_specials || a,
             copy_links: c.copy_links,
@@ -618,6 +631,16 @@ mod tests {
         let o = Options::parse_from(["barqsync", "-a", "s/", "d"]).unwrap();
         assert!(o.recursive && o.links && o.perms && o.times && o.group && o.owner);
         assert!(o.devices && o.specials);
+    }
+
+    #[test]
+    fn xattrs_and_acls() {
+        let o = Options::parse_from(["barqsync", "-aXX", "src/", "dst"]).unwrap();
+        assert_eq!((o.xattrs, o.acls), (2, false));
+        let o = Options::parse_from(["barqsync", "-rA", "src/", "dst"]).unwrap();
+        assert!(o.acls && o.perms, "-A implies -p");
+        let o = Options::parse_from(["barqsync", "-a", "src/", "dst"]).unwrap();
+        assert_eq!((o.xattrs, o.acls), (0, false), "-a includes neither");
     }
 
     #[test]

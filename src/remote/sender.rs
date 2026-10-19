@@ -11,7 +11,9 @@ use crate::checksum::{self, Sum};
 use crate::delta::{self, Delta, Op, Params, ReadAt, ReadOnce, cdc};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::ids;
+use crate::local::extra;
 use crate::local::flags::{adjust_listing, adjust_mode, remove_source};
+use crate::xattrs::{Rules, Xattr};
 use crate::select::{self, Descend, Sel};
 use crate::exit;
 use crate::filter::Filter;
@@ -47,6 +49,8 @@ struct Sender<'a> {
     ids: Mutex<ids::Sent>,
     /// Each root's base directory (`--remove-source-files` paths are relative to it).
     bases: Vec<PathBuf>,
+    /// `-X`: which attribute names are sent.
+    xrules: Rules,
 }
 
 /// A source argument resolved on disk.
@@ -73,7 +77,7 @@ impl Sender<'_> {
         let sums = if self.opts.checksum { self.checksums(&path, &entries) } else { Vec::new() };
         let dir = self.next_dir.fetch_add(1, SeqCst);
         self.listings.lock().unwrap().insert(dir, (path, entries.clone()));
-        self.name_ids(entries.iter().map(|e| &e.meta));
+        self.name_ids(entries.iter().map(|e| (&e.meta, e.extra.as_deref())));
         self.send(Msg::DirBatch { root, dir, rel, entries, sums });
     }
 
@@ -88,17 +92,34 @@ impl Sender<'_> {
             .collect()
     }
 
-    /// Without `--numeric-ids`, name each uid/gid before the first listing that uses it.
-    /// The names are queued under the lock, so no listing using an id can overtake them.
-    fn name_ids<'m>(&self, metas: impl Iterator<Item = &'m Meta>) {
-        if self.opts.numeric_ids || !(self.opts.owner || self.opts.group) {
+    /// Without `--numeric-ids`, name each uid/gid before the first listing that uses it
+    /// (as an owner, or in an ACL entry). The names are queued under the lock, so no
+    /// listing using an id can overtake them.
+    fn name_ids<'m>(&self, ents: impl Iterator<Item = (&'m Meta, Option<&'m crate::entry::Extra>)>) {
+        if self.opts.numeric_ids || !(self.opts.owner || self.opts.group || self.opts.acls) {
             return;
         }
         let mut sent = self.ids.lock().unwrap();
-        let (users, groups) = sent.new_names(metas, self.opts.owner, self.opts.group);
+        let (mut users, mut groups) = (Vec::new(), Vec::new());
+        for (m, x) in ents {
+            let (u, g) = sent.new_names(std::iter::once(m), self.opts.owner, self.opts.group);
+            users.extend(u);
+            groups.extend(g);
+            if let Some(acl) = x.and_then(|x| x.acl.as_ref()) {
+                let (u, g) = sent.new_acl_names(acl.ids());
+                users.extend(u);
+                groups.extend(g);
+            }
+        }
         if !users.is_empty() || !groups.is_empty() {
             self.send(Msg::IdNames { users, groups });
         }
+    }
+
+    /// `-L`/`-k`/`--chmod`, then (`-X`/`-A`) the entries' attributes and ACLs.
+    fn listing(&self, dir: &Path, ents: Vec<DirEnt>) -> Vec<DirEnt> {
+        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.err(m));
+        extra::collect(self.opts, &self.xrules, dir, ents, &mut |m| self.err(m))
     }
 
     fn walk_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, path: PathBuf, root_dev: u64, sel: Option<&'static Sel>) {
@@ -108,7 +129,7 @@ impl Sender<'_> {
         let ents = match sel {
             Some(sel) if !sel.contents => self.read_selected(&path, sel),
             _ => match fsops::read_dir_meta(&path) {
-                Ok(v) => adjust_listing(self.opts, &path, v, &mut |m| self.err(m)),
+                Ok(v) => self.listing(&path, v),
                 Err(e) => return self.err(path_msg("opendir \"", &path, format!("\" failed: {e}"))),
             },
         };
@@ -135,7 +156,7 @@ impl Sender<'_> {
         for (p, e) in errs {
             self.err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
         }
-        adjust_listing(self.opts, dir, ents, &mut |m| self.err(m))
+        self.listing(dir, ents)
     }
 
     /// Whether the listing of subdirectory `e` is sent (and with which selection). The
@@ -208,14 +229,40 @@ impl Sender<'_> {
     // Serving requests
     // -----------------------------------------------------------------------
 
-    fn serve<'s>(&'s self, s: &Scope<'s>, dir: u32, reqs: Vec<NeedReq>) {
+    fn serve<'s>(&'s self, s: &Scope<'s>, dir: u32, reqs: Vec<NeedReq>, xattrs: Vec<u32>) {
         let listing = self.listings.lock().unwrap().remove(&dir);
         match listing {
-            Some((base, entries)) => self.serve_listing(s, dir, &base, &entries, reqs),
+            Some((base, entries)) => {
+                self.send_xattrs(dir, &base, &entries, xattrs);
+                self.serve_listing(s, dir, &base, &entries, reqs)
+            }
             None => self.err(format!("protocol error: request for unknown directory {dir}")),
         }
         self.needs_done.fetch_add(1, SeqCst);
         self.check_done();
+    }
+
+    /// `-X`: the attributes of these entries in full, for the receiver to update them.
+    fn send_xattrs(&self, dir: u32, base: &Path, entries: &[DirEnt], idxs: Vec<u32>) {
+        for idx in idxs {
+            let Some(e) = entries.get(idx as usize) else {
+                self.err(format!("protocol error: request for unknown entry {dir}/{idx}"));
+                continue;
+            };
+            let xattrs = self.full_xattrs(&base.join(&e.name));
+            self.send(Msg::Xattrs { id: file_id(dir, idx), xattrs });
+        }
+    }
+
+    /// An entry's attributes with every value in full (`None` after reporting an error).
+    fn full_xattrs(&self, path: &Path) -> Option<Vec<Xattr>> {
+        match crate::xattrs::read_wire(path, &self.xrules, true) {
+            Ok(x) => Some(x),
+            Err(e) => {
+                self.err(path_msg("get_xattr \"", path, format!("\" failed: {e}")));
+                None
+            }
+        }
     }
 
     /// Answer one `Need`. No nested parallel loops here: these tasks block on the
@@ -232,24 +279,27 @@ impl Sender<'_> {
             };
             let id = file_id(dir, req.idx);
             let path = base.join(&e.name);
+            // Values the listing only had checksums of go along with the data.
+            let full = extra::has_summed(e.extra.as_deref());
             crate::progress::planned(e.meta.size);
             if req.sig.is_none() && e.meta.size <= proto::SMALL_FILE {
-                small.push((id, path));
+                small.push((id, path, full));
             } else {
-                large.push((id, path, req.sig));
+                large.push((id, path, req.sig, full));
             }
         }
         if !small.is_empty() {
             self.send_small(small);
         }
-        for (id, path, sig) in large {
+        for (id, path, sig, full) in large {
             self.pending_files.fetch_add(1, SeqCst);
             s.spawn(move |_| {
                 if !fsops::interrupted() {
                     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let xattrs = if full { self.full_xattrs(&path) } else { None };
                     let r = match sig {
-                        Some(sig) => self.send_delta(id, &path, sig),
-                        None => self.send_whole(id, &path),
+                        Some(sig) => self.send_delta(id, &path, sig, xattrs),
+                        None => self.send_whole(id, &path, xattrs),
                     };
                     if let Err(e) = r {
                         self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
@@ -264,16 +314,25 @@ impl Sender<'_> {
     }
 
     /// Read small files in parallel and send them packed into frames of ~4 MiB.
-    fn send_small(&self, files: Vec<(u64, PathBuf)>) {
-        let read = files.into_iter().map(|(id, path)| (id, std::fs::read(&path), path));
+    /// `full`: the file's attribute values go along in full.
+    fn send_small(&self, files: Vec<(u64, PathBuf, bool)>) {
+        let read = files.into_iter().map(|(id, path, full)| (id, std::fs::read(&path), path, full));
         let mut pack: Vec<(u64, u32)> = Vec::new();
         let mut blob: Vec<u8> = Vec::new();
-        for (id, data, path) in read {
+        let mut xattrs: Vec<(u64, Vec<Xattr>)> = Vec::new();
+        for (id, data, path, full) in read {
             match data {
                 Ok(d) => {
                     crate::progress::done(d.len() as u64);
                     if !blob.is_empty() && blob.len() + d.len() > proto::PACK_BYTES {
-                        self.send(Msg::SmallPack { files: std::mem::take(&mut pack), blob: std::mem::take(&mut blob) });
+                        self.send(Msg::SmallPack {
+                            files: std::mem::take(&mut pack),
+                            blob: std::mem::take(&mut blob),
+                            xattrs: std::mem::take(&mut xattrs),
+                        });
+                    }
+                    if full && let Some(x) = self.full_xattrs(&path) {
+                        xattrs.push((id, x));
                     }
                     pack.push((id, d.len() as u32));
                     blob.extend_from_slice(&d);
@@ -285,7 +344,7 @@ impl Sender<'_> {
             }
         }
         if !pack.is_empty() {
-            self.send(Msg::SmallPack { files: pack, blob });
+            self.send(Msg::SmallPack { files: pack, blob, xattrs });
         }
     }
 
@@ -302,14 +361,14 @@ impl Sender<'_> {
         Ok(())
     }
 
-    fn send_whole(&self, id: u64, path: &Path) -> io::Result<()> {
+    fn send_whole(&self, id: u64, path: &Path, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
         let f = File::open(path)?;
-        self.send_whole_file(id, &f)
+        self.send_whole_file(id, &f, xattrs)
     }
 
-    fn send_whole_file(&self, id: u64, f: &File) -> io::Result<()> {
+    fn send_whole_file(&self, id: u64, f: &File, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
         let size = f.metadata()?.len();
-        self.send(Msg::FileBegin { id, size });
+        self.send(Msg::FileBegin { id, size, xattrs });
         self.send_range(&ReadOnce::new(f, size), id, 0, size)?;
         self.send(Msg::FileEnd { id, ok: true });
         Ok(())
@@ -317,13 +376,13 @@ impl Sender<'_> {
 
     /// Diff the source file against the receiver's basis signature and send only the
     /// ranges it doesn't have.
-    fn send_delta(&self, id: u64, path: &Path, sig: Sig) -> io::Result<()> {
+    fn send_delta(&self, id: u64, path: &Path, sig: Sig, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
         if let Sig::Cdc(basis) = &sig {
             return match cdc::Mapped::new(&file, size) {
-                Ok(m) => self.send_ops(id, &file, &cdc::diff(m.bytes(), basis, &Params::DEFAULT), &m),
-                Err(e) if cdc::is_changed(&e) => self.send_whole_file(id, &file),
+                Ok(m) => self.send_ops(id, &file, &cdc::diff(m.bytes(), basis, &Params::DEFAULT), &m, xattrs),
+                Err(e) if cdc::is_changed(&e) => self.send_whole_file(id, &file, xattrs),
                 Err(e) => Err(e),
             };
         }
@@ -332,7 +391,7 @@ impl Sender<'_> {
             Sig::Blocks(basis) => {
                 let bs = basis.block_size as usize;
                 if bs == 0 {
-                    return self.send_whole_file(id, &file);
+                    return self.send_whole_file(id, &file, xattrs);
                 }
                 let p = Params { block_size: bs, segment: (Params::DEFAULT.segment / bs).max(1) * bs, ..Params::DEFAULT };
                 delta::diff_blocks(&delta::block_signature(&f, size, &p)?, &basis)
@@ -340,17 +399,17 @@ impl Sender<'_> {
             Sig::Chunks(basis) => delta::diff_chunks(&delta::chunk_signature(&f, size, &Params::DEFAULT)?, &basis),
             Sig::Cdc(_) => unreachable!(),
         };
-        self.send_ops(id, &file, &d, &f)
+        self.send_ops(id, &file, &d, &f, xattrs)
     }
 
     /// Send a delta: the copy ops up front, then the literal ranges read from `src`.
-    fn send_ops(&self, id: u64, file: &File, d: &Delta, src: &dyn ReadAt) -> io::Result<()> {
+    fn send_ops(&self, id: u64, file: &File, d: &Delta, src: &dyn ReadAt, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
         if d.matched_bytes() == 0 {
-            return self.send_whole_file(id, file);
+            return self.send_whole_file(id, file, xattrs);
         }
         let size = d.size;
         let copies: Vec<Op> = d.ops.iter().copied().filter(|o| matches!(o, Op::Copy { .. })).collect();
-        self.send(Msg::DeltaBegin { id, size, copies });
+        self.send(Msg::DeltaBegin { id, size, copies, xattrs });
         for op in &d.ops {
             if let Op::Literal { off, len } = *op {
                 self.send_range(src, id, off, len)?;
@@ -371,6 +430,7 @@ fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, o
         errors.fetch_add(1, SeqCst);
         out.error(m);
     };
+    let xrules = extra::rules(opts);
     let mut roots = Vec::new();
     for r in sel_roots {
         let sel = select::leak(r.sel);
@@ -378,7 +438,8 @@ fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, o
             match fsops::stat(&r.base) {
                 Ok(mut m) => {
                     adjust_mode(opts, &mut m);
-                    RootInfo { contents: true, meta: Some(m), items: Vec::new(), sel: Some(sel.clone()) }
+                    let extra = root_extra(opts, &xrules, &r.base, &m, &mut err);
+                    RootInfo { contents: true, meta: Some(m), items: Vec::new(), sel: Some(sel.clone()), extra }
                 }
                 Err(e) => {
                     err(path_msg("link_stat \"", &r.base, format!("\" failed: {e}")));
@@ -394,7 +455,8 @@ fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, o
                 .into_iter()
                 .filter(|e| !filter.is_excluded(e.name.as_bytes(), e.meta.kind == Kind::Dir))
                 .collect();
-            RootInfo { contents: false, meta: None, items, sel: Some(sel.clone()) }
+            let items = extra::collect(opts, &xrules, &r.base, items, &mut err);
+            RootInfo { contents: false, meta: None, items, sel: Some(sel.clone()), extra: None }
         };
         roots.push(SrcRoot { info, base: r.base, sel: Some(sel) });
     }
@@ -407,6 +469,11 @@ fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, out: &Ou
     if opts.relative {
         return resolve_select_roots(opts, sources, filter, out, errors);
     }
+    let xrules = extra::rules(opts);
+    let mut err = |m: Vec<u8>| {
+        errors.fetch_add(1, SeqCst);
+        out.error(m);
+    };
     let mut roots = Vec::new();
     for s in sources {
         let sp = PathBuf::from(s);
@@ -415,8 +482,7 @@ fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, out: &Ou
                 let meta = match fsops::lstat(&sp) {
                     Ok(m) => m,
                     Err(e) => {
-                        errors.fetch_add(1, SeqCst);
-                        out.error(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
+                        err(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
                         continue;
                     }
                 };
@@ -424,32 +490,32 @@ fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, out: &Ou
                     continue;
                 }
                 let link = if meta.kind == Kind::Symlink { fsops::read_link_bytes(&sp).ok() } else { None };
-                let mut err = |m: Vec<u8>| {
-                    errors.fetch_add(1, SeqCst);
-                    out.error(m);
-                };
-                let items = adjust_listing(opts, &parent, vec![DirEnt { name, meta, link }], &mut err);
-                let info = RootInfo { contents: false, meta: None, items, sel: None };
+                let items = adjust_listing(opts, &parent, vec![DirEnt::new(name, meta, link)], &mut err);
+                let items = extra::collect(opts, &xrules, &parent, items, &mut err);
+                let info = RootInfo { contents: false, meta: None, items, sel: None, extra: None };
                 roots.push(SrcRoot { info, base: parent, sel: None });
             }
             _ => match fsops::stat(&sp) {
                 Ok(mut m) if m.kind == Kind::Dir => {
                     adjust_mode(opts, &mut m);
-                    let info = RootInfo { contents: true, meta: Some(m), items: Vec::new(), sel: None };
+                    let extra = root_extra(opts, &xrules, &sp, &m, &mut err);
+                    let info = RootInfo { contents: true, meta: Some(m), items: Vec::new(), sel: None, extra };
                     roots.push(SrcRoot { info, base: sp, sel: None })
                 }
-                Ok(_) => {
-                    errors.fetch_add(1, SeqCst);
-                    out.error(path_msg("change_dir \"", &sp, "\" failed: Not a directory"));
-                }
-                Err(e) => {
-                    errors.fetch_add(1, SeqCst);
-                    out.error(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
-                }
+                Ok(_) => err(path_msg("change_dir \"", &sp, "\" failed: Not a directory")),
+                Err(e) => err(path_msg("link_stat \"", &sp, format!("\" failed: {e}"))),
             },
         }
     }
     roots
+}
+
+/// A `src/` root directory's own attributes (values in full) and ACLs.
+fn root_extra(opts: &Options, r: &Rules, path: &Path, meta: &Meta, err: &mut dyn FnMut(Vec<u8>)) -> Option<Box<crate::entry::Extra>> {
+    extra::read_wire(opts, r, path, Kind::Dir, meta.mode, true)
+        .map_err(|e| err(path_msg("get_xattr/get_acl \"", path, format!("\" failed: {e}"))))
+        .ok()
+        .flatten()
 }
 
 /// Run the sending side until the receiver reports completion. Returns the exit code
@@ -495,8 +561,12 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
         errors,
         ids: Mutex::new(ids::Sent::default()),
         bases: roots.iter().map(|r| r.base.clone()).collect(),
+        xrules: extra::rules(opts),
     };
-    sender.name_ids(roots.iter().flat_map(|r| r.info.meta.iter().chain(r.info.items.iter().map(|e| &e.meta))));
+    sender.name_ids(roots.iter().flat_map(|r| {
+        let root = r.info.meta.as_ref().map(|m| (m, r.info.extra.as_deref()));
+        root.into_iter().chain(r.info.items.iter().map(|e| (&e.meta, e.extra.as_deref())))
+    }));
     sender.send(Msg::Roots(roots.iter().map(|r| r.info.clone()).collect()));
 
     let pool = match rayon::ThreadPoolBuilder::new()
@@ -523,7 +593,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
             });
             loop {
                 match recv(conn) {
-                    Ok(Frame::Msg(Msg::Need { dir, files })) => s.spawn(move |s| sender.serve(s, dir, files)),
+                    Ok(Frame::Msg(Msg::Need { dir, files, xattrs })) => s.spawn(move |s| sender.serve(s, dir, files, xattrs)),
                     Ok(Frame::Msg(Msg::Synced { root, files })) => s.spawn(move |_| sender.remove_synced(root, files)),
                     Ok(Frame::Msg(Msg::ReceiverDone { stats })) => break Ok(stats),
                     Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),

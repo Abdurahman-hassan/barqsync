@@ -8,6 +8,7 @@ mod linux;
 pub mod uring;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod xattr;
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]
@@ -183,7 +184,7 @@ pub fn read_dir_stat(dir: &Path) -> io::Result<Vec<DirEnt>> {
             },
             _ => None,
         };
-        Some(Ok(DirEnt { name, meta, link }))
+        Some(Ok(DirEnt::new(name, meta, link)))
     };
     let res: io::Result<Vec<DirEnt>> = if names.len() > PARALLEL_STAT_THRESHOLD {
         names.into_par_iter().filter_map(stat_one).collect()
@@ -594,7 +595,7 @@ mod tests {
                     let p = d.join(&name);
                     let meta = lstat(&p).unwrap();
                     let link = (meta.kind == Kind::Symlink).then(|| read_link_bytes(&p).unwrap());
-                    DirEnt { name, meta, link }
+                    DirEnt::new(name, meta, link)
                 })
                 .collect();
             v.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
