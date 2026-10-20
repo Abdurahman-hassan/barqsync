@@ -126,6 +126,43 @@ fn stat_bytes(stdout: &str, label: &str) -> u64 {
         .unwrap_or_else(|| panic!("no {label:?} in:\n{stdout}"))
 }
 
+/// "Literal data" and "Matched data" as rsync counts them: a file sent whole (copied
+/// locally, a whole file or one in a small-file pack over the wire) is all literal data.
+#[test]
+fn whole_file_stats_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let num = |out: &RunOut, label: &str| -> u64 {
+        out.stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(label))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.replace(',', "").parse().ok())
+            .unwrap_or_else(|| panic!("no {label:?} in:\n{}", out.stdout))
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    t.file("big", noise(300_000, 1)).file("sub/mid", noise(70_000, 2)).file("small", "s\n");
+    t.settle_mtimes();
+    let runs: [(&[&str], bool); 3] = [
+        (&["-a", "--stats", "src/", "{dst}"], false),
+        (&["-a", "--stats", "src/", "{host}{dst}"], true),
+        (&["-a", "--stats", "{host}src/", "{dst}"], true),
+    ];
+    for (args, remote) in runs {
+        let (r, f) = if remote { both_remote(tmp.path(), args, "r", "f") } else { both(tmp.path(), args, "r", "f") }.unwrap();
+        assert_eq!((r.code, f.code), (0, 0), "{args:?}\n{}", f.stderr);
+        for label in ["Literal data: ", "Matched data: "] {
+            assert_eq!(num(&r, label), num(&f, label), "{args:?} {label}\nrsync:\n{}\nbarqsync:\n{}", r.stdout, f.stdout);
+        }
+        assert_eq!(num(&f, "Literal data: "), 300_000 + 70_000 + 2, "{args:?}");
+        for d in ["r", "f"] {
+            fs::remove_dir_all(tmp.path().join(d)).unwrap();
+        }
+    }
+}
+
 #[test]
 fn delta_over_the_wire() {
     let modes: [&[&str]; 7] =

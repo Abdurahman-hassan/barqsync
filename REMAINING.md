@@ -1,60 +1,65 @@
 # What's left in barqsync
 
-Status on 20 October 2026. Released: **0.3.0** (crates.io, GitHub release with binaries for
-macOS and Linux, `main` at `f9f8d8d`). It includes `-X`/`-A`, `--transport auto` and the CI
-and release automation; its protocol is 9, so it can't talk to 0.2.x.
+Status on 20 October 2026.
 
-## Fixed on `fix/streams-through-firewall` (not released yet)
+- **Released:** 0.3.0 (crates.io, and a GitHub release with binaries and installers for
+  macOS and Linux). Protocol 9.
+- **On `main`, not released:**
+  - parallel streams through ssh when a firewall blocks them;
+  - `~` in remote paths;
+  - clearer errors;
+  - local copy progress;
+  - whole files counted as literal data in `--stats`;
+  - QUIC's fixed cost cut to about two round trips;
+  - `--transport auto` remembering clean links;
+  - pull `--remove-source-files` reporting its removals;
+  - `BARQSYNC_TIMING`.
 
-| Problem | Cause | Fix | Checked by |
-| --- | --- | --- | --- |
-| `--streams` failed with "Connection reset by peer" and fell back to the slow single ssh pipe | The server listens for the streams on a new random TCP port. A firewall on the server (the macOS firewall for an app it hasn't been told about, or any host or network firewall, NAT or VPN) refuses it. The only way around it was a `sudo socketfilterfw` rule on the remote, repeated after every reinstall. | When no direct connection opens, each stream goes over its own extra ssh connection instead. `barqsync --stream-relay` on the server passes the bytes to the stream listener on that machine, which now also listens on loopback with the same port. TLS with the pinned certificate and token still runs end to end, and several TCP connections still carry the data. No firewall change is needed. | `bench/net/container.sh firewall`: real OpenSSH plus an iptables rule that resets every TCP connection except ssh. Push and pull with 4 streams through ssh gave identical copies, and no relay was left running. Integration tests with a blocked direct path, and with relays failing too. |
-| The first relay version stalled for 10–20 s with real ssh, then fell back | `io::copy` uses `splice(2)` between pipe and socket on Linux. Through sshd's pipes, the TLS handshake stopped after the server's first flight. It worked whenever the relay ran slowly (under strace). | The relay uses plain reads and writes. | The same firewall run. The relay's log showed the full handshake passing within 2 ms. |
-| `host:~/dir/` and `--remote-path=~/bin/barqsync` failed (`mkdir "~/dir/" failed`) | Paths travel in the handshake, so no shell expands `~`. `--remote-path` was quoted whole. | The server expands a leading `~` or `~user`. A leading `~` in `--remote-path` is left unquoted for the remote shell, as rsync does. | Unit tests; push and pull with both through the test shell |
-| A missing barqsync on the remote gave a vague error | – | Exit status 127 now says the command wasn't found, and that ssh commands read `~/.zshenv`, not `~/.zshrc`. | `bad_remote_path_fails_cleanly` |
-| A version mismatch named only protocol numbers | – | Both sides now name their barqsync version and say to install the same one on both machines. | – |
-| `@host:dir` (an empty `$user`) showed ssh's usage text | – | Refused before ssh runs, with a clear message. | Integration test |
-| A big local copy to a disk without clones moved the progress line only at the end | Progress counted a file when it was done. | The copy loops count as they write: `copy_file_range` on Linux, and the buffered and uncached loops. Only transfers count, not backups or `--link-dest` copies. | Unit tests |
-| README described the delta piece sizes by the new file's size (open review finding on PR 3) | – | The size of the old copy decides; the README now says so. | – |
-
-Compatibility: a client with this fix talking to a 0.3.0 server can't use relays, because the
-server doesn't know `--stream-relay`. It then falls back to the ssh pipe as before. No
-protocol change, so this can ship as **0.3.1**.
+  The details are in `CHANGELOG.md` under "Unreleased". The protocol is now 10, so the next
+  release can't talk to 0.3.x.
 
 ## Next steps, in order
 
-1. **Merge `fix/streams-through-firewall`** and release 0.3.1: bump the version, add a
-   CHANGELOG entry, tag `v0.3.1` (the release workflow builds the binaries), then
-   `cargo publish`.
-2. **Try it against the real macOS firewall.** The second Mac didn't answer over ssh while this
-   was built, so relays were tested against iptables, not the macOS firewall. Install 0.3.1
-   on both Macs, then run `barqsync -av --streams 4 big/ user@mac:big/`. Expect "using 4
-   streams through ssh". The relay reaches the listener over loopback, which the macOS
-   firewall shouldn't filter. If it does, the relay tries the advertised address next.
-3. **Review and merge PR 12:** `feat/quic-close-cost` (QUIC setup and close cost about three
-   round trips lower; `--transport auto` remembers hosts with a clean link) and
-   `fix/pull-remove-source-logs` on top of it (a pull with `--remove-source-files` now
-   prints rsync's "sender removed" lines and exits 23 when a removal fails), merged with
-   `main` as M19. Its `RemovalsDone` message makes the protocol 10, so a release that
-   includes it can't talk to 0.3.x: release 0.3.1 from `main` before merging it, or make the
-   next release 0.4.0 (and update the README's "0.3.x uses protocol 9").
-4. **Clean up branches:** `feat/zen-lamport-e84742` holds one README commit from before the
-   README rewrite (obsolete). The merged PR branches can go too.
+1. **Release 0.4.0.**
+   - Set `version = "0.4.0"` in `Cargo.toml` and update `Cargo.lock` (`cargo update -p barqsync`).
+   - Rename the CHANGELOG's "Unreleased" heading to "0.4.0 - <date>".
+   - In the README, change "0.3.x uses protocol 9" to "0.4.x uses protocol 10 and cannot
+     communicate with 0.3.x or earlier".
+   - Tag `v0.4.0` and push the tag: the release workflow builds the binaries, installers and
+     checksums.
+   - Run `cargo publish` from `main`.
+2. **Install 0.4.0 on both Macs** (`cargo install barqsync`, or the release's installer).
+   Then `--streams` works on the second Mac without its firewall exception, as checked
+   against that firewall. Afterwards, delete the old copies there: the test build
+   `~/bin/barqsync-pr11` and `~/bin/barqsync` (0.1.0).
+3. **Have Codex review what went in without it.** PRs 11, 12 and 13 hit the Codex usage
+   limit. Once it resets, ask for a review (`@codex review` on a PR), or review
+   `main` since `v0.3.0` yourself.
+4. **Clean up branches.** All of these are merged or superseded:
+   - the milestone branches `local-engine`, `delta-engine`, `remote-ssh`, `parallel-tcp`,
+     `polish-m6`, `plan-v2`, `m7-integrated`, `m8-verify`, `m9-delta-cdc`, `m10-jwalk-scanner`,
+     `m11-quic-rkyv`, `m12-adaptive`, `m13-io-uring`, `m14-verification`;
+   - the PR branches `ccr-2f85cd18-jxdmlm`, `docs/scrub-host-address`, `feat/*` and `fix/*`;
+   - `feat/zen-lamport-e84742` and `feat/gallant-sanderson-bf6749`, which hold early
+     work that was redone.
+
+   Keep the milestone branches if you want the history by milestone; `main` has all the
+   code. There are also 11 local worktrees under `.claude/worktrees/`.
 
 ## Still open
 
 ### Bugs and rough edges
 
 - **QUIC behind a firewall.** UDP can't go through ssh, so `--transport quic` and `auto` fall
-  back to the single ssh pipe when the server's firewall blocks them. A better fallback:
-  relayed TCP streams, as `--transport tcp` now does. That needs the server to offer both
+  back to the single ssh pipe when the server's firewall blocks UDP. A better fallback would
+  be relayed TCP streams, as `--transport tcp` now does. That needs the server to offer both
   (a protocol change).
 - **Firewalls that drop instead of reset ("stealth mode").** The direct attempt waits its full
-  5 s before the relays start, on every run. The fix is to remember per host that direct
+  5 s before the relays start, on every run. The fix: remember per host that direct
   connections fail, as `--transport auto` does for QUIC.
 - **Relays need ssh keys or an agent.** They run with `BatchMode=yes`, so a host that only
   takes passwords stays on the single ssh pipe.
-- **Leftover `barqsync --server` after Ctrl-C** (seen twice on macOS, not reproduced). Most
+- **Leftover `barqsync --server` after Ctrl-C** (seen twice on macOS, never reproduced). Most
   likely the external drive that hung at the time: rsync's servers writing to it got stuck
   the same way, in state U, where even `kill -9` can't end a process. If it happens with a
   healthy disk, run `sample <pid>` on the leftover process before killing it.
@@ -65,18 +70,33 @@ protocol change, so this can ship as **0.3.1**.
 ### Not built (from rsync or the original plan)
 
 - Daemon mode (`rsync://`) and the single-argument listing mode.
-- NFS isn't tested (no server); cold-cache benchmarks need `sudo purge`/`drop_caches`.
-- No benchmark on a real LAN yet: the real-host runs were over Tailscale across the internet.
-- Worth trying: making `--transport auto` the default (with PR 12 it tells clean long links
-  from lossy ones after a transfer; it still opens a UDP port on every server and hasn't met
-  a fast real long link); a cheaper adaptive probe (`--strategy adaptive` costs 4–22% on
-  incompressible data); a refinement threshold set from the measured round trip.
+- NFS isn't tested (no server). Cold-cache benchmarks need `sudo purge` or `drop_caches`.
+- No benchmark on a fast wired LAN yet. The real-host runs were over Tailscale: first across
+  the internet (about 4 Mbit/s), then directly over Wi-Fi (about 30 Mbit/s).
+- **Worth trying:**
+  - Make `--transport auto` the default. It now tells clean long links from lossy ones after a
+    transfer, but it still opens a UDP port on every server and hasn't met a fast real long
+    link.
+  - A cheaper adaptive probe: `--strategy adaptive` costs 4–22% on incompressible data.
+  - A refinement threshold set from the measured round trip.
 
 ### Outside barqsync (the Mac-to-Mac setup)
 
-- One Mac is on 2.4 GHz Wi-Fi (0.5–7.8 MB/s measured): a cable or 5 GHz is the biggest
+- One Mac is on 2.4 GHz Wi-Fi (0.5–7.8 MB/s measured). A cable or 5 GHz is the biggest
   speed-up available.
-- The external drive on the other Mac hung (processes stuck in state U): unplug it or
+- The external drive on the second Mac hung (processes stuck in state U). Unplug it or
   restart, then check how it is mounted and its write speed before using it again.
-- Once 0.3.1 is installed on both Macs, `--streams` no longer needs the firewall exception.
-  QUIC still does.
+- The second Mac's disk is nearly full: 6–7 GiB free of 932 GiB.
+- QUIC to the second Mac still needs its firewall exception; `--streams` doesn't anymore.
+
+## Done since 0.3.0, for reference
+
+| Problem | Fix | Checked by |
+| --- | --- | --- |
+| `--streams` failed with "Connection reset by peer" behind a firewall and fell back to the slow single ssh pipe | Blocked streams go over extra ssh connections. A relay on the server passes them to the stream listener over loopback. TLS with the pinned certificate and token still runs end to end. | The real macOS firewall: push 18.0 s on the single ssh pipe vs 12.7 s with relays, and pull 65.5 s vs 38.6 s, on 57 MB with identical files. Also iptables with real OpenSSH (`bench/net/container.sh firewall`) and integration tests. |
+| The first relay version stalled for 10–20 s with real ssh | `io::copy` splices between pipe and socket on Linux, and through sshd's pipes the TLS handshake stalled. The relay now uses plain reads and writes. | The same firewall runs |
+| `host:~/dir/` and `--remote-path=~/…` failed | The server expands a leading `~`, and the client leaves it unquoted in `--remote-path`, as rsync does | Tests, and the real Mac |
+| Vague errors (missing remote binary, version mismatch, `@host`) | Exit 127 now says the command wasn't found and mentions `~/.zshenv`. A mismatch names both versions. `@host` is refused before ssh runs. | Tests |
+| A big local copy moved the progress line only at the end | The copy loops count as they go (transfers only) | Unit tests |
+| `--stats` "Literal data: 0 bytes" for whole files | A whole file counts as literal data, as in rsync | Differential test against rsync (local, push, pull) |
+| QUIC cost three to five round trips more than ssh; pull `--remove-source-files` was silent | PR 12 | Its tests (see the PR) |
