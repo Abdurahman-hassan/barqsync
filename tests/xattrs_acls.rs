@@ -621,3 +621,90 @@ fn xattrs_and_acls_with_delete_and_hard_links() {
         assert_eq!(ino(df, "h1"), ino(df, "sub/h2"), "{how:?}: still one inode");
     }
 }
+
+/// An `--link-dest`/`--compare-dest` file with the same data but other attribute values
+/// (long ones, which a remote receiver asks the sender for in full) is copied and given
+/// the source's values: on the file in place, not on the temp file it was set up as.
+#[test]
+fn alt_dest_copies_get_the_sources_long_attributes() {
+    let tmp = tempfile::tempdir().unwrap();
+    if skip_x(tmp.path()) {
+        return;
+    }
+    for (i, how) in HOWS.iter().enumerate() {
+        for alt in ["--link-dest", "--compare-dest"] {
+            let cwd = tmp.path().join(format!("a{i}{}", &alt[2..3]));
+            let (t, a) = (Tree::new(cwd.join("src")), Tree::new(cwd.join("alt")));
+            for n in ["f1", "f2", "sub/f3"] {
+                t.file(n, format!("{n} data\n"));
+                a.file(n, format!("{n} data\n"));
+                set_x(&t.path(n), &nm("long"), &bytes(100, 1)).unwrap();
+                set_x(&a.path(n), &nm("long"), &bytes(100, 2)).unwrap();
+            }
+            t.same_mtimes(1_600_000_000);
+            a.same_mtimes(1_600_000_000);
+            let flag = format!("{alt}={}", cwd.join("alt").display());
+            let what = format!("{how:?} {alt}");
+            let out = sync(&cwd, *how, &["-aiX", &flag], "d-r", "d-f");
+            assert_eq!(out.1.code, 0, "{what}: {}", out.1.stderr);
+            check(&cwd, &out, "d-r", "d-f", &what);
+            for n in ["f1", "f2", "sub/f3"] {
+                assert_eq!(get_x(&cwd.join("d-f").join(n), &nm("long")), Some(bytes(100, 1)), "{what}: {n}");
+            }
+        }
+    }
+}
+
+/// barqsync alone, `src/` into `dst` the way `how` says.
+fn barqsync_how(cwd: &Path, how: How, flags: &[&str], dst: &str) -> RunOut {
+    let mut args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_barqsync"));
+    cmd.env("LC_ALL", TEST_LOCALE);
+    match how {
+        How::Local => args.extend(["src/".into(), dst.into()]),
+        How::Push(t) | How::Pull(t) => {
+            let shim = fake_ssh(cwd);
+            args.extend(["-e".into(), shim.display().to_string()]);
+            args.push(format!("--remote-path={}", env!("CARGO_BIN_EXE_barqsync")));
+            if matches!(how, How::Push(_)) {
+                args.extend(["src/".into(), format!("fakehost:{dst}")]);
+            } else {
+                args.extend(["fakehost:src/".into(), dst.into()]);
+            }
+            cmd.env("BARQSYNC_TRANSPORT", t);
+        }
+    }
+    run(cmd.args(&args), cwd)
+}
+
+/// `--remove-source-files` with attribute-only updates whose long values a remote
+/// receiver asks for: each source stays until its values are written. More entries than
+/// one report batch holds, so reports go out while the values are still to come.
+#[test]
+fn remove_source_files_waits_for_requested_attributes() {
+    let tmp = tempfile::tempdir().unwrap();
+    if skip_x(tmp.path()) {
+        return;
+    }
+    const N: usize = 1500;
+    for (i, how) in HOWS.iter().enumerate() {
+        let cwd = tmp.path().join(format!("r{i}"));
+        let t = Tree::new(cwd.join("src"));
+        for n in 0..N {
+            t.file(&format!("f{n}"), format!("{n}\n"));
+        }
+        t.same_mtimes(1_600_000_000);
+        let first = barqsync_how(&cwd, *how, &["-aX"], "dst");
+        assert_eq!(first.code, 0, "{how:?} first: {}", first.stderr);
+        for n in 0..N {
+            set_x(&t.path(&format!("f{n}")), &nm("long"), &bytes(100, n as u8)).unwrap();
+        }
+        let out = barqsync_how(&cwd, *how, &["-aX", "--remove-source-files"], "dst");
+        assert_eq!(out.code, 0, "{how:?}: {}", out.stderr);
+        for n in 0..N {
+            let f = format!("f{n}");
+            assert_eq!(get_x(&cwd.join("dst").join(&f), &nm("long")), Some(bytes(100, n as u8)), "{how:?}: {f}");
+            assert!(!t.path(&f).exists(), "{how:?}: {f} not removed");
+        }
+    }
+}

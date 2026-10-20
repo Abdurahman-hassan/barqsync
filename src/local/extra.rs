@@ -85,8 +85,10 @@ pub(crate) enum XSource<'a> {
     Local(&'a Path),
     /// Already at hand (sent along with a file's data, or a root's listing).
     Full(&'a [Xattr]),
-    /// Entry `idx` of remote listing `dir`: asked for, and written when it arrives.
-    Remote { dir: u32, idx: u32 },
+    /// Entry `idx` of remote listing `dir`: asked for, and written to `dst`, its final
+    /// path, when it arrives (whatever temp file is being set up meanwhile). `rel` in
+    /// root `root`: its name for `--remove-source-files`, which waits for the values.
+    Remote { dir: u32, idx: u32, root: u16, rel: &'a [u8], dst: &'a Path },
 }
 
 /// The source side of an entry, for comparing and writing.
@@ -208,16 +210,26 @@ impl Engine<'_> {
                     fetched = self.xrules.to_local(xattrs::read_wire(p, &self.xrules, true)?);
                     Some(&fetched)
                 }
-                XSource::Remote { dir, idx } => {
-                    // Written once the sender has sent the values.
+                XSource::Remote { dir, idx, root, rel, dst } => {
+                    // Written once the sender has sent the values: to the final path,
+                    // as a temp file at `path` is renamed before then.
                     if let Some(r) = &self.remote {
-                        r.defer_xattrs(dir, idx, path, src.kind);
+                        let hold = self.opts.remove_source_files.then_some((root, rel));
+                        r.defer_xattrs(dir, idx, dst, src.kind, hold);
                     }
                     return Ok(());
                 }
             }
         };
         xattrs::apply(path, src.kind, want, have, full, &self.xrules).map(drop)
+    }
+
+    /// An entry set up with `src`'s attributes wasn't written after all: withdraw any
+    /// request for its full values.
+    pub(crate) fn not_written(&self, src: &Src) {
+        if let (XSource::Remote { dir, idx, .. }, Some(r)) = (src.from, &self.remote) {
+            r.forget_xattrs(dir, idx);
+        }
     }
 
     /// `-X`/`-A` for a file this run wrote at `path` (a temp file, or the destination

@@ -162,8 +162,29 @@ pub struct RemoteState {
     synced: Mutex<HashMap<u16, SyncedFiles>>,
     /// `-X`: entries waiting for their attribute values (by file id), and the requests
     /// for them not sent yet (by listing; they go out with the listing's `Need`).
-    xattr_wait: Mutex<HashMap<u64, (PathBuf, Kind)>>,
+    xattr_wait: Mutex<HashMap<u64, XattrWait>>,
     xattr_reqs: Mutex<HashMap<u32, Vec<u32>>>,
+    /// `--remove-source-files`: entries (by root and name) whose source must stay until
+    /// their deferred attribute values are written.
+    held: Mutex<HashMap<(u16, Vec<u8>), Held>>,
+}
+
+/// An entry waiting for its attribute values.
+struct XattrWait {
+    path: PathBuf,
+    kind: Kind,
+    /// Its key in `held`.
+    hold: Option<(u16, Vec<u8>)>,
+}
+
+/// Where a held entry is at.
+enum Held {
+    /// Its values haven't been written yet.
+    Waiting,
+    /// The rest of it is done too: report it once the values are written.
+    Synced(u64, i64),
+    /// Writing the values failed: its source stays.
+    Failed,
 }
 
 /// Literal ranges arrive as `Data` frames, never through [`apply`].
@@ -193,28 +214,60 @@ impl RemoteState {
             synced: Mutex::new(HashMap::new()),
             xattr_wait: Mutex::new(HashMap::new()),
             xattr_reqs: Mutex::new(HashMap::new()),
+            held: Mutex::new(HashMap::new()),
         }
     }
 
     /// `-X`: entry `idx` of listing `dir` (at `path`) needs attribute values only the
-    /// sender has in full: ask for them with the listing's `Need`.
-    pub(crate) fn defer_xattrs(&self, dir: u32, idx: u32, path: &Path, kind: Kind) {
-        self.xattr_wait.lock().unwrap().insert(file_id(dir, idx), (path.to_path_buf(), kind));
+    /// sender has in full: ask for them with the listing's `Need`. `hold` (`root`, `rel`):
+    /// with `--remove-source-files`, its source stays until they are written.
+    pub(crate) fn defer_xattrs(&self, dir: u32, idx: u32, path: &Path, kind: Kind, hold: Option<(u16, &[u8])>) {
+        let hold = hold.map(|(root, rel)| (root, rel.to_vec()));
+        if let Some(k) = &hold {
+            self.held.lock().unwrap().insert(k.clone(), Held::Waiting);
+        }
+        self.xattr_wait.lock().unwrap().insert(file_id(dir, idx), XattrWait { path: path.to_path_buf(), kind, hold });
         self.xattr_reqs.lock().unwrap().entry(dir).or_default().push(idx);
+    }
+
+    /// Withdraw a deferral whose entry wasn't written after all (while its request is
+    /// still unsent; afterwards the values are expected).
+    pub(crate) fn forget_xattrs(&self, dir: u32, idx: u32) {
+        {
+            let mut reqs = self.xattr_reqs.lock().unwrap();
+            let Some(v) = reqs.get_mut(&dir) else { return };
+            let Some(i) = v.iter().position(|&x| x == idx) else { return };
+            v.remove(i);
+        }
+        if let Some(XattrWait { hold: Some(k), .. }) = self.xattr_wait.lock().unwrap().remove(&file_id(dir, idx)) {
+            self.held.lock().unwrap().remove(&k);
+        }
     }
 
     /// The attribute values asked for with [`RemoteState::defer_xattrs`] arrived.
     fn on_xattrs(&self, eng: &Engine, id: u64, xattrs: Option<Vec<Xattr>>) {
-        let Some((path, kind)) = self.xattr_wait.lock().unwrap().remove(&id) else {
+        let Some(XattrWait { path, kind, hold }) = self.xattr_wait.lock().unwrap().remove(&id) else {
             return eng.err(format!("protocol error: attributes for unrequested entry {id:#x}"));
         };
         // `None`: the sender couldn't read them and has said so.
-        let Some(xattrs) = xattrs else { return };
-        let want = eng.xrules.to_local(xattrs);
-        let r = crate::xattrs::read_local(&path, &eng.xrules)
-            .and_then(|have| crate::xattrs::apply(&path, kind, &want, &have, None, &eng.xrules));
-        if let Err(e) = r {
-            eng.err(path_msg("set_xattr \"", &path, format!("\" failed: {e}")));
+        let written = xattrs.is_some_and(|xattrs| {
+            let want = eng.xrules.to_local(xattrs);
+            let r = crate::xattrs::read_local(&path, &eng.xrules)
+                .and_then(|have| crate::xattrs::apply(&path, kind, &want, &have, None, &eng.xrules));
+            r.map_err(|e| eng.err(path_msg("set_xattr \"", &path, format!("\" failed: {e}")))).is_ok()
+        });
+        if let Some(k) = hold {
+            let mut held = self.held.lock().unwrap();
+            match held.remove(&k) {
+                Some(Held::Synced(size, mtime)) if written => {
+                    drop(held);
+                    self.push_synced(k.0, k.1, size, mtime);
+                }
+                Some(Held::Waiting) if !written => {
+                    held.insert(k, Held::Failed);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -223,11 +276,33 @@ impl RemoteState {
         self.sums.lock().unwrap().get(&dir)?.get(idx as usize).copied().flatten()
     }
 
-    /// `--remove-source-files`: the receiver has this entry; tell the sender (in batches).
+    /// `--remove-source-files`: the receiver has this entry; tell the sender (in batches),
+    /// or, while it waits for attribute values, once they are written.
     pub(crate) fn synced(&self, root: u16, rel: &[u8], meta: &Meta) {
+        {
+            let mut held = self.held.lock().unwrap();
+            if !held.is_empty() {
+                let k = (root, rel.to_vec());
+                match held.get_mut(&k) {
+                    Some(Held::Failed) => {
+                        held.remove(&k);
+                        return;
+                    }
+                    Some(h) => {
+                        *h = Held::Synced(meta.size, meta.mtime);
+                        return;
+                    }
+                    None => {}
+                }
+            }
+        }
+        self.push_synced(root, rel.to_vec(), meta.size, meta.mtime);
+    }
+
+    fn push_synced(&self, root: u16, rel: Vec<u8>, size: u64, mtime: i64) {
         let mut map = self.synced.lock().unwrap();
         let v = map.entry(root).or_default();
-        v.push((rel.to_vec(), meta.size, meta.mtime));
+        v.push((rel, size, mtime));
         if v.len() >= 1000 {
             let files = std::mem::take(v);
             drop(map);

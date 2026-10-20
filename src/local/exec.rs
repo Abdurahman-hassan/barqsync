@@ -286,8 +286,11 @@ impl<'a> Engine<'a> {
     }
 
     /// Where an entry's full attribute values come from (see [`XSource`]).
-    fn xsource<'p>(&self, wire_dir: u32, idx: u32, src_path: &'p Path) -> XSource<'p> {
-        if self.remote.is_some() { XSource::Remote { dir: wire_dir, idx } } else { XSource::Local(src_path) }
+    fn xsource<'p>(&self, ctx: &Ctx, idx: u32, src_path: &'p Path, rel: &'p [u8], dst_path: &'p Path) -> XSource<'p> {
+        match self.remote {
+            Some(_) => XSource::Remote { dir: ctx.wire_dir, idx, root: ctx.root, rel, dst: dst_path },
+            None => XSource::Local(src_path),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -863,7 +866,7 @@ impl<'a> Engine<'a> {
                         },
                         None => {}
                     }
-                    let from = self.xsource(ctx.wire_dir, idx, &src_path);
+                    let from = self.xsource(ctx, idx, &src_path, &rel, &dst_path);
                     let src = Src { kind: Kind::File, meta: &e.meta, extra: e.extra.as_deref(), from };
                     let mut have: Option<DstExtra> = None;
                     let action = file_action_ext(&e.meta, dst_meta.as_ref(), &self.rules, same_sums.contains(&idx), &mut || {
@@ -952,7 +955,7 @@ impl<'a> Engine<'a> {
                         self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
-                    changed |= self.handle_symlink(ctx.root, &e, self.xsource(ctx.wire_dir, idx, &src_path), &rel, &src_path, &dst_path, dst_kind);
+                    changed |= self.handle_symlink(ctx.root, &e, self.xsource(ctx, idx, &src_path, &rel, &dst_path), &rel, &src_path, &dst_path, dst_kind);
                 }
                 kind => {
                     Stats::add(&self.stats.specials, 1);
@@ -965,7 +968,7 @@ impl<'a> Engine<'a> {
                         self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
-                    let src = Src { kind, meta: &e.meta, extra: e.extra.as_deref(), from: self.xsource(ctx.wire_dir, idx, &src_path) };
+                    let src = Src { kind, meta: &e.meta, extra: e.extra.as_deref(), from: self.xsource(ctx, idx, &src_path, &rel, &dst_path) };
                     changed |= self.handle_special(ctx.root, &src, &rel, &src_path, &dst_path, dst_kind);
                 }
             }
@@ -1071,7 +1074,7 @@ impl<'a> Engine<'a> {
             None => {}
         }
         let is_new = pre.is_none();
-        let x = Src { kind: Kind::Dir, meta: &meta, extra, from: self.xsource(ctx.wire_dir, idx, &src_path) };
+        let x = Src { kind: Kind::Dir, meta: &meta, extra, from: self.xsource(ctx, idx, &src_path, &rel, &dst_path) };
         let (ext, have) = match &pre {
             Some(p) if kept_link.is_none() => self.extra_change(&x, &dst_path, p),
             _ => ((false, false), None),

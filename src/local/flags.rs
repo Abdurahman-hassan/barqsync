@@ -255,7 +255,9 @@ impl Engine<'_> {
             return AltFile::Done;
         }
         if let Some((p, m)) = same_data {
-            let change = Change { local: true, ..self.attr_change(src, &m, false) };
+            // Compared with the alt file it is copied from, as rsync does.
+            let (xattr, acl) = self.extra_change(x, &p, &m).0;
+            let change = Change { local: true, xattr, acl, ..self.attr_change(src, &m, false) };
             self.out.item(rel, Kind::File, Link::None, change, true);
             if dst_meta.is_none() {
                 Stats::add(&self.stats.created, 1);
@@ -265,6 +267,7 @@ impl Engine<'_> {
             {
                 let to = path_msg("\" -> \"", dst_path, format!("\" failed: {e}"));
                 self.err(path_msg("copy \"", &p, to));
+                self.not_written(x);
                 return AltFile::Done;
             }
             self.source_done(root, src_path, rel, src);
