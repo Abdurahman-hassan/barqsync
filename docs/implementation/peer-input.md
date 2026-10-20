@@ -87,6 +87,17 @@ written outside the destination, zero-filled and empty files are committed, a ba
 delta exits 0, a listing over 64 MiB cannot be sent, a grown file is packed, and with
 two roots a file is written outside the destination.
 
+## Results
+
+On the branch merged with `main` at `68f7ecf`:
+
+| Check | Result |
+| --- | --- |
+| macOS arm64, `env -u BARQSYNC_TEST_REMOTE cargo test` | 233 passed, 0 failed; the 3 `real_remote` tests returned early |
+| Linux aarch64 (Podman, rsync 3.2.7), `bench/net/container.sh test` | 237 passed, 0 failed |
+| Clippy, all targets, warnings denied (macOS and Linux) | Passed |
+| New regressions against `eeb6955` | 8 of 10 in `tests/peer_input.rs` fail there; the 2 others cover behavior that already worked |
+
 ## Remaining acceptance work
 
 - **Descriptor confinement is not implemented.** Writes, renames, metadata updates and
