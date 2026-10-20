@@ -46,6 +46,7 @@ impl DiffRules {
             mtime: self.times && !self.same_mtime(src, dst),
             owner: self.wanted_uid(src).is_some_and(|u| u != dst.uid)
                 || self.wanted_gid(src).is_some_and(|g| g != dst.gid),
+            ..AttrDiff::default()
         }
     }
 }
@@ -55,11 +56,15 @@ pub struct AttrDiff {
     pub mode: bool,
     pub mtime: bool,
     pub owner: bool,
+    /// `-X`: the extended attributes differ.
+    pub xattr: bool,
+    /// `-A`: the ACLs differ.
+    pub acl: bool,
 }
 
 impl AttrDiff {
     pub fn any(&self) -> bool {
-        self.mode || self.mtime || self.owner
+        self.mode || self.mtime || self.owner || self.xattr || self.acl
     }
 }
 
@@ -81,6 +86,19 @@ pub fn file_action(src: &Meta, dst: Option<&Meta>, r: &DiffRules) -> FileAction 
 /// [`file_action`] with `-c`: `same_sum` says whether the checksums of `src` and `dst`
 /// match (only consulted when the sizes do).
 pub fn file_action_sum(src: &Meta, dst: Option<&Meta>, r: &DiffRules, same_sum: bool) -> FileAction {
+    file_action_ext(src, dst, r, same_sum, &mut || (false, false))
+}
+
+/// [`file_action_sum`] with `-X`/`-A`: `ext` says whether the extended attributes and
+/// the ACLs differ. It is only asked when the data is the same: differing ones then
+/// need an attribute update, as in rsync, never a transfer.
+pub fn file_action_ext(
+    src: &Meta,
+    dst: Option<&Meta>,
+    r: &DiffRules,
+    same_sum: bool,
+    ext: &mut dyn FnMut() -> (bool, bool),
+) -> FileAction {
     let Some(dst) = dst else { return FileAction::Transfer };
     if dst.kind != Kind::File {
         return FileAction::Transfer;
@@ -103,7 +121,8 @@ pub fn file_action_sum(src: &Meta, dst: Option<&Meta>, r: &DiffRules, same_sum: 
     if !data_same {
         return FileAction::Transfer;
     }
-    let diff = r.attrs_differ(src, dst);
+    let (xattr, acl) = ext();
+    let diff = AttrDiff { xattr, acl, ..r.attrs_differ(src, dst) };
     if diff.any() { FileAction::Attrs(diff) } else { FileAction::Skip }
 }
 
@@ -170,6 +189,25 @@ mod tests {
             FileAction::Attrs(d) => assert!(d.mode && !d.mtime && !d.owner),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn xattrs_and_acls_alone_update_attributes() {
+        let r = rules();
+        let s = file(10, 100, 0, 0o644);
+        let d = s;
+        let act = |x, a| file_action_ext(&s, Some(&d), &r, false, &mut || (x, a));
+        assert_eq!(act(false, false), FileAction::Skip);
+        assert_eq!(act(true, false), FileAction::Attrs(AttrDiff { xattr: true, ..AttrDiff::default() }));
+        assert_eq!(act(false, true), FileAction::Attrs(AttrDiff { acl: true, ..AttrDiff::default() }));
+        // Not asked when the data differs: that is a transfer anyway.
+        let changed = file(11, 100, 0, 0o644);
+        let mut asked = false;
+        let a = file_action_ext(&s, Some(&changed), &r, false, &mut || {
+            asked = true;
+            (true, true)
+        });
+        assert_eq!((a, asked), (FileAction::Transfer, false));
     }
 
     #[test]

@@ -89,6 +89,28 @@ impl Sent {
         }
         (u, g)
     }
+
+    /// Names for the ids of ACL entries (`(is_user, id)`) not sent yet.
+    pub fn new_acl_names(&mut self, ids: impl Iterator<Item = (bool, u32)>) -> (Names, Names) {
+        let (mut u, mut g) = (Vec::new(), Vec::new());
+        for (user, id) in ids {
+            if id == 0 {
+                continue;
+            }
+            if user {
+                if self.users.insert(id)
+                    && let Some(n) = user_name(id)
+                {
+                    u.push((id, n));
+                }
+            } else if self.groups.insert(id)
+                && let Some(n) = group_name(id)
+            {
+                g.push((id, n));
+            }
+        }
+        (u, g)
+    }
 }
 
 /// Receiver side: sender id -> local id, for the names that exist locally.
@@ -124,6 +146,12 @@ impl IdMap {
 
     pub fn is_empty(&self) -> bool {
         self.users.is_empty() && self.groups.is_empty()
+    }
+
+    /// A sender's user (`user`) or group id, mapped.
+    pub fn map(&self, user: bool, id: u32) -> u32 {
+        let map = if user { &self.users } else { &self.groups };
+        map.get(&id).copied().unwrap_or(id)
     }
 
     pub fn apply(&self, m: &mut Meta) {

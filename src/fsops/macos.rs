@@ -175,7 +175,7 @@ pub fn read_dir_bulk(dir: &DirHandle) -> io::Result<Option<Vec<DirEnt>>> {
             },
             _ => None,
         };
-        out.push(DirEnt { name, meta, link });
+        out.push(DirEnt::new(name, meta, link));
     }
     Ok(Some(out))
 }

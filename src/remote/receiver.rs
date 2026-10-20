@@ -13,7 +13,9 @@ use crate::delta::refine::{self, GapReq, Grain};
 use crate::delta::{self, Delta, DeltaMode, Op, ReadAt, ReadOnce, apply::apply, cdc};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::ids::IdMap;
+use crate::local::extra;
 use crate::local::flags::write_sparse_at;
+use crate::xattrs::Xattr;
 use crate::select::{self, Sel};
 use crate::exit;
 use crate::filter::Filter;
@@ -158,6 +160,31 @@ pub struct RemoteState {
     ids: Mutex<IdMap>,
     /// `--remove-source-files`: entries to report back to the sender, per root.
     synced: Mutex<HashMap<u16, SyncedFiles>>,
+    /// `-X`: entries waiting for their attribute values (by file id), and the requests
+    /// for them not sent yet (by listing; they go out with the listing's `Need`).
+    xattr_wait: Mutex<HashMap<u64, XattrWait>>,
+    xattr_reqs: Mutex<HashMap<u32, Vec<u32>>>,
+    /// `--remove-source-files`: entries (by root and name) whose source must stay until
+    /// their deferred attribute values are written.
+    held: Mutex<HashMap<(u16, Vec<u8>), Held>>,
+}
+
+/// An entry waiting for its attribute values.
+struct XattrWait {
+    path: PathBuf,
+    kind: Kind,
+    /// Its key in `held`.
+    hold: Option<(u16, Vec<u8>)>,
+}
+
+/// Where a held entry is at.
+enum Held {
+    /// Its values haven't been written yet.
+    Waiting,
+    /// The rest of it is done too: report it once the values are written.
+    Synced(u64, i64),
+    /// Writing the values failed: its source stays.
+    Failed,
 }
 
 /// Literal ranges arrive as `Data` frames, never through [`apply`].
@@ -185,18 +212,97 @@ impl RemoteState {
             sums: Mutex::new(HashMap::new()),
             ids: Mutex::new(ids),
             synced: Mutex::new(HashMap::new()),
+            xattr_wait: Mutex::new(HashMap::new()),
+            xattr_reqs: Mutex::new(HashMap::new()),
+            held: Mutex::new(HashMap::new()),
         }
     }
+
+    /// `-X`: entry `idx` of listing `dir` (at `path`) needs attribute values only the
+    /// sender has in full: ask for them with the listing's `Need`. `hold` (`root`, `rel`):
+    /// with `--remove-source-files`, its source stays until they are written.
+    pub(crate) fn defer_xattrs(&self, dir: u32, idx: u32, path: &Path, kind: Kind, hold: Option<(u16, &[u8])>) {
+        let hold = hold.map(|(root, rel)| (root, rel.to_vec()));
+        if let Some(k) = &hold {
+            self.held.lock().unwrap().insert(k.clone(), Held::Waiting);
+        }
+        self.xattr_wait.lock().unwrap().insert(file_id(dir, idx), XattrWait { path: path.to_path_buf(), kind, hold });
+        self.xattr_reqs.lock().unwrap().entry(dir).or_default().push(idx);
+    }
+
+    /// Withdraw a deferral whose entry wasn't written after all (while its request is
+    /// still unsent; afterwards the values are expected).
+    pub(crate) fn forget_xattrs(&self, dir: u32, idx: u32) {
+        {
+            let mut reqs = self.xattr_reqs.lock().unwrap();
+            let Some(v) = reqs.get_mut(&dir) else { return };
+            let Some(i) = v.iter().position(|&x| x == idx) else { return };
+            v.remove(i);
+        }
+        if let Some(XattrWait { hold: Some(k), .. }) = self.xattr_wait.lock().unwrap().remove(&file_id(dir, idx)) {
+            self.held.lock().unwrap().remove(&k);
+        }
+    }
+
+    /// The attribute values asked for with [`RemoteState::defer_xattrs`] arrived.
+    fn on_xattrs(&self, eng: &Engine, id: u64, xattrs: Option<Vec<Xattr>>) {
+        let Some(XattrWait { path, kind, hold }) = self.xattr_wait.lock().unwrap().remove(&id) else {
+            return eng.err(format!("protocol error: attributes for unrequested entry {id:#x}"));
+        };
+        // `None`: the sender couldn't read them and has said so.
+        let written = xattrs.is_some_and(|xattrs| {
+            let want = eng.xrules.to_local(xattrs);
+            let r = crate::xattrs::read_local(&path, &eng.xrules)
+                .and_then(|have| crate::xattrs::apply(&path, kind, &want, &have, None, &eng.xrules));
+            r.map_err(|e| eng.err(path_msg("set_xattr \"", &path, format!("\" failed: {e}")))).is_ok()
+        });
+        if let Some(k) = hold {
+            let mut held = self.held.lock().unwrap();
+            match held.remove(&k) {
+                Some(Held::Synced(size, mtime)) if written => {
+                    drop(held);
+                    self.push_synced(k.0, k.1, size, mtime);
+                }
+                Some(Held::Waiting) if !written => {
+                    held.insert(k, Held::Failed);
+                }
+                _ => {}
+            }
+        }
+    }
+
 
     pub(crate) fn src_sum(&self, dir: u32, idx: u32) -> Option<Sum> {
         self.sums.lock().unwrap().get(&dir)?.get(idx as usize).copied().flatten()
     }
 
-    /// `--remove-source-files`: the receiver has this entry; tell the sender (in batches).
+    /// `--remove-source-files`: the receiver has this entry; tell the sender (in batches),
+    /// or, while it waits for attribute values, once they are written.
     pub(crate) fn synced(&self, root: u16, rel: &[u8], meta: &Meta) {
+        {
+            let mut held = self.held.lock().unwrap();
+            if !held.is_empty() {
+                let k = (root, rel.to_vec());
+                match held.get_mut(&k) {
+                    Some(Held::Failed) => {
+                        held.remove(&k);
+                        return;
+                    }
+                    Some(h) => {
+                        *h = Held::Synced(meta.size, meta.mtime);
+                        return;
+                    }
+                    None => {}
+                }
+            }
+        }
+        self.push_synced(root, rel.to_vec(), meta.size, meta.mtime);
+    }
+
+    fn push_synced(&self, root: u16, rel: Vec<u8>, size: u64, mtime: i64) {
         let mut map = self.synced.lock().unwrap();
         let v = map.entry(root).or_default();
-        v.push((rel.to_vec(), meta.size, meta.mtime));
+        v.push((rel, size, mtime));
         if v.len() >= 1000 {
             let files = std::mem::take(v);
             drop(map);
@@ -266,6 +372,12 @@ impl RemoteState {
                 entries.iter_mut().for_each(|e| ids.apply(&mut e.meta));
             }
         }
+        if eng.extras_on() {
+            let ids = self.ids.lock().unwrap();
+            for e in &mut entries {
+                e.extra = local_extra(&ids, &eng.xrules, e.extra.take(), e.meta.mode);
+            }
+        }
         let key = (root, rel);
         let mut slots = self.slots.lock().unwrap();
         match slots.remove(&key) {
@@ -329,7 +441,7 @@ impl RemoteState {
             .collect();
         for k in orphans {
             if let Some(Slot::Batch { dir, .. }) = slots.remove(&k) {
-                let _ = self.out.msg(Msg::Need { dir, files: Vec::new() });
+                let _ = self.out.msg(Msg::Need { dir, files: Vec::new(), xattrs: Vec::new() });
             }
         }
     }
@@ -355,7 +467,8 @@ impl RemoteState {
             reqs.push(NeedReq { idx: job.idx, sig });
             self.needed.lock().unwrap().insert(file_id(wire_dir, job.idx), job);
         }
-        let _ = self.out.msg(Msg::Need { dir: wire_dir, files: reqs });
+        let xattrs = self.xattr_reqs.lock().unwrap().remove(&wire_dir).unwrap_or_default();
+        let _ = self.out.msg(Msg::Need { dir: wire_dir, files: reqs, xattrs });
     }
 
     // -----------------------------------------------------------------------
@@ -408,8 +521,15 @@ impl RemoteState {
         Ok((f, tmp, true, true, true))
     }
 
-    fn file_begin(&self, eng: &Engine, id: u64, size: u64) -> io::Result<()> {
-        let job = self.take_job(id)?;
+    /// The requested file `id`, with the attribute values that came with its data.
+    fn take_job_with(&self, eng: &Engine, id: u64, xattrs: Option<Vec<Xattr>>) -> io::Result<FileJob> {
+        let mut job = self.take_job(id)?;
+        job.full_xattrs = xattrs.map(|x| eng.xrules.to_local(x));
+        Ok(job)
+    }
+
+    fn file_begin(&self, eng: &Engine, id: u64, size: u64, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
+        let job = self.take_job_with(eng, id, xattrs)?;
         eng.backup_existing_file(&job);
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
@@ -432,8 +552,8 @@ impl RemoteState {
         Ok(())
     }
 
-    fn delta_begin(&self, eng: &Engine, id: u64, size: u64, copies: Vec<Op>) -> io::Result<()> {
-        let job = self.take_job(id)?;
+    fn delta_begin(&self, eng: &Engine, id: u64, size: u64, copies: Vec<Op>, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
+        let job = self.take_job_with(eng, id, xattrs)?;
         eng.backup_existing_file(&job);
         let basis = File::open(job.basis_path())?;
         let d = Delta { size, ops: copies };
@@ -456,6 +576,7 @@ impl RemoteState {
             })?;
             if cloned {
                 Stats::add(&eng.stats.cloned, 1);
+                eng.cloned(&tmp);
             }
             match fs::OpenOptions::new().write(true).open(&tmp) {
                 Ok(f) => (f, tmp, true, true, cloned),
@@ -570,11 +691,12 @@ impl RemoteState {
         }
         let (mode, uid, gid) = eng.target_attrs(job);
         let meta = job.meta;
+        let src = job.src(true);
         if created && !delta {
             let mtime = eng.opts.times.then_some((meta.mtime, meta.mtime_ns));
-            eng.apply_new_file_attrs(path, Copied::Written(file), mode, uid, gid, mtime)?;
+            eng.apply_new_file_attrs(path, Copied::Written(file), mode, uid, gid, mtime, Some(&src))?;
         } else {
-            eng.finish_delta_file(&file, &meta, mode, uid, gid)?;
+            eng.finish_delta_file(&file, &meta, mode, uid, gid, Some((path, &src)))?;
             drop(file);
         }
         fsops::check_interrupt()?;
@@ -584,10 +706,11 @@ impl RemoteState {
         Ok(())
     }
 
-    fn small_pack(&self, eng: &Engine, files: Vec<(u64, u32)>, blob: Vec<u8>) {
+    fn small_pack(&self, eng: &Engine, files: Vec<(u64, u32)>, blob: Vec<u8>, xattrs: Vec<(u64, Vec<Xattr>)>) {
+        let mut xattrs: HashMap<u64, Vec<Xattr>> = xattrs.into_iter().collect();
         #[cfg(target_os = "linux")]
         if eng.opts.io_uring && !eng.opts.inplace && !eng.opts.sparse && fsops::uring::available() {
-            return self.small_pack_uring(eng, files, &blob);
+            return self.small_pack_uring(eng, files, &blob, xattrs);
         }
         let mut off = 0usize;
         for (id, len) in files {
@@ -596,7 +719,7 @@ impl RemoteState {
             if fsops::interrupted() {
                 return;
             }
-            let job = match self.take_job(id) {
+            let job = match self.take_job_with(eng, id, xattrs.remove(&id)) {
                 Ok(j) => j,
                 Err(e) => {
                     eng.err(e.to_string());
@@ -616,7 +739,7 @@ impl RemoteState {
     /// `--io-uring`: create, write and close the pack's files in three ring batches.
     /// Files the batch can't create (a temp-name collision, say) take the normal path.
     #[cfg(target_os = "linux")]
-    fn small_pack_uring(&self, eng: &Engine, files: Vec<(u64, u32)>, blob: &[u8]) {
+    fn small_pack_uring(&self, eng: &Engine, files: Vec<(u64, u32)>, blob: &[u8], mut xattrs: HashMap<u64, Vec<Xattr>>) {
         use crate::fsops::uring;
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
@@ -630,7 +753,7 @@ impl RemoteState {
         for (id, len) in files {
             let bytes = blob.get(off..off + len as usize).unwrap_or(&[]);
             off += len as usize;
-            match self.take_job(id) {
+            match self.take_job_with(eng, id, xattrs.remove(&id)) {
                 Ok(job) => {
                     crate::progress::done(job.meta.size);
                     eng.backup_existing_file(&job);
@@ -673,7 +796,8 @@ impl RemoteState {
             let file = File::from(fd);
             let (mode, uid, gid) = eng.target_attrs(&job);
             let mtime = eng.opts.times.then_some((job.meta.mtime, job.meta.mtime_ns));
-            done.push((job, tmp, w.and_then(|()| eng.set_written_attrs(&file, mode, uid, gid, mtime))));
+            let r = w.and_then(|()| eng.set_written_attrs(&file, mode, uid, gid, mtime, Some((&tmp, &job.src(true)))));
+            done.push((job, tmp, r));
             fds.push(std::os::fd::OwnedFd::from(file));
         }
         let _ = uring::close_all(fds);
@@ -719,6 +843,18 @@ impl RemoteState {
             }
         }
     }
+}
+
+/// A sender's `-X`/`-A` data in the receiver's form: ACL ids mapped by name, then local
+/// attribute names and ACL masks (`mode`: the entry's mode as sent).
+fn local_extra(ids: &IdMap, r: &crate::xattrs::Rules, x: Option<Box<crate::entry::Extra>>, mode: u32) -> Option<Box<crate::entry::Extra>> {
+    let mut x = x?;
+    if let Some(acl) = &mut x.acl
+        && !ids.is_empty()
+    {
+        acl.map_ids(|user, id| ids.map(user, id));
+    }
+    extra::to_local(r, Some(x), mode)
 }
 
 /// Coarse signature of the destination file to send along with a request, so the sender
@@ -805,7 +941,7 @@ fn plan_dest(eng: &mut Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -
             let sel = root.sel.clone().map(select::leak);
             let slot = match (root.contents, root.meta) {
                 (true, Some(meta)) => {
-                    let mut job = eng.root_job(PathBuf::new(), dest_path.clone(), meta, r, dest_exists && !fresh);
+                    let mut job = eng.root_job(PathBuf::new(), dest_path.clone(), meta, r, dest_exists && !fresh, root.extra.clone());
                     job.sel = sel.and_then(|s| s.at_root(eng.opts.recursive));
                     Slot::Job(job)
                 }
@@ -860,6 +996,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
         root.items.iter_mut().for_each(|e| ids.apply(&mut e.meta));
     }
     let mut engine = Engine::new(opts, filter, out);
+    for root in roots.iter_mut().filter(|_| engine.extras_on()) {
+        let mode = root.meta.map_or(0, |m| m.mode);
+        root.extra = local_extra(&ids, &engine.xrules, root.extra.take(), mode);
+    }
     // --scanner=jwalk indexes the destination while listings arrive, if it existed
     // before this run (a directory created now is being filled at the same time).
     let index_dest = opts.scanner == Scanner::Jwalk && opts.recursive && fs::metadata(dest).is_ok_and(|m| m.is_dir());
@@ -934,8 +1074,12 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
                             remote.ids.lock().unwrap().add(&users, &groups);
                             Ok(())
                         }
-                        Msg::FileBegin { id, size } => remote.file_begin(engine, id, size),
-                        Msg::DeltaBegin { id, size, copies } => remote.delta_begin(engine, id, size, copies),
+                        Msg::FileBegin { id, size, xattrs } => remote.file_begin(engine, id, size, xattrs),
+                        Msg::DeltaBegin { id, size, copies, xattrs } => remote.delta_begin(engine, id, size, copies, xattrs),
+                        Msg::Xattrs { id, xattrs } => {
+                            remote.on_xattrs(engine, id, xattrs);
+                            Ok(())
+                        }
                         Msg::Refine { id, grain, gaps } => {
                             remote.refine(s, id, grain, gaps);
                             Ok(())
@@ -944,10 +1088,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
                             remote.file_end(engine, id, ok);
                             Ok(())
                         }
-                        Msg::SmallPack { files, blob } => {
+                        Msg::SmallPack { files, blob, xattrs } => {
                             remote.acquire_pack();
                             s.spawn(move |_| {
-                                remote.small_pack(engine, files, blob);
+                                remote.small_pack(engine, files, blob, xattrs);
                                 remote.release_pack();
                             });
                             Ok(())
@@ -998,6 +1142,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
     if unanswered > 0 {
         engine.err(format!("{unanswered} requested files were never received"));
         remote.abandon(engine);
+    }
+    let waiting = remote.xattr_wait.lock().unwrap().len();
+    if waiting > 0 {
+        engine.err(format!("attributes of {waiting} entries were never received"));
     }
     pool.install(|| {
         engine.link_followers();

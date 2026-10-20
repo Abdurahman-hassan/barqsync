@@ -137,7 +137,7 @@ encryption are a tie. Method, raw data and more cases:
 | **Deleting** | `--delete`, `--delete-excluded`, `--remove-source-files` |
 | **Comparing** | `-c`, `--size-only`, `-I`, `--modify-window` |
 | **Writing** | `--inplace`, `--partial`, `--partial-dir`, `-P`, `-S`, `-W`, `--no-whole-file`, `--fsync`, `-b`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest` |
-| **Links and metadata** | `-l`, `-L`, `-k`, `-K`, `-H`, `-p`, `-t`, `-g`, `-o`, `-D`, `-O`, `--numeric-ids`, `--chmod` |
+| **Links and metadata** | `-l`, `-L`, `-k`, `-K`, `-H`, `-p`, `-t`, `-g`, `-o`, `-D`, `-O`, `-X` (extended attributes), `-A` (ACLs), `--numeric-ids`, `--chmod` |
 | **Remote** | `-e`, `--remote-path`, `--transport` (ssh, tcp, quic, auto), `--streams N`, `--strategy adaptive`, `--compress-level N` |
 | **Output** | `-i`, `--out-format`, `--progress`, `--info=progress2` |
 
@@ -149,9 +149,10 @@ Every option, and where barqsync differs from rsync:
 - **macOS and Linux only.**
 - **Remote copies need barqsync on both machines,** like rsync, or `--remote-path` to point
   at it. Both ends must run the same release line.
-- **Not supported yet:** extended attributes and ACLs (`-X`, `-A`), daemon mode (`rsync://`,
-  `host::module`) and a few rarer flags such as `--bwlimit` and `--fuzzy`.
-- **On APFS, clones also keep extended attributes** (rsync needs `-X` for that).
+- **Not supported yet:** daemon mode (`rsync://`, `host::module`) and a few rarer flags such
+  as `--bwlimit` and `--fuzzy`.
+- **`-X` and `-A` follow rsync's rules** on each system (which attribute namespaces are
+  copied, POSIX ACLs on Linux, extended ACLs on macOS); ACLs aren't translated between the two.
 
 ## Learn more
 

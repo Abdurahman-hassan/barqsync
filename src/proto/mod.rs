@@ -11,6 +11,7 @@
 //!   ...                                  <-----   Need (one per DirBatch: files + basis signatures)
 //!   SmallPack / FileBegin+Data+FileEnd /
 //!   DeltaBegin+Data+FileEnd -------------------->   write files in parallel
+//!   Xattrs (one per entry asked for in a Need) ->   write attribute values
 //!   ScanDone, then SenderDone ----------------->
 //!                                        <-----   ReceiverDone (stats)
 //! ```
@@ -31,6 +32,7 @@ use crate::delta::cdc::CdcSig;
 use crate::delta::refine::{GapReq, GapSig, Grain};
 use crate::delta::{BlockSig, ChunkSig, Op};
 use crate::entry::{DirEnt, Meta};
+use crate::xattrs::Xattr;
 use crate::output::StatsSnapshot;
 use crate::remote::adapt::Compression;
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -45,7 +47,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
-pub const VERSION: u32 = 8;
+/// 9: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
+pub const VERSION: u32 = 9;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -76,6 +79,8 @@ pub struct RootInfo {
     /// `-R`/`--files-from`: the selected paths of this root. Both sides use it to
     /// decide which directories are descended into and pruned.
     pub sel: Option<Sel>,
+    /// `-X`/`-A`: the `src/` directory's own attributes (values in full) and ACLs.
+    pub extra: Option<Box<crate::entry::Extra>>,
 }
 
 /// The receiver's coarse basis-file signature, chosen by the receiver: aligned blocks when
@@ -145,10 +150,11 @@ pub enum Msg {
     /// User and group names for ids in the listings that follow (no `--numeric-ids`).
     IdNames { users: Names, groups: Names },
     ScanDone { dirs: u32 },
-    FileBegin { id: u64, size: u64 },
+    /// `xattrs`: `-X` attribute values in full, when the listing only had checksums of some.
+    FileBegin { id: u64, size: u64, xattrs: Option<Vec<Xattr>> },
     /// Start a delta-encoded file: `copies` come from the receiver's basis, the
     /// remaining ranges arrive as `Data` frames.
-    DeltaBegin { id: u64, size: u64, copies: Vec<Op> },
+    DeltaBegin { id: u64, size: u64, copies: Vec<Op>, xattrs: Option<Vec<Xattr>> },
     /// Sender → receiver, before `DeltaBegin`: fine signatures wanted for the basis
     /// stretches the coarse delta left literal (see `delta::refine`).
     Refine { id: u64, grain: Grain, gaps: Vec<GapReq> },
@@ -156,13 +162,18 @@ pub enum Msg {
     /// receiver can't refine (the sender then keeps the coarse delta).
     Refined { id: u64, gaps: Vec<GapSig> },
     FileEnd { id: u64, ok: bool },
-    /// Several complete small files: `(id, len)` pairs, contents concatenated in `blob`.
-    SmallPack { files: Vec<(u64, u32)>, blob: Vec<u8> },
+    /// Several complete small files: `(id, len)` pairs, contents concatenated in `blob`;
+    /// full attribute values for the files that need them (see `FileBegin`).
+    SmallPack { files: Vec<(u64, u32)>, blob: Vec<u8>, xattrs: Vec<(u64, Vec<Xattr>)> },
+    /// The answer to a `Need`'s `xattrs`: one entry's attributes with their values in
+    /// full (`None`: the sender couldn't read them, and said why).
+    Xattrs { id: u64, xattrs: Option<Vec<Xattr>> },
     SenderDone { errors: u64 },
 
     // receiver → sender
-    /// The answer to one `DirBatch`: which of its files the receiver wants.
-    Need { dir: u32, files: Vec<NeedReq> },
+    /// The answer to one `DirBatch`: which of its files the receiver wants, and (`-X`)
+    /// which entries' attribute values it needs in full to update them in place.
+    Need { dir: u32, files: Vec<NeedReq>, xattrs: Vec<u32> },
     /// `--remove-source-files`: these entries are on the receiver now. `(rel, size, mtime)`
     /// relative to the root; the sender removes them unless they changed meanwhile.
     Synced { root: u16, files: SyncedFiles },
@@ -658,9 +669,11 @@ mod tests {
 
     #[test]
     fn messages_roundtrip() {
-        let m = Msg::Need { dir: 7, files: vec![NeedReq { idx: 2, sig: None }] };
+        let m = Msg::Need { dir: 7, files: vec![NeedReq { idx: 2, sig: None }], xattrs: vec![4] };
         match roundtrip(Frame::Msg(m), true) {
-            Frame::Msg(Msg::Need { dir, files }) => assert_eq!((dir, files.len(), files[0].idx), (7, 1, 2)),
+            Frame::Msg(Msg::Need { dir, files, xattrs }) => {
+                assert_eq!((dir, files.len(), files[0].idx, xattrs), (7, 1, 2, vec![4]))
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -680,21 +693,37 @@ mod tests {
         let chunks = crate::delta::chunk_signature(&data, data.len() as u64, &crate::delta::Params::DEFAULT).unwrap();
         let reqs = vec![GapReq { off: 4_000, len: 70_000, chunks: true }, GapReq { off: 200_000, len: 9_000, chunks: false }];
         let fine = crate::delta::refine::basis_sigs(&data, data.len() as u64, &p, &reqs).unwrap();
+        // -X/-A data with non-UTF-8 names, both value forms and both ACL flavors.
+        use crate::acls::{AclName, Acls, Flavor, RsyncAcl};
+        use crate::xattrs::XValue;
+        let xattrs = vec![
+            Xattr { name: vec![b'u', 0xfe, b'.'], value: XValue::Full(vec![0, 1, 0xff]) },
+            Xattr { name: b"user.big".to_vec(), value: XValue::new(vec![9; 1000], false) },
+        ];
+        let acl = Acls {
+            flavor: Flavor::Posix,
+            access: RsyncAcl { group_obj: Some(5), mask_obj: Some(7), names: vec![AclName { id: 1000, user: true, access: 6 }], ..RsyncAcl::default() },
+            default: RsyncAcl { user_obj: Some(7), group_obj: Some(5), mask_obj: None, other_obj: Some(0), names: Vec::new() },
+        };
+        let mac = Acls { flavor: Flavor::Darwin, access: RsyncAcl { names: vec![AclName { id: 20, user: false, access: 1 << 31 | 3 }], ..RsyncAcl::default() }, default: RsyncAcl::default() };
+        let extra = crate::entry::Extra { xattrs: xattrs.clone(), acl: Some(acl) };
+        let mut ent = DirEnt::new(name, meta, Some(b"t".to_vec()));
+        ent.extra = Some(Box::new(extra.clone()));
+        let plain = DirEnt::new(std::ffi::OsString::from("p"), meta, None);
+        let mut mac_ent = plain.clone();
+        mac_ent.extra = Some(Box::new(crate::entry::Extra { xattrs: Vec::new(), acl: Some(mac) }));
         vec![
             Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender: false, opts: Box::new(opts) },
-            Msg::Roots(vec![RootInfo { contents: true, meta: Some(meta), items: Vec::new(), sel: Some(sel) }]),
-            Msg::DirBatch {
-                root: 1,
-                dir: 2,
-                rel: b"x/y".to_vec(),
-                entries: vec![DirEnt { name, meta, link: Some(b"t".to_vec()) }],
-                sums: vec![Some([1; 16])],
-            },
-            Msg::Need { dir: 2, files: vec![NeedReq { idx: 0, sig: Some(Sig::Cdc(sig)) }] },
-            Msg::Need { dir: 3, files: vec![NeedReq { idx: 1, sig: Some(Sig::Chunks(chunks)) }] },
+            Msg::Roots(vec![RootInfo { contents: true, meta: Some(meta), items: Vec::new(), sel: Some(sel), extra: Some(Box::new(extra)) }]),
+            Msg::DirBatch { root: 1, dir: 2, rel: b"x/y".to_vec(), entries: vec![ent, plain, mac_ent], sums: vec![Some([1; 16])] },
+            Msg::Need { dir: 2, files: vec![NeedReq { idx: 0, sig: Some(Sig::Cdc(sig)) }], xattrs: vec![1, 5] },
+            Msg::Need { dir: 3, files: vec![NeedReq { idx: 1, sig: Some(Sig::Chunks(chunks)) }], xattrs: Vec::new() },
             Msg::Refine { id: file_id(3, 1), grain: Grain::of(&p), gaps: reqs },
             Msg::Refined { id: file_id(3, 1), gaps: fine },
-            Msg::SmallPack { files: vec![(file_id(2, 0), 3)], blob: b"abc".to_vec() },
+            Msg::SmallPack { files: vec![(file_id(2, 0), 3)], blob: b"abc".to_vec(), xattrs: vec![(file_id(2, 0), xattrs.clone())] },
+            Msg::FileBegin { id: 3, size: 9, xattrs: Some(xattrs.clone()) },
+            Msg::Xattrs { id: file_id(2, 1), xattrs: Some(xattrs) },
+            Msg::Xattrs { id: 5, xattrs: None },
         ]
     }
 
@@ -722,10 +751,13 @@ mod tests {
             let body = buf.len() - 5;
             // Truncated archives, and archives with bytes flipped near the root (where
             // rkyv keeps relative pointers and lengths), must fail validation, not panic.
-            for cut in [1, 4, body / 2] {
+            // (A cut at an aligned offset can land on a valid shorter archive by chance,
+            // so the long cut is odd; frames are length-prefixed on a reliable stream.)
+            for cut in [1, 4, (body / 2) | 1] {
                 let mut b = buf[..buf.len() - cut].to_vec();
                 b[..4].copy_from_slice(&((body - cut) as u32).to_le_bytes());
-                assert!(read_frame(&mut &b[..]).is_err() || cut == 0);
+                let got = read_frame(&mut &b[..]);
+                assert!(got.is_err() || cut == 0, "cut {cut} of {body}: {got:?}");
             }
             for back in 1..=12.min(body) {
                 let mut b = buf.clone();
