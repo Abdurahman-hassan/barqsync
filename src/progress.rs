@@ -8,8 +8,11 @@
 //! Files are transferred in parallel, so rsync's per-file `--progress` lines would
 //! interleave meaninglessly; every progress flag shows this overall line instead.
 //! "Planned" grows while the scan is still finding files, like rsync's incremental `ir-chk`.
+//! As in rsync, a running line shows the speed of the last few seconds and the time left;
+//! the final line shows the average speed and the total time.
 
 use crate::output::{Output, human_num};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -26,9 +29,16 @@ pub fn planned(size: u64) {
     PLANNED_FILES.fetch_add(1, Relaxed);
 }
 
-/// A planned file has been written (or sent, on a sending client).
-pub fn done(size: u64) {
-    DONE_BYTES.fetch_add(size, Relaxed);
+/// `n` more bytes of a planned file have been written (or sent), before it is done, so a
+/// big file moves the line while it travels instead of all at once at the end.
+pub fn bytes(n: u64) {
+    DONE_BYTES.fetch_add(n, Relaxed);
+}
+
+/// A planned file has been written (or sent, on a sending client); `rest` is the part of
+/// its size not already counted with [`bytes`] (all of it, for a file written in one go).
+pub fn done(rest: u64) {
+    DONE_BYTES.fetch_add(rest, Relaxed);
     DONE_FILES.fetch_add(1, Relaxed);
 }
 
@@ -44,22 +54,55 @@ fn grouped(n: u64) -> String {
     out
 }
 
-/// `last`: the scan is over, so the file count is final (`to-chk`); before that the
-/// count is still growing (`ir-chk`, as rsync labels its incremental file list).
-fn status(started: Instant, human: bool, last: bool) -> String {
+/// Speed over a sliding window of recent samples, so a burst at the start (data the
+/// other side already had, say) doesn't hide what the link does now.
+#[derive(Default)]
+struct Speed {
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl Speed {
+    const WINDOW: Duration = Duration::from_secs(5);
+
+    /// Record `done` bytes at `now`; the bytes per second since the oldest sample kept.
+    fn update(&mut self, now: Instant, done: u64) -> f64 {
+        self.samples.push_back((now, done));
+        // Keep one sample at least WINDOW old, once there is one.
+        while self.samples.len() > 2 && now - self.samples[1].0 >= Self::WINDOW {
+            self.samples.pop_front();
+        }
+        let (t0, b0) = self.samples[0];
+        let secs = (now - t0).as_secs_f64();
+        if secs > 0.0 { done.saturating_sub(b0) as f64 / secs } else { 0.0 }
+    }
+}
+
+/// `h:mm:ss`, right-aligned like rsync's time column.
+fn clock(secs: u64) -> String {
+    format!("{:>4}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
+/// `recent`: while running, the speed of the last few seconds, shown with the time left;
+/// `None` for the final line, with the average speed and the total time. The scan is
+/// over by then, so the file count is final (`to-chk`); before that it is still growing
+/// (`ir-chk`, as rsync labels its incremental file list).
+fn status(started: Instant, human: bool, recent: Option<f64>) -> String {
+    let last = recent.is_none();
     let (pb, pf) = (PLANNED_BYTES.load(Relaxed), PLANNED_FILES.load(Relaxed));
     let (db, df) = (DONE_BYTES.load(Relaxed), DONE_FILES.load(Relaxed));
     let secs = started.elapsed().as_secs_f64();
-    let pct = (db * 100).checked_div(pb).map_or(if pf == df { 100 } else { 0 }, |p| p.min(100));
-    let rate = if secs > 0.0 { (db as f64 / secs) as u64 } else { 0 };
-    let t = secs as u64;
+    // Nothing planned yet reads 0%, not 100%, until the scan is over.
+    let all_done = pf == df && (last || pf > 0);
+    let pct = (db * 100).checked_div(pb).map_or(if all_done { 100 } else { 0 }, |p| p.min(100));
+    let (rate, time) = match recent {
+        Some(rate) if rate >= 1.0 => (rate, clock((pb.saturating_sub(db) as f64 / rate) as u64)),
+        Some(_) => (0.0, format!("{:>10}", "--:--:--")),
+        None => (if secs > 0.0 { db as f64 / secs } else { 0.0 }, clock(secs as u64)),
+    };
     let bytes = if human { human_num(db) } else { grouped(db) };
     format!(
-        "{bytes:>15} {pct:>3}% {:>10}B/s {:>4}:{:02}:{:02} (xfr#{df}, {}={}/{pf})",
-        human_num(rate),
-        t / 3600,
-        t / 60 % 60,
-        t % 60,
+        "{bytes:>15} {pct:>3}% {:>10}B/s {time} (xfr#{df}, {}={}/{pf})",
+        human_num(rate as u64),
         if last { "to-chk" } else { "ir-chk" },
         pf.saturating_sub(df),
     )
@@ -84,8 +127,10 @@ impl Reporter {
             .spawn(move || {
                 let (lock, cvar) = &*stop2;
                 let mut stopped = lock.lock().unwrap();
+                let mut speed = Speed::default();
                 while !*stopped {
-                    out.progress(status(started, human, false).as_bytes(), false);
+                    let recent = speed.update(Instant::now(), DONE_BYTES.load(Relaxed));
+                    out.progress(status(started, human, Some(recent)).as_bytes(), false);
                     stopped = cvar.wait_timeout(stopped, Duration::from_millis(500)).unwrap().0;
                 }
             })
@@ -96,7 +141,7 @@ impl Reporter {
     /// Stop redrawing and leave the final status on screen.
     pub fn finish(mut self, out: &Output) {
         self.halt();
-        out.progress(status(self.started, self.human, true).as_bytes(), true);
+        out.progress(status(self.started, self.human, None).as_bytes(), true);
     }
 
     fn halt(&mut self) {
@@ -116,7 +161,33 @@ impl Drop for Reporter {
 
 #[cfg(test)]
 mod tests {
-    use super::grouped;
+    use super::{Speed, clock, grouped};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn speed_follows_the_last_seconds() {
+        let t = Instant::now();
+        let at = |s: u64| t + Duration::from_secs(s);
+        let mut speed = Speed::default();
+        assert_eq!(speed.update(at(0), 0), 0.0);
+        // 1 GB at once, then 10 MB a second: the start no longer counts after 5 s.
+        assert_eq!(speed.update(at(1), 1_000_000_000), 1e9);
+        for s in 2..=20 {
+            speed.update(at(s), 1_000_000_000 + (s - 1) * 10_000_000);
+        }
+        assert_eq!(speed.update(at(21), 1_200_000_000), 10_000_000.0);
+        // A stall reads 0.
+        for s in 22..=27 {
+            speed.update(at(s), 1_200_000_000);
+        }
+        assert_eq!(speed.update(at(28), 1_200_000_000), 0.0);
+    }
+
+    #[test]
+    fn clock_format() {
+        assert_eq!(clock(0), "   0:00:00");
+        assert_eq!(clock(3 * 3600 + 25 * 60 + 7), "   3:25:07");
+    }
 
     #[test]
     fn thousands_separators() {

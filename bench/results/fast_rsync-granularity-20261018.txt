@@ -1,0 +1,21 @@
+== sqlite
+blocks 64 KiB: literal  213.30 MB, signature     62 KB,   63 ms
+blocks 16 KiB: literal   94.82 MB, signature    246 KB,   52 ms
+blocks  4 KiB: literal   29.84 MB, signature    986 KB,   64 ms
+chunks avg 32 KiB: literal  192.30 MB, signature    163 KB,  117 ms
+chunks avg  8 KiB: literal   92.24 MB, signature    656 KB,  123 ms
+chunks avg  4 KiB: literal   62.20 MB, signature   1305 KB,  151 ms
+== shift
+blocks 64 KiB: literal  268.08 MB, signature     66 KB,   75 ms
+blocks 16 KiB: literal  268.05 MB, signature    262 KB,   56 ms
+blocks  4 KiB: literal  268.05 MB, signature   1049 KB,   74 ms
+chunks avg 32 KiB: literal    4.61 MB, signature    180 KB,  123 ms
+chunks avg  8 KiB: literal    1.36 MB, signature    717 KB,  134 ms
+chunks avg  4 KiB: literal    1.04 MB, signature   1434 KB,  152 ms
+== mid (m000)
+blocks 64 KiB: literal    0.07 MB, signature      1 KB,    7 ms
+blocks 16 KiB: literal    0.02 MB, signature      4 KB,    4 ms
+blocks  4 KiB: literal    0.00 MB, signature     16 KB,    4 ms
+chunks avg 32 KiB: literal    0.07 MB, signature      3 KB,    6 ms
+chunks avg  8 KiB: literal    0.02 MB, signature     11 KB,    7 ms
+chunks avg  4 KiB: literal    0.01 MB, signature     22 KB,    9 ms

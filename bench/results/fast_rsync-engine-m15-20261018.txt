@@ -1,0 +1,72 @@
+== run 1 inplace
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=7995501	sig_ms=65.7	diff_ms=444.3	apply_ms=184.6	verify_ms=21.5	total_ms=716.0
+barqsync	mode=4K-blocks	sig_bytes=1048586	delta_bytes=7905435	sig_ms=40.0	diff_ms=37.5	apply_ms=117.0	verify_ms=0.0	total_ms=194.5
+== run 1 scatter
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=45327781	sig_ms=63.5	diff_ms=858.1	apply_ms=202.5	verify_ms=19.5	total_ms=1143.6
+barqsync	mode=4K-blocks	sig_bytes=1048586	delta_bytes=12189533	sig_ms=39.8	diff_ms=37.2	apply_ms=143.2	verify_ms=0.0	total_ms=220.1
+== run 1 shift
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=1255402	sig_ms=64.1	diff_ms=366.0	apply_ms=160.4	verify_ms=17.9	total_ms=608.4
+barqsync	mode=4K-both	sig_bytes=1970344	delta_bytes=1041302	sig_ms=104.7	diff_ms=111.3	apply_ms=115.0	verify_ms=0.0	total_ms=331.0
+== run 1 append
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=8388624	sig_ms=75.4	diff_ms=485.1	apply_ms=638.2	verify_ms=18.0	total_ms=1216.7
+barqsync	mode=4K-both	sig_bytes=1971136	delta_bytes=8388627	sig_ms=101.8	diff_ms=114.6	apply_ms=119.4	verify_ms=0.0	total_ms=335.8
+== run 1 sqlite
+fast_rsync	block=15880	sig_bytes=190680	delta_bytes=103962848	sig_ms=53.3	diff_ms=1449.1	apply_ms=161.0	verify_ms=22.6	total_ms=1685.9
+barqsync	mode=4K-both	sig_bytes=1824568	delta_bytes=27954653	sig_ms=93.9	diff_ms=128.2	apply_ms=185.1	verify_ms=0.0	total_ms=407.3
+== run 1 tar
+fast_rsync	block=7360	sig_bytes=88500	delta_bytes=859716	sig_ms=13.9	diff_ms=78.1	apply_ms=37.1	verify_ms=3.8	total_ms=133.0
+barqsync	mode=4K-both	sig_bytes=395386	delta_bytes=850232	sig_ms=24.3	diff_ms=20.3	apply_ms=33.0	verify_ms=0.0	total_ms=77.6
+== run 1 csv
+fast_rsync	block=8808	sig_bytes=105840	delta_bytes=2603560	sig_ms=22.6	diff_ms=162.6	apply_ms=60.3	verify_ms=5.5	total_ms=251.0
+barqsync	mode=4K-both	sig_bytes=570819	delta_bytes=2097277	sig_ms=34.3	diff_ms=33.4	apply_ms=41.7	verify_ms=0.0	total_ms=109.5
+== run 1 mid (m000)
+fast_rsync	block=2048	sig_bytes=24588	delta_bytes=2071	sig_ms=1.4	diff_ms=5.4	apply_ms=2.3	verify_ms=0.7	total_ms=9.9
+barqsync	mode=4K-blocks	sig_bytes=16392	delta_bytes=4120	sig_ms=4.0	diff_ms=2.1	apply_ms=3.7	verify_ms=0.0	total_ms=9.8
+== run 2 inplace
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=7995501	sig_ms=71.9	diff_ms=433.8	apply_ms=154.8	verify_ms=16.1	total_ms=676.6
+barqsync	mode=4K-blocks	sig_bytes=1048586	delta_bytes=7905435	sig_ms=42.1	diff_ms=40.7	apply_ms=144.6	verify_ms=0.0	total_ms=227.3
+== run 2 scatter
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=45327781	sig_ms=71.6	diff_ms=833.8	apply_ms=784.1	verify_ms=18.1	total_ms=1707.6
+barqsync	mode=4K-blocks	sig_bytes=1048586	delta_bytes=12189533	sig_ms=44.1	diff_ms=37.1	apply_ms=139.8	verify_ms=0.0	total_ms=220.9
+== run 2 shift
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=1255402	sig_ms=53.3	diff_ms=293.3	apply_ms=165.0	verify_ms=21.9	total_ms=533.4
+barqsync	mode=4K-both	sig_bytes=1970344	delta_bytes=1041302	sig_ms=101.0	diff_ms=102.5	apply_ms=111.5	verify_ms=0.0	total_ms=315.0
+== run 2 append
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=8388624	sig_ms=97.9	diff_ms=478.3	apply_ms=1047.7	verify_ms=21.3	total_ms=1645.2
+barqsync	mode=4K-both	sig_bytes=1971136	delta_bytes=8388627	sig_ms=114.2	diff_ms=110.4	apply_ms=120.7	verify_ms=0.0	total_ms=345.3
+== run 2 sqlite
+fast_rsync	block=15880	sig_bytes=190680	delta_bytes=103962848	sig_ms=65.1	diff_ms=1662.8	apply_ms=608.1	verify_ms=20.0	total_ms=2356.0
+barqsync	mode=4K-both	sig_bytes=1824568	delta_bytes=27954653	sig_ms=107.7	diff_ms=122.4	apply_ms=201.1	verify_ms=0.0	total_ms=431.2
+== run 2 tar
+fast_rsync	block=7360	sig_bytes=88500	delta_bytes=859716	sig_ms=17.3	diff_ms=87.8	apply_ms=34.3	verify_ms=5.1	total_ms=144.6
+barqsync	mode=4K-both	sig_bytes=395386	delta_bytes=850232	sig_ms=26.8	diff_ms=25.3	apply_ms=38.8	verify_ms=0.0	total_ms=90.9
+== run 2 csv
+fast_rsync	block=8808	sig_bytes=105840	delta_bytes=2603560	sig_ms=24.1	diff_ms=139.9	apply_ms=48.9	verify_ms=6.6	total_ms=219.5
+barqsync	mode=4K-both	sig_bytes=570819	delta_bytes=2097277	sig_ms=34.5	diff_ms=32.2	apply_ms=44.8	verify_ms=0.0	total_ms=111.5
+== run 2 mid (m000)
+fast_rsync	block=2048	sig_bytes=24588	delta_bytes=2071	sig_ms=2.2	diff_ms=5.8	apply_ms=2.7	verify_ms=1.0	total_ms=11.8
+barqsync	mode=4K-blocks	sig_bytes=16392	delta_bytes=4120	sig_ms=4.4	diff_ms=3.5	apply_ms=4.1	verify_ms=0.0	total_ms=12.1
+== run 3 inplace
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=7995501	sig_ms=66.0	diff_ms=465.7	apply_ms=179.2	verify_ms=19.6	total_ms=730.5
+barqsync	mode=4K-blocks	sig_bytes=1048586	delta_bytes=7905435	sig_ms=41.7	diff_ms=42.7	apply_ms=106.0	verify_ms=0.0	total_ms=190.4
+== run 3 scatter
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=45327781	sig_ms=66.6	diff_ms=815.0	apply_ms=166.9	verify_ms=16.3	total_ms=1064.8
+barqsync	mode=4K-blocks	sig_bytes=1048586	delta_bytes=12189533	sig_ms=39.4	diff_ms=36.0	apply_ms=131.9	verify_ms=0.0	total_ms=207.2
+== run 3 shift
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=1255402	sig_ms=63.4	diff_ms=323.8	apply_ms=500.1	verify_ms=19.9	total_ms=907.3
+barqsync	mode=4K-both	sig_bytes=1970344	delta_bytes=1041302	sig_ms=108.9	diff_ms=108.1	apply_ms=486.9	verify_ms=0.0	total_ms=703.9
+== run 3 append
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=8388624	sig_ms=62.9	diff_ms=448.9	apply_ms=171.4	verify_ms=17.5	total_ms=700.7
+barqsync	mode=4K-both	sig_bytes=1971136	delta_bytes=8388627	sig_ms=102.7	diff_ms=113.0	apply_ms=132.0	verify_ms=0.0	total_ms=347.7
+== run 3 sqlite
+fast_rsync	block=15880	sig_bytes=190680	delta_bytes=103962848	sig_ms=64.6	diff_ms=1663.6	apply_ms=735.4	verify_ms=16.6	total_ms=2480.2
+barqsync	mode=4K-both	sig_bytes=1824568	delta_bytes=27954653	sig_ms=95.9	diff_ms=105.6	apply_ms=190.1	verify_ms=0.0	total_ms=391.7
+== run 3 tar
+fast_rsync	block=7360	sig_bytes=88500	delta_bytes=859716	sig_ms=19.6	diff_ms=90.4	apply_ms=37.5	verify_ms=6.3	total_ms=153.7
+barqsync	mode=4K-both	sig_bytes=395386	delta_bytes=850232	sig_ms=24.6	diff_ms=25.4	apply_ms=32.9	verify_ms=0.0	total_ms=83.0
+== run 3 csv
+fast_rsync	block=8808	sig_bytes=105840	delta_bytes=2603560	sig_ms=16.5	diff_ms=102.1	apply_ms=46.7	verify_ms=5.6	total_ms=171.0
+barqsync	mode=4K-both	sig_bytes=570819	delta_bytes=2097277	sig_ms=30.3	diff_ms=30.7	apply_ms=41.8	verify_ms=0.0	total_ms=102.9
+== run 3 mid (m000)
+fast_rsync	block=2048	sig_bytes=24588	delta_bytes=2071	sig_ms=1.5	diff_ms=5.5	apply_ms=2.5	verify_ms=1.0	total_ms=10.5
+barqsync	mode=4K-blocks	sig_bytes=16392	delta_bytes=4120	sig_ms=4.1	diff_ms=2.1	apply_ms=4.2	verify_ms=0.0	total_ms=10.3

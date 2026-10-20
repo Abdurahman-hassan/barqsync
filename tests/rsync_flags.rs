@@ -329,7 +329,11 @@ fn relative_delete_spares_implied_dirs_like_rsync() {
     let tmp = tempfile::tempdir().unwrap();
     relative_fixture(tmp.path());
     for d in ["dr", "df", "pr", "pf"] {
-        Tree::new(tmp.path().join(d)).file("src/x/extra/e", "e").file("src/x/y/e2", "e2").file("src/stray", "s");
+        Tree::new(tmp.path().join(d))
+            .file("src/x/extra/e", "e")
+            .file("src/x/y/e2", "e2")
+            .file("src/stray", "s")
+            .same_mtimes(BASE_TIME + 800_000);
     }
     let (r, f) = both(tmp.path(), &["-aiR", "--delete", "src/x/y", "{dst}"], "dr", "df").unwrap();
     same_output(&r, &f, &[], "local -R --delete");
@@ -649,7 +653,12 @@ fn keep_dirlinks_matches_rsync() {
     let tmp = tempfile::tempdir().unwrap();
     links_fixture(tmp.path());
     for d in ["dr", "df", "pr", "pf", "nr", "nf"] {
-        Tree::new(tmp.path().join(d)).file("realdir/old", "old").symlink("real", "realdir").file("tgt", "x").symlink("target", "tgt");
+        Tree::new(tmp.path().join(d))
+            .file("realdir/old", "old")
+            .symlink("real", "realdir")
+            .file("tgt", "x")
+            .symlink("target", "tgt")
+            .same_mtimes(BASE_TIME + 800_000);
     }
     // rsync sets the time on the kept symlink, so the real directory keeps "now".
     let (r, f) = both(tmp.path(), &["-aiK", "src/", "{dst}"], "dr", "df").unwrap();

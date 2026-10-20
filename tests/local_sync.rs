@@ -116,7 +116,7 @@ fn excludes_match_rsync() {
         let (dr, df) = (format!("r{i}"), format!("f{i}"));
         // Pre-populate destinations with an excluded file so --delete protection is tested.
         for d in [&dr, &df] {
-            Tree::new(tmp.path().join(d)).file("drop.log", "old").file("stale", "s");
+            Tree::new(tmp.path().join(d)).file("drop.log", "old").file("stale", "s").same_mtimes(BASE_TIME + 800_000);
         }
         let mut args = vec!["-av", "--delete"];
         args.extend_from_slice(flags);

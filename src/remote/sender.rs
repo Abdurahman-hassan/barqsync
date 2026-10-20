@@ -8,6 +8,7 @@
 use super::{Stop, Strategy, WORKER_STACK, adapt, recv};
 use crate::cli::Options;
 use crate::checksum::{self, Sum};
+use crate::delta::refine::{self, GapSig, Grain};
 use crate::delta::{self, Delta, Op, Params, ReadAt, ReadOnce, cdc};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::ids;
@@ -47,6 +48,8 @@ struct Sender<'a> {
     ids: Mutex<ids::Sent>,
     /// Each root's base directory (`--remove-source-files` paths are relative to it).
     bases: Vec<PathBuf>,
+    /// Deltas waiting for the receiver's answer to a `Refine`: file id -> where it goes.
+    refining: Mutex<HashMap<u64, crossbeam_channel::Sender<Vec<GapSig>>>>,
 }
 
 /// A source argument resolved on disk.
@@ -251,11 +254,18 @@ impl Sender<'_> {
                         Some(sig) => self.send_delta(id, &path, sig),
                         None => self.send_whole(id, &path),
                     };
-                    if let Err(e) = r {
-                        self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
-                        self.send(Msg::FileEnd { id, ok: false });
+                    match r {
+                        // Sent bytes were counted as they went.
+                        Ok(sent) => crate::progress::done(size.saturating_sub(sent)),
+                        // A failed file doesn't count as transferred; after Ctrl-C the
+                        // closed connection is expected, not worth a message.
+                        Err(e) => {
+                            if !fsops::interrupted() {
+                                self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
+                            }
+                            self.send(Msg::FileEnd { id, ok: false });
+                        }
                     }
-                    crate::progress::done(size);
                 }
                 self.pending_files.fetch_sub(1, SeqCst);
                 self.check_done();
@@ -297,27 +307,30 @@ impl Sender<'_> {
             let mut buf = vec![0u8; n];
             f.read_exact_at(&mut buf, off + pos)?;
             self.out_frames.send(Frame::Data { id, off: off + pos, bytes: buf })?;
+            crate::progress::bytes(n as u64);
             pos += n as u64;
         }
         Ok(())
     }
 
-    fn send_whole(&self, id: u64, path: &Path) -> io::Result<()> {
+    /// The sending functions return the size of the file as sent, all of it counted for
+    /// progress by then.
+    fn send_whole(&self, id: u64, path: &Path) -> io::Result<u64> {
         let f = File::open(path)?;
         self.send_whole_file(id, &f)
     }
 
-    fn send_whole_file(&self, id: u64, f: &File) -> io::Result<()> {
+    fn send_whole_file(&self, id: u64, f: &File) -> io::Result<u64> {
         let size = f.metadata()?.len();
         self.send(Msg::FileBegin { id, size });
         self.send_range(&ReadOnce::new(f, size), id, 0, size)?;
         self.send(Msg::FileEnd { id, ok: true });
-        Ok(())
+        Ok(size)
     }
 
     /// Diff the source file against the receiver's basis signature and send only the
     /// ranges it doesn't have.
-    fn send_delta(&self, id: u64, path: &Path, sig: Sig) -> io::Result<()> {
+    fn send_delta(&self, id: u64, path: &Path, sig: Sig) -> io::Result<u64> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
         if let Sig::Cdc(basis) = &sig {
@@ -328,36 +341,59 @@ impl Sender<'_> {
             };
         }
         let f = ReadOnce::new(&file, size);
-        let d = match sig {
+        // Hash this file with the receiver's block or chunk sizes; refuse sizes that make
+        // no sense (they come from the other side) by sending the file whole.
+        let (d, basis_size, unit) = match sig {
             Sig::Blocks(basis) => {
                 let bs = basis.block_size as usize;
                 if bs == 0 {
                     return self.send_whole_file(id, &file);
                 }
                 let p = Params { block_size: bs, segment: (Params::DEFAULT.segment / bs).max(1) * bs, ..Params::DEFAULT };
-                delta::diff_blocks(&delta::block_signature(&f, size, &p)?, &basis)
+                (delta::diff_blocks(&delta::block_signature(&f, size, &p)?, &basis), basis.size, bs)
             }
-            Sig::Chunks(basis) => delta::diff_chunks(&delta::chunk_signature(&f, size, &Params::DEFAULT)?, &basis),
+            Sig::Chunks(basis) => {
+                let Some(p) = basis.params(Params::DEFAULT) else { return self.send_whole_file(id, &file) };
+                (delta::diff_chunks(&delta::chunk_signature(&f, size, &p)?, &basis), basis.size, p.cdc_avg)
+            }
             Sig::Cdc(_) => unreachable!(),
         };
+        let d = self.refine(id, &f, size, basis_size, unit, d)?;
         self.send_ops(id, &file, &d, &f)
     }
 
-    /// Send a delta: the copy ops up front, then the literal ranges read from `src`.
-    fn send_ops(&self, id: u64, file: &File, d: &Delta, src: &dyn ReadAt) -> io::Result<()> {
+    /// Refine a coarse delta where it is worth it ([`refine::plan`]): ask the receiver for
+    /// fine signatures of the basis stretches between matched ranges, hash this file's side
+    /// meanwhile, then combine. One round trip, which an append (nothing to refine) skips.
+    fn refine(&self, id: u64, new: &dyn ReadAt, size: u64, basis_size: u64, unit: usize, d: Delta) -> io::Result<Delta> {
+        let p = Params::for_size(basis_size);
+        let Some(gaps) = refine::plan(&d, basis_size, unit, &p, refine::REFINE_MIN) else { return Ok(d) };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.refining.lock().unwrap().insert(id, tx);
+        self.send(Msg::Refine { id, grain: Grain::of(&p), gaps: gaps.iter().map(refine::Gap::request).collect() });
+        let ours = refine::new_side(new, size, basis_size, &p, &gaps);
+        // No answer (the connection ended): keep the coarse delta, sending will fail anyway.
+        let theirs = rx.recv().unwrap_or_default();
+        Ok(refine::combine(&d, basis_size, &p, &gaps, &ours?, &theirs))
+    }
+
+    /// Send a delta: the copy ops up front, then the literal ranges read from `src`. The
+    /// copied ranges count for progress at once, as rsync counts matched data.
+    fn send_ops(&self, id: u64, file: &File, d: &Delta, src: &dyn ReadAt) -> io::Result<u64> {
         if d.matched_bytes() == 0 {
             return self.send_whole_file(id, file);
         }
         let size = d.size;
         let copies: Vec<Op> = d.ops.iter().copied().filter(|o| matches!(o, Op::Copy { .. })).collect();
         self.send(Msg::DeltaBegin { id, size, copies });
+        crate::progress::bytes(d.matched_bytes());
         for op in &d.ops {
             if let Op::Literal { off, len } = *op {
                 self.send_range(src, id, off, len)?;
             }
         }
         self.send(Msg::FileEnd { id, ok: true });
-        Ok(())
+        Ok(size)
     }
 }
 
@@ -495,6 +531,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
         errors,
         ids: Mutex::new(ids::Sent::default()),
         bases: roots.iter().map(|r| r.base.clone()).collect(),
+        refining: Mutex::new(HashMap::new()),
     };
     sender.name_ids(roots.iter().flat_map(|r| r.info.meta.iter().chain(r.info.items.iter().map(|e| &e.meta))));
     sender.send(Msg::Roots(roots.iter().map(|r| r.info.clone()).collect()));
@@ -521,9 +558,14 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
                 sender.scan_done.store(true, SeqCst);
                 sender.check_done();
             });
-            loop {
+            let r = loop {
                 match recv(conn) {
                     Ok(Frame::Msg(Msg::Need { dir, files })) => s.spawn(move |s| sender.serve(s, dir, files)),
+                    Ok(Frame::Msg(Msg::Refined { id, gaps })) => {
+                        if let Some(tx) = sender.refining.lock().unwrap().remove(&id) {
+                            let _ = tx.send(gaps);
+                        }
+                    }
                     Ok(Frame::Msg(Msg::Synced { root, files })) => s.spawn(move |_| sender.remove_synced(root, files)),
                     Ok(Frame::Msg(Msg::ReceiverDone { stats })) => break Ok(stats),
                     Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
@@ -535,13 +577,18 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
                         out.error(format!("protocol error: unexpected {other:?}"));
                         break Err(exit::PROTOCOL);
                     }
+                    // After Ctrl-C, which also stops ssh, a closed connection is expected.
                     Err(Stop::Interrupted) => break Err(exit::SIGNAL),
+                    Err(Stop::Io(_)) if fsops::interrupted() => break Err(exit::SIGNAL),
                     Err(Stop::Io(e)) => {
                         out.error(format!("connection error: {e}"));
                         break Err(exit::PROTOCOL);
                     }
                 }
-            }
+            };
+            // Release deltas still waiting for an answer that won't come.
+            sender.refining.lock().unwrap().clear();
+            r
         })
     });
     match result {
