@@ -21,7 +21,7 @@
 #
 # VARIANTS picks commands by name (default: all), e.g. VARIANTS="rsync ssh quic".
 # `auto` starts every run without --transport auto's memory of hosts where QUIC failed
-# (the first contact); `auto-warm` keeps it between runs.
+# (the first contact); `auto-warm` keeps it between the runs of one profile.
 set -euo pipefail
 PROFILES=${*:-lan wan lossy}
 WORKLOADS=${WORKLOADS:-small delta noop}
@@ -149,6 +149,8 @@ trap 'tc qdisc del dev lo root 2>/dev/null || true; tc qdisc del dev lo ingress 
 for p in $PROFILES; do
   echo "== profile: $p"
   shape "$p"
+  # auto-warm remembers hosts across the runs of one link, not from another link's runs.
+  rm -rf "$AUTO_WARM"
   echo "## $p" >> "$REPORT"
   for wl in $WORKLOADS; do
     case $wl in
