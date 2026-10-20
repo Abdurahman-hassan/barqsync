@@ -1,0 +1,94 @@
+# Build, test and lint on macOS (arm64) and Linux (x86_64).
+#
+# The differential tests compare barqsync against a reference rsync 3.x and are
+# skipped when none is found, so both jobs install one and fail if it is missing.
+# On Linux the suite runs twice: with the default transport and with QUIC.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "LICENSE-*", "bench/results/**"]
+  pull_request:
+    paths-ignore: ["**.md", "LICENSE-*", "bench/results/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR cancels the run still in progress.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    # A hung transfer test must not burn hours of (10x-billed) macOS minutes.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # PRs restore main's cache but don't save their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # /usr/bin/rsync on macOS is openrsync, which the tests ignore.
+      - name: Install rsync 3.x (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: |
+          brew install rsync
+          echo "RSYNC=$(brew --prefix)/bin/rsync" >> "$GITHUB_ENV"
+
+      - name: Install rsync 3.x (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v rsync >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq rsync
+          fi
+          echo "RSYNC=$(command -v rsync)" >> "$GITHUB_ENV"
+
+      - name: Check the reference rsync
+        run: |
+          "$RSYNC" --version | head -1
+          if ! "$RSYNC" --version | head -1 | grep -q '^rsync  version 3'; then
+            echo "::error::$RSYNC is not rsync 3.x; the differential tests would be skipped"
+            exit 1
+          fi
+
+      - name: cargo build
+        id: build
+        run: cargo build --locked --all-targets
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: cargo test (BARQSYNC_TRANSPORT=quic)
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.build.outcome == 'success' }}
+        env:
+          BARQSYNC_TRANSPORT: quic
+        run: cargo test --locked
+
+      - name: cargo clippy
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo clippy --locked --all-targets -- -D warnings
