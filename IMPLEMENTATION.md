@@ -34,6 +34,7 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M15 | delta block and chunk sizes scale with the file (4–64 KiB); a remote file that changed size got both signatures and a merged delta (protocol 6): 1.4–7.5× faster on small or scattered edits, but 4–22% slower on large appends and in-place runs, so M16 replaced the signature scheme | done |
 | M16 | two-level delta: the coarse signatures of 0.1.1, refined on demand with one round trip where the coarse delta left enough literal data (protocol 7). Over 100 Mbit: as fast as 0.1.1 on appends, in-place runs and small files, 1.3–7.6× faster on everything else (a growing SQLite database 16.7 → 3.2 s, rsync 9.4 s), faster than rsync on 7 of 8 datasets; see [Two-level delta](#two-level-delta-m16). Also fixed a racy test fixture | done |
 | M17 | `--transport auto`: an ssh ping picks QUIC on round trips of 30 ms and more, a short wait for it, hosts where it failed skipped for an hour (protocol 8). As fast as QUIC on the lossy link (2–3× the ssh pipe), 0.5 s lost at most where UDP is blocked, but a round trip more on short links and QUIC's ~3-round-trip setup and close on clean long ones (11–22% slower there on a delta or a no-op), so the ssh pipe stays the default; see [`--transport auto`, measured](#--transport-auto-measured) | done |
+| M18 | `-X/--xattrs` (`-XX`) and `-A/--acls` with rsync's semantics, locally and remote (protocol 9): rsync's namespace rules on each system, long values sent as checksums and fetched only when needed, POSIX ACLs on Linux and extended ACLs on macOS, `x`/`a` item columns, attribute-only updates; APFS clones no longer keep attributes without `-X`; see [Extended attributes and ACLs](#extended-attributes-and-acls--x--a) | done |
 
 The test suite passes on macOS (APFS; 164 tests at M17, 154 at M16, 145 at M14, when it was
 also built as x86_64 and run under Rosetta) and Linux (167 tests at M17 in an aarch64
@@ -77,7 +78,8 @@ With Homebrew's keg-only rustup, add `/opt/homebrew/opt/rustup/bin` to `PATH`.
 
 ## Supported options
 
-`-a` (= `-rlptgoD`), `-r -l -p -t -g -o -D --devices --specials`, `-H`, `-v -q -n`,
+`-a` (= `-rlptgoD`), `-r -l -p -t -g -o -D --devices --specials`, `-H`, `-X`/`-XX`, `-A`,
+`-v -q -n`,
 `-i`/`-ii` (`%i` in `--out-format`), `--progress`/`-P`/`--info=progress2`,
 `--out-format` (`%n`, `%L`), `--delete`, `--delete-excluded`,
 `--exclude/--include/--exclude-from/--include-from` (rsync wildcard rules, first match wins,
@@ -116,14 +118,12 @@ Also, with rsync's semantics locally and over ssh (each has a differential test 
 Trailing-slash semantics match rsync: `src/` syncs the contents, `src` syncs the directory itself.
 Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 20 interrupted, 23 partial transfer).
 
-Still missing: `-X/--xattrs`, `-A/--acls` and daemon mode (`rsync://`, `host::module`), as
-well as `--delete-before/-after/-delay`, `--no-OPTION`, `--copy-dest`, `--fuzzy`, `-T`,
+Still missing: daemon mode (`rsync://`, `host::module`), as well as `--delete-before/-after/-delay`, `--no-OPTION`, `--copy-dest`, `--fuzzy`, `-T`,
 `--bwlimit`, `--timeout`, `--log-file`, `--usermap/--groupmap/--chown`, `--no-implied-dirs`,
 `--no-R`, and a remote (`host:`) `--files-from` list.
 
 Known differences:
 
-- On APFS, clones also carry extended attributes (rsync needs `-X` for those).
 - With `-H`, the same names end up sharing inodes as with rsync, but the name shown after
   `=>` can differ. rsync links each group to the last name in its file list; barqsync's
   parallel walk links them to the first name it reaches.
@@ -140,6 +140,78 @@ Known differences:
   barqsync prints it.
 - With `-K`, rsync on macOS also tries to chmod the symlink and fails ("Too many levels of
   symbolic links"); barqsync leaves the mode alone.
+
+### Extended attributes and ACLs (`-X`, `-A`)
+
+Both follow rsync's xattrs.c and acls.c, locally and over the wire, and each has
+differential tests against rsync (`tests/xattrs_acls.rs`: locally and pushed and pulled over
+the ssh pipe, TCP streams and QUIC; updates of attributes or ACLs alone, removed and
+destination-only ones, symlinks, a read-only file, `-XX`, `--delete` and `-H`).
+
+- **Which attributes.** Linux never copies `system.*`; a non-root receiver stores and
+  compares only `user.*` (non-root senders can't list `trusted.*` anyway), root all the
+  others. macOS has a single namespace: names travel as `user.NAME`, `rsync.NS` names (other
+  systems' namespaces kept by a root receiver) as `NS`, and a non-root receiver drops names
+  outside `user.`. rsync's own `rsync.%...` attributes (`user.rsync.%...` on Linux) need
+  `-XX`. Extra attributes on the destination are removed. macOS keeps none on devices and
+  FIFOs; on Linux symlinks only root's namespaces (`trusted.*`, ...) are written, since the
+  kernel refuses `user.*` there, as rsync.
+- **ACLs** (`-A` implies `-p`): POSIX access ACLs, and default ACLs on directories, on Linux
+  (read and written as the kernel's `system.posix_acl_*` attributes); extended ACLs on macOS
+  (`acl_get_link_np`/`acl_set_link_np`, ids through UUIDs, entries packed as rsync packs them,
+  so `synchronize` is dropped as rsync drops it). What the mode says is not sent, and only
+  the extended part is compared, as rsync's `rsync_acl_equal_enough`. Not for symlinks.
+  ACLs from the other system aren't translated (they are left alone). Remote transfers map
+  the users and groups named in ACL entries by name, like owners.
+- **Comparing.** Attributes or ACLs that differ alone update the entry in place (`.f........x`,
+  `.f.......a.`), never a transfer; a rewritten file shows them too (`>f.st......x`). As with
+  rsync, a hard-linked name already linked to its leader shows `hf........x` when the
+  leader's attributes changed (not for modes and ACLs). Plain `-v` shows none of this.
+- **Writing.** After the owner and before the mode, as rsync's `set_file_attrs` (a later
+  `chown` would drop a file capability); files get theirs on the temp file before the
+  rename. An entry the owner can't write gets `u+w` for the moment. Directories get theirs
+  when created, their mode last.
+- **Over the wire.** Listings carry the attributes, with values over 32 bytes as a length
+  and BLAKE3-128 checksum (rsync's limit); the full values come with the file's data when it
+  is sent anyway, or in an `Xattrs` reply to the listing's `Need` for an in-place update.
+  Protocol version 9: older peers are refused with "protocol version mismatch".
+- **Clones.** An APFS clone carries its source's attributes, so without `-X` they are removed
+  from it, leaving the file as rsync's freshly written one (the kernel-managed
+  `com.apple.provenance` stays, as on any new file). Clones made without `CLONE_ACL` already
+  get the destination directory's inherited ACL, like a new file.
+- **One difference:** rsync rewrites every attribute value of an entry it updates, barqsync
+  only those that differ. Where a value can't be written but is already identical (as root
+  in a container, the SELinux labels: `lsetxattr(..., "security.selinux") failed: Operation not
+  supported`), rsync ends with exit code 23 and barqsync succeeds.
+
+Measured (release build, warm cache; rsync 3.5.1 on macOS, 3.2.7 on Linux). macOS, APFS, M-series
+Mac, 10 cores; every file there also carries the system's `com.apple.provenance`, so `-X`
+reads one attribute per file even in the plain tree; "tagged" adds a short and a 100-byte
+`user.` attribute to every file:
+
+| macOS | barqsync `-a` | barqsync `-aX` | barqsync `-aA` | rsync `-a` | rsync `-aX` | rsync `-aA` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5,000 files, fresh copy | 426 ms | 444 ms | | 1151 ms | 1285 ms | |
+| 5,000 tagged, fresh copy | 424 ms | 752 ms | | 1151 ms | 1585 ms | |
+| 5,000 files, no-op | 11 ms | 97 ms | 33 ms | 57 ms | 295 ms | 144 ms |
+| 5,000 tagged, no-op | 12 ms | 210 ms | 31 ms | 49 ms | 657 ms | 153 ms |
+| 500,000 files (C), no-op | 2.98 s | 13.2 s | 4.60 s | 9.78 s | 31.9 s | |
+
+APFS makes extended-attribute calls expensive: ~10 µs of kernel time each, and they contend
+(the first build took 21.3 s on the 500k no-op, with 157 s of system CPU). Two changes got it
+to 13.2 s: a value is read in one call into a reusable buffer instead of asking for its size
+first, and at most 3 threads make attribute calls at once (2: 14.6 s, 4: 13.3 s, 8: 16.7 s,
+unlimited: 20.5 s; `BARQSYNC_XATTR_LANES` overrides). What remains is four calls per file
+(list and read, on both sides), against rsync's six.
+
+On Linux (container on the same Mac, tmpfs, non-root, 5 cores) attribute calls are cheap:
+
+| Linux | barqsync `-a` | barqsync `-aX` | barqsync `-aA` | rsync `-a` | rsync `-aX` | rsync `-aA` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5,000 files, fresh copy | 17.8 ms | 18.8 ms | 18.8 ms | 109 ms | 115 ms | 113 ms |
+| 5,000 tagged, fresh copy | 15.6 ms | 25.3 ms | 15.1 ms | 116 ms | 125 ms | 114 ms |
+| 5,000 files, no-op | 3.3 ms | 6.5 ms | 4.7 ms | 55 ms | 64 ms | 62 ms |
+| 5,000 tagged, no-op | 2.7 ms | 9.0 ms | 4.7 ms | 59 ms | 87 ms | 62 ms |
 
 ## Remote transfers
 
@@ -639,12 +711,16 @@ src/chmod.rs        --chmod parser and mode tweaks
 src/select.rs       -R / --files-from path selection (implied directories)
 src/checksum.rs     -c whole-file BLAKE3 on a dedicated pool
 src/ids.rs          user/group name mapping for remote transfers (--numeric-ids off)
+src/xattrs.rs       -X: rsync's name rules, summed long values, compare and apply
+src/acls.rs         -A: rsync's ACL model; POSIX ACL encoding (Linux), acl(3) (macOS)
 src/paths.rs        host:path detection, trailing-slash rules
 src/filter.rs       rsync wildmatch + include/exclude rules
 src/diff.rs         quick check (size + mtime, --modify-window, -u, --size-only, ...)
-src/fsops/          readdir + fstatat, temp names, clone/copy, utimensat, mknod, page-cache hints
+src/fsops/          readdir + fstatat, temp names, clone/copy, utimensat, mknod, page-cache hints,
+                    xattr syscalls
 src/local/          planner (SRC... DEST → roots) and the parallel per-directory engine;
                     flags.rs: link/compare-dest, backups, partial, sparse, -L/-k, removals
+                    extra.rs: -X/-A in the engine (read, compare, write)
                     pipeline.rs: --scanner=jwalk feed, transfer queues A-D
 src/scan.rs         --scanner=jwalk tree scan (jwalk hook) and the destination index
 src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild);
@@ -658,6 +734,7 @@ tests/local_sync.rs end-to-end tests, most of them differential against rsync 3.
 tests/delta_sync.rs --no-whole-file end to end (clone+patch, --inplace, rebuild) vs rsync
 tests/remote_sync.rs push/pull through a fake ssh, differential against rsync over the same shim
 tests/rsync_flags.rs the options above, locally and over the fake ssh (and one that cuts it)
+tests/xattrs_acls.rs -X / -A vs rsync, locally and pushed/pulled on each transport
 bench/              dataset generator + hyperfine runner
 .github/workflows/  ci.yml: build, test, clippy; release.yml: release builds (generated by dist)
 dist-workspace.toml release targets, archive format and installers for dist

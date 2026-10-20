@@ -753,7 +753,7 @@ mod tests {
             // rkyv keeps relative pointers and lengths), must fail validation, not panic.
             // (A cut at an aligned offset can land on a valid shorter archive by chance,
             // so the long cut is odd; frames are length-prefixed on a reliable stream.)
-            for cut in [1, 4, body / 2 | 1] {
+            for cut in [1, 4, (body / 2) | 1] {
                 let mut b = buf[..buf.len() - cut].to_vec();
                 b[..4].copy_from_slice(&((body - cut) as u32).to_le_bytes());
                 let got = read_frame(&mut &b[..]);

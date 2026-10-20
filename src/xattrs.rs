@@ -135,15 +135,13 @@ impl Rules {
 /// Does rsync keep attributes for this kind of entry (`get_xattr`)? macOS has none on
 /// devices and special files; Linux keeps them where the entry is transferred at all.
 pub fn kind_has_xattrs(kind: Kind) -> bool {
-    match kind {
-        Kind::File | Kind::Dir | Kind::Symlink => true,
-        _ => cfg!(target_os = "linux"),
-    }
+    matches!(kind, Kind::File | Kind::Dir | Kind::Symlink) || cfg!(target_os = "linux")
 }
 
 /// Read `path`'s attributes whose names pass `keep`, renamed by it, sorted. Values over
 /// [`INLINE_MAX`] are summed unless `full`.
 fn read_with(path: &Path, full: bool, keep: impl Fn(&[u8]) -> Option<Vec<u8>>) -> io::Result<Vec<Xattr>> {
+    let _lane = xattr::lane();
     let mut out = Vec::new();
     for name in xattr::names(path)? {
         let Some(shown) = keep(&name) else { continue };
@@ -181,14 +179,13 @@ pub fn needs_full(want: &[Xattr], have: &[Xattr]) -> bool {
 /// Give `path` exactly the attributes `want` (receiver names), where `have` is what it
 /// has now. Summed values not already on `path` come from `full` (the complete list with
 /// full values, see [`needs_full`]). Like rsync, the owner gets write permission for a
-/// moment when the entry lacks it, and Linux symlinks are left alone (no `user.`
-/// attributes there). Returns whether anything changed.
+/// moment when the entry lacks it, and `user.` names on Linux symlinks (where the
+/// kernel refuses them) are left alone. Returns whether anything changed.
 pub fn apply(path: &Path, kind: Kind, want: &[Xattr], have: &[Xattr], full: Option<&[Xattr]>, r: &Rules) -> io::Result<bool> {
-    if cfg!(target_os = "linux") && kind == Kind::Symlink {
-        return Ok(false);
-    }
+    // rsync's NO_SYMLINK_USER_XATTRS (Linux): other namespaces still go on symlinks.
+    let settable = |name: &[u8]| !(cfg!(target_os = "linux") && kind == Kind::Symlink && name.starts_with(USER_PREFIX));
     let mut sets: Vec<(&[u8], &[u8])> = Vec::new();
-    for w in want {
+    for w in want.iter().filter(|w| settable(&w.name)) {
         if have.iter().any(|h| h.name == w.name && h.value.same(&w.value)) {
             continue;
         }
@@ -206,12 +203,13 @@ pub fn apply(path: &Path, kind: Kind, want: &[Xattr], have: &[Xattr], full: Opti
     }
     let removes: Vec<&[u8]> = have
         .iter()
-        .filter(|h| r.is_local(&h.name) && !want.iter().any(|w| w.name == h.name))
+        .filter(|h| r.is_local(&h.name) && settable(&h.name) && !want.iter().any(|w| w.name == h.name))
         .map(|h| h.name.as_slice())
         .collect();
     if sets.is_empty() && removes.is_empty() {
         return Ok(false);
     }
+    let _lane = xattr::lane();
     let restore = if !r.am_root && kind != Kind::Symlink { add_write_perm(path)? } else { None };
     let res = (|| {
         for (name, value) in &sets {
@@ -342,8 +340,16 @@ mod tests {
         // Sorted by name, as lists always are.
         let want = vec![Xattr { name: n("big").into_bytes(), value: XValue::new(big.clone(), false) }, full(&n("keep"), b"v")];
         let have = read_local(&p, &r).unwrap();
+        // What the system put there (SELinux labels, macOS provenance) stays wanted.
+        let theirs: Vec<Xattr> = have.iter().filter(|h| h.name != n("probe").as_bytes()).cloned().collect();
+        let with_theirs = |mine: Vec<Xattr>| {
+            let mut v: Vec<Xattr> = theirs.iter().cloned().chain(mine).collect();
+            v.sort_by(|a, b| a.name.cmp(&b.name));
+            v
+        };
+        let (want, mine_want) = (with_theirs(want.clone()), want);
         assert!(apply(&p, Kind::File, &want, &have, None, &r).is_err(), "a summed value must be supplied");
-        let fulls = vec![Xattr { name: n("big").into_bytes(), value: XValue::Full(big.clone()) }, full(&n("keep"), b"v")];
+        let fulls = with_theirs(vec![Xattr { name: n("big").into_bytes(), value: XValue::Full(big.clone()) }, full(&n("keep"), b"v")]);
         // Read-only files work too (write permission is added for the moment).
         crate::fsops::chmod(&p, 0o444).unwrap();
         assert!(apply(&p, Kind::File, &want, &have, Some(&fulls), &r).unwrap());
@@ -351,8 +357,8 @@ mod tests {
         assert_eq!(xattr::get(&p, n("big").as_bytes()).unwrap(), Some(big));
         assert_eq!(xattr::get(&p, n("probe").as_bytes()).unwrap(), None, "extra names are removed");
         let now = read_local(&p, &r).unwrap();
-        let mine: Vec<Xattr> = now.into_iter().filter(|x| x.name.starts_with(pre.as_bytes()) && !x.name.starts_with(b"com.apple.")).collect();
-        assert!(same(&mine, &want), "{mine:?}");
-        assert!(!needs_full(&want, &mine));
+        let mine: Vec<Xattr> = now.iter().filter(|x| !theirs.contains(x)).cloned().collect();
+        assert!(same(&mine, &mine_want), "{mine:?}");
+        assert!(!needs_full(&want, &now));
     }
 }

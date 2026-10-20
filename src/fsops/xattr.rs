@@ -21,7 +21,9 @@ pub fn is_missing(e: &io::Error) -> bool {
 
 /// The filesystem has no extended attributes at all.
 pub fn is_unsupported(e: &io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EOPNOTSUPP))
+    // The same number on Linux, two on macOS.
+    let code = e.raw_os_error();
+    code == Some(libc::ENOTSUP) || code == Some(libc::EOPNOTSUPP)
 }
 
 #[cfg(target_os = "macos")]
@@ -63,6 +65,56 @@ mod sys {
 
 thread_local! {
     static NAMES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static VALUE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Values up to this size are read in one call (see [`get`]).
+const VALUE_BUF: usize = 16 << 10;
+
+/// How many threads may be in extended-attribute calls at once (0: no limit).
+///
+/// On APFS each call costs ~10 µs of kernel time and they contend: a no-op `-X` sync of
+/// 500,000 files took 20.5 s with all 20 threads in them, 12.8 s with 3 (13.3 s with 4,
+/// 14.6 s with 2, 16.7 s with 8). ACL reads go through it too. Linux doesn't need it.
+/// `BARQSYNC_XATTR_LANES=N` overrides (benchmarking aid).
+fn lanes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BARQSYNC_XATTR_LANES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if cfg!(target_os = "macos") { DEFAULT_LANES } else { 0 })
+    })
+}
+
+const DEFAULT_LANES: usize = 3;
+
+static BUSY: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Held while making one entry's extended-attribute calls (see [`lanes`]).
+pub struct Lane(bool);
+
+pub fn lane() -> Lane {
+    let n = lanes();
+    if n == 0 {
+        return Lane(false);
+    }
+    let mut busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    while *busy >= n {
+        busy = FREED.wait(busy).unwrap_or_else(|e| e.into_inner());
+    }
+    *busy += 1;
+    Lane(true)
+}
+
+impl Drop for Lane {
+    fn drop(&mut self) {
+        if self.0 {
+            *BUSY.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            FREED.notify_one();
+        }
+    }
 }
 
 /// Names of `path`'s extended attributes. A filesystem without them has none.
@@ -100,6 +152,27 @@ pub fn names(path: &Path) -> io::Result<Vec<Vec<u8>>> {
 /// The value of attribute `name`, or `None` if it does not exist (any more).
 pub fn get(path: &Path, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
     let (c, n) = (cstr(path)?, cname(name)?);
+    // Most values are short: one call into a reusable buffer (each of these calls is ~10
+    // µs of kernel time on APFS, so asking for the size first would double the cost).
+    let first = VALUE.with(|b| {
+        let mut buf = b.borrow_mut();
+        if buf.len() < VALUE_BUF {
+            buf.resize(VALUE_BUF, 0);
+        }
+        let r = unsafe { sys::get(&c, &n, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        // A full buffer may be cut short: macOS hands out a resource fork in pieces
+        // rather than failing with ERANGE. Read those the sized way below.
+        if r >= 0 && (r as usize) < buf.len() {
+            return Ok(Some(buf[..r as usize].to_vec()));
+        }
+        Err(if r >= 0 { io::Error::from_raw_os_error(libc::ERANGE) } else { io::Error::last_os_error() })
+    });
+    match first {
+        Ok(v) => return Ok(v),
+        Err(e) if is_missing(&e) => return Ok(None),
+        Err(e) if e.raw_os_error() != Some(libc::ERANGE) => return Err(e),
+        Err(_) => {}
+    }
     loop {
         let size = unsafe { sys::get(&c, &n, std::ptr::null_mut(), 0, 0) };
         if size < 0 {
@@ -159,13 +232,20 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         let name: &[u8] = b"user.barqsync.test";
         // Linux filesystems keep values within a block; macOS takes any size.
-        let big = vec![7u8; if cfg!(target_os = "macos") { 100_000 } else { 2000 }];
+        let big: Vec<u8> = (0..if cfg!(target_os = "macos") { 100_000u32 } else { 2000 }).map(|i| i as u8).collect();
         match set(&p, name, &big) {
             Err(e) if is_unsupported(&e) => return, // e.g. tmpfs without user xattrs
             r => r.unwrap(),
         }
         assert_eq!(get(&p, name).unwrap().as_deref(), Some(&big[..]));
         assert!(names(&p).unwrap().iter().any(|n| n == name));
+        #[cfg(target_os = "macos")]
+        {
+            // Resource forks come in pieces when the buffer is too small (no ERANGE).
+            let fork: Vec<u8> = (0..(VALUE_BUF as u32) * 5).map(|i| (i % 251) as u8).collect();
+            set(&p, b"com.apple.ResourceFork", &fork).unwrap();
+            assert_eq!(get(&p, b"com.apple.ResourceFork").unwrap().as_deref(), Some(&fork[..]));
+        }
         remove(&p, name).unwrap();
         remove(&p, name).unwrap();
         assert_eq!(get(&p, name).unwrap(), None);

@@ -177,6 +177,7 @@ pub fn kind_has_acls(kind: Kind) -> bool {
 
 /// The ACLs of `path` (an entry of `kind` and `mode`) as the system has them.
 pub fn read(path: &Path, kind: Kind, mode: u32) -> io::Result<Acls> {
+    let _lane = crate::fsops::xattr::lane();
     sys::read(path, kind == Kind::Dir, mode)
 }
 
@@ -226,11 +227,11 @@ mod posix {
 
     /// Decode the kernel's `system.posix_acl_*` value.
     pub fn decode(v: &[u8]) -> Option<RsyncAcl> {
-        if v.len() < 4 || (v.len() - 4) % 8 != 0 || u32::from_le_bytes(v[..4].try_into().ok()?) != VERSION {
+        if v.len() < 4 || !(v.len() - 4).is_multiple_of(8) || u32::from_le_bytes(v[..4].try_into().ok()?) != VERSION {
             return None;
         }
         let mut acl = RsyncAcl::default();
-        for e in v[4..].chunks_exact(8) {
+        for e in v[4..].as_chunks::<8>().0 {
             let tag = u16::from_le_bytes([e[0], e[1]]);
             let perm = (u16::from_le_bytes([e[2], e[3]]) & 7) as u8;
             let id = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);

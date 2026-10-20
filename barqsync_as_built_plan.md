@@ -454,8 +454,8 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
   LAN, and TCP/QUIC there need its firewall to allow the binary.
 - **Cold-cache runs** (`bench/run.sh DIR all --cold`) need `sudo purge` on macOS.
 - **NFS** isn't covered (no server).
-- **From rsync's feature set:** xattrs and ACLs (`-X`, `-A`), daemon mode (`rsync://`), and the
-  single-argument listing mode.
+- **From rsync's feature set:** daemon mode (`rsync://`) and the single-argument listing mode.
+  (`-X`/`-A` are done: see `IMPLEMENTATION.md`, M18.)
 - **Worth trying next:** cutting QUIC's fixed cost (about three round trips for setup and
   close, measured on a clean 80 ms link) and telling clean long links from lossy ones
   (e.g. remembering per host the loss QUIC saw on the last transfer): together these keep

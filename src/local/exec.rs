@@ -147,6 +147,9 @@ struct HardGroup {
     leader_dst: PathBuf,
     leader_rel: Vec<u8>,
     followers: Vec<Follower>,
+    /// `-X`: the leader's attributes were updated in place, so names already linked to
+    /// it had the old ones too (see [`Follower::xattr`]).
+    xattr: bool,
 }
 
 struct Follower {
@@ -155,6 +158,10 @@ struct Follower {
     dst_path: PathBuf,
     rel: Vec<u8>,
     meta: Meta,
+    /// `-X`: the destination name's attributes differed when it was reached. rsync shows
+    /// that on a name already linked to its leader too (its receiver writes attributes
+    /// after the generator has looked at every name, unlike modes and ACLs).
+    xattr: bool,
 }
 
 struct DirFixup {
@@ -265,6 +272,17 @@ impl<'a> Engine<'a> {
     /// Permissions for a newly written file or directory.
     pub(crate) fn new_mode(&self, src: &Meta) -> u32 {
         if self.opts.perms { src.mode } else { src.mode & 0o777 & !self.umask }
+    }
+
+    /// `p` for an in-place update of a non-directory. rsync on Linux writes a changed
+    /// access ACL before it itemizes the entry, and that write sets the permission bits:
+    /// only setuid, setgid and sticky can still differ then.
+    fn perms_shown(&self, src: &Meta, dst: &Meta, perms: bool, acl_rewritten: bool) -> bool {
+        if acl_rewritten && crate::acls::Flavor::native() == crate::acls::Flavor::Posix {
+            perms && src.mode & 0o7000 != dst.mode & 0o7000
+        } else {
+            perms
+        }
     }
 
     /// Where an entry's full attribute values come from (see [`XSource`]).
@@ -646,23 +664,35 @@ impl<'a> Engine<'a> {
 
     /// `-H`: true if this name leads its hard-link group (and is transferred normally);
     /// otherwise it is queued to be linked to the leader at the end.
-    fn claim_leader(&self, root: u16, meta: &Meta, src_path: &Path, dst_path: &Path, rel: &[u8]) -> bool {
+    fn claim_leader(&self, root: u16, x: &Src, src_path: &Path, dst_path: &Path, rel: &[u8]) -> bool {
+        let meta = x.meta;
         let mut groups = self.hardlinks.lock().unwrap();
         match groups.entry((meta.dev, meta.ino)) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(HardGroup { leader_dst: dst_path.to_path_buf(), leader_rel: rel.to_vec(), followers: Vec::new() });
+                v.insert(HardGroup { leader_dst: dst_path.to_path_buf(), leader_rel: rel.to_vec(), followers: Vec::new(), xattr: false });
                 true
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
+                let xattr = self.want_xattrs(Kind::File)
+                    && self.out.itemizes()
+                    && fsops::lstat(dst_path).is_ok_and(|d| d.kind == Kind::File && self.extra_change(x, dst_path, &d).0.0);
                 o.get_mut().followers.push(Follower {
                     root,
                     src_path: src_path.to_path_buf(),
                     dst_path: dst_path.to_path_buf(),
                     rel: rel.to_vec(),
                     meta: *meta,
+                    xattr,
                 });
                 false
             }
+        }
+    }
+
+    /// `-H`: the leader of `meta`'s group gets its attributes updated in place.
+    fn leader_xattrs_changed(&self, meta: &Meta) {
+        if let Some(g) = self.hardlinks.lock().unwrap().get_mut(&(meta.dev, meta.ino)) {
+            g.xattr = true;
         }
     }
 
@@ -683,7 +713,11 @@ impl<'a> Engine<'a> {
                 if let (Some(l), Some(d)) = (leader, dst)
                     && (l.dev, l.ino) == (d.dev, d.ino)
                 {
-                    self.out.item(&f.rel, Kind::File, Link::Hard(&g.leader_rel), Change::default(), false);
+                    // Already linked: rsync shows `hf` without naming the leader.
+                    let change = Change { hardlink: true, xattr: f.xattr || g.xattr, ..Change::default() };
+                    if change.xattr || self.opts.itemize >= 2 {
+                        self.out.item(&f.rel, Kind::File, Link::None, change, false);
+                    }
                     self.source_done(f.root, &f.src_path, &f.rel, &f.meta);
                     continue;
                 }
@@ -802,7 +836,11 @@ impl<'a> Engine<'a> {
                     if self.size_filtered(&e.meta, &rel) {
                         continue;
                     }
-                    if self.opts.hard_links && e.meta.nlink > 1 && !self.claim_leader(ctx.root, &e.meta, &src_path, &dst_path, &rel) {
+                    let leads = || {
+                        let x = Src { kind: Kind::File, meta: &e.meta, extra: e.extra.as_deref(), from: XSource::Full(&[]) };
+                        self.claim_leader(ctx.root, &x, &src_path, &dst_path, &rel)
+                    };
+                    if self.opts.hard_links && e.meta.nlink > 1 && !leads() {
                         // Linked at the end, which modifies this directory.
                         changed = true;
                         continue;
@@ -855,8 +893,12 @@ impl<'a> Engine<'a> {
                             self.source_done(ctx.root, &src_path, &rel, &e.meta);
                         }
                         FileAction::Attrs(a) => {
+                            if a.xattr && self.opts.hard_links && e.meta.nlink > 1 {
+                                self.leader_xattrs_changed(&e.meta);
+                            }
                             if let Some(d) = &dst_meta {
-                                let change = Change { xattr: a.xattr, acl: a.acl, ..self.attr_change(&e.meta, d, false) };
+                                let mut change = Change { xattr: a.xattr, acl: a.acl, ..self.attr_change(&e.meta, d, false) };
+                                change.perms = self.perms_shown(&e.meta, d, change.perms, a.acl);
                                 self.out.item(&rel, Kind::File, Link::None, change, false);
                             }
                             if !self.dry() {
@@ -1195,7 +1237,8 @@ impl<'a> Engine<'a> {
                     && d.rdev == meta.rdev
                 {
                     let ((xattr, acl), have) = self.extra_change(x, dst_path, &d);
-                    let change = Change { xattr, acl, ..self.attr_change(meta, &d, false) };
+                    let mut change = Change { xattr, acl, ..self.attr_change(meta, &d, false) };
+                    change.perms = self.perms_shown(meta, &d, change.perms, acl);
                     self.out.item(rel, meta.kind, Link::None, change, false);
                     let a = AttrDiff { xattr, acl, ..self.rules.attrs_differ(meta, &d) };
                     if !a.any() || self.dry() || self.fix_attrs(dst_path, x, a, have) {
