@@ -17,7 +17,8 @@ them, and sends only the parts of a file that changed.
   pieces where it differs (4 KiB up to 256 MiB, larger for larger files). A SQLite database
   after 8,000 changes sends 30 MB; rsync sends 104 MB.
 - **Made for real networks:** ssh by default, parallel TLS streams or QUIC for long or lossy
-  links.
+  links, or `--transport auto` to use QUIC only where the round trip is long and UDP gets
+  through.
 
 ## Install
 
@@ -79,6 +80,7 @@ barqsync -a photos  backup/    →  backup/photos/a.jpg  backup/photos/b.jpg   (
 | copy only the files named in a list | `barqsync -a --files-from=list.txt src/ dst/` |
 | use another ssh port or key | `barqsync -a -e "ssh -p 2222" src/ me@server:dst/` |
 | sync over a lossy or long-distance link | `barqsync -a --transport quic data/ me@server:data/` |
+| use QUIC on long links, the ssh pipe on short ones or where UDP is blocked | `barqsync -a --transport auto data/ me@server:data/` |
 | fill a fast link with parallel connections | `barqsync -a --streams 8 data/ me@server:data/` |
 | compress automatically to suit a slow link | `barqsync -a --strategy adaptive logs/ me@server:logs/` |
 
@@ -124,7 +126,7 @@ encryption are a tie. Method, raw data and more cases:
 | **Comparing** | `-c`, `--size-only`, `-I`, `--modify-window` |
 | **Writing** | `--inplace`, `--partial`, `--partial-dir`, `-P`, `-S`, `-W`, `--no-whole-file`, `--fsync`, `-b`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest` |
 | **Links and metadata** | `-l`, `-L`, `-k`, `-K`, `-H`, `-p`, `-t`, `-g`, `-o`, `-D`, `-O`, `--numeric-ids`, `--chmod` |
-| **Remote** | `-e`, `--remote-path`, `--transport` (ssh, tcp, quic), `--streams N`, `--strategy adaptive`, `--compress-level N` |
+| **Remote** | `-e`, `--remote-path`, `--transport` (ssh, tcp, quic, auto), `--streams N`, `--strategy adaptive`, `--compress-level N` |
 | **Output** | `-i`, `--out-format`, `--progress`, `--info=progress2` |
 
 Every option, and where barqsync differs from rsync:

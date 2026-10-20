@@ -244,7 +244,7 @@ pub struct Cli {
     /// Number of parallel data streams for remote transfers (TCP, or QUIC streams)
     #[arg(long, value_name = "N")]
     streams: Option<usize>,
-    /// Remote data path: the ssh pipe alone, TLS-over-TCP streams, or QUIC
+    /// Remote data path: the ssh pipe alone, TLS-over-TCP streams, QUIC, or auto (QUIC on long links)
     #[arg(long, value_enum, value_name = "MODE", env = "BARQSYNC_TRANSPORT", hide_env = true)]
     transport: Option<Transport>,
     /// Measure the link and pick delta vs whole files and compression from it, or don't
@@ -489,9 +489,9 @@ impl Options {
             transport: c.transport.unwrap_or(if c.streams.is_some_and(|n| n > 0) { Transport::Tcp } else { Transport::DEFAULT }),
             streams: match c.transport {
                 Some(Transport::Ssh) => 0,
-                Some(Transport::Quic) => c.streams.unwrap_or(Transport::QUIC_STREAMS).clamp(1, Transport::MAX_STREAMS),
+                Some(Transport::Quic | Transport::Auto) => c.streams.unwrap_or(Transport::QUIC_STREAMS).clamp(1, Transport::MAX_STREAMS),
                 Some(Transport::Tcp) => c.streams.unwrap_or(Transport::TCP_STREAMS).clamp(1, Transport::MAX_STREAMS),
-                None if Transport::DEFAULT == Transport::Quic => c.streams.unwrap_or(Transport::QUIC_STREAMS).min(Transport::MAX_STREAMS),
+                None if Transport::DEFAULT.quic() => c.streams.unwrap_or(Transport::QUIC_STREAMS).min(Transport::MAX_STREAMS),
                 None => c.streams.unwrap_or(0).min(Transport::MAX_STREAMS),
             },
             wire: c.wire,

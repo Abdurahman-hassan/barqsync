@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.

@@ -33,10 +33,12 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M14 | full verification: local A/B/C/D vs rsync and `cp`, Linux syscall counts and flamegraphs, every transport and strategy over lan/wan/lossy links; README and as-built plan updated | done |
 | M15 | delta block and chunk sizes scale with the file (4–64 KiB); a remote file that changed size got both signatures and a merged delta (protocol 6): 1.4–7.5× faster on small or scattered edits, but 4–22% slower on large appends and in-place runs, so M16 replaced the signature scheme | done |
 | M16 | two-level delta: the coarse signatures of 0.1.1, refined on demand with one round trip where the coarse delta left enough literal data (protocol 7). Over 100 Mbit: as fast as 0.1.1 on appends, in-place runs and small files, 1.3–7.6× faster on everything else (a growing SQLite database 16.7 → 3.2 s, rsync 9.4 s), faster than rsync on 7 of 8 datasets; see [Two-level delta](#two-level-delta-m16). Also fixed a racy test fixture | done |
+| M17 | `--transport auto`: an ssh ping picks QUIC on round trips of 30 ms and more, a short wait for it, hosts where it failed skipped for an hour (protocol 8). As fast as QUIC on the lossy link (2–3× the ssh pipe), 0.5 s lost at most where UDP is blocked, but a round trip more on short links and QUIC's ~3-round-trip setup and close on clean long ones (11–22% slower there on a delta or a no-op), so the ssh pipe stays the default; see [`--transport auto`, measured](#--transport-auto-measured) | done |
 
-The test suite passes on macOS (APFS; 154 tests at M16, 145 at M14, when it was also built as
-x86_64 and run under Rosetta) and Linux (157 tests at M16 on an x86_64 VM, 148 at M14 in an
-aarch64 container), compared against rsync 3.2.7. Three tests are Linux-only.
+The test suite passes on macOS (APFS; 164 tests at M17, 154 at M16, 145 at M14, when it was
+also built as x86_64 and run under Rosetta) and Linux (167 tests at M17 in an aarch64
+container, 157 at M16 on an x86_64 VM, 148 at M14), compared against rsync 3.2.7. Three tests
+are Linux-only.
 
 ## Install
 
@@ -87,7 +89,7 @@ writes new files directly, like rsync),
 for files of 8 MiB+, on by default; see [Page-cache hints](#page-cache-hints)),
 `--delta=blocks|cdc` (delta design, see [Delta transfer](#delta-transfer); for a remote
 transfer the receiver's choice applies), `--scanner=dirtask|jwalk`, `--transport
-ssh|tcp|quic` with `--streams N`, `--wire postcard|rkyv` (see [Remote transfers](#remote-transfers)),
+ssh|tcp|quic|auto` with `--streams N`, `--wire postcard|rkyv` (see [Remote transfers](#remote-transfers)),
 `--strategy adaptive|fixed` and `--compress-level N` (see [Adaptive strategy](#adaptive-strategy---strategy-adaptive)),
 `--io-uring` (Linux; see [io_uring](#io_uring---io-uring-linux)).
 
@@ -215,6 +217,44 @@ acknowledges it. Then:
 quinn drives a connection from one task, which limits QUIC to about 350 MB/s per transfer on
 this Mac over loopback; TLS-over-TCP streams scale with the number of streams.
 
+### Automatic choice (`--transport auto`)
+
+QUIC is 2–4× faster than the ssh pipe on a long, lossy link, ties it on a clean WAN, is a few
+percent slower on a LAN, and costs `--transport quic` 3 s wherever UDP is blocked.
+`--transport auto` decides per transfer, before the first listing:
+
+1. **Offer.** The server opens its QUIC endpoint and sends the offer over ssh, as for
+   `--transport quic`. (The server is told `quic`: an older server can still read the
+   handshake and say it speaks another protocol version.)
+2. **Ping.** The client pings the server over ssh. A round trip under 30 ms is a short link:
+   the transfer stays on the ssh pipe, and no UDP packet is ever sent. The ping is all it
+   costs.
+3. **Try QUIC, briefly.** On a longer round trip the client connects to QUIC, with the
+   ping's round trip as QUIC's first estimate, and waits 300 ms plus two round trips (the
+   handshake and token take two). If QUIC connected, and its own handshake also measured
+   30 ms or more (a ping that ssh had to resend looks long), the transfer moves to QUIC,
+   with `--streams` data streams (16 by default). Otherwise it stays on ssh.
+4. **Remember.** A host where QUIC didn't connect is not tried again for an hour. The
+   marker is an empty file per host (named by a hash of the host, without `user@`) in
+   `$XDG_RUNTIME_DIR/barqsync` (gone at logout), else `~/Library/Caches/barqsync` (macOS) or
+   `~/.cache/barqsync`; `BARQSYNC_CACHE_DIR` moves it.
+
+`-vv` says what auto chose and why, e.g. `auto: 81.2 ms round trip, QUIC connected in 168
+ms, using QUIC to 10.0.0.5:50612 (16 data streams)` or `auto: 0.4 ms round trip, using the
+ssh connection`; `-v` output stays rsync's. The QUIC server assumes a 50 ms round trip until
+it has measured one (quinn's default of 333 ms re-sends a lost first flight only after
+~1 s), so one lost handshake packet on a lossy link doesn't miss auto's short wait. The
+setup step is new on the wire: the protocol version is 8, and older servers refuse the
+connection with "protocol version mismatch".
+
+Loss is not measured directly. The handshake is a handful of packets, too few to see a 1%
+loss rate, and a probe burst large enough to see it costs more on a clean WAN than QUIC
+saves there. A long round trip is the signal instead, and that is auto's weakness: on a
+clean long link it picks QUIC, which is slower there. **The ssh pipe stays the default**;
+use `--transport auto` for links that are long and may be lossy (Wi-Fi, mobile, across
+continents), especially where UDP may be blocked. See
+[`--transport auto`, measured](#--transport-auto-measured).
+
 ### Wire format (`--wire postcard|rkyv`)
 
 Control messages (listings, requests, signatures) are postcard-encoded by default.
@@ -275,6 +315,67 @@ tokio I/O layer are within noise of postcard and threads, which stay the default
 stream queued behind 256 MiB of buffered file data, and closing waited out QUIC's closing
 period. Prioritizing the control stream, right-sizing the windows and a FIN-for-FIN close
 fixed both; `bench/results/net-20261017-095932.md` is that first run.)
+
+### `--transport auto`, measured
+
+Same container and datasets (`bench/net/net_bench.sh`, `SCALE=0.5`), plus `far` = 100 Mbit
+with 80 ms round trips and no loss, and `-noudp` profiles that drop every UDP packet (a
+firewall that blocks QUIC). 5 runs on lan and wan, 6 on lossy, 3 elsewhere; lossy is noisy
+for every transport (one run of the same command can take twice as long as another).
+
+| Profile, workload | ssh pipe | `--transport quic` | `--transport auto` | auto chose |
+| --- | ---: | ---: | ---: | --- |
+| lan (0.7 ms), 4,000 small files | 0.32 s | 0.34 s | **0.32 s** | ssh |
+| lan, 128 MiB delta | 0.41 s¹ | 0.34 s | **0.34 s** | ssh |
+| lan, 3 changed of 20,000 | 0.24 s¹ | 0.19 s | **0.19 s** | ssh |
+| wan (22 ms), 4,000 small files | 2.11 s | **2.04 s** | 2.05 s | ssh |
+| wan, 128 MiB delta | **1.50 s** | 1.54 s | 1.52 s | ssh |
+| wan, 3 changed of 20,000 | **0.63 s** | 0.70 s | 0.65 s | ssh |
+| lossy (82 ms, ~1% loss), 4,000 small files | 38.8 s | 15.4 s | **13.0 s** | QUIC |
+| lossy, 128 MiB delta | 15.6 s | 7.4 s | **7.1 s** | QUIC |
+| lossy, 3 changed of 20,000 | 2.64 s | 3.08 s | **2.43 s** | QUIC |
+| far (82 ms, no loss), 4,000 small files | 3.55 s | **3.54 s** | 3.60 s | QUIC |
+| far, 128 MiB delta | **3.06 s** | 3.41 s | 3.39 s | QUIC |
+| far, 3 changed of 20,000 | **1.85 s** | 2.17 s | 2.25 s | QUIC |
+
+¹ The ssh pipe's first run was slow; its fastest runs (0.32 s and 0.18 s) match auto's, which
+ran the same pipe.
+
+Where UDP is blocked (3 changed of 20,000):
+
+| Profile | ssh pipe | `--transport quic` | auto, first contact | auto, host remembered |
+| --- | ---: | ---: | ---: | ---: |
+| wan-noudp | 0.62 s | 3.63 s | 0.65 s | 0.65 s |
+| far-noudp | 1.92 s | 4.87 s | 2.41 s | **1.86 s** |
+| lossy-noudp | 3.06 s | 5.33 s | 2.95 s | 3.08 s |
+
+What this shows:
+
+- **auto does what it was built for.** On a LAN and a WAN it stays on the ssh pipe; on the
+  lossy link it is as fast as QUIC, 2–3× faster than the pipe. In 40 setups on the lossy link
+  QUIC connected every time, in 166–185 ms (two round trips), well inside the 464 ms wait.
+  Where UDP is blocked it loses 0.5 s on first contact (`--transport quic`: 3 s) and nothing
+  once the host is remembered; on a WAN it doesn't even try.
+- **It costs a round trip when it stays on ssh:** the ping. That shows only on the WAN no-op,
+  0.65 s against 0.63 s (+4%, every time).
+- **On a clean long link it picks QUIC, and QUIC is slower there.** A one-file transfer over
+  `far` (10 runs each) takes 1.44 s over the pipe, 1.70 s over QUIC and 1.77 s with auto:
+  QUIC's setup and close cost about three round trips (the handshake and token two, the
+  close one more: data streams wait for the peer's acknowledgement and both control streams
+  end before the idle ssh pipe closes), auto's ping a fourth. That makes the delta and the
+  no-op 11–22% slower, and at 100 Mbit QUIC gains nothing on the small files to make up for
+  it. The round trip can't tell a clean long link from a lossy one, and loss can't be seen
+  cheaply beforehand.
+- **QUIC's lead on the lossy link is not a quirk of the emulation.** Loopback hands netem
+  TCP segments of up to 44 packets (GSO), and a loss drops all of them. With `GSO=off`, TCP's
+  losses are single packets, and the pipe gets slower, not faster: 4,000 small files 56.3 s
+  (QUIC 12.9 s), the delta 23.0 s (QUIC 7.1 s).
+
+So **the ssh pipe stays the default** and `--transport auto` is opt-in, like
+`--strategy adaptive`: a large win where links are long and lossy, a small fixed cost
+elsewhere. Reports: `bench/results/net-20261020-070426.md` (lan, wan),
+`-070637.md` (lossy, far), `-071421.md` (UDP blocked), `-071612.md` (GSO off),
+`-073038.md` (lossy, 6 runs).
 
 ### Adaptive strategy (`--strategy adaptive`)
 
@@ -570,8 +671,10 @@ The delta engine also has property tests (random insert/delete/overwrite/append/
 sequences; every delta must rebuild the new file exactly via both rebuild and clone+patch).
 `PROPTEST_CASES=5000 cargo test --release delta` runs a longer sweep.
 `BARQSYNC_DELTA=cdc cargo test` runs the whole suite with `--delta=cdc` as the default;
-`BARQSYNC_SCANNER=jwalk`, `BARQSYNC_TRANSPORT=quic`, `BARQSYNC_WIRE=rkyv` and
-`BARQSYNC_NET_IO=tokio` do the same for the other alternatives.
+`BARQSYNC_SCANNER=jwalk`, `BARQSYNC_TRANSPORT=quic`, `BARQSYNC_TRANSPORT=auto`,
+`BARQSYNC_WIRE=rkyv` and `BARQSYNC_NET_IO=tokio` do the same for the other alternatives.
+The fake ssh is a short link, so auto stays on the pipe there; `BARQSYNC_AUTO_RTT_MS=0`
+lowers its threshold so that it moves to QUIC.
 
 The integration tests run each scenario through the reference rsync 3.x as well (found at
 `/opt/homebrew/bin/rsync`, `/usr/local/bin/rsync` or `/usr/bin/rsync`, or set
