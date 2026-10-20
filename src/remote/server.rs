@@ -7,6 +7,7 @@ use crate::exit;
 use crate::output::Output;
 use crate::proto::async_io::FdIo;
 use crate::proto::{Conn, Frame, MAGIC, Msg, VERSION};
+use crate::timing::mark;
 
 pub fn run() -> i32 {
     let mut conn = match async_stdio() {
@@ -35,6 +36,7 @@ pub fn run() -> i32 {
     conn.set_compression(opts.compression());
     conn.set_wire(opts.wire);
     crate::fsops::cache::set_enabled(opts.drop_cache);
+    mark("handshake done");
     if conn.msg(Msg::HelloAck { version: VERSION }).is_err() {
         return exit::PROTOCOL;
     }
@@ -44,6 +46,7 @@ pub fn run() -> i32 {
         let _ = conn.finish();
         return exit::PROTOCOL;
     }
+    mark("setup done");
     let fwd = conn.out.clone();
     // In a push the items come from this (receiving) side but describe what the
     // client sent, so they are shown as rsync's sender does (`<f...`).
@@ -65,8 +68,10 @@ pub fn run() -> i32 {
             }
         }
     };
+    mark("transfer done");
     drop(out);
     let _ = conn.finish();
+    mark("connection closed");
     code
 }
 

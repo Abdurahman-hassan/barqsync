@@ -608,24 +608,32 @@ impl Conn {
     /// Flush everything queued and close our side of the stream. Clones of the sender
     /// may still exist (e.g. in a forwarding `Output`), so closing is an explicit request.
     pub fn finish(mut self) -> io::Result<()> {
+        use crate::timing::mark;
+        let quic = self.session.is_some();
         for tx in self.out.data.iter().flat_map(|d| d.iter()) {
             let _ = tx.send(Vec::new());
         }
         for h in self.data_writers.drain(..) {
             let _ = h.join();
         }
+        if quic {
+            mark("finish: data streams closed");
+        }
         let _ = self.out.tx.send(Vec::new());
         let r = self.writer.take().map_or(Ok(()), Joiner::join);
-        if self.session.is_some() {
+        if quic {
+            mark("finish: control stream closed");
             // QUIC: wait (bounded) for the peer to end its control stream too. Once both
             // sides have read each other's end, closing can't cut anything off, and
             // neither waits on a close notice that a process exiting might never send.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while self.rx.recv_deadline(deadline).is_ok() {}
+            mark("finish: peer's control stream ended");
         }
         drop(self.session.take());
         if let Some(under) = self.under.take() {
             let _ = under.finish();
+            mark("finish: ssh pipe closed");
         }
         r
     }

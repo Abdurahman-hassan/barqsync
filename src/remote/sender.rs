@@ -204,6 +204,7 @@ impl Sender<'_> {
                 self.err(format!("closing data streams failed: {e}"));
             }
             self.send(Msg::SenderDone { errors: self.errors.load(SeqCst) });
+            crate::timing::mark("SenderDone sent");
         }
     }
 
@@ -567,7 +568,10 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
                         }
                     }
                     Ok(Frame::Msg(Msg::Synced { root, files })) => s.spawn(move |_| sender.remove_synced(root, files)),
-                    Ok(Frame::Msg(Msg::ReceiverDone { stats })) => break Ok(stats),
+                    Ok(Frame::Msg(Msg::ReceiverDone { stats })) => {
+                        crate::timing::mark("ReceiverDone received");
+                        break Ok(stats);
+                    }
                     Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
                     Ok(Frame::Msg(Msg::Fatal { msg })) => {
                         out.error(format!("remote: {msg}"));

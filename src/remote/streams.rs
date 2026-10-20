@@ -15,6 +15,7 @@ use super::{Transport, auto, quic};
 use crate::proto::async_io;
 use crate::output::Output;
 use crate::proto::{Conn, Frame, Msg, StreamOffer};
+use crate::timing::mark;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -422,6 +423,7 @@ fn auto_client(conn: &mut Conn, offer: &StreamOffer, want: usize, sending: bool,
         other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected a pong, got {other:?}"))),
     }
     let rtt = started.elapsed();
+    mark(format_args!("auto: pong after {:.1} ms", rtt.as_secs_f64() * 1e3));
     let threshold = auto::threshold();
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     let stay = |conn: &Conn, why: String| -> io::Result<()> {
@@ -439,7 +441,9 @@ fn auto_client(conn: &mut Conn, offer: &StreamOffer, want: usize, sending: bool,
     // again in time.
     let limit = auto::deadline(rtt);
     let tried = Instant::now();
-    match quic::start(offer, Some(rtt)).and_then(|a| a.wait(tried + limit)) {
+    let attempt = quic::start(offer, Some(rtt)).and_then(|a| a.wait(tried + limit));
+    mark(format_args!("auto: QUIC attempt ended ({})", if attempt.is_ok() { "connected" } else { "failed" }));
+    match attempt {
         // A ping that looked long because ssh resent it: QUIC's own measurement decides.
         Ok(session) if !auto::wants_quic(session.min_rtt(), threshold) => {
             stay(conn, format!("{:.1} ms round trip over QUIC ({:.1} ms over ssh)", ms(session.min_rtt()), ms(rtt)))?;
@@ -483,7 +487,10 @@ pub fn setup_client(
                 auto_client(conn, &offer, want, sending, out).map(Some)
             }
             Frame::Msg(Msg::QuicOffer(offer)) => {
-                match quic::connect(&offer) {
+                mark("QUIC: connecting");
+                let session = quic::connect(&offer);
+                mark("QUIC: connect ended");
+                match session {
                     Ok(session) => {
                         conn.msg(Msg::StreamsReady { count: want as u16 })?;
                         if out.verbose() > 1 {
@@ -555,7 +562,9 @@ pub fn setup_server(conn: &mut Conn, transport: Transport, want: usize, sending:
                     Frame::Msg(Msg::Ping) => conn.msg(Msg::Pong)?,
                     Frame::Msg(Msg::StreamsReady { count: 0 }) => return Ok(()),
                     Frame::Msg(Msg::StreamsReady { count }) => {
+                        mark("QUIC: client ready");
                         let session = pending.wait(Duration::from_secs(10))?;
+                        mark("QUIC: session accepted");
                         return quic_switch(conn, session, count as usize, sending);
                     }
                     other => {

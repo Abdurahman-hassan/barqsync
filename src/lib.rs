@@ -17,6 +17,7 @@ pub mod proto;
 pub mod remote;
 pub mod scan;
 pub mod select;
+pub mod timing;
 
 use cli::Options;
 use paths::{Location, parse_location};
@@ -36,6 +37,7 @@ pub mod exit {
 }
 
 pub fn run(opts: Options) -> i32 {
+    timing::init(opts.server);
     proto::async_io::set_enabled(opts.net_io_tokio);
     if opts.server {
         return remote::server::run();

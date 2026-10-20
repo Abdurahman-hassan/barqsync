@@ -957,6 +957,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
                             Ok(())
                         }
                         Msg::SenderDone { errors } => {
+                            crate::timing::mark("SenderDone received");
                             sender_done = Some(errors);
                             Ok(())
                         }
@@ -1007,6 +1008,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
     Stats::add(&engine.stats.errors, sender_errors);
     let stats = engine.stats.snapshot();
     let _ = conn.msg(Msg::ReceiverDone { stats: stats.clone() });
+    crate::timing::mark("ReceiverDone sent");
     let code = if Stats::get(&engine.stats.errors) > 0 { exit::PARTIAL } else { exit::OK };
     (code, stats)
 }

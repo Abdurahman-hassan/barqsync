@@ -7,6 +7,7 @@ use crate::exit;
 use crate::output::{Output, Stats};
 use crate::paths::{Location, parse_location};
 use crate::proto::{Conn, Frame, MAGIC, Msg, VERSION};
+use crate::timing::mark;
 use std::ffi::OsString;
 use std::io;
 use std::process::{Child, Command, Stdio};
@@ -26,10 +27,14 @@ fn spawn_server(opts: &Options, host: &str) -> io::Result<Child> {
     let remote = opts.remote_path.clone().unwrap_or_else(|| "barqsync".to_string());
     let quoted = shlex::try_quote(&remote)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad --remote-path: {e}")))?;
+    let mut command = if opts.net_io_tokio { format!("{quoted} --server --net-io=tokio") } else { format!("{quoted} --server") };
+    if crate::timing::enabled() {
+        command = format!("env {}=1 {command}", crate::timing::VAR);
+    }
     Command::new(program)
         .args(argv)
         .arg(host)
-        .arg(if opts.net_io_tokio { format!("{quoted} --server --net-io=tokio") } else { format!("{quoted} --server") })
+        .arg(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -82,6 +87,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
             return exit::IPC;
         }
     };
+    mark("remote shell started");
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         out.error("remote shell has no stdin/stdout");
         return exit::IPC;
@@ -117,7 +123,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };
     let handshake = conn.msg(hello).map_err(Stop::Io).and_then(|()| recv(&conn));
     match handshake {
-        Ok(Frame::Msg(Msg::HelloAck { .. })) => {}
+        Ok(Frame::Msg(Msg::HelloAck { .. })) => mark("handshake done"),
         Ok(Frame::Msg(Msg::Fatal { msg })) => {
             out.error(format!("remote: {msg}"));
             let _ = child.kill();
@@ -154,6 +160,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     }
 
+    mark("setup done");
     let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));
     let (code, stats) = if server_is_sender {
         let (code, stats) = receiver::run(&conn, opts, dest, out);
@@ -164,8 +171,11 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     if let Some(r) = reporter {
         r.finish(out);
     }
+    mark("transfer done");
     let _ = conn.finish();
+    mark("connection closed");
     let _ = child.wait();
+    mark("remote shell exited");
     out.flush();
     if let Some(s) = stats
         && (opts.stats || opts.verbose > 0)
