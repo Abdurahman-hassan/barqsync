@@ -753,7 +753,7 @@ impl<'a> Engine<'a> {
                     if change.xattr || self.opts.itemize >= 2 {
                         self.out.item(&f.rel, Kind::File, Link::None, change, false);
                     }
-                    self.source_done(f.root, &f.src_path, &f.rel, &f.meta);
+                    self.source_done(f.root, &f.src_path, &f.dst_path, &f.rel, &f.meta);
                     continue;
                 }
                 if leader.is_none() && !self.dry() {
@@ -798,11 +798,14 @@ impl<'a> Engine<'a> {
                 if dst.is_some_and(|d| d.kind == Kind::Dir) && !self.remove_conflicting_dir(&f.dst_path, &f.rel) {
                     continue;
                 }
+                if !self.backup_existing(&f.src_path, &f.dst_path, false) {
+                    continue;
+                }
                 let (dir, name) = split_dst(&f.dst_path);
                 let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&g.leader_dst, tmp))
                     .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, &f.dst_path)));
                 match r {
-                    Ok(()) => self.source_done(f.root, &f.src_path, &f.rel, &f.meta),
+                    Ok(()) => self.source_done(f.root, &f.src_path, &f.dst_path, &f.rel, &f.meta),
                     Err(e) => self.err(path_msg("link \"", &f.dst_path, format!("\" failed: {e}"))),
                 }
             }
@@ -925,7 +928,7 @@ impl<'a> Engine<'a> {
                     match action {
                         FileAction::Skip => {
                             self.out.item(&rel, Kind::File, Link::None, Change::default(), false);
-                            self.source_done(ctx.root, &src_path, &rel, &e.meta);
+                            self.source_done(ctx.root, &src_path, &dst_path, &rel, &e.meta);
                         }
                         FileAction::Attrs(a) => {
                             if a.xattr && self.opts.hard_links && e.meta.nlink > 1 {
@@ -950,7 +953,7 @@ impl<'a> Engine<'a> {
                                     }),
                                     None => {
                                         if self.fix_attrs(&dst_path, &src, a, have) {
-                                            self.source_done(ctx.root, &src_path, &rel, &e.meta);
+                                            self.source_done(ctx.root, &src_path, &dst_path, &rel, &e.meta);
                                         }
                                     }
                                 }
@@ -1207,13 +1210,13 @@ impl<'a> Engine<'a> {
                             let _ = fsops::set_symlink_mtime(dst_path, meta.mtime, meta.mtime_ns);
                         }
                     }
-                    self.source_done(root, src_path, rel, meta);
+                    self.source_done(root, src_path, dst_path, rel, meta);
                     return false;
                 }
             }
             Some(Kind::Dir) if !self.remove_conflicting_dir(dst_path, rel) => return false,
             None if self.alt_symlink(rel, target.as_os_str().as_bytes(), dst_path) => {
-                self.source_done(root, src_path, rel, meta);
+                self.source_done(root, src_path, dst_path, rel, meta);
                 return true;
             }
             _ => {}
@@ -1236,8 +1239,8 @@ impl<'a> Engine<'a> {
         if self.dry() {
             return true;
         }
-        if dst_kind.is_some_and(|k| k != Kind::Dir) {
-            self.backup_existing(dst_path, false);
+        if dst_kind.is_some_and(|k| k != Kind::Dir) && !self.backup_existing(src_path, dst_path, false) {
+            return false;
         }
         let (dir, name) = split_dst(dst_path);
         let res = fsops::with_temp(dir, name, |tmp| std::os::unix::fs::symlink(&target, tmp)).and_then(|(tmp, ())| {
@@ -1258,7 +1261,7 @@ impl<'a> Engine<'a> {
                 {
                     self.err(path_msg("set_xattr \"", dst_path, format!("\" failed: {e}")));
                 }
-                self.source_done(root, src_path, rel, meta)
+                self.source_done(root, src_path, dst_path, rel, meta)
             }
         }
         true
@@ -1277,7 +1280,7 @@ impl<'a> Engine<'a> {
                     self.out.item(rel, meta.kind, Link::None, change, false);
                     let a = AttrDiff { xattr, acl, ..self.rules.attrs_differ(meta, &d) };
                     if !a.any() || self.dry() || self.fix_attrs(dst_path, x, a, have) {
-                        self.source_done(root, src_path, rel, meta);
+                        self.source_done(root, src_path, dst_path, rel, meta);
                     }
                     return false;
                 }
@@ -1289,6 +1292,9 @@ impl<'a> Engine<'a> {
         Stats::add(&self.stats.created, 1);
         if self.dry() {
             return true;
+        }
+        if dst_kind.is_some_and(|k| k != Kind::Dir) && !self.backup_existing(src_path, dst_path, false) {
+            return false;
         }
         let (dir, name) = split_dst(dst_path);
         let res = fsops::with_temp(dir, name, |tmp| fsops::mknod(tmp, meta.kind, meta.mode, meta.rdev)).and_then(
@@ -1310,7 +1316,7 @@ impl<'a> Engine<'a> {
             {
                 self.err(path_msg("set_xattr/set_acl \"", dst_path, format!("\" failed: {e}")));
             }
-            self.source_done(root, src_path, rel, meta);
+            self.source_done(root, src_path, dst_path, rel, meta);
         }
         if let Err(e) = res {
             self.err(path_msg("mknod \"", dst_path, format!("\" failed: {e}")));
@@ -1323,7 +1329,7 @@ impl<'a> Engine<'a> {
     pub(crate) fn attr_job(&self, j: super::pipeline::AttrJob) {
         let x = Src { kind: Kind::File, meta: &j.meta, extra: j.extra.as_deref(), from: XSource::Local(&j.src_path) };
         if self.fix_attrs(&j.dst_path, &x, j.diff, j.have) {
-            self.source_done(j.root, &j.src_path, &j.rel, &j.meta);
+            self.source_done(j.root, &j.src_path, &j.dst_path, &j.rel, &j.meta);
         }
     }
 
@@ -1406,7 +1412,10 @@ impl<'a> Engine<'a> {
             crate::progress::done(job.meta.size);
             return;
         }
-        self.backup_existing_file(job);
+        if !self.backup_existing_file(job) {
+            crate::progress::done(job.meta.size);
+            return;
+        }
         // A big copy moves the progress line as it goes, not only once it is done.
         let (r, counted) = crate::progress::tracking(|| self.write_file(job));
         crate::progress::done(job.meta.size.saturating_sub(counted));

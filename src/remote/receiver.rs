@@ -11,7 +11,7 @@ use crate::cli::Options;
 use crate::checksum::Sum;
 use crate::delta::refine::{self, GapReq, Grain};
 use crate::delta::{self, Delta, DeltaMode, Op, ReadAt, ReadOnce, apply::apply, cdc};
-use crate::entry::{DirEnt, Kind, Meta};
+use crate::entry::{DirEnt, Kind};
 use crate::ids::IdMap;
 use crate::local::extra;
 use crate::local::flags::write_sparse_at;
@@ -182,7 +182,7 @@ enum Held {
     /// Its values haven't been written yet.
     Waiting,
     /// The rest of it is done too: report it once the values are written.
-    Synced(u64, i64),
+    Synced,
     /// Writing the values failed: its source stays.
     Failed,
 }
@@ -259,9 +259,9 @@ impl RemoteState {
         if let Some(k) = hold {
             let mut held = self.held.lock().unwrap();
             match held.remove(&k) {
-                Some(Held::Synced(size, mtime)) if written => {
+                Some(Held::Synced) if written => {
                     drop(held);
-                    self.push_synced(k.0, k.1, size, mtime);
+                    self.push_synced(k.0, k.1);
                 }
                 Some(Held::Waiting) if !written => {
                     held.insert(k, Held::Failed);
@@ -278,7 +278,7 @@ impl RemoteState {
 
     /// `--remove-source-files`: the receiver has this entry; tell the sender (in batches),
     /// or, while it waits for attribute values, once they are written.
-    pub(crate) fn synced(&self, root: u16, rel: &[u8], meta: &Meta) {
+    pub(crate) fn synced(&self, root: u16, rel: &[u8]) {
         {
             let mut held = self.held.lock().unwrap();
             if !held.is_empty() {
@@ -289,20 +289,20 @@ impl RemoteState {
                         return;
                     }
                     Some(h) => {
-                        *h = Held::Synced(meta.size, meta.mtime);
+                        *h = Held::Synced;
                         return;
                     }
                     None => {}
                 }
             }
         }
-        self.push_synced(root, rel.to_vec(), meta.size, meta.mtime);
+        self.push_synced(root, rel.to_vec());
     }
 
-    fn push_synced(&self, root: u16, rel: Vec<u8>, size: u64, mtime: i64) {
+    fn push_synced(&self, root: u16, rel: Vec<u8>) {
         let mut map = self.synced.lock().unwrap();
         let v = map.entry(root).or_default();
-        v.push((rel, size, mtime));
+        v.push(rel);
         if v.len() >= 1000 {
             let files = std::mem::take(v);
             drop(map);
@@ -530,9 +530,12 @@ impl RemoteState {
 
     fn file_begin(&self, eng: &Engine, id: u64, size: u64, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
         let job = self.take_job_with(eng, id, xattrs)?;
+        // Without a backup the file stays as it is; its data is ignored.
+        if !eng.backup_existing_file(&job) {
+            return Ok(());
+        }
         // A whole file is all literal data, as rsync counts it.
         Stats::add(&eng.stats.literal_bytes, size);
-        eng.backup_existing_file(&job);
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let hint = cache::Writer::new(&file, size);
@@ -556,7 +559,9 @@ impl RemoteState {
 
     fn delta_begin(&self, eng: &Engine, id: u64, size: u64, copies: Vec<Op>, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
         let job = self.take_job_with(eng, id, xattrs)?;
-        eng.backup_existing_file(&job);
+        if !eng.backup_existing_file(&job) {
+            return Ok(());
+        }
         let basis = File::open(job.basis_path())?;
         let d = Delta { size, ops: copies };
         let matched: u64 = d.ops.iter().map(Op::len).sum();
@@ -759,8 +764,10 @@ impl RemoteState {
             match self.take_job_with(eng, id, xattrs.remove(&id)) {
                 Ok(job) => {
                     crate::progress::done(job.meta.size);
+                    if !eng.backup_existing_file(&job) {
+                        continue;
+                    }
                     Stats::add(&eng.stats.literal_bytes, len as u64);
-                    eng.backup_existing_file(&job);
                     let (dir, name) = split_dst(&job.dst_path);
                     let tmp = dir.join(fsops::temp_name(name));
                     fsops::register_temp(&tmp);
@@ -815,7 +822,9 @@ impl RemoteState {
     }
 
     fn write_small(&self, eng: &Engine, job: FileJob, bytes: &[u8]) -> io::Result<()> {
-        eng.backup_existing_file(&job);
+        if !eng.backup_existing_file(&job) {
+            return Ok(());
+        }
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let size = bytes.len() as u64;
@@ -1048,101 +1057,101 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     let engine = &engine;
     let remote = engine.remote.as_ref().unwrap();
     let streams = conn.data_streams_in();
-    let (sender_errors, failure) = pool.install(|| {
-        rayon::scope(|s| {
-            {
-                let mut map = remote.slots.lock().unwrap();
-                for (r, slot) in slots {
-                    map.insert((r, Vec::new()), slot);
-                }
+    // Keep blocking protocol coordination on the caller; every configured
+    // worker remains available for finite scan, hash and write tasks.
+    let (sender_errors, failure) = pool.in_place_scope(|s| {
+        {
+            let mut map = remote.slots.lock().unwrap();
+            for (r, slot) in slots {
+                map.insert((r, Vec::new()), slot);
             }
-            let mut streams_ended = 0;
-            let mut sender_done: Option<u64> = None;
-            loop {
-                if let Some(errors) = sender_done
-                    && streams_ended == streams
-                {
-                    break (errors, None);
+        }
+        let mut streams_ended = 0;
+        let mut sender_done: Option<u64> = None;
+        loop {
+            if let Some(errors) = sender_done
+                && streams_ended == streams
+            {
+                break (errors, None);
+            }
+            let frame = match recv(conn) {
+                Ok(f) => f,
+                // After Ctrl-C, which also stops ssh, a closed connection is expected.
+                Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
+                Err(Stop::Io(_)) if fsops::interrupted() => break (0, Some(exit::SIGNAL)),
+                Err(Stop::Io(e)) => {
+                    out.error(format!("connection error: {e}"));
+                    break (0, Some(exit::PROTOCOL));
                 }
-                let frame = match recv(conn) {
-                    Ok(f) => f,
-                    // After Ctrl-C, which also stops ssh, a closed connection is expected.
-                    Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
-                    Err(Stop::Io(_)) if fsops::interrupted() => break (0, Some(exit::SIGNAL)),
-                    Err(Stop::Io(e)) => {
-                        out.error(format!("connection error: {e}"));
+            };
+            let r = match frame {
+                Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
+                Frame::Msg(m) => match m {
+                    Msg::DirBatch { root, dir, rel, entries, sums } => {
+                        remote.on_batch(s, engine, root, dir, rel, entries, sums);
+                        Ok(())
+                    }
+                    Msg::IdNames { users, groups } => {
+                        remote.ids.lock().unwrap().add(&users, &groups);
+                        Ok(())
+                    }
+                    Msg::FileBegin { id, size, xattrs } => remote.file_begin(engine, id, size, xattrs),
+                    Msg::DeltaBegin { id, size, copies, xattrs } => remote.delta_begin(engine, id, size, copies, xattrs),
+                    Msg::Xattrs { id, xattrs } => {
+                        remote.on_xattrs(engine, id, xattrs);
+                        Ok(())
+                    }
+                    Msg::Refine { id, grain, gaps } => {
+                        remote.refine(s, id, grain, gaps);
+                        Ok(())
+                    }
+                    Msg::FileEnd { id, ok } => {
+                        remote.file_end(engine, id, ok);
+                        Ok(())
+                    }
+                    Msg::SmallPack { files, blob, xattrs } => {
+                        remote.acquire_pack();
+                        s.spawn(move |_| {
+                            remote.small_pack(engine, files, blob, xattrs);
+                            remote.release_pack();
+                        });
+                        Ok(())
+                    }
+                    Msg::ScanDone { .. } => {
+                        remote.on_scan_done();
+                        Ok(())
+                    }
+                    Msg::IoError => {
+                        engine.sender_io_error();
+                        Ok(())
+                    }
+                    Msg::SenderDone { errors } => {
+                        crate::timing::mark("SenderDone received");
+                        sender_done = Some(errors);
+                        Ok(())
+                    }
+                    Msg::StreamEnd => {
+                        streams_ended += 1;
+                        Ok(())
+                    }
+                    Msg::Log { stderr, escape, text } => {
+                        out.print_forwarded(stderr, escape, &text);
+                        Ok(())
+                    }
+                    Msg::Fatal { msg } => {
+                        out.error(format!("remote: {msg}"));
                         break (0, Some(exit::PROTOCOL));
                     }
-                };
-                let r = match frame {
-                    Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
-                    Frame::Msg(m) => match m {
-                        Msg::DirBatch { root, dir, rel, entries, sums } => {
-                            remote.on_batch(s, engine, root, dir, rel, entries, sums);
-                            Ok(())
-                        }
-                        Msg::IdNames { users, groups } => {
-                            remote.ids.lock().unwrap().add(&users, &groups);
-                            Ok(())
-                        }
-                        Msg::FileBegin { id, size, xattrs } => remote.file_begin(engine, id, size, xattrs),
-                        Msg::DeltaBegin { id, size, copies, xattrs } => remote.delta_begin(engine, id, size, copies, xattrs),
-                        Msg::Xattrs { id, xattrs } => {
-                            remote.on_xattrs(engine, id, xattrs);
-                            Ok(())
-                        }
-                        Msg::Refine { id, grain, gaps } => {
-                            remote.refine(s, id, grain, gaps);
-                            Ok(())
-                        }
-                        Msg::FileEnd { id, ok } => {
-                            remote.file_end(engine, id, ok);
-                            Ok(())
-                        }
-                        Msg::SmallPack { files, blob, xattrs } => {
-                            remote.acquire_pack();
-                            s.spawn(move |_| {
-                                remote.small_pack(engine, files, blob, xattrs);
-                                remote.release_pack();
-                            });
-                            Ok(())
-                        }
-                        Msg::ScanDone { .. } => {
-                            remote.on_scan_done();
-                            Ok(())
-                        }
-                        Msg::IoError => {
-                            engine.sender_io_error();
-                            Ok(())
-                        }
-                        Msg::SenderDone { errors } => {
-                            crate::timing::mark("SenderDone received");
-                            sender_done = Some(errors);
-                            Ok(())
-                        }
-                        Msg::StreamEnd => {
-                            streams_ended += 1;
-                            Ok(())
-                        }
-                        Msg::Log { stderr, escape, text } => {
-                            out.print_forwarded(stderr, escape, &text);
-                            Ok(())
-                        }
-                        Msg::Fatal { msg } => {
-                            out.error(format!("remote: {msg}"));
-                            break (0, Some(exit::PROTOCOL));
-                        }
-                        other => {
-                            out.error(format!("protocol error: unexpected {other:?}"));
-                            break (0, Some(exit::PROTOCOL));
-                        }
-                    },
-                };
-                if let Err(e) = r {
-                    engine.err(format!("receiving file data failed: {e}"));
-                }
+                    other => {
+                        out.error(format!("protocol error: unexpected {other:?}"));
+                        break (0, Some(exit::PROTOCOL));
+                    }
+                },
+            };
+            if let Err(e) = r {
+                engine.err(format!("receiving file data failed: {e}"));
             }
-        })
+        }
     });
 
     if let Some((index, scan)) = dst_scan {

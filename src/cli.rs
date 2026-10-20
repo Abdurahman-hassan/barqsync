@@ -402,6 +402,10 @@ impl Options {
         if !cli.link_dest.is_empty() && !cli.compare_dest.is_empty() {
             bail!("--link-dest cannot be combined with --compare-dest");
         }
+        // The backup would be the file itself.
+        if cli.backup && cli.backup_dir.is_none() && cli.suffix.as_deref() == Some("") {
+            bail!("--suffix cannot be empty without a --backup-dir");
+        }
         let files_from = match &cli.files_from {
             Some(f) => Some(read_files_from(f, cli.from0)?),
             None => None,
@@ -581,7 +585,7 @@ fn read_files_from(file: &OsString, from0: bool) -> Result<Vec<Vec<u8>>> {
         std::io::stdin().read_to_end(&mut v).context("reading --files-from from stdin")?;
         v
     } else {
-        if let crate::paths::Location::Remote { .. } = crate::paths::parse_location(file) {
+        if let crate::paths::Location::Remote { .. } = crate::paths::parse_location(file)? {
             bail!("a remote --files-from list is not supported");
         }
         std::fs::read(file).with_context(|| format!("failed to open files-from file {}", file.to_string_lossy()))?
@@ -709,6 +713,8 @@ mod tests {
         assert!(o.backup);
         assert_eq!(o.suffix, "");
         assert!(Options::parse_from(["barqsync", "--link-dest=a", "--compare-dest=b", "s", "d"]).is_err());
+        assert!(Options::parse_from(["barqsync", "-b", "--suffix=", "s", "d"]).is_err());
+        assert!(Options::parse_from(["barqsync", "-b", "--suffix=", "--backup-dir=bk", "s", "d"]).is_ok());
     }
 
     #[test]

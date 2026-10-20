@@ -1,0 +1,52 @@
+Review baseline: f9f8d8d87855c3ac8d24c8d852ca6c37a80ecc69 (v0.3.0), 2026-10-20
+macOS 26.6.2 arm64; rustc/cargo 1.92.0; rsync 3.5.1
+
+Protocol probes (in-process UnixStream pair; no external host):
+traversal: exit=0, result=Ok([71, 79, 79, 68])
+missing_data: exit=0, result=Ok([0, 0, 0, 0])
+short_pack: exit=0, result=Ok([])
+delete dry=false remove_source_files=false: exit=0, outside_source_exists=false
+delete dry=true remove_source_files=false: exit=0, outside_source_exists=false
+same_second_source_change: result=Ok(()), exists=false
+fixtures=/var/folders/37/04p3mnrs69v45n39dll6ptz40000gn/T/barqsync-probes-86927
+
+CLI probes (isolated temporary trees; fake SSH runs the server locally):
+{"case": "multiple_roots_delete", "tool": "barqsync", "exit": 0, "stdout": "", "stderr": "", "files": {"dst/beta": "beta", "a/alpha": "alpha", "b/beta": "beta"}}
+{"case": "multiple_roots_delete", "tool": "rsync", "exit": 0, "stdout": "", "stderr": "", "files": {"dst/beta": "beta", "dst/alpha": "alpha", "a/alpha": "alpha", "b/beta": "beta"}}
+{"case": "delete_scan_error", "tool": "barqsync", "exit": 23, "stdout": "", "stderr": "barqsync: symlink has no referent: \"src/keep\"\n", "files": {}}
+{"case": "delete_scan_error", "tool": "rsync", "exit": 23, "stdout": "IO error encountered -- skipping file deletion\n", "stderr": "symlink has no referent: \"/private/var/folders/37/04p3mnrs69v45n39dll6ptz40000gn/T/barqsync-cli-review-hxebimit/delete_scan_error-rsync/src/keep\"\nrsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1412) [sender=3.5.1]\n", "files": {"dst/keep": "VALUABLE"}}
+{"case": "backup_failed", "tool": "barqsync", "exit": 23, "stdout": "", "stderr": "barqsync: make_backup \"dst/f\" failed: Not a directory (os error 20)\n", "files": {"dst/f": "NEW DATA", "dst/blocked": "FILE", "src/f": "NEW DATA"}}
+{"case": "backup_failed", "tool": "rsync", "exit": 11, "stdout": "", "stderr": "Failed to stat blocked/sub: Not a directory\nrsync error: error in file IO (code 11) at main.c(1049) [Receiver=3.5.1]\n", "files": {"dst/f": "OLD", "dst/blocked": "FILE", "src/f": "NEW DATA"}}
+{"case": "same_file_inplace", "tool": "barqsync", "exit": 0, "stdout": "", "stderr": "", "files": {"f": ""}}
+{"case": "same_file_inplace", "tool": "rsync", "exit": 0, "stdout": "", "stderr": "", "files": {"f": "VALUABLE"}}
+{"case": "same_file_remove", "tool": "barqsync", "exit": 0, "stdout": "", "stderr": "", "files": {}}
+{"case": "same_file_remove", "tool": "rsync", "exit": 23, "stdout": "", "stderr": "ERROR: Skipping sender remove of destination file: f\nrsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1412) [sender=3.5.1]\n", "files": {"f": "VALUABLE"}}
+{"case": "remote_threads_1", "timeout": 7}
+{"case": "remote_threads_2", "exit": 0, "stdout": "", "stderr": ""}
+fixtures=/var/folders/37/04p3mnrs69v45n39dll6ptz40000gn/T/barqsync-cli-review-hxebimit
+
+Dependency lookup (OSV querybatch; all registry packages in Cargo.lock):
+{
+  "queried": 203,
+  "results_received": 203,
+  "matches": [
+    {
+      "name": "atomic-polyfill",
+      "version": "1.0.3",
+      "vulns": [
+        {
+          "id": "RUSTSEC-2023-0089",
+          "modified": "2025-04-29T08:31:10Z"
+        }
+      ]
+    }
+  ]
+}
+
+Baseline cargo test --locked --offline: 184 reported passed; 0 failed.
+The 3 real_remote cases returned early with BARQSYNC_TEST_REMOTE unset.
+Linux-only behavior was not validated on macOS.
+The initial sandboxed attempt had 8 socket-permission failures; a rerun with local networking allowed passed.
+cargo clippy --locked --offline --all-targets -- -D warnings: passed.
+Local firewall status read only: disabled; block-all disabled. No firewall setting changed.
+Local debug executable: ad hoc, linker-signed; no TeamIdentifier. No release artifact was inspected.

@@ -51,7 +51,7 @@ use std::thread::JoinHandle;
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 9: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
 /// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
-/// `IoError` (source read errors stop deletions).
+///     `Synced` names entries only; `IoError` (source read errors stop deletions).
 pub const VERSION: u32 = 10;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
@@ -111,8 +111,8 @@ pub struct StreamOffer {
     pub token: [u8; 32],
 }
 
-/// `--remove-source-files`: `(rel, size, mtime)` of entries the receiver now has.
-pub type SyncedFiles = Vec<(Vec<u8>, u64, i64)>;
+/// `--remove-source-files`: paths (relative to the root) of entries the receiver now has.
+pub type SyncedFiles = Vec<Vec<u8>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -186,8 +186,8 @@ pub enum Msg {
     /// The answer to one `DirBatch`: which of its files the receiver wants, and (`-X`)
     /// which entries' attribute values it needs in full to update them in place.
     Need { dir: u32, files: Vec<NeedReq>, xattrs: Vec<u32> },
-    /// `--remove-source-files`: these entries are on the receiver now. `(rel, size, mtime)`
-    /// relative to the root; the sender removes them unless they changed meanwhile.
+    /// `--remove-source-files`: these entries are on the receiver now. The sender removes
+    /// only entries it listed itself, unchanged since by its own record of them.
     Synced { root: u16, files: SyncedFiles },
     ReceiverDone { stats: StatsSnapshot },
 }
