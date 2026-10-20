@@ -53,22 +53,37 @@ pub fn adjust_listing(opts: &Options, dir: &Path, ents: Vec<DirEnt>, err: &mut d
         .collect()
 }
 
-/// `--remove-source-files`: delete an unchanged source using the sender's own
-/// metadata snapshot, never facts provided by the peer. Path confinement and
-/// protection against concurrent directory replacement are separate concerns.
-pub fn remove_source(opts: &Options, path: &Path, expected: &Meta) -> Result<(), Vec<u8>> {
+/// `--remove-source-files`: delete a source entry the receiver now has. `listed` is the
+/// sender's own record of it; an entry that is no longer that file (type, device and
+/// inode) with that size and modification time, to the nanosecond, changed since and
+/// stays. `dst` (local transfers): the destination, which must not be the source itself
+/// (`f f`, or a hard link). Returns the error message on failure.
+pub fn remove_source(opts: &Options, path: &Path, listed: &Meta, dst: Option<&Path>) -> Result<(), Vec<u8>> {
     if !opts.remove_source_files || opts.dry_run {
-        return Err(path_msg("source removal is not authorized: ", path, ""));
+        return Err(path_msg("ERROR: Skipping sender remove (not requested): ", path, ""));
     }
-    let cur = if opts.copy_links { fsops::stat(path) } else { fsops::lstat(path) };
-    match cur {
+    let cur = match if opts.copy_links { fsops::stat(path) } else { fsops::lstat(path) } {
         Ok(c) if c.kind == Kind::Dir => return Err(path_msg("sender failed to remove ", path, ": Is a directory")),
-        Ok(c) if (c.kind, c.dev, c.ino, c.size, c.mtime, c.mtime_ns)
-            == (expected.kind, expected.dev, expected.ino, expected.size, expected.mtime, expected.mtime_ns) => {}
-        Ok(_) => return Err(path_msg("ERROR: Skipping sender remove for changed file: ", path, "")),
+        Ok(c) => c,
         Err(e) => return Err(path_msg("sender failed to remove ", path, format!(": {e}"))),
+    };
+    if dst.is_some_and(|d| fsops::lstat(d).is_ok_and(|d| fsops::same_file(&cur, &d))) {
+        return Err(path_msg("ERROR: Skipping sender remove of destination file: ", path, ""));
+    }
+    let unchanged = (cur.kind, cur.size, cur.mtime, cur.mtime_ns) == (listed.kind, listed.size, listed.mtime, listed.mtime_ns)
+        && fsops::same_file(&cur, listed);
+    if !unchanged {
+        return Err(path_msg("ERROR: Skipping sender remove for changed file: ", path, ""));
     }
     fs::remove_file(path).map_err(|e| path_msg("sender failed to remove ", path, format!(": {e}")))
+}
+
+/// Whether `a` and `b` name the same directory entry (the same name in the same
+/// directory), not merely the same file.
+fn same_entry(a: &Path, b: &Path) -> bool {
+    let (da, na) = split_dst(a);
+    let (db, nb) = split_dst(b);
+    na == nb && matches!((fsops::stat(da), fsops::stat(db)), (Ok(x), Ok(y)) if fsops::same_file(&x, &y))
 }
 
 /// Write `buf` at `off`, skipping 4 KiB blocks of zeros so they become holes (`-S`).
@@ -123,21 +138,6 @@ pub(crate) enum AltFile {
 }
 
 impl Engine<'_> {
-    /// Local sources and destinations share an inode namespace. Remote source
-    /// paths are display paths, so their dev/ino values must never be compared
-    /// with this machine's filesystem identities.
-    pub(crate) fn check_distinct(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        if self.remote.is_some() {
-            return Ok(());
-        }
-        let source = if self.opts.copy_links { fsops::stat(src)? } else { fsops::lstat(src)? };
-        match fsops::lstat(dst) {
-            Ok(destination) => fsops::ensure_distinct(&source, &destination),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Record the destination directory and resolve the directories that are relative
     /// to it (`--link-dest`, `--compare-dest`, `--backup-dir`).
     pub fn set_dest(&mut self, dest_root: &Path) {
@@ -257,9 +257,11 @@ impl Engine<'_> {
                     Stats::add(&self.stats.created, 1);
                 }
                 if !self.dry() {
+                    if !self.backup_existing(src_path, dst_path, false) {
+                        return AltFile::Done;
+                    }
                     let (dir, name) = split_dst(dst_path);
-                    let r = self.backup_if_present(dst_path, false)
-                        .and_then(|()| fsops::with_temp(dir, name, |tmp| fs::hard_link(&p, tmp)))
+                    let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&p, tmp))
                         .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, dst_path)));
                     if let Err(e) = r {
                         self.err(path_msg("link \"", dst_path, format!("\" failed: {e}")));
@@ -268,7 +270,8 @@ impl Engine<'_> {
                 }
             } else {
                 self.out.item(rel, Kind::File, Link::None, Change::default(), false);
-                if dst_meta.is_some() && !self.dry()
+                if dst_meta.is_some()
+                    && !self.dry()
                     && let Err(e) = self.remove_or_backup(dst_path)
                 {
                     self.err(path_msg("remove \"", dst_path, format!("\" failed: {e}")));
@@ -285,6 +288,10 @@ impl Engine<'_> {
             self.out.item(rel, Kind::File, Link::None, change, true);
             if dst_meta.is_none() {
                 Stats::add(&self.stats.created, 1);
+            }
+            if !self.dry() && !self.backup_existing(src_path, dst_path, false) {
+                self.not_written(x);
+                return AltFile::Done;
             }
             if !self.dry()
                 && let Err(e) = self.copy_alt(&p, dst_path, x)
@@ -305,7 +312,6 @@ impl Engine<'_> {
 
     /// Copy an alt-dest file with identical data into place, with the source's attributes.
     fn copy_alt(&self, alt: &Path, dst_path: &Path, x: &Src) -> io::Result<()> {
-        self.backup_if_present(dst_path, false)?;
         let src = x.meta;
         let mode = self.new_mode(src);
         let (uid, gid) = (self.rules.wanted_uid(src), self.rules.wanted_gid(src));
@@ -420,18 +426,16 @@ impl Engine<'_> {
     // --remove-source-files
     // -----------------------------------------------------------------------
 
-    /// The receiver has this entry: with `--remove-source-files`, the sender removes it.
+    /// The receiver has this entry (now at `dst_path`): with `--remove-source-files`, the
+    /// sender removes it.
     pub(crate) fn source_done(&self, root: u16, src_path: &Path, dst_path: &Path, rel: &[u8], meta: &Meta) {
         if !self.opts.remove_source_files || self.dry() {
             return;
         }
         if let Some(r) = &self.remote {
-            return r.synced(root, rel, meta);
+            return r.synced(root, rel);
         }
-        if let Err(e) = self.check_distinct(src_path, dst_path) {
-            return self.err(path_msg("sender failed to remove ", src_path, format!(": {e}")));
-        }
-        match remove_source(self.opts, src_path, meta) {
+        match remove_source(self.opts, src_path, meta, Some(dst_path)) {
             Ok(()) if self.out.verbose() >= 2 => self.out.info([b"sender removed ", rel].concat()),
             Ok(()) => {}
             Err(m) => self.err(m),
@@ -460,20 +464,33 @@ impl Engine<'_> {
             && name.as_bytes().ends_with(self.opts.suffix.as_bytes())
     }
 
-    fn prepare_backup(&self, dst: &Path) -> io::Result<PathBuf> {
+    /// Where `dst` (as `d`) is backed up. It must not be `dst` itself (an empty `--suffix`
+    /// with a `--backup-dir` leading back to its directory) or `src` (`-b f~ f`), which
+    /// the backup would replace. `Ok((b, true))`: `b` is a hard link to `dst` already.
+    fn backup_target(&self, dst: &Path, d: &Meta, src: Option<&Path>) -> io::Result<(PathBuf, bool)> {
         let b = self.backup_path(dst);
-        let original = fsops::lstat(dst)?;
-        match fsops::lstat(&b) {
-            Ok(backup) => fsops::ensure_distinct(&original, &backup)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        let bm = match fsops::lstat(&b) {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
+        };
+        let linked = bm.is_some_and(|bm| fsops::same_file(d, &bm));
+        if linked && same_entry(dst, &b) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "the backup would replace the file itself"));
+        }
+        // A remote source's path means nothing on this machine.
+        let is_src = |s: &Path, bm: &Meta| [fsops::lstat(s), fsops::stat(s)].into_iter().flatten().any(|m| fsops::same_file(&m, bm));
+        if let (Some(bm), Some(src), None) = (bm, src, &self.remote)
+            && is_src(src, &bm)
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "the backup would replace the source file"));
         }
         if self.backup_root.is_some()
             && let Some(parent) = b.parent()
         {
             fs::create_dir_all(parent)?;
         }
-        Ok(b)
+        Ok((b, linked))
     }
 
     fn report_backup(&self, dst: &Path, b: &Path) {
@@ -484,67 +501,80 @@ impl Engine<'_> {
         }
     }
 
-    /// `--backup` before `dst` is replaced: keep the old version under its backup name.
-    /// It is hard-linked (or copied, with `copy` or across filesystems), so `dst` stays in
-    /// place until the new version is renamed over it.
-    pub(crate) fn backup_existing(&self, dst: &Path, copy: bool) -> io::Result<()> {
+    /// `--backup` before `dst` is replaced by a copy of `src`: keep the old version under
+    /// its backup name. It is hard-linked (or copied, with `copy` or across filesystems),
+    /// so `dst` stays in place until the new version is renamed over it. The backup is
+    /// made under a temp name and renamed over the previous one, which a failure leaves
+    /// as it was. Returns false, after reporting why, when there is no backup: `dst` must
+    /// then not be replaced.
+    pub(crate) fn backup_existing(&self, src: &Path, dst: &Path, copy: bool) -> bool {
         if !self.opts.backup || self.dry() {
-            return Ok(());
+            return true;
         }
-        let b = self.prepare_backup(dst)?;
-        let m = fsops::lstat(dst)?;
-        let (dir, name) = split_dst(&b);
-        // Keep the previous backup until its replacement has been fully made.
-        let (tmp, ()) = fsops::with_temp(dir, name, |tmp| {
-            if !copy && fs::hard_link(dst, tmp).is_ok() {
-                return Ok(());
+        match self.make_backup(src, dst, copy) {
+            Ok(()) => true,
+            Err(e) => {
+                self.err(path_msg("make_backup \"", dst, format!("\" failed: {e}")));
+                false
             }
-            match m.kind {
-                Kind::File => {
-                    let source = File::open(dst)?;
-                    let target = fsops::create_new(tmp, m.mode)?;
-                    io::copy(&mut &source, &mut &target)?;
-                    fsops::fchmod(&target, m.mode)?;
-                    fsops::set_fd_mtime(&target, m.mtime, m.mtime_ns)?;
-                    if self.opts.fsync {
-                        target.sync_all()?;
-                    }
+        }
+    }
+
+    fn make_backup(&self, src: &Path, dst: &Path, copy: bool) -> io::Result<()> {
+        let d = match fsops::lstat(dst) {
+            Ok(d) if d.kind != Kind::Dir => d,
+            // Nothing to keep (a directory in the way is the caller's to deal with).
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let (b, linked) = self.backup_target(dst, &d, Some(src))?;
+        // `copy`: `dst` is rewritten in place, which a hard link would see.
+        if !linked || copy {
+            let (dir, name) = split_dst(&b);
+            let (tmp, ()) = fsops::with_temp(dir, name, |tmp| {
+                if !copy && fs::hard_link(dst, tmp).is_ok() {
+                    return Ok(());
                 }
-                Kind::Symlink => std::os::unix::fs::symlink(fs::read_link(dst)?, tmp)?,
-                Kind::Fifo | Kind::CharDev | Kind::BlockDev => fsops::mknod(tmp, m.kind, m.mode, m.rdev)?,
-                _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported backup file type")),
-            }
-            Ok(())
-        })?;
-        finish_temp(&tmp, fsops::check_interrupt().and_then(|()| fs::rename(&tmp, &b)))?;
+                match d.kind {
+                    Kind::File => {
+                        drop(fsops::copy_new(dst, tmp, d.size, !self.opts.no_clone, d.mode)?);
+                        fsops::chmod(tmp, d.mode)?;
+                        fsops::set_mtime(tmp, d.mtime, d.mtime_ns)?;
+                        if self.opts.fsync {
+                            fsops::fsync_path(tmp)?;
+                        }
+                        Ok(())
+                    }
+                    Kind::Symlink => std::os::unix::fs::symlink(fs::read_link(dst)?, tmp),
+                    kind => fsops::mknod(tmp, kind, d.mode, d.rdev),
+                }
+            })?;
+            // Interrupted: the previous backup stays.
+            finish_temp(&tmp, fsops::check_interrupt().and_then(|()| fs::rename(&tmp, &b)))?;
+        }
         self.report_backup(dst, &b);
         Ok(())
     }
 
-    pub(crate) fn backup_existing_file(&self, job: &FileJob) -> io::Result<()> {
-        self.backup_if_present(&job.dst_path, self.opts.inplace)
+    /// [`Engine::backup_existing`] for a file about to be rewritten.
+    pub(crate) fn backup_existing_file(&self, job: &FileJob) -> bool {
+        self.backup_existing(&job.src_path, &job.dst_path, self.opts.inplace)
     }
 
-    /// Recheck at replacement time; the planning snapshot may be stale.
-    pub(crate) fn backup_if_present(&self, dst: &Path, copy: bool) -> io::Result<()> {
-        if !self.opts.backup || self.dry() {
-            return Ok(());
-        }
-        match fsops::lstat(dst) {
-            Ok(m) if m.kind != Kind::Dir => self.backup_existing(dst, copy),
-            Ok(_) => Err(io::Error::new(io::ErrorKind::IsADirectory, "cannot back up a directory as a file")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Remove a non-directory, or with `--backup` move it to its backup name.
+    /// Remove a non-directory, or with `--backup` move it to its backup name (replacing
+    /// an older backup only once it is there).
     pub(crate) fn remove_or_backup(&self, path: &Path) -> io::Result<()> {
         if !self.opts.backup {
             return fs::remove_file(path);
         }
-        let b = self.prepare_backup(path)?;
-        fs::rename(path, &b)?;
+        let (b, linked) = self.backup_target(path, &fsops::lstat(path)?, None)?;
+        if linked {
+            // The backup holds this version already; renaming a link over itself does nothing.
+            fs::remove_file(path)?;
+        } else {
+            fs::rename(path, &b)?;
+        }
         self.report_backup(path, &b);
         Ok(())
     }

@@ -23,8 +23,8 @@ use crate::output::{Output, StatsSnapshot, path_msg};
 use crate::paths::{join_rel, split_source, wants_contents};
 use crate::proto::{self, Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
 use rayon::Scope;
-use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -50,19 +50,16 @@ struct Sender<'a> {
     reported: AtomicU64,
     /// Ids already named to the receiver (no `--numeric-ids`).
     ids: Mutex<ids::Sent>,
-    /// Sender-owned deletion authority. Peer-supplied paths and timestamps are
-    /// never used to resolve a file or decide whether it is unchanged.
-    removals: Mutex<RemovalLedger>,
+    /// Each root's base directory (`--remove-source-files` paths are relative to it).
+    bases: Vec<PathBuf>,
+    /// `--remove-source-files`: the entries listed so far and not yet removed, by root and
+    /// path, as they were listed. The receiver names what it has; only these may go, and
+    /// whether they changed meanwhile is judged by this record.
+    removable: Mutex<HashMap<(u16, Vec<u8>), Meta>>,
     /// `-X`: which attribute names are sent.
     xrules: Rules,
     /// Deltas waiting for the receiver's answer to a `Refine`: file id -> where it goes.
     refining: Mutex<HashMap<u64, crossbeam_channel::Sender<Vec<GapSig>>>>,
-}
-
-#[derive(Default)]
-struct RemovalLedger {
-    entries: HashMap<(u16, Vec<u8>), (PathBuf, Meta)>,
-    acknowledged: HashSet<(u16, Vec<u8>)>,
 }
 
 /// A source argument resolved on disk.
@@ -90,10 +87,10 @@ impl Sender<'_> {
     fn send_listing(&self, root: u16, rel: Vec<u8>, path: PathBuf, entries: Vec<DirEnt>) {
         let sums = if self.opts.checksum { self.checksums(&path, &entries) } else { Vec::new() };
         let dir = self.next_dir.fetch_add(1, SeqCst);
-        if self.opts.remove_source_files && !self.opts.dry_run {
-            let mut ledger = self.removals.lock().unwrap();
+        if self.removes() {
+            let mut removable = self.removable.lock().unwrap();
             for e in entries.iter().filter(|e| e.meta.kind != Kind::Dir) {
-                ledger.entries.insert((root, join_rel(&rel, &e.name)), (path.join(&e.name), e.meta));
+                removable.insert((root, join_rel(&rel, &e.name)), e.meta);
             }
         }
         self.listings.lock().unwrap().insert(dir, (path, entries.clone()));
@@ -214,30 +211,25 @@ impl Sender<'_> {
         }
     }
 
-    /// Record acknowledgements only for entries this sender actually listed.
-    /// Deletion waits for successful session completion so an acknowledgement
-    /// cannot race outstanding data or deferred metadata work.
-    fn remove_synced(&self, root: u16, files: SyncedFiles) {
-        if !self.opts.remove_source_files || self.opts.dry_run {
-            return self.err("protocol error: source removal is not authorized");
-        }
-        let mut ledger = self.removals.lock().unwrap();
-        for (rel, _, _) in files {
-            let key = (root, rel);
-            if !ledger.entries.contains_key(&key) {
-                self.err("protocol error: source acknowledgement for an unlisted entry");
-            } else if !ledger.acknowledged.insert(key) {
-                self.err("protocol error: duplicate source acknowledgement");
-            }
-        }
+    /// Whether the receiver may report entries for removal (`Synced`).
+    fn removes(&self) -> bool {
+        self.opts.remove_source_files && !self.opts.dry_run
     }
 
-    fn finish_removals(&self) {
-        let ledger = std::mem::take(&mut *self.removals.lock().unwrap());
-        for key in ledger.acknowledged {
-            let (path, meta) = &ledger.entries[&key];
-            match remove_source(self.opts, path, meta) {
-                Ok(()) if self.out.verbose() >= 2 => self.out.info([&b"sender removed "[..], &key.1].concat()),
+    /// `--remove-source-files`: the receiver has these entries now. Each must be one this
+    /// run listed and hasn't removed yet; anything else is an error and stays.
+    fn remove_synced(&self, root: u16, files: SyncedFiles) {
+        for rel in files {
+            let key = (root, rel);
+            let listed = self.removable.lock().unwrap().remove(&key);
+            let rel = key.1;
+            let (Some(listed), Some(base)) = (listed, self.bases.get(root as usize)) else {
+                self.err([&b"protocol error: removal of an entry not sent or already removed: "[..], &rel].concat());
+                continue;
+            };
+            let path = base.join(OsStr::from_bytes(&rel));
+            match remove_source(self.opts, &path, &listed, None) {
+                Ok(()) if self.out.verbose() >= 2 => self.out.info([&b"sender removed "[..], &rel].concat()),
                 Ok(()) => {}
                 Err(m) => self.err(m),
             }
@@ -633,7 +625,8 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         errors,
         reported: AtomicU64::new(0),
         ids: Mutex::new(ids::Sent::default()),
-        removals: Mutex::new(RemovalLedger::default()),
+        bases: roots.iter().map(|r| r.base.clone()).collect(),
+        removable: Mutex::new(HashMap::new()),
         xrules: extra::rules(opts),
         refining: Mutex::new(HashMap::new()),
     };
@@ -674,7 +667,13 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
                         let _ = tx.send(gaps);
                     }
                 }
-                Ok(Frame::Msg(Msg::Synced { root, files })) => sender.remove_synced(root, files),
+                Ok(Frame::Msg(Msg::Synced { root, files })) if sender.removes() => {
+                    s.spawn(move |_| sender.remove_synced(root, files))
+                }
+                Ok(Frame::Msg(Msg::Synced { .. })) => {
+                    out.error("protocol error: source removal without --remove-source-files, or in a dry run");
+                    break Err(exit::PROTOCOL);
+                }
                 Ok(Frame::Msg(Msg::ReceiverDone { stats })) => {
                     crate::timing::mark("ReceiverDone received");
                     if !sender.done_sent.load(SeqCst) {
@@ -706,12 +705,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
     });
     match result {
         Ok(stats) => {
-            // Fail closed: a partial transfer leaves every source available for
-            // retry. The peer's `(size, mtime)` fields carry no deletion authority.
-            if stats.errors() == 0 && sender.errors.load(SeqCst) == 0 {
-                sender.finish_removals();
-            }
-            // Report removal errors and forwarded output before the pull closes.
+            // The scope has waited for the removals; their output went out before this.
             if report_removals {
                 let errors = sender.errors.load(SeqCst) - sender.reported.load(SeqCst);
                 sender.send(Msg::RemovalsDone { errors });
