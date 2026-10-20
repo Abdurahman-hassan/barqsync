@@ -274,6 +274,13 @@ fn is_item_line(l: &[u8]) -> bool {
 }
 
 pub fn run(cmd: &mut Command, cwd: &Path) -> RunOut {
+    // `--transport auto` remembers hosts (unreachable, or clean): every run starts without
+    // that memory unless its test keeps one, and the user's own is left alone.
+    let _cache = (!cmd.get_envs().any(|(k, _)| k == "BARQSYNC_CACHE_DIR")).then(|| {
+        let dir = tempfile::tempdir().expect("cache dir");
+        cmd.env("BARQSYNC_CACHE_DIR", dir.path());
+        dir
+    });
     let o = cmd.current_dir(cwd).output().expect("spawn");
     RunOut {
         code: o.status.code().unwrap_or(-1),

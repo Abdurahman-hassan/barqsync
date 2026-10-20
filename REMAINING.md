@@ -31,13 +31,13 @@ protocol change, so this can ship as **0.3.1**.
    on both Macs, then run `barqsync -av --streams 4 big/ user@mac:big/`. Expect "using 4
    streams through ssh". The relay reaches the listener over loopback, which the macOS
    firewall shouldn't filter. If it does, the relay tries the advertised address next.
-3. **Two local branches were never pushed:** `feat/quic-close-cost` (9 commits: QUIC setup and
-   close cost about three round trips lower; `--transport auto` remembers hosts with a
-   clean link) and `fix/pull-remove-source-logs` on top of it (a pull with
-   `--remove-source-files` now prints rsync's "sender removed" lines and exits 23 when a
-   removal fails). Both now conflict with `main` in `src/proto/mod.rs`, `src/lib.rs`,
-   `bench/net/net_bench.sh` and the two docs, so they need merging with `main` (the
-   protocol number too), testing on both systems and a PR.
+3. **Review and merge PR 12:** `feat/quic-close-cost` (QUIC setup and close cost about three
+   round trips lower; `--transport auto` remembers hosts with a clean link) and
+   `fix/pull-remove-source-logs` on top of it (a pull with `--remove-source-files` now
+   prints rsync's "sender removed" lines and exits 23 when a removal fails), merged with
+   `main` as M19. Its `RemovalsDone` message makes the protocol 10, so a release that
+   includes it can't talk to 0.3.x: release 0.3.1 from `main` before merging it, or make the
+   next release 0.4.0 (and update the README's "0.3.x uses protocol 9").
 4. **Clean up branches:** `feat/zen-lamport-e84742` holds one README commit from before the
    README rewrite (obsolete). The merged PR branches can go too.
 
@@ -67,8 +67,9 @@ protocol change, so this can ship as **0.3.1**.
 - Daemon mode (`rsync://`) and the single-argument listing mode.
 - NFS isn't tested (no server); cold-cache benchmarks need `sudo purge`/`drop_caches`.
 - No benchmark on a real LAN yet: the real-host runs were over Tailscale across the internet.
-- Worth trying: making `--transport auto` the default once it can tell clean long links
-  from lossy ones; a cheaper adaptive probe (`--strategy adaptive` costs 4–22% on
+- Worth trying: making `--transport auto` the default (with PR 12 it tells clean long links
+  from lossy ones after a transfer; it still opens a UDP port on every server and hasn't met
+  a fast real long link); a cheaper adaptive probe (`--strategy adaptive` costs 4–22% on
   incompressible data); a refinement threshold set from the measured round trip.
 
 ### Outside barqsync (the Mac-to-Mac setup)
