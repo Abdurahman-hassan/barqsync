@@ -47,4 +47,3 @@ pub fn fake_ssh(dir: &Path) {
     fs::write(&path, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n").unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
-
