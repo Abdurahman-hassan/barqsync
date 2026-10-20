@@ -141,6 +141,19 @@ pub fn stat(path: &Path) -> io::Result<Meta> {
     Ok(Meta::from_metadata(&fs::metadata(path)?))
 }
 
+/// Refuse operations whose source and destination name the same inode. Compare
+/// metadata obtained from open descriptors at the destructive operation too.
+pub fn ensure_distinct(src: &Meta, dst: &Meta) -> io::Result<()> {
+    if (src.dev, src.ino) == (dst.dev, dst.ino) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "source and destination are the same file"));
+    }
+    Ok(())
+}
+
+pub fn ensure_distinct_files(src: &File, dst: &File) -> io::Result<()> {
+    ensure_distinct(&Meta::from_metadata(&src.metadata()?), &Meta::from_metadata(&dst.metadata()?))
+}
+
 /// Read a directory and `lstat` every child. Entries that vanish between `readdir`
 /// and `lstat` are skipped, matching rsync's behaviour for files deleted mid-scan.
 ///
@@ -456,7 +469,11 @@ fn read_full(mut f: &File, buf: &mut [u8]) -> io::Result<usize> {
 /// Overwrite an existing file in place with `src`, expected to be `size` bytes (for `--inplace`).
 pub fn copy_into_existing(src: &Path, dst: &Path, size: u64) -> io::Result<()> {
     let s = File::open(src)?;
-    let d = fs::OpenOptions::new().write(true).truncate(true).open(dst)?;
+    // Opening with O_TRUNC would destroy the source before checking hard-link or
+    // symlink aliases. Check the exact descriptors that will be read and written.
+    let d = fs::OpenOptions::new().write(true).open(dst)?;
+    ensure_distinct_files(&s, &d)?;
+    d.set_len(0)?;
     copy_buffered(&s, &d, size)?;
     Ok(())
 }
