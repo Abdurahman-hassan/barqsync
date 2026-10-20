@@ -78,7 +78,9 @@ impl Sender<'_> {
     }
 
     fn send(&self, m: Msg) {
-        let _ = self.out_frames.msg(m);
+        if let Err(e) = self.out_frames.msg(m) {
+            self.err(format!("sending protocol message failed: {e}"));
+        }
     }
 
     /// Register a listing and send it. Registered first, so a quick `Need` finds it.
@@ -648,55 +650,58 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
     };
     let sender = &sender;
     let roots = &roots;
-    let result = pool.install(|| {
-        rayon::scope(|s| {
-            s.spawn(move |_| {
-                rayon::scope(|ws| sender.walk_roots(ws, roots));
-                sender.send(Msg::ScanDone { dirs: sender.next_dir.load(SeqCst) });
-                sender.scan_done.store(true, SeqCst);
-                sender.check_done();
-            });
-            let r = loop {
-                match recv(conn) {
-                    Ok(Frame::Msg(Msg::Need { dir, files, xattrs })) => s.spawn(move |s| sender.serve(s, dir, files, xattrs)),
-                    Ok(Frame::Msg(Msg::Refined { id, gaps })) => {
-                        if let Some(tx) = sender.refining.lock().unwrap().remove(&id) {
-                            let _ = tx.send(gaps);
-                        }
-                    }
-                    Ok(Frame::Msg(Msg::Synced { root, files })) if sender.removes() => {
-                        s.spawn(move |_| sender.remove_synced(root, files))
-                    }
-                    Ok(Frame::Msg(Msg::Synced { .. })) => {
-                        out.error("protocol error: source removal without --remove-source-files, or in a dry run");
-                        break Err(exit::PROTOCOL);
-                    }
-                    Ok(Frame::Msg(Msg::ReceiverDone { stats })) => {
-                        crate::timing::mark("ReceiverDone received");
-                        break Ok(stats);
-                    }
-                    Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
-                    Ok(Frame::Msg(Msg::Fatal { msg })) => {
-                        out.error(format!("remote: {msg}"));
-                        break Err(exit::PROTOCOL);
-                    }
-                    Ok(other) => {
-                        out.error(format!("protocol error: unexpected {other:?}"));
-                        break Err(exit::PROTOCOL);
-                    }
-                    // After Ctrl-C, which also stops ssh, a closed connection is expected.
-                    Err(Stop::Interrupted) => break Err(exit::SIGNAL),
-                    Err(Stop::Io(_)) if fsops::interrupted() => break Err(exit::SIGNAL),
-                    Err(Stop::Io(e)) => {
-                        out.error(format!("connection error: {e}"));
-                        break Err(exit::PROTOCOL);
+    // Keep blocking protocol coordination on the caller; every configured
+    // worker remains available for finite scan, hash and write tasks.
+    let result = pool.in_place_scope(|s| {
+        s.spawn(move |_| {
+            rayon::scope(|ws| sender.walk_roots(ws, roots));
+            sender.send(Msg::ScanDone { dirs: sender.next_dir.load(SeqCst) });
+            sender.scan_done.store(true, SeqCst);
+            sender.check_done();
+        });
+        let r = loop {
+            match recv(conn) {
+                Ok(Frame::Msg(Msg::Need { dir, files, xattrs })) => s.spawn(move |s| sender.serve(s, dir, files, xattrs)),
+                Ok(Frame::Msg(Msg::Refined { id, gaps })) => {
+                    if let Some(tx) = sender.refining.lock().unwrap().remove(&id) {
+                        let _ = tx.send(gaps);
                     }
                 }
-            };
-            // Release deltas still waiting for an answer that won't come.
-            sender.refining.lock().unwrap().clear();
-            r
-        })
+                Ok(Frame::Msg(Msg::Synced { root, files })) if sender.removes() => {
+                    s.spawn(move |_| sender.remove_synced(root, files))
+                }
+                Ok(Frame::Msg(Msg::Synced { .. })) => {
+                    out.error("protocol error: source removal without --remove-source-files, or in a dry run");
+                    break Err(exit::PROTOCOL);
+                }
+                Ok(Frame::Msg(Msg::ReceiverDone { stats })) => {
+                    crate::timing::mark("ReceiverDone received");
+                    if !sender.done_sent.load(SeqCst) {
+                        sender.err("protocol error: receiver completed before the sender");
+                    }
+                    break Ok(stats);
+                }
+                Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
+                Ok(Frame::Msg(Msg::Fatal { msg })) => {
+                    out.error(format!("remote: {msg}"));
+                    break Err(exit::PROTOCOL);
+                }
+                Ok(other) => {
+                    out.error(format!("protocol error: unexpected {other:?}"));
+                    break Err(exit::PROTOCOL);
+                }
+                // After Ctrl-C, which also stops ssh, a closed connection is expected.
+                Err(Stop::Interrupted) => break Err(exit::SIGNAL),
+                Err(Stop::Io(_)) if fsops::interrupted() => break Err(exit::SIGNAL),
+                Err(Stop::Io(e)) => {
+                    out.error(format!("connection error: {e}"));
+                    break Err(exit::PROTOCOL);
+                }
+            }
+        };
+        // Release deltas still waiting for an answer that won't come.
+        sender.refining.lock().unwrap().clear();
+        r
     });
     match result {
         Ok(stats) => {

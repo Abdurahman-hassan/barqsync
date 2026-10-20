@@ -1052,97 +1052,97 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     let engine = &engine;
     let remote = engine.remote.as_ref().unwrap();
     let streams = conn.data_streams_in();
-    let (sender_errors, failure) = pool.install(|| {
-        rayon::scope(|s| {
-            {
-                let mut map = remote.slots.lock().unwrap();
-                for (r, slot) in slots {
-                    map.insert((r, Vec::new()), slot);
-                }
+    // Keep blocking protocol coordination on the caller; every configured
+    // worker remains available for finite scan, hash and write tasks.
+    let (sender_errors, failure) = pool.in_place_scope(|s| {
+        {
+            let mut map = remote.slots.lock().unwrap();
+            for (r, slot) in slots {
+                map.insert((r, Vec::new()), slot);
             }
-            let mut streams_ended = 0;
-            let mut sender_done: Option<u64> = None;
-            loop {
-                if let Some(errors) = sender_done
-                    && streams_ended == streams
-                {
-                    break (errors, None);
+        }
+        let mut streams_ended = 0;
+        let mut sender_done: Option<u64> = None;
+        loop {
+            if let Some(errors) = sender_done
+                && streams_ended == streams
+            {
+                break (errors, None);
+            }
+            let frame = match recv(conn) {
+                Ok(f) => f,
+                // After Ctrl-C, which also stops ssh, a closed connection is expected.
+                Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
+                Err(Stop::Io(_)) if fsops::interrupted() => break (0, Some(exit::SIGNAL)),
+                Err(Stop::Io(e)) => {
+                    out.error(format!("connection error: {e}"));
+                    break (0, Some(exit::PROTOCOL));
                 }
-                let frame = match recv(conn) {
-                    Ok(f) => f,
-                    // After Ctrl-C, which also stops ssh, a closed connection is expected.
-                    Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
-                    Err(Stop::Io(_)) if fsops::interrupted() => break (0, Some(exit::SIGNAL)),
-                    Err(Stop::Io(e)) => {
-                        out.error(format!("connection error: {e}"));
+            };
+            let r = match frame {
+                Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
+                Frame::Msg(m) => match m {
+                    Msg::DirBatch { root, dir, rel, entries, sums } => {
+                        remote.on_batch(s, engine, root, dir, rel, entries, sums);
+                        Ok(())
+                    }
+                    Msg::IdNames { users, groups } => {
+                        remote.ids.lock().unwrap().add(&users, &groups);
+                        Ok(())
+                    }
+                    Msg::FileBegin { id, size, xattrs } => remote.file_begin(engine, id, size, xattrs),
+                    Msg::DeltaBegin { id, size, copies, xattrs } => remote.delta_begin(engine, id, size, copies, xattrs),
+                    Msg::Xattrs { id, xattrs } => {
+                        remote.on_xattrs(engine, id, xattrs);
+                        Ok(())
+                    }
+                    Msg::Refine { id, grain, gaps } => {
+                        remote.refine(s, id, grain, gaps);
+                        Ok(())
+                    }
+                    Msg::FileEnd { id, ok } => {
+                        remote.file_end(engine, id, ok);
+                        Ok(())
+                    }
+                    Msg::SmallPack { files, blob, xattrs } => {
+                        remote.acquire_pack();
+                        s.spawn(move |_| {
+                            remote.small_pack(engine, files, blob, xattrs);
+                            remote.release_pack();
+                        });
+                        Ok(())
+                    }
+                    Msg::ScanDone { .. } => {
+                        remote.on_scan_done();
+                        Ok(())
+                    }
+                    Msg::SenderDone { errors } => {
+                        crate::timing::mark("SenderDone received");
+                        sender_done = Some(errors);
+                        Ok(())
+                    }
+                    Msg::StreamEnd => {
+                        streams_ended += 1;
+                        Ok(())
+                    }
+                    Msg::Log { stderr, escape, text } => {
+                        out.print_forwarded(stderr, escape, &text);
+                        Ok(())
+                    }
+                    Msg::Fatal { msg } => {
+                        out.error(format!("remote: {msg}"));
                         break (0, Some(exit::PROTOCOL));
                     }
-                };
-                let r = match frame {
-                    Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
-                    Frame::Msg(m) => match m {
-                        Msg::DirBatch { root, dir, rel, entries, sums } => {
-                            remote.on_batch(s, engine, root, dir, rel, entries, sums);
-                            Ok(())
-                        }
-                        Msg::IdNames { users, groups } => {
-                            remote.ids.lock().unwrap().add(&users, &groups);
-                            Ok(())
-                        }
-                        Msg::FileBegin { id, size, xattrs } => remote.file_begin(engine, id, size, xattrs),
-                        Msg::DeltaBegin { id, size, copies, xattrs } => remote.delta_begin(engine, id, size, copies, xattrs),
-                        Msg::Xattrs { id, xattrs } => {
-                            remote.on_xattrs(engine, id, xattrs);
-                            Ok(())
-                        }
-                        Msg::Refine { id, grain, gaps } => {
-                            remote.refine(s, id, grain, gaps);
-                            Ok(())
-                        }
-                        Msg::FileEnd { id, ok } => {
-                            remote.file_end(engine, id, ok);
-                            Ok(())
-                        }
-                        Msg::SmallPack { files, blob, xattrs } => {
-                            remote.acquire_pack();
-                            s.spawn(move |_| {
-                                remote.small_pack(engine, files, blob, xattrs);
-                                remote.release_pack();
-                            });
-                            Ok(())
-                        }
-                        Msg::ScanDone { .. } => {
-                            remote.on_scan_done();
-                            Ok(())
-                        }
-                        Msg::SenderDone { errors } => {
-                            crate::timing::mark("SenderDone received");
-                            sender_done = Some(errors);
-                            Ok(())
-                        }
-                        Msg::StreamEnd => {
-                            streams_ended += 1;
-                            Ok(())
-                        }
-                        Msg::Log { stderr, escape, text } => {
-                            out.print_forwarded(stderr, escape, &text);
-                            Ok(())
-                        }
-                        Msg::Fatal { msg } => {
-                            out.error(format!("remote: {msg}"));
-                            break (0, Some(exit::PROTOCOL));
-                        }
-                        other => {
-                            out.error(format!("protocol error: unexpected {other:?}"));
-                            break (0, Some(exit::PROTOCOL));
-                        }
-                    },
-                };
-                if let Err(e) = r {
-                    engine.err(format!("receiving file data failed: {e}"));
-                }
+                    other => {
+                        out.error(format!("protocol error: unexpected {other:?}"));
+                        break (0, Some(exit::PROTOCOL));
+                    }
+                },
+            };
+            if let Err(e) = r {
+                engine.err(format!("receiving file data failed: {e}"));
             }
-        })
+        }
     });
 
     if let Some((index, scan)) = dst_scan {

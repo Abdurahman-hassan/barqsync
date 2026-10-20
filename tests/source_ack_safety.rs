@@ -50,6 +50,9 @@ enum Case {
     Changed,
     /// Replaced by another file with the same size and time.
     Replaced,
+    /// The listed file, named before the receiver even answered its listing, then
+    /// `ReceiverDone` before the sender is done.
+    Premature,
     Valid,
 }
 
@@ -82,11 +85,13 @@ fn run_case(wire: Wire, case: Case) {
         }
     };
     assert_eq!(root_entry, "f");
-    // In a dry run the receiver asks for no data.
-    let dry = matches!(case, Case::NotRequestedDry | Case::Dry);
-    let files = if dry { vec![] } else { vec![NeedReq { idx: 0, sig: None }] };
-    peer.msg(Msg::Need { dir, files, xattrs: vec![] }).unwrap();
-    while !matches!(next(&peer), Frame::Msg(Msg::SenderDone { .. })) {}
+    if case != Case::Premature {
+        // In a dry run the receiver asks for no data.
+        let dry = matches!(case, Case::NotRequestedDry | Case::Dry);
+        let files = if dry { vec![] } else { vec![NeedReq { idx: 0, sig: None }] };
+        peer.msg(Msg::Need { dir, files, xattrs: vec![] }).unwrap();
+        while !matches!(next(&peer), Frame::Msg(Msg::SenderDone { .. })) {}
+    }
 
     let _held;
     match case {
@@ -131,7 +136,10 @@ fn run_case(wire: Wire, case: Case) {
             assert_eq!(code, 0, "{what}");
             assert!(!file.exists(), "{what}: the listed file wasn't removed");
         }
-        Case::Twice => {
+        // Like rsync, a listed and unchanged entry the receiver names is removed whenever
+        // it is named (the receiver is trusted to have stored it); a second time, or
+        // finishing before the sender, is an error.
+        Case::Twice | Case::Premature => {
             assert_eq!(code, barqsync::exit::PARTIAL, "{what}");
             assert!(!file.exists(), "{what}");
         }
@@ -151,7 +159,7 @@ fn run_case(wire: Wire, case: Case) {
 fn a_receiver_cannot_remove_what_it_is_not_entitled_to() {
     use Case::*;
     for wire in [Wire::Postcard, Wire::Rkyv] {
-        for case in [NotRequested, NotRequestedDry, Dry, Absolute, Traversal, UnknownRoot, NotListed, Twice, Changed, Replaced, Valid] {
+        for case in [NotRequested, NotRequestedDry, Dry, Absolute, Traversal, UnknownRoot, NotListed, Twice, Changed, Replaced, Premature, Valid] {
             run_case(wire, case);
         }
     }

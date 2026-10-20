@@ -257,6 +257,9 @@ impl Engine<'_> {
                     Stats::add(&self.stats.created, 1);
                 }
                 if !self.dry() {
+                    if !self.backup_existing(src_path, dst_path, false) {
+                        return AltFile::Done;
+                    }
                     let (dir, name) = split_dst(dst_path);
                     let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&p, tmp))
                         .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, dst_path)));
@@ -267,8 +270,12 @@ impl Engine<'_> {
                 }
             } else {
                 self.out.item(rel, Kind::File, Link::None, Change::default(), false);
-                if dst_meta.is_some() && !self.dry() {
-                    let _ = fs::remove_file(dst_path);
+                if dst_meta.is_some()
+                    && !self.dry()
+                    && let Err(e) = self.remove_or_backup(dst_path)
+                {
+                    self.err(path_msg("remove \"", dst_path, format!("\" failed: {e}")));
+                    return AltFile::Done;
                 }
             }
             self.source_done(root, src_path, dst_path, rel, src);
@@ -281,6 +288,10 @@ impl Engine<'_> {
             self.out.item(rel, Kind::File, Link::None, change, true);
             if dst_meta.is_none() {
                 Stats::add(&self.stats.created, 1);
+            }
+            if !self.dry() && !self.backup_existing(src_path, dst_path, false) {
+                self.not_written(x);
+                return AltFile::Done;
             }
             if !self.dry()
                 && let Err(e) = self.copy_alt(&p, dst_path, x)
