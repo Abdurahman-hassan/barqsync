@@ -50,7 +50,8 @@ use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 9: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
-/// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals).
+/// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
+///     `Synced` names entries only.
 pub const VERSION: u32 = 10;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.
@@ -114,9 +115,8 @@ pub struct StreamOffer {
     pub token: [u8; 32],
 }
 
-/// Protocol 10 acknowledgement payload. The sender uses `rel` only as a ledger key;
-/// peer-supplied `size` and `mtime` are retained for compatibility, not authority.
-pub type SyncedFiles = Vec<(Vec<u8>, u64, i64)>;
+/// `--remove-source-files`: paths (relative to the root) of entries the receiver now has.
+pub type SyncedFiles = Vec<Vec<u8>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -186,9 +186,8 @@ pub enum Msg {
     /// The answer to one `DirBatch`: which of its files the receiver wants, and (`-X`)
     /// which entries' attribute values it needs in full to update them in place.
     Need { dir: u32, files: Vec<NeedReq>, xattrs: Vec<u32> },
-    /// `--remove-source-files`: these entries are on the receiver now. `(rel, size, mtime)`
-    /// relative to the root. The sender validates its own ledger and defers removal
-    /// until successful session completion.
+    /// `--remove-source-files`: these entries are on the receiver now. The sender removes
+    /// only entries it listed itself, unchanged since by its own record of them.
     Synced { root: u16, files: SyncedFiles },
     ReceiverDone { stats: StatsSnapshot },
 }

@@ -49,9 +49,8 @@ speaks yet; its framing gains one frame kind.
 - **PROTO-01, send failures.** A message that cannot be encoded (over 1 GiB) stops
   the transfer: the side that failed tells its peer with `Fatal`, and its receive loop
   stops and reports the message it could not send. A closed connection is left to the
-  receive loop as before. On the sender, every failed send also counts as an error,
-  so source removal (part 1A) still fails closed. A refinement request that is not
-  sent no longer waits for an answer.
+  receive loop as before. On the sender, every failed send still counts as an error.
+  A refinement request that is not sent no longer waits for an answer.
 - A file listed as small and found larger than the small-file size when it is read
   is sent as a large file. The whole file is no longer read into one pack.
 

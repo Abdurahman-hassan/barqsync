@@ -141,17 +141,14 @@ pub fn stat(path: &Path) -> io::Result<Meta> {
     Ok(Meta::from_metadata(&fs::metadata(path)?))
 }
 
-/// Refuse operations whose source and destination name the same inode. Compare
-/// metadata obtained from open descriptors at the destructive operation too.
-pub fn ensure_distinct(src: &Meta, dst: &Meta) -> io::Result<()> {
-    if (src.dev, src.ino) == (dst.dev, dst.ino) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "source and destination are the same file"));
-    }
-    Ok(())
+/// Whether two entries are one file: the same name, a hard link, or another path to it.
+pub fn same_file(a: &Meta, b: &Meta) -> bool {
+    (a.dev, a.ino) == (b.dev, b.ino)
 }
 
-pub fn ensure_distinct_files(src: &File, dst: &File) -> io::Result<()> {
-    ensure_distinct(&Meta::from_metadata(&src.metadata()?), &Meta::from_metadata(&dst.metadata()?))
+/// [`same_file`] for two open files.
+pub fn same_open_file(a: &File, b: &File) -> io::Result<bool> {
+    Ok(same_file(&Meta::from_metadata(&a.metadata()?), &Meta::from_metadata(&b.metadata()?)))
 }
 
 /// Read a directory and `lstat` every child. Entries that vanish between `readdir`
@@ -468,15 +465,18 @@ fn read_full(mut f: &File, buf: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
-/// Overwrite an existing file in place with `src`, expected to be `size` bytes (for `--inplace`).
+/// Overwrite an existing file in place with `src`, expected to be `size` bytes (for
+/// `--inplace`), then cut it to the length copied. When both are the same file (`f f`,
+/// or hard links), nothing is written: it already holds the data, and writing into it
+/// would destroy the source.
 pub fn copy_into_existing(src: &Path, dst: &Path, size: u64) -> io::Result<()> {
     let s = File::open(src)?;
-    // Opening with O_TRUNC would destroy the source before checking hard-link or
-    // symlink aliases. Check the exact descriptors that will be read and written.
     let d = fs::OpenOptions::new().write(true).open(dst)?;
-    ensure_distinct_files(&s, &d)?;
-    d.set_len(0)?;
-    copy_buffered(&s, &d, size)?;
+    if same_open_file(&s, &d)? {
+        return Ok(());
+    }
+    let n = copy_buffered(&s, &d, size)?;
+    d.set_len(n)?;
     Ok(())
 }
 

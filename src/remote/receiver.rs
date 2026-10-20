@@ -11,7 +11,7 @@ use crate::cli::Options;
 use crate::checksum::Sum;
 use crate::delta::refine::{self, GapReq, Grain};
 use crate::delta::{self, Delta, DeltaMode, Op, ReadAt, ReadOnce, apply::apply, cdc};
-use crate::entry::{DirEnt, Kind, Meta};
+use crate::entry::{DirEnt, Kind};
 use crate::ids::IdMap;
 use crate::local::extra;
 use crate::local::flags::write_sparse_at;
@@ -248,7 +248,7 @@ enum Held {
     /// Its values haven't been written yet.
     Waiting,
     /// The rest of it is done too: report it once the values are written.
-    Synced(u64, i64),
+    Synced,
     /// Writing the values failed: its source stays.
     Failed,
 }
@@ -332,9 +332,9 @@ impl RemoteState {
         if let Some(k) = hold {
             let mut held = self.held.lock().unwrap();
             match held.remove(&k) {
-                Some(Held::Synced(size, mtime)) if written => {
+                Some(Held::Synced) if written => {
                     drop(held);
-                    self.push_synced(k.0, k.1, size, mtime);
+                    self.push_synced(k.0, k.1);
                 }
                 Some(Held::Waiting) if !written => {
                     held.insert(k, Held::Failed);
@@ -351,7 +351,7 @@ impl RemoteState {
 
     /// `--remove-source-files`: the receiver has this entry; tell the sender (in batches),
     /// or, while it waits for attribute values, once they are written.
-    pub(crate) fn synced(&self, root: u16, rel: &[u8], meta: &Meta) {
+    pub(crate) fn synced(&self, root: u16, rel: &[u8]) {
         {
             let mut held = self.held.lock().unwrap();
             if !held.is_empty() {
@@ -362,20 +362,20 @@ impl RemoteState {
                         return;
                     }
                     Some(h) => {
-                        *h = Held::Synced(meta.size, meta.mtime);
+                        *h = Held::Synced;
                         return;
                     }
                     None => {}
                 }
             }
         }
-        self.push_synced(root, rel.to_vec(), meta.size, meta.mtime);
+        self.push_synced(root, rel.to_vec());
     }
 
-    fn push_synced(&self, root: u16, rel: Vec<u8>, size: u64, mtime: i64) {
+    fn push_synced(&self, root: u16, rel: Vec<u8>) {
         let mut map = self.synced.lock().unwrap();
         let v = map.entry(root).or_default();
-        v.push((rel, size, mtime));
+        v.push(rel);
         if v.len() >= 1000 {
             let files = std::mem::take(v);
             drop(map);
@@ -608,19 +608,29 @@ impl RemoteState {
     fn begin(&self, eng: &Engine, id: u64, xattrs: Option<Vec<Xattr>>, begin: impl FnOnce(FileJob) -> io::Result<()>) -> io::Result<()> {
         let job = self.take_job_with(eng, id, xattrs)?;
         let dst = job.dst_path.clone();
-        if let Err(e) = begin(job) {
-            self.lost.lock().unwrap().insert(id);
-            if !fsops::interrupted() {
-                eng.err(path_msg("receiving \"", &dst, format!("\" failed: {e}")));
+        match begin(job) {
+            Ok(()) if self.incoming.lock().unwrap().contains_key(&id) => {}
+            // Left as it was (its backup failed, as reported): its data is dropped.
+            Ok(()) => {
+                self.lost.lock().unwrap().insert(id);
+            }
+            Err(e) => {
+                self.lost.lock().unwrap().insert(id);
+                if !fsops::interrupted() {
+                    eng.err(path_msg("receiving \"", &dst, format!("\" failed: {e}")));
+                }
             }
         }
         Ok(())
     }
 
     fn file_begin(&self, eng: &Engine, id: u64, size: u64, job: FileJob) -> io::Result<()> {
+        // Without a backup the file stays as it is; its data is ignored.
+        if !eng.backup_existing_file(&job) {
+            return Ok(());
+        }
         // A whole file is all literal data, as rsync counts it.
         Stats::add(&eng.stats.literal_bytes, size);
-        eng.backup_existing_file(&job)?;
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let hint = cache::Writer::new(&file, size);
@@ -646,7 +656,10 @@ impl RemoteState {
         let basis = File::open(job.basis_path())?;
         let basis_size = basis.metadata()?.len();
         check::copies(&copies, size, basis_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid delta: {e}")))?;
-        eng.backup_existing_file(&job)?;
+        // Without a backup the file stays as it is; its data is ignored.
+        if !eng.backup_existing_file(&job) {
+            return Ok(());
+        }
         let d = Delta { size, ops: copies };
         let matched: u64 = d.ops.iter().map(Op::len).sum();
         Stats::add(&eng.stats.delta_files, 1);
@@ -888,11 +901,10 @@ impl RemoteState {
             match self.take_job_with(eng, id, xattrs.remove(&id)) {
                 Ok(job) => {
                     crate::progress::done(job.meta.size);
-                    Stats::add(&eng.stats.literal_bytes, len as u64);
-                    if let Err(e) = eng.backup_existing_file(&job) {
-                        report(&job.dst_path, e);
+                    if !eng.backup_existing_file(&job) {
                         continue;
                     }
+                    Stats::add(&eng.stats.literal_bytes, len as u64);
                     let (dir, name) = split_dst(&job.dst_path);
                     let tmp = dir.join(fsops::temp_name(name));
                     fsops::register_temp(&tmp);
@@ -947,7 +959,9 @@ impl RemoteState {
     }
 
     fn write_small(&self, eng: &Engine, job: FileJob, bytes: &[u8]) -> io::Result<()> {
-        eng.backup_existing_file(&job)?;
+        if !eng.backup_existing_file(&job) {
+            return Ok(());
+        }
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let size = bytes.len() as u64;

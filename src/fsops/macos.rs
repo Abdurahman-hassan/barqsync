@@ -198,7 +198,8 @@ fn parse_record(rec: &[u8]) -> io::Result<(OsString, Option<Meta>)> {
     let start = (name_at as isize + name_off as isize) as usize;
     let name = rec.get(start..start + name_len.saturating_sub(1)).ok_or_else(|| io::Error::other("bad name"))?;
     let name = OsString::from_vec(name.to_vec());
-    let dev = r.i32()? as u32 as u64;
+    // Sign-extended like `st_dev as u64`, so it compares equal to what `lstat` gives.
+    let dev = r.i32()? as u64;
     let objtype = r.u32()?;
     let mtime = r.i64()?;
     let mtime_ns = r.i64()? as u32;

@@ -7,70 +7,74 @@ Status: implemented; checkpoint verification is recorded in
 
 ## Changes
 
-- **DATA-01:** compare device/inode identities before local work, backup and
-  source removal. In-place copying opens both files without truncating, compares
-  those descriptors, then truncates. In-place delta application checks its open
-  source/output descriptors too. Same-path, `./` and hard-link aliases fail with
-  a partial-transfer status while retaining their data.
-- **DATA-04:** backup preparation returns errors to the replacement caller.
-  Regular files, remote whole files/deltas/packs, io_uring packs, symlinks,
-  special files, hard-link followers and alternate-destination copies stop on
-  backup failure. A new backup is built beside the existing backup and renamed
-  into place only after construction succeeds. Backup names aliasing the
-  original inode are refused. Symlink backups preserve the link itself.
-- **SEC-02:** source removal is checked at both the acknowledgement handler and
-  the filesystem helper. Disabled removal and dry runs cannot unlink sources.
-  A sender-owned ledger records the paths and metadata of listed non-directory
-  entries. A peer's relative path is only a lookup key; its size and timestamps
-  are ignored. Unknown roots/paths and duplicate acknowledgements report errors.
-- **SEC-02 / DATA-06:** remote removals wait until a successful transfer has
-  finished. An early `ReceiverDone`, sender error, receiver error or disconnect
-  leaves sources in place. Before unlinking, the helper compares type,
-  device/inode, size, mtime seconds and nanoseconds with the sender's snapshot.
-  Same-second edits and same-size inode replacement therefore prevent removal.
-- Sender control-send failures now contribute to its error count, preventing a
-  failed send from authorizing source removal. Full send-error cancellation and
-  metadata chunking remain milestone 3 work.
+Revised on 21 October 2026 to match rsync where the first checkpoint did not, and to
+close the gaps listed below it.
 
-The checkpoint is reconciled with v0.4.0 (`eeb6955`), preserving protocol 10,
-`RemovalsDone`, live local copy progress and literal-byte statistics. No wire
-schema change is introduced. The Rust `remove_source` helper now takes `&Meta`
-instead of peer-style size/seconds arguments.
+- **DATA-01:** a source that is also the destination (the same path, a `./` alias,
+  or a hard link) is never truncated or removed. In-place copying opens both files
+  without truncating and compares those descriptors; when they are one file it writes
+  nothing, since the file already holds the data, and cuts the length only after
+  copying otherwise. `--remove-source-files` compares the source with the destination
+  and keeps it ("Skipping sender remove of destination file", partial-transfer status),
+  as rsync does. Syncs that change nothing (`-a f f`, `src/ src/`, a destination of
+  hard links to the source) succeed, as with rsync; the first checkpoint failed them.
+- **DATA-04:** a backup that can't be made stops that file's replacement: regular
+  files, remote whole files/deltas/packs, io_uring packs, symlinks, special files,
+  hard-link followers and alternate-destination links and copies. Hard-link followers
+  and special files are now backed up at all, as rsync does. A new backup is built
+  under a temp name beside the previous one and renamed over it only once complete.
+  A backup that would replace the file itself (an empty suffix with a backup directory
+  leading back to it) or the source being copied (`-b f~ f`) is refused, and an empty
+  `--suffix` without `--backup-dir` is rejected up front, as rsync does. A backup name
+  that is already a hard link to the file holds that version and is kept (with
+  `--inplace` it becomes a copy first); the first checkpoint refused it on every run.
+- **SEC-02:** the sender records each non-directory entry it lists (root, path, and
+  its own metadata) and honors a `Synced` only for entries on that record that it
+  hasn't removed yet, each once; anything else is an error and nothing is removed.
+  `Synced` without `--remove-source-files`, or in a dry run, is a protocol error, and
+  the removal helper refuses on its own too. `Synced` now carries entry names only:
+  the receiver no longer sends size and time, so there is nothing to trust (protocol
+  10, which no release speaks yet).
+- **DATA-06:** before unlinking, the helper compares type, device/inode, size and
+  mtime to the nanosecond with the sender's record. Same-second edits, same-size inode
+  replacement and symlink swaps prevent removal. The macOS bulk scanner now reports
+  device numbers sign-extended like `stat`, so its records compare equal to `lstat`.
+- Removal happens as each entry is acknowledged, as with rsync, not only after a
+  fully successful session: one failed file no longer keeps every other source.
+- Sender control-send failures count as errors.
+
+`remove_source` takes the sender's `&Meta` record and, for local transfers, the
+destination path.
 
 ## Verification coverage
 
-`tests/mutation_safety.rs` covers both local scanners, same-file aliases,
-whole-file and delta in-place modes, direct descriptor guards, directory
-self-sync, invalid backup directories, collisions with the original inode,
-failed atomic backup replacement, unreadable backup sources and successful
-retry. Backup-failure cases run locally and through fake-SSH push/pull with
-both threaded and Tokio I/O, small and large files, and the io_uring option.
+`tests/mutation_safety.rs` covers same-file aliases (whole-file, delta, backup and
+removal modes), trees synced onto themselves or onto hard links to them with both
+scanners, the descriptor check, invalid backup directories (locally and through
+fake-SSH push/pull, threaded and Tokio I/O, small and large files, deltas, io_uring),
+hard-link and special-file backups, an existing hard-linked backup, a directory in the
+backup's way, unreadable backup sources and retry, backups onto the source or the file
+itself, the removal helper's checks, and authorized removal of files, hard links and
+symlinks locally, in a push and in a pull.
 
-`tests/source_ack_safety.rs` uses malicious peers with postcard and rkyv. It
-checks disabled removal, dry run, absolute and traversal paths, unknown roots,
-duplicate acknowledgements, changed/replaced sources and premature completion.
-It also verifies that valid authorized removal uses the sender's metadata.
+`tests/source_ack_safety.rs` uses misbehaving receivers with postcard and rkyv:
+removal not requested (with and without dry run), dry run, absolute and traversal
+paths, unknown roots, entries created after listing, duplicates, changed and replaced
+sources, acknowledgements before the listing was answered, and valid removal.
 
-`tests/remote_lifecycle.rs` and the existing rsync/xattr suites cover successful
-removal of regular files, symlinks, hard links and deferred xattrs. New CLI
-regressions have a 20-second deadline and terminate their own process group on
-failure. Protocol probes have 10-second receive/completion deadlines.
+`tests/remote_lifecycle.rs` and the rsync/xattr suites cover removal with hard links
+and deferred xattrs. Each fix's regression test was checked to fail with that fix
+reverted (the io_uring receiver path on Linux only).
 
 ## Remaining acceptance work
 
 - Descriptor-based confinement and protection from concurrent parent-directory
   or symlink replacement are **not implemented**. SEC-01 remains open.
-- Acknowledgements still use the protocol-10 path-shaped key. Transfer IDs,
-  per-entry lifecycle validation and bound source descriptors remain part 1B.
-- The snapshot comes from listing metadata. Ctime, the identity of dereferenced
-  symlinks and verification against the file actually transferred still need
-  work. This is not a filesystem snapshot and does not close DATA-06.
+- The record comes from listing metadata. Ctime and verification against the file
+  actually transferred still need work; a file changed between the check and the
+  unlink is not caught. This is not a filesystem snapshot.
+- Same-file detection covers transfers on one machine; a remote transfer to the
+  same host (`localhost:`) is not detected, as with rsync.
 - Backup paths colliding with a different active output need namespace-wide
   checks. ENOSPC and injected short-write failures still need dedicated tests.
   These changes do not establish crash durability or directory fsync guarantees.
-- Linux io_uring execution and cross-filesystem backup fallback need Linux and
-  cross-volume verification; selecting the flag on macOS does not exercise it.
-
-Remote source removal is deliberately conservative: a failed session retains
-all its sources, even if some individual files arrived successfully. This is a
-behavior change from removing each source as its acknowledgement arrives.

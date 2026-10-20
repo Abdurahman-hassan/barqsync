@@ -730,10 +730,6 @@ impl<'a> Engine<'a> {
                 if fsops::interrupted() {
                     return;
                 }
-                if let Err(e) = self.check_distinct(&f.src_path, &f.dst_path) {
-                    self.err(path_msg("link \"", &f.dst_path, format!("\" failed: {e}")));
-                    continue;
-                }
                 let dst = fsops::lstat(&f.dst_path).ok();
                 if let (Some(l), Some(d)) = (leader, dst)
                     && (l.dev, l.ino) == (d.dev, d.ino)
@@ -788,9 +784,11 @@ impl<'a> Engine<'a> {
                 if dst.is_some_and(|d| d.kind == Kind::Dir) && !self.remove_conflicting_dir(&f.dst_path, &f.rel) {
                     continue;
                 }
+                if !self.backup_existing(&f.src_path, &f.dst_path, false) {
+                    continue;
+                }
                 let (dir, name) = split_dst(&f.dst_path);
-                let r = self.backup_if_present(&f.dst_path, false)
-                    .and_then(|()| fsops::with_temp(dir, name, |tmp| fs::hard_link(&g.leader_dst, tmp)))
+                let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&g.leader_dst, tmp))
                     .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, &f.dst_path)));
                 match r {
                     Ok(()) => self.source_done(f.root, &f.src_path, &f.dst_path, &f.rel, &f.meta),
@@ -849,12 +847,6 @@ impl<'a> Engine<'a> {
             let rel = join_rel(ctx.rel, &e.name);
             let src_path = ctx.src.join(&e.name);
             let dst_path = ctx.dst.join(dname);
-            if e.meta.kind != Kind::Dir
-                && let Err(e) = self.check_distinct(&src_path, &dst_path)
-            {
-                self.err(path_msg("sync \"", &src_path, format!("\" failed: {e}")));
-                continue;
-            }
             let dst_kind = if ctx.dst_is_new { None } else { dst_map.get(dname).copied() };
             if self.opts.existing && dst_kind.is_none() && !(e.meta.kind == Kind::Dir && !self.opts.recursive && !self.opts.dirs) {
                 // --existing: nothing new is created, not even directories.
@@ -1244,10 +1236,7 @@ impl<'a> Engine<'a> {
         if self.dry() {
             return true;
         }
-        if let Err(e) = self.check_distinct(src_path, dst_path)
-            .and_then(|()| self.backup_if_present(dst_path, false))
-        {
-            self.err(path_msg("symlink \"", dst_path, format!("\" failed: {e}")));
+        if dst_kind.is_some_and(|k| k != Kind::Dir) && !self.backup_existing(src_path, dst_path, false) {
             return false;
         }
         let (dir, name) = split_dst(dst_path);
@@ -1301,10 +1290,7 @@ impl<'a> Engine<'a> {
         if self.dry() {
             return true;
         }
-        if let Err(e) = self.check_distinct(src_path, dst_path)
-            .and_then(|()| self.backup_if_present(dst_path, false))
-        {
-            self.err(path_msg("mknod \"", dst_path, format!("\" failed: {e}")));
+        if dst_kind.is_some_and(|k| k != Kind::Dir) && !self.backup_existing(src_path, dst_path, false) {
             return false;
         }
         let (dir, name) = split_dst(dst_path);
@@ -1423,12 +1409,12 @@ impl<'a> Engine<'a> {
             crate::progress::done(job.meta.size);
             return;
         }
-        // Preserve live progress while refusing unsafe writes before they begin.
-        let (r, counted) = crate::progress::tracking(|| {
-            self.check_distinct(&job.src_path, &job.dst_path)
-                .and_then(|()| self.backup_existing_file(job))
-                .and_then(|()| self.write_file(job))
-        });
+        if !self.backup_existing_file(job) {
+            crate::progress::done(job.meta.size);
+            return;
+        }
+        // A big copy moves the progress line as it goes, not only once it is done.
+        let (r, counted) = crate::progress::tracking(|| self.write_file(job));
         crate::progress::done(job.meta.size.saturating_sub(counted));
         match r {
             Ok(()) => self.file_written(job),
@@ -1541,7 +1527,6 @@ impl<'a> Engine<'a> {
 
         if self.opts.inplace && d.is_in_place() && job.basis.is_none() {
             let out = fs::OpenOptions::new().write(true).open(&job.dst_path)?;
-            fsops::ensure_distinct_files(&new, &out)?;
             apply(&d, basis_r, new_r, &out, true)?;
             self.finish_delta_file(&out, &job.meta, mode, uid, gid, Some((&job.dst_path, &job.src(false))))?;
             return Ok(true);
