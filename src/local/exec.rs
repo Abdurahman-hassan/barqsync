@@ -1401,6 +1401,8 @@ impl<'a> Engine<'a> {
                 Err(_) => {}
             }
         }
+        // All of a file sent whole is literal data, as rsync counts it.
+        Stats::add(&self.stats.literal_bytes, src.size);
 
         if self.opts.inplace && job.dst_meta.is_some_and(|d| d.kind == Kind::File) {
             fsops::copy_into_existing(&job.src_path, &job.dst_path, src.size)?;

@@ -530,6 +530,8 @@ impl RemoteState {
 
     fn file_begin(&self, eng: &Engine, id: u64, size: u64, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
         let job = self.take_job_with(eng, id, xattrs)?;
+        // A whole file is all literal data, as rsync counts it.
+        Stats::add(&eng.stats.literal_bytes, size);
         eng.backup_existing_file(&job);
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
@@ -728,6 +730,7 @@ impl RemoteState {
             };
             let dst = job.dst_path.clone();
             crate::progress::done(job.meta.size);
+            Stats::add(&eng.stats.literal_bytes, len as u64);
             if let Err(e) = self.write_small(eng, job, bytes)
                 && !fsops::interrupted()
             {
@@ -756,6 +759,7 @@ impl RemoteState {
             match self.take_job_with(eng, id, xattrs.remove(&id)) {
                 Ok(job) => {
                     crate::progress::done(job.meta.size);
+                    Stats::add(&eng.stats.literal_bytes, len as u64);
                     eng.backup_existing_file(&job);
                     let (dir, name) = split_dst(&job.dst_path);
                     let tmp = dir.join(fsops::temp_name(name));

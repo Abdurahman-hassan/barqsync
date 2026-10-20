@@ -13,6 +13,8 @@
   remote home directory, as with rsync.
 - A big local copy to a disk without clones now moves the progress line as it is copied,
   not only when it is done.
+- `--stats` now counts a file sent or copied whole as literal data, as rsync does
+  ("Literal data" was 0 unless a delta was used).
 - Clearer errors: barqsync missing on the remote host (with a hint about `~/.zshenv`), a
   version mismatch (naming both versions), and a host with an empty user name (`@host`).
 
