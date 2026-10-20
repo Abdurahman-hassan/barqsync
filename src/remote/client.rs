@@ -172,7 +172,8 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         r.finish(out);
     }
     mark("transfer done");
-    let _ = conn.finish();
+    // A sender with the receiver's final counters knows the receiver has everything.
+    let _ = if !server_is_sender && stats.is_some() { conn.finish_confirmed() } else { conn.finish() };
     mark("connection closed");
     let _ = child.wait();
     mark("remote shell exited");

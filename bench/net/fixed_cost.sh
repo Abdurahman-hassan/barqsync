@@ -12,8 +12,9 @@ VARIANTS=${VARIANTS:-ssh quic auto}
 RUNS=${RUNS:-10}
 FR=/target/release/barqsync
 OUT=/work/bench/results
-LOG=/tmp/fixed-cost
 tag=$(date +%Y%m%d-%H%M%S)
+# Raw milestones stay in the target volume.
+LOG=/target/fixed-cost/$tag
 REPORT="$OUT/fixed-cost-$tag.md"
 mkdir -p "$OUT" "$LOG" /bench /dst
 
@@ -110,6 +111,21 @@ with open(report, "w") as out:
                     else:
                         cells.append(f"{statistics.median(vals):.0f}")
                 out.write(f"| {d}, {v} | " + " | ".join(cells) + " |\n")
+        out.write("\n")
+        out.write(f"Closing, step by step: medians in ms from `ReceiverDone sent`, {p}.\n\n")
+        for d in ["push", "pull"]:
+            for v in variants:
+                offs = {}
+                for i in range(1, runs + 1):
+                    marks, _ = parse(f"{log}/{p}-{d}-{v}-{i}.log")
+                    t0 = marks.get(("server" if d == "push" else "client", "ReceiverDone sent"))
+                    if t0 is None:
+                        continue
+                    for (side, label), t in marks.items():
+                        if t >= t0 - 1e-4 and label not in ("transfer done",):
+                            offs.setdefault((side, label), []).append((t - t0) * 1e3)
+                steps = sorted(((statistics.median(x), side, label) for (side, label), x in offs.items()))
+                out.write(f"- {d}, {v}: " + "; ".join(f"{side} {label} {m:.0f}" for m, side, label in steps) + "\n")
         out.write("\n")
 print(open(report).read())
 print(f"report: bench/results/{report.split('/')[-1]}")

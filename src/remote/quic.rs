@@ -34,8 +34,6 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// which matters to `--transport auto`'s short wait. A path that is actually longer only
 /// gets a spurious copy of a handshake packet or two.
 pub const INITIAL_RTT: Duration = Duration::from_millis(50);
-/// How long closing waits for the peer to take the last data.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn rt() -> &'static tokio::runtime::Runtime {
     crate::proto::async_io::rt()
@@ -262,9 +260,9 @@ impl Session {
 }
 
 impl Drop for Session {
-    /// Every stream has been finished and taken by the peer by now (the writers wait for
-    /// that), so close without waiting out QUIC's closing period (three probe timeouts,
-    /// ~100 ms on a LAN): nothing is left to deliver.
+    /// By now the peer has read all it needs (see `Conn::finish`), so close without
+    /// waiting out QUIC's closing period (three probe timeouts, ~100 ms on a LAN): nothing
+    /// is left to deliver.
     fn drop(&mut self) {
         if std::env::var_os("BARQSYNC_QUIC_STATS").is_some() {
             let s = self.conn.stats();
@@ -283,8 +281,9 @@ impl Drop for Session {
     }
 }
 
-/// A send stream as `Write`. Dropping it ends the stream and waits (bounded) until the
-/// peer has read everything, so nothing is lost when the process exits.
+/// A send stream as `Write`. Dropping it ends the stream without waiting for the peer to
+/// acknowledge the end: the protocol says when the peer has everything (`ReceiverDone`,
+/// or the peer ending too; see `Conn::finish`), and the session stays open until then.
 struct QuicWrite {
     inner: Option<SyncIoBridge<SendStream>>,
 }
@@ -306,12 +305,8 @@ impl Write for QuicWrite {
 
 impl Drop for QuicWrite {
     fn drop(&mut self) {
-        let Some(bridge) = self.inner.take() else { return };
-        let mut send = bridge.into_inner();
-        if send.finish().is_ok() {
-            rt().block_on(async move {
-                let _ = tokio::time::timeout(CLOSE_TIMEOUT, send.stopped()).await;
-            });
+        if let Some(bridge) = self.inner.take() {
+            let _ = bridge.into_inner().finish();
         }
     }
 }

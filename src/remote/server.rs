@@ -57,20 +57,22 @@ pub fn run() -> i32 {
             let _ = fwd.msg(Msg::Log { stderr, escape, text: text.to_vec() });
         }),
     );
-    let code = if server_is_sender {
-        sender::run(&conn, &opts, &opts.paths, &out).0
+    let (code, confirmed) = if server_is_sender {
+        let (code, stats) = sender::run(&conn, &opts, &opts.paths, &out);
+        (code, stats.is_some())
     } else {
         match opts.paths.first() {
-            Some(dest) => receiver::run(&conn, &opts, dest, &out).0,
+            Some(dest) => (receiver::run(&conn, &opts, dest, &out).0, false),
             None => {
                 let _ = conn.msg(Msg::Fatal { msg: "no destination given to the server".into() });
-                exit::SYNTAX
+                (exit::SYNTAX, false)
             }
         }
     };
     mark("transfer done");
     drop(out);
-    let _ = conn.finish();
+    // A sender with the receiver's final counters knows the receiver has everything.
+    let _ = if confirmed { conn.finish_confirmed() } else { conn.finish() };
     mark("connection closed");
     code
 }
