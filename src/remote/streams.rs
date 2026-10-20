@@ -11,7 +11,7 @@
 //! 3. the server acknowledges each authenticated stream; the client reports how many
 //!    it got. Zero means both sides stay on the ssh pipe.
 
-use super::{Transport, quic};
+use super::{Transport, auto, quic};
 use crate::proto::async_io;
 use crate::output::Output;
 use crate::proto::{Conn, Frame, Msg, StreamOffer};
@@ -218,28 +218,34 @@ impl ServerCertVerifier for Pinned {
 }
 
 /// Client side: open up to `n` authenticated streams in parallel. Failed ones are
-/// dropped; an empty result means "use the ssh pipe".
-pub fn connect(offer: &StreamOffer, n: usize) -> Vec<DataStream> {
-    let Ok(addr) = offer.addr.parse::<SocketAddr>() else { return Vec::new() };
+/// dropped; if none opens, the error says why (the caller then uses the ssh pipe).
+pub fn connect(offer: &StreamOffer, n: usize) -> io::Result<Vec<DataStream>> {
+    let addr = offer.addr.parse::<SocketAddr>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let provider = provider();
-    let config = match ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions() {
-        Ok(b) => Arc::new(
-            b.dangerous()
-                .with_custom_certificate_verifier(Arc::new(Pinned { fingerprint: offer.fingerprint, provider }))
-                .with_no_client_auth(),
-        ),
-        Err(_) => return Vec::new(),
+    let config = Arc::new(
+        ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(tls_err)?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pinned { fingerprint: offer.fingerprint, provider }))
+            .with_no_client_auth(),
+    );
+    let results = if async_io::enabled() {
+        connect_async(addr, config, offer.token, n)
+    } else {
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let (config, token) = (config.clone(), offer.token);
+                std::thread::spawn(move || connect_one(addr, config, &token, i as u16).map(DataStream::Sync))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(io::Error::other("connect thread panicked")))).collect()
     };
-    if async_io::enabled() {
-        return connect_async(addr, config, offer.token, n);
+    let (streams, errors): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+    match errors.into_iter().next() {
+        Some(Err(e)) if streams.is_empty() => Err(e),
+        _ => Ok(streams.into_iter().flatten().collect()),
     }
-    let handles: Vec<_> = (0..n)
-        .map(|i| {
-            let (config, token) = (config.clone(), offer.token);
-            std::thread::spawn(move || connect_one(addr, config, &token, i as u16))
-        })
-        .collect();
-    handles.into_iter().filter_map(|h| h.join().ok().and_then(Result::ok)).map(DataStream::Sync).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +306,7 @@ fn listen_async(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
     Ok((StreamOffer { addr: advertised, fingerprint, token }, Acceptor { accepted, stop, thread: None }))
 }
 
-fn connect_async(addr: SocketAddr, config: Arc<ClientConfig>, token: [u8; 32], n: usize) -> Vec<DataStream> {
+fn connect_async(addr: SocketAddr, config: Arc<ClientConfig>, token: [u8; 32], n: usize) -> Vec<io::Result<DataStream>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let connector = tokio_rustls::TlsConnector::from(config);
     async_io::rt().block_on(async move {
@@ -327,9 +333,12 @@ fn connect_async(addr: SocketAddr, config: Arc<ClientConfig>, token: [u8; 32], n
             .collect();
         let mut out = Vec::new();
         for t in tasks {
-            if let Ok(Ok(Ok(tls))) = t.await {
-                out.push(DataStream::Async(Box::new(tls) as Box<dyn AsyncStream>));
-            }
+            out.push(match t.await {
+                Ok(Ok(Ok(tls))) => Ok(DataStream::Async(Box::new(tls) as Box<dyn AsyncStream>)),
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err(io::Error::new(io::ErrorKind::TimedOut, "connection timed out")),
+                Err(_) => Err(io::Error::other("connect task failed")),
+            });
         }
         out
     })
@@ -402,14 +411,77 @@ fn quic_switch(conn: &mut Conn, mut session: quic::Session, n: usize, sending: b
     Ok(())
 }
 
+/// `--transport auto`, client side: ping over ssh; on a long round trip, try QUIC for a
+/// short while and use it if it connects and measures a long round trip too, else stay on
+/// the ssh pipe (see [`auto`]). The server answers the ping and waits for `StreamsReady`.
+fn auto_client(conn: &mut Conn, offer: &StreamOffer, want: usize, sending: bool, out: &Output) -> io::Result<auto::Outcome> {
+    let started = Instant::now();
+    conn.msg(Msg::Ping)?;
+    match recv_setup(conn, Duration::from_secs(60))? {
+        Frame::Msg(Msg::Pong) => {}
+        other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected a pong, got {other:?}"))),
+    }
+    let rtt = started.elapsed();
+    let threshold = auto::threshold();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let stay = |conn: &Conn, why: String| -> io::Result<()> {
+        conn.msg(Msg::StreamsReady { count: 0 })?;
+        if out.verbose() > 1 {
+            out.info(format!("auto: {why}, using the ssh connection"));
+        }
+        Ok(())
+    };
+    if !auto::wants_quic(rtt, threshold) {
+        stay(conn, format!("{:.1} ms round trip", ms(rtt)))?;
+        return Ok(auto::Outcome::Ssh);
+    }
+    // The ping's round trip is QUIC's first guess, so a lost handshake packet is sent
+    // again in time.
+    let limit = auto::deadline(rtt);
+    let tried = Instant::now();
+    match quic::start(offer, Some(rtt)).and_then(|a| a.wait(tried + limit)) {
+        // A ping that looked long because ssh resent it: QUIC's own measurement decides.
+        Ok(session) if !auto::wants_quic(session.min_rtt(), threshold) => {
+            stay(conn, format!("{:.1} ms round trip over QUIC ({:.1} ms over ssh)", ms(session.min_rtt()), ms(rtt)))?;
+            Ok(auto::Outcome::Ssh)
+        }
+        Ok(session) => {
+            conn.msg(Msg::StreamsReady { count: want as u16 })?;
+            if out.verbose() > 1 {
+                out.info(format!(
+                    "auto: {:.1} ms round trip, QUIC connected in {:.0} ms, using QUIC to {} ({want} data streams)",
+                    ms(rtt),
+                    ms(tried.elapsed()),
+                    offer.addr
+                ));
+            }
+            quic_switch(conn, session, want, sending)?;
+            Ok(auto::Outcome::Quic)
+        }
+        Err(e) => {
+            stay(conn, format!("QUIC to {} did not connect within {:.0} ms ({e})", offer.addr, ms(limit)))?;
+            Ok(auto::Outcome::Unreachable)
+        }
+    }
+}
+
 /// Client side of the setup (right after the handshake). `sending`: this side sends
-/// file data. Always seals the connection.
-pub fn setup_client(conn: &mut Conn, transport: Transport, want: usize, sending: bool, out: &Output) -> io::Result<()> {
+/// file data. Always seals the connection. With `--transport auto`, says what it chose.
+pub fn setup_client(
+    conn: &mut Conn,
+    transport: Transport,
+    want: usize,
+    sending: bool,
+    out: &Output,
+) -> io::Result<Option<auto::Outcome>> {
     let r = (|| {
         if want == 0 || transport == Transport::Ssh {
-            return Ok(());
+            return Ok(None);
         }
         match recv_setup(conn, Duration::from_secs(60))? {
+            Frame::Msg(Msg::QuicOffer(offer)) if transport == Transport::Auto => {
+                auto_client(conn, &offer, want, sending, out).map(Some)
+            }
             Frame::Msg(Msg::QuicOffer(offer)) => {
                 match quic::connect(&offer) {
                     Ok(session) => {
@@ -424,28 +496,38 @@ pub fn setup_client(conn: &mut Conn, transport: Transport, want: usize, sending:
                         out.info(format!("QUIC: could not connect to {} ({e}), using the ssh connection", offer.addr));
                     }
                 }
-                Ok(())
+                Ok(None)
             }
             Frame::Msg(Msg::StreamOffer(offer)) => {
-                let streams = connect(&offer, want);
-                let n = streams.len();
-                conn.msg(Msg::StreamsReady { count: n as u16 })?;
-                if n == 0 {
-                    out.info(format!(
-                        "parallel streams: could not connect to {}, using the ssh connection",
-                        offer.addr
-                    ));
-                } else {
-                    if out.verbose() > 1 {
-                        out.info(format!("using {n} parallel TLS data streams to {}", offer.addr));
+                match connect(&offer, want) {
+                    Ok(streams) if !streams.is_empty() => {
+                        let n = streams.len();
+                        conn.msg(Msg::StreamsReady { count: n as u16 })?;
+                        if out.verbose() > 1 {
+                            out.info(format!("using {n} parallel TLS data streams to {}", offer.addr));
+                        }
+                        attach(conn, streams, sending);
                     }
-                    attach(conn, streams, sending);
+                    r => {
+                        conn.msg(Msg::StreamsReady { count: 0 })?;
+                        let why = r.err().map_or_else(|| "no stream opened".to_string(), |e| e.to_string());
+                        out.info(format!(
+                            "parallel streams: could not connect to {} ({why}), using the ssh connection",
+                            offer.addr
+                        ));
+                    }
                 }
-                Ok(())
+                Ok(None)
+            }
+            Frame::Msg(Msg::StreamUnavailable { reason }) if transport == Transport::Auto => {
+                if out.verbose() > 1 {
+                    out.info(format!("auto: no QUIC on the server ({reason}), using the ssh connection"));
+                }
+                Ok(Some(auto::Outcome::Ssh))
             }
             Frame::Msg(Msg::StreamUnavailable { reason }) => {
                 out.info(format!("parallel streams unavailable ({reason}), using the ssh connection"));
-                Ok(())
+                Ok(None)
             }
             other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected a stream offer, got {other:?}"))),
         }
@@ -460,21 +542,27 @@ pub fn setup_server(conn: &mut Conn, transport: Transport, want: usize, sending:
         if want == 0 || transport == Transport::Ssh {
             return Ok(());
         }
-        if transport == Transport::Quic {
+        if transport.quic() {
             let (offer, listener) = match quic::listen() {
                 Ok(x) => x,
                 Err(e) => return conn.msg(Msg::StreamUnavailable { reason: e.to_string() }),
             };
             let pending = listener.accept();
             conn.msg(Msg::QuicOffer(offer))?;
-            return match recv_setup(conn, Duration::from_secs(60))? {
-                Frame::Msg(Msg::StreamsReady { count: 0 }) => Ok(()),
-                Frame::Msg(Msg::StreamsReady { count }) => {
-                    let session = pending.wait(Duration::from_secs(10))?;
-                    quic_switch(conn, session, count as usize, sending)
+            loop {
+                match recv_setup(conn, Duration::from_secs(60))? {
+                    // `auto` measures the round trip first.
+                    Frame::Msg(Msg::Ping) => conn.msg(Msg::Pong)?,
+                    Frame::Msg(Msg::StreamsReady { count: 0 }) => return Ok(()),
+                    Frame::Msg(Msg::StreamsReady { count }) => {
+                        let session = pending.wait(Duration::from_secs(10))?;
+                        return quic_switch(conn, session, count as usize, sending);
+                    }
+                    other => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected stream count, got {other:?}")));
+                    }
                 }
-                other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected stream count, got {other:?}"))),
-            };
+            }
         }
         let (offer, acceptor) = match listen(want) {
             Ok(x) => x,
@@ -519,7 +607,7 @@ mod tests {
     #[test]
     fn streams_connect_authenticate_and_carry_data() {
         let (offer, acceptor) = listen(3).unwrap();
-        let client = sync(connect(&offer, 3));
+        let client = sync(connect(&offer, 3).unwrap());
         assert_eq!(client.len(), 3);
         let server = sync(acceptor.take(3, Duration::from_secs(5)).unwrap());
         for (c, s) in client.into_iter().zip(server) {
@@ -531,14 +619,14 @@ mod tests {
     fn wrong_fingerprint_is_refused() {
         let (mut offer, _acceptor) = listen(1).unwrap();
         offer.fingerprint[0] ^= 1;
-        assert!(connect(&offer, 1).is_empty());
+        assert!(connect(&offer, 1).is_err());
     }
 
     #[test]
     fn wrong_token_is_refused() {
         let (mut offer, acceptor) = listen(1).unwrap();
         offer.token[31] ^= 1;
-        assert!(connect(&offer, 1).is_empty());
+        assert!(connect(&offer, 1).is_err());
         assert!(acceptor.take(1, Duration::from_millis(300)).is_err());
     }
 
@@ -547,6 +635,7 @@ mod tests {
         let (mut offer, _acceptor) = listen(1).unwrap();
         // Port 1 on loopback: refused immediately.
         offer.addr = "127.0.0.1:1".into();
-        assert!(connect(&offer, 2).is_empty());
+        let e = connect(&offer, 2).err().expect("no streams");
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
     }
 }

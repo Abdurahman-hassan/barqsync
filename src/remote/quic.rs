@@ -23,12 +23,17 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::io::SyncIoBridge;
 
 const ALPN: &[u8] = b"barqsync";
 /// The client gives up on QUIC (and stays on ssh) after this long.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// The round trip the server assumes until the handshake measures one: a lost first
+/// flight is sent again after about three times this (~150 ms) instead of quinn's ~1 s,
+/// which matters to `--transport auto`'s short wait. A path that is actually longer only
+/// gets a spurious copy of a handshake packet or two.
+pub const INITIAL_RTT: Duration = Duration::from_millis(50);
 /// How long closing waits for the peer to take the last data.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -36,8 +41,13 @@ fn rt() -> &'static tokio::runtime::Runtime {
     crate::proto::async_io::rt()
 }
 
-fn transport() -> Arc<TransportConfig> {
+/// `initial_rtt`: the round trip assumed until the handshake measures one, which sets how
+/// soon a lost handshake packet is sent again (quinn's default, 333 ms, waits about 1 s).
+fn transport(initial_rtt: Option<Duration>) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
+    if let Some(rtt) = initial_rtt {
+        t.initial_rtt(rtt);
+    }
     t.max_concurrent_uni_streams(256u32.into());
     // Enough in flight for 1 Gbit/s at 100 ms (12.5 MB), not much more: data buffered
     // beyond what the link holds only delays the control stream behind it.
@@ -80,7 +90,7 @@ pub fn listen() -> io::Result<(StreamOffer, Listener)> {
         .map_err(tls_err)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).map_err(tls_err)?));
-    config.transport_config(transport());
+    config.transport_config(transport(Some(INITIAL_RTT)));
     let endpoint = {
         let _rt = rt().enter();
         Endpoint::server(config, SocketAddr::new(listen_ip(), 0))?
@@ -153,6 +163,16 @@ impl Drop for Pending {
 /// Client side: connect, authenticate, and open the control stream. Fails within
 /// [`CONNECT_TIMEOUT`] when UDP doesn't get through.
 pub fn connect(offer: &StreamOffer) -> io::Result<Session> {
+    start(offer, None)?.wait(Instant::now() + CONNECT_TIMEOUT)
+}
+
+/// A client connection attempt running in the background; dropping it gives up.
+pub struct Attempt {
+    task: Option<tokio::task::JoinHandle<io::Result<Session>>>,
+}
+
+/// Start connecting to `offer` without waiting (see [`connect`]).
+pub fn start(offer: &StreamOffer, initial_rtt: Option<Duration>) -> io::Result<Attempt> {
     let addr: SocketAddr = offer.addr.parse().map_err(|_| io::Error::other("bad QUIC address"))?;
     let provider = provider();
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -163,7 +183,7 @@ pub fn connect(offer: &StreamOffer) -> io::Result<Session> {
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).map_err(tls_err)?));
-    config.transport_config(transport());
+    config.transport_config(transport(initial_rtt));
     let local = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let mut endpoint = {
         let _rt = rt().enter();
@@ -171,26 +191,51 @@ pub fn connect(offer: &StreamOffer) -> io::Result<Session> {
     };
     endpoint.set_default_client_config(config);
     let token = offer.token;
-    let ep = endpoint.clone();
-    let (conn, send, recv) = rt().block_on(async move {
-        tokio::time::timeout(CONNECT_TIMEOUT, async {
-            let conn = ep.connect(addr, CERT_NAME).map_err(io::Error::other)?.await.map_err(io::Error::other)?;
-            let (mut send, mut recv) = conn.open_bi().await.map_err(io::Error::other)?;
-            send.write_all(&token).await.map_err(io::Error::other)?;
-            let mut ack = [0u8; 1];
-            recv.read_exact(&mut ack).await.map_err(io::Error::other)?;
-            if ack[0] != 1 {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "QUIC session rejected"));
+    let task = rt().spawn(async move {
+        let conn = endpoint.connect(addr, CERT_NAME).map_err(io::Error::other)?.await.map_err(io::Error::other)?;
+        let (mut send, mut recv) = conn.open_bi().await.map_err(io::Error::other)?;
+        send.write_all(&token).await.map_err(io::Error::other)?;
+        let mut ack = [0u8; 1];
+        recv.read_exact(&mut ack).await.map_err(io::Error::other)?;
+        if ack[0] != 1 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "QUIC session rejected"));
+        }
+        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)) })
+    });
+    Ok(Attempt { task: Some(task) })
+}
+
+impl Attempt {
+    /// The session, if the attempt succeeds by `deadline`; gives up at the deadline.
+    pub fn wait(mut self, deadline: Instant) -> io::Result<Session> {
+        let mut task = self.task.take().expect("attempt task");
+        rt().block_on(async {
+            match tokio::time::timeout_at(deadline.into(), &mut task).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => Err(io::Error::other(e)),
+                Err(_) => {
+                    task.abort();
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "QUIC did not connect"))
+                }
             }
-            Ok((conn, send, recv))
         })
-        .await
-        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "QUIC did not connect")))
-    })?;
-    Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)) })
+    }
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+    }
 }
 
 impl Session {
+    /// The shortest round trip measured so far.
+    pub fn min_rtt(&self) -> Duration {
+        self.conn.min_rtt()
+    }
+
     /// The control stream as blocking halves.
     pub fn control(&mut self) -> (Box<dyn Read + Send>, Box<dyn Write + Send>) {
         let (send, recv) = self.control.take().expect("control stream taken once");

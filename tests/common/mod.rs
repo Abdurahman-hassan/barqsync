@@ -75,6 +75,17 @@ impl Tree {
         self
     }
 
+    /// Give every regular file the same old mtime. For destination trees made once per
+    /// tool: files the sync leaves alone must not differ by the second they were created in.
+    pub fn same_mtimes(&self, secs: u64) -> &Self {
+        let mut all = Vec::new();
+        walk(&self.root, &mut all);
+        for p in all.iter().filter(|p| fs::symlink_metadata(p).unwrap().is_file()) {
+            set_mtime(p, secs);
+        }
+        self
+    }
+
     /// Give every file and directory a distinct, old mtime (directories last,
     /// deepest first) so quick-check results never depend on wall-clock timing.
     pub fn settle_mtimes(&self) -> &Self {

@@ -20,10 +20,16 @@ shift || true
 run() {
   # /bench and /dst are RAM-backed: the container's overlay filesystem makes parallel
   # small-file writes erratic, which would measure the VM's disk instead of the network.
+  # TARGET_VOLUME keeps one checkout's builds apart from another's, REGISTRY_VOLUME keeps
+  # downloaded crates between runs; BARQSYNC_* variables
+  # (e.g. BARQSYNC_TRANSPORT=auto for `test`) and WORKLOADS/VARIANTS/GSO are passed through.
+  local pass=()
+  [[ -n ${REGISTRY_VOLUME:-} ]] && pass+=(-v "$REGISTRY_VOLUME":/usr/local/cargo/registry)
+  for v in $(compgen -v | grep -E '^(BARQSYNC_[A-Z_]+|WORKLOADS|VARIANTS|GSO)$'); do pass+=(-e "$v"); done
   "$ENGINE" run --rm --privileged --security-opt seccomp=unconfined \
     --tmpfs /bench:rw,size=2g --tmpfs /dst:rw,size=2g \
-    -v "$ROOT":/work -w /work -v barqsync-target:/target -e CARGO_TARGET_DIR=/target \
-    -e RUNS="${RUNS:-3}" -e SCALE="${SCALE:-1}" "$@"
+    -v "$ROOT":/work -w /work -v "${TARGET_VOLUME:-barqsync-target}":/target -e CARGO_TARGET_DIR=/target \
+    -e RUNS="${RUNS:-3}" -e SCALE="${SCALE:-1}" ${pass[@]+"${pass[@]}"} "$@"
 }
 
 case "$cmd" in

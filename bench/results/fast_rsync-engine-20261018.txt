@@ -1,0 +1,45 @@
+== run 1 inplace
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=7995501	sig_ms=65.9	diff_ms=390.0	apply_ms=143.3	verify_ms=15.8	total_ms=615.0
+barqsync	mode=blocks	sig_bytes=65536	delta_bytes=8323372	sig_ms=27.8	diff_ms=24.8	apply_ms=92.1	verify_ms=0.0	total_ms=144.7
+== run 1 shift
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=1255402	sig_ms=66.4	diff_ms=356.0	apply_ms=160.3	verify_ms=18.5	total_ms=601.3
+barqsync	mode=chunks	sig_bytes=179788	delta_bytes=4614824	sig_ms=68.3	diff_ms=58.0	apply_ms=116.1	verify_ms=0.0	total_ms=242.4
+== run 1 append
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=8388624	sig_ms=116.4	diff_ms=563.1	apply_ms=174.0	verify_ms=15.7	total_ms=869.3
+barqsync	mode=chunks	sig_bytes=179676	delta_bytes=8422763	sig_ms=60.5	diff_ms=63.6	apply_ms=97.7	verify_ms=0.0	total_ms=221.8
+== run 1 sqlite
+fast_rsync	block=15880	sig_bytes=190680	delta_bytes=103962848	sig_ms=53.1	diff_ms=1323.8	apply_ms=147.2	verify_ms=16.1	total_ms=1540.3
+barqsync	mode=chunks	sig_bytes=163408	delta_bytes=192345216	sig_ms=55.0	diff_ms=52.6	apply_ms=194.1	verify_ms=0.0	total_ms=301.7
+== run 1 mid (m000)
+fast_rsync	block=2048	sig_bytes=24588	delta_bytes=2071	sig_ms=1.8	diff_ms=6.0	apply_ms=3.0	verify_ms=0.9	total_ms=11.7
+barqsync	mode=blocks	sig_bytes=1024	delta_bytes=65596	sig_ms=3.4	diff_ms=1.5	apply_ms=3.3	verify_ms=0.0	total_ms=8.2
+== run 2 inplace
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=7995501	sig_ms=67.2	diff_ms=433.3	apply_ms=256.5	verify_ms=23.7	total_ms=780.6
+barqsync	mode=blocks	sig_bytes=65536	delta_bytes=8323372	sig_ms=44.8	diff_ms=30.9	apply_ms=105.7	verify_ms=0.0	total_ms=181.4
+== run 2 shift
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=1255402	sig_ms=63.9	diff_ms=355.7	apply_ms=152.5	verify_ms=23.1	total_ms=595.2
+barqsync	mode=chunks	sig_bytes=179788	delta_bytes=4614824	sig_ms=95.1	diff_ms=76.4	apply_ms=125.5	verify_ms=0.0	total_ms=297.0
+== run 2 append
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=8388624	sig_ms=65.5	diff_ms=433.3	apply_ms=505.1	verify_ms=22.9	total_ms=1026.8
+barqsync	mode=chunks	sig_bytes=179676	delta_bytes=8422763	sig_ms=62.3	diff_ms=60.0	apply_ms=225.6	verify_ms=0.0	total_ms=347.9
+== run 2 sqlite
+fast_rsync	block=15880	sig_bytes=190680	delta_bytes=103962848	sig_ms=58.3	diff_ms=1500.9	apply_ms=547.2	verify_ms=18.2	total_ms=2124.6
+barqsync	mode=chunks	sig_bytes=163408	delta_bytes=192345216	sig_ms=66.8	diff_ms=74.0	apply_ms=122.4	verify_ms=0.0	total_ms=263.3
+== run 2 mid (m000)
+fast_rsync	block=2048	sig_bytes=24588	delta_bytes=2071	sig_ms=1.4	diff_ms=5.4	apply_ms=2.5	verify_ms=0.7	total_ms=10.1
+barqsync	mode=blocks	sig_bytes=1024	delta_bytes=65596	sig_ms=3.8	diff_ms=1.7	apply_ms=4.2	verify_ms=0.0	total_ms=9.6
+== run 3 inplace
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=7995501	sig_ms=103.2	diff_ms=488.2	apply_ms=161.9	verify_ms=18.4	total_ms=771.7
+barqsync	mode=blocks	sig_bytes=65536	delta_bytes=8323372	sig_ms=30.3	diff_ms=25.5	apply_ms=130.9	verify_ms=0.0	total_ms=186.7
+== run 3 shift
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=1255402	sig_ms=52.2	diff_ms=310.3	apply_ms=167.4	verify_ms=18.1	total_ms=547.9
+barqsync	mode=chunks	sig_bytes=179788	delta_bytes=4614824	sig_ms=65.9	diff_ms=72.0	apply_ms=407.2	verify_ms=0.0	total_ms=545.2
+== run 3 append
+fast_rsync	block=16384	sig_bytes=196620	delta_bytes=8388624	sig_ms=60.0	diff_ms=412.1	apply_ms=173.7	verify_ms=15.4	total_ms=661.2
+barqsync	mode=chunks	sig_bytes=179676	delta_bytes=8422763	sig_ms=61.4	diff_ms=58.0	apply_ms=107.5	verify_ms=0.0	total_ms=226.9
+== run 3 sqlite
+fast_rsync	block=15880	sig_bytes=190680	delta_bytes=103962848	sig_ms=61.0	diff_ms=1356.1	apply_ms=137.9	verify_ms=25.4	total_ms=1580.5
+barqsync	mode=chunks	sig_bytes=163408	delta_bytes=192345216	sig_ms=54.4	diff_ms=56.1	apply_ms=139.3	verify_ms=0.0	total_ms=249.8
+== run 3 mid (m000)
+fast_rsync	block=2048	sig_bytes=24588	delta_bytes=2071	sig_ms=1.4	diff_ms=5.6	apply_ms=2.7	verify_ms=1.3	total_ms=11.1
+barqsync	mode=blocks	sig_bytes=1024	delta_bytes=65596	sig_ms=3.6	diff_ms=1.5	apply_ms=3.6	verify_ms=0.0	total_ms=8.6

@@ -8,10 +8,14 @@
 //!   always "in place" (same offset), which lets the receiver clone the basis and write
 //!   only the changed blocks.
 //! - **Content-defined chunks** (FastCDC): chunk boundaries follow the content, so data
-//!   that moved (inserts/deletes) still matches. Used as the fallback when aligned
-//!   blocks match poorly. Chunked in parallel per segment and joined at the segment
-//!   edges so the cuts are exactly those of one sequential pass (see
-//!   [`chunk_signature`]).
+//!   that moved (inserts/deletes) still matches. Used when aligned blocks match poorly
+//!   (locally) or the file changed size (remotely), merged with the aligned-block delta
+//!   so data that stayed in place still matches block by block ([`merge_in_place`]).
+//!   Chunked in parallel per segment and joined at the segment edges so the cuts are
+//!   exactly those of one sequential pass (see [`chunk_signature`]).
+//!
+//! Block and chunk sizes scale with the file, from 4 KiB to 64 KiB
+//! ([`Params::for_size`]).
 //!
 //! Matching uses BLAKE3 truncated to 128 bits, so every reused range is
 //! cryptographically verified (no separate whole-file pass, which would have to
@@ -22,6 +26,7 @@
 
 pub mod apply;
 pub mod cdc;
+pub mod refine;
 
 use crate::fsops::cache;
 use rayon::prelude::*;
@@ -48,6 +53,8 @@ pub struct Params {
 }
 
 impl Params {
+    /// Coarse sizes: the first signature of every delta, `--delta=cdc` throughout, and the
+    /// upper bound of [`Params::for_size`].
     pub const DEFAULT: Params = Params {
         block_size: 64 << 10,
         segment: 4 << 20,
@@ -56,6 +63,16 @@ impl Params {
         cdc_max: 64 << 10,
         cdc_region: 16 << 20,
     };
+
+    /// Fine block and chunk sizes, used to refine what a coarse delta left literal
+    /// ([`refine`]) for a basis of `size` bytes: a quarter of √size rounded up to a power of
+    /// two, between 4 KiB and 64 KiB (4 KiB up to 256 MiB, 8 KiB up to 1 GiB, 16 KiB up to
+    /// 4 GiB, 32 KiB up to 16 GiB, 64 KiB beyond). Chunks average the block size (half to
+    /// twice it). Measured in `fast_rsync_comparison.md`.
+    pub fn for_size(size: u64) -> Params {
+        let unit = ((size.isqrt() / 4) as usize).next_power_of_two().clamp(4 << 10, Params::DEFAULT.block_size);
+        Params { block_size: unit, cdc_min: unit / 2, cdc_avg: unit, cdc_max: unit * 2, ..Params::DEFAULT }
+    }
 }
 
 /// Which delta design to use (`--delta`).
@@ -288,10 +305,11 @@ pub fn diff_blocks(new: &BlockSig, basis: &BlockSig) -> Delta {
 // Content-defined chunks
 // ---------------------------------------------------------------------------
 
+/// One content-defined chunk. Chunks tile the file in order, so offsets are implied
+/// (see [`ChunkSig::iter`]) and not sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ChunkEntry {
-    pub off: u64,
     pub len: u32,
     pub hash: Hash128,
 }
@@ -300,7 +318,40 @@ pub struct ChunkEntry {
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ChunkSig {
     pub size: u64,
+    /// FastCDC sizes the chunks were cut with; the other side must cut its file the same way.
+    pub min: u32,
+    pub avg: u32,
+    pub max: u32,
     pub chunks: Vec<ChunkEntry>,
+}
+
+impl ChunkSig {
+    /// `(offset, length, hash)` of every chunk.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, u32, &Hash128)> + '_ {
+        self.chunks.iter().scan(0u64, |off, c| {
+            let at = *off;
+            *off += c.len as u64;
+            Some((at, c.len, &c.hash))
+        })
+    }
+
+    /// `p` with this signature's chunk sizes, or `None` if FastCDC would reject them
+    /// (the signature comes from the other side).
+    pub fn params(&self, p: Params) -> Option<Params> {
+        with_cdc(p, self.min, self.avg, self.max)
+    }
+}
+
+/// `p` with these FastCDC sizes, or `None` if FastCDC would reject them.
+pub(crate) fn with_cdc(p: Params, min: u32, avg: u32, max: u32) -> Option<Params> {
+    use fastcdc::v2020::{AVERAGE_MAX, AVERAGE_MIN, MAXIMUM_MAX, MAXIMUM_MIN, MINIMUM_MAX, MINIMUM_MIN};
+    let (min, avg, max) = (min as usize, avg as usize, max as usize);
+    let ok = (MINIMUM_MIN..=MINIMUM_MAX).contains(&min)
+        && (AVERAGE_MIN..=AVERAGE_MAX).contains(&avg)
+        && (MAXIMUM_MIN..=MAXIMUM_MAX).contains(&max)
+        && min <= avg
+        && avg <= max;
+    ok.then_some(Params { cdc_min: min, cdc_avg: avg, cdc_max: max, ..p })
 }
 
 /// Content-defined chunks, cut exactly where one sequential FastCDC pass over the whole
@@ -313,48 +364,46 @@ pub struct ChunkSig {
 /// chunks on (reading `cdc_max`-byte windows) until it reaches one of this segment's cuts,
 /// and takes the rest of the segment's chunks from there.
 pub fn chunk_signature(src: &dyn ReadAt, size: u64, p: &Params) -> io::Result<ChunkSig> {
-    let per_seg: Vec<Vec<ChunkEntry>> = segments(size, p.segment)
+    // Per segment: cuts as (offset, length, hash).
+    let per_seg: Vec<Vec<(u64, u32, Hash128)>> = segments(size, p.segment)
         .into_par_iter()
         .map(|(seg_off, len)| {
             let seg_end = seg_off + len as u64;
             let read = (size - seg_off).min((len + p.cdc_max) as u64) as usize;
             with_range(src, seg_off, read, |buf| {
-                let mut out = Vec::new();
+                let mut cuts = Vec::new();
                 for c in fastcdc::v2020::FastCDC::new(buf, p.cdc_min, p.cdc_avg, p.cdc_max) {
-                    out.push(ChunkEntry {
-                        off: seg_off + c.offset as u64,
-                        len: c.length as u32,
-                        hash: strong_hash(&buf[c.offset..c.offset + c.length]),
-                    });
+                    cuts.push((seg_off + c.offset as u64, c.length as u32, strong_hash(&buf[c.offset..c.offset + c.length])));
                     if seg_off + (c.offset + c.length) as u64 >= seg_end {
                         break;
                     }
                 }
-                out
+                cuts
             })
         })
         .collect::<io::Result<_>>()?;
     let mut chunks: Vec<ChunkEntry> = Vec::with_capacity(per_seg.iter().map(Vec::len).sum());
     let mut pos = 0u64;
     for seg in per_seg {
-        let Some(last) = seg.last().map(|c| c.off + c.len as u64) else { continue };
+        let Some(last) = seg.last().map(|c| c.0 + c.1 as u64) else { continue };
         while pos < last {
-            if let Ok(i) = seg.binary_search_by_key(&pos, |c| c.off) {
-                chunks.extend_from_slice(&seg[i..]);
+            if let Ok(i) = seg.binary_search_by_key(&pos, |c| c.0) {
+                chunks.extend(seg[i..].iter().map(|&(_, len, hash)| ChunkEntry { len, hash }));
                 pos = last;
                 break;
             }
             let window = (size - pos).min(p.cdc_max as u64) as usize;
             let c = with_range(src, pos, window, |buf| {
                 let n = fastcdc::v2020::FastCDC::new(buf, p.cdc_min, p.cdc_avg, p.cdc_max).next().map_or(buf.len(), |c| c.length);
-                ChunkEntry { off: pos, len: n as u32, hash: strong_hash(&buf[..n]) }
+                ChunkEntry { len: n as u32, hash: strong_hash(&buf[..n]) }
             })?;
             pos += c.len as u64;
             chunks.push(c);
         }
     }
     debug_assert_eq!(pos, size);
-    Ok(ChunkSig { size, chunks })
+    let (min, avg, max) = (p.cdc_min as u32, p.cdc_avg as u32, p.cdc_max as u32);
+    Ok(ChunkSig { size, min, avg, max, chunks })
 }
 
 /// Match new-file chunks against basis chunks by content. A chunk found at the same
@@ -362,24 +411,72 @@ pub fn chunk_signature(src: &dyn ReadAt, size: u64, p: &Params) -> io::Result<Ch
 pub fn diff_chunks(new: &ChunkSig, basis: &ChunkSig) -> Delta {
     let mut by_hash: HashMap<Hash128, (u64, u32)> = HashMap::with_capacity(basis.chunks.len());
     let mut at_off: HashMap<u64, Hash128> = HashMap::with_capacity(basis.chunks.len());
-    for c in &basis.chunks {
-        by_hash.entry(c.hash).or_insert((c.off, c.len));
-        at_off.insert(c.off, c.hash);
+    for (off, len, hash) in basis.iter() {
+        by_hash.entry(*hash).or_insert((off, len));
+        at_off.insert(off, *hash);
     }
     let mut d = Delta::new(new.size);
-    for c in &new.chunks {
-        let len = c.len as u64;
-        if at_off.get(&c.off) == Some(&c.hash) && c.off + len <= basis.size {
-            d.push(Op::Copy { off: c.off, basis_off: c.off, len });
-        } else if let Some(&(boff, blen)) = by_hash.get(&c.hash)
-            && blen == c.len
+    for (off, clen, hash) in new.iter() {
+        let len = clen as u64;
+        if at_off.get(&off) == Some(hash) && off + len <= basis.size {
+            d.push(Op::Copy { off, basis_off: off, len });
+        } else if let Some(&(boff, blen)) = by_hash.get(hash)
+            && blen == clen
         {
-            d.push(Op::Copy { off: c.off, basis_off: boff, len });
+            d.push(Op::Copy { off, basis_off: boff, len });
         } else {
-            d.push(Op::Literal { off: c.off, len });
+            d.push(Op::Literal { off, len });
         }
     }
     d
+}
+
+/// Combine a content-defined-chunk delta with an aligned-block delta of the same new
+/// file: every literal range of `chunks` that `blocks` found unchanged at the same offset
+/// becomes a copy. The result never has more literal bytes than either input, so a file
+/// that grew but kept its data in place (a database, a VM image) costs only its changed
+/// blocks, while one whose data moved still matches by content.
+pub fn merge_in_place(chunks: &Delta, blocks: &Delta) -> Delta {
+    debug_assert_eq!(chunks.size, blocks.size);
+    let copies: Vec<(u64, u64, u64)> = blocks
+        .ops
+        .iter()
+        .filter_map(|o| match *o {
+            Op::Copy { off, basis_off, len } => Some((off, basis_off, len)),
+            Op::Literal { .. } => None,
+        })
+        .collect();
+    let mut d = Delta::new(chunks.size);
+    overlay(&mut d, &chunks.ops, &copies);
+    d
+}
+
+/// Push `ops` into `out`, with every part of a literal op that one of `copies`
+/// (`(off, basis_off, len)`, sorted by `off`, disjoint) covers turned into a copy.
+pub(crate) fn overlay(out: &mut Delta, ops: &[Op], copies: &[(u64, u64, u64)]) {
+    let mut i = 0;
+    for op in ops {
+        let Op::Literal { off, len } = *op else {
+            out.push(*op);
+            continue;
+        };
+        let (mut pos, end) = (off, off + len);
+        while i < copies.len() && copies[i].0 + copies[i].2 <= pos {
+            i += 1;
+        }
+        while i < copies.len() && copies[i].0 < end {
+            let (c_off, c_basis, c_len) = copies[i];
+            let (s, e) = (c_off.max(pos), (c_off + c_len).min(end));
+            out.push(Op::Literal { off: pos, len: s - pos });
+            out.push(Op::Copy { off: s, basis_off: c_basis + (s - c_off), len: e - s });
+            pos = e;
+            if c_off + c_len > end {
+                break; // the copy continues past this literal
+            }
+            i += 1;
+        }
+        out.push(Op::Literal { off: pos, len: end - pos });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -387,17 +484,28 @@ pub fn diff_chunks(new: &ChunkSig, basis: &ChunkSig) -> Delta {
 // ---------------------------------------------------------------------------
 
 /// Compute a delta when both files are local: hash both concurrently with aligned
-/// blocks, and fall back to content-defined chunking when fewer than half of the
-/// bytes matched.
+/// blocks of `p`, and when fewer than half of the bytes matched, chunk both by content and
+/// merge the two deltas ([`merge_in_place`]). Then refine what is still literal with the
+/// file's finer sizes ([`refine`]).
 pub fn local_delta(new: &dyn ReadAt, new_size: u64, basis: &dyn ReadAt, basis_size: u64, p: &Params) -> io::Result<Delta> {
+    local_delta_with(new, new_size, basis, basis_size, p, &Params::for_size(basis_size))
+}
+
+/// [`local_delta`] refined with the given fine sizes.
+pub(crate) fn local_delta_with(new: &dyn ReadAt, new_size: u64, basis: &dyn ReadAt, basis_size: u64, p: &Params, fine: &Params) -> io::Result<Delta> {
     let (ns, bs) = rayon::join(|| block_signature(new, new_size, p), || block_signature(basis, basis_size, p));
     let aligned = diff_blocks(&ns?, &bs?);
-    if aligned.matched_bytes() * 2 >= new_size {
-        return Ok(aligned);
+    // The coarse unit is that of the pass taken: refining is worth it below it.
+    let (coarse, unit) = if aligned.matched_bytes() * 2 >= new_size {
+        (aligned, p.block_size)
+    } else {
+        let (nc, bc) = rayon::join(|| chunk_signature(new, new_size, p), || chunk_signature(basis, basis_size, p));
+        (merge_in_place(&diff_chunks(&nc?, &bc?), &aligned), p.cdc_avg)
+    };
+    match refine::plan(&coarse, basis_size, unit, fine, 0) {
+        Some(gaps) => refine::local(&coarse, new, new_size, basis, basis_size, fine, &gaps),
+        None => Ok(coarse),
     }
-    let (nc, bc) = rayon::join(|| chunk_signature(new, new_size, p), || chunk_signature(basis, basis_size, p));
-    let cdc = diff_chunks(&nc?, &bc?);
-    Ok(if cdc.matched_bytes() > aligned.matched_bytes() { cdc } else { aligned })
 }
 
 #[cfg(test)]

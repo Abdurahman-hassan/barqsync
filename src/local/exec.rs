@@ -1418,7 +1418,6 @@ impl<'a> Engine<'a> {
         let new = fs::File::open(&job.src_path)?;
         let basis = fs::File::open(job.basis_path())?;
         let basis_size = basis.metadata()?.len();
-        let p = &delta::Params::DEFAULT;
         let (maps, reads);
         let (d, new_r, basis_r): (delta::Delta, &dyn delta::ReadAt, &dyn delta::ReadAt) = if self.opts.delta == DeltaMode::Cdc {
             maps = match (cdc::Mapped::new(&new, job.meta.size), cdc::Mapped::new(&basis, basis_size)) {
@@ -1427,10 +1426,10 @@ impl<'a> Engine<'a> {
                 (Err(e), _) | (_, Err(e)) if cdc::is_changed(&e) => return Ok(false),
                 (Err(e), _) | (_, Err(e)) => return Err(e),
             };
-            (cdc::local_delta(maps.0.bytes(), maps.1.bytes(), p), &maps.0, &maps.1)
+            (cdc::local_delta(maps.0.bytes(), maps.1.bytes(), &delta::Params::DEFAULT), &maps.0, &maps.1)
         } else {
             reads = (delta::ReadOnce::new(&new, job.meta.size), delta::ReadOnce::new(&basis, basis_size));
-            (delta::local_delta(&reads.0, job.meta.size, &reads.1, basis_size, p)?, &reads.0, &reads.1)
+            (delta::local_delta(&reads.0, job.meta.size, &reads.1, basis_size, &delta::Params::DEFAULT)?, &reads.0, &reads.1)
         };
         if d.matched_bytes() == 0 {
             return Ok(false);

@@ -58,7 +58,7 @@ rtt=$(ping -c 5 -q "${HOST#*@}" 2>/dev/null | awk -F/ '/round-trip|rtt/ {print $
 {
   echo "# Real host ($tag)"
   echo
-  echo "Local: $(uname -sm), remote: $("${SSH[@]}" 'uname -sm; sysctl -n machdep.cpu.brand_string 2>/dev/null' | tr '\n' ' ')over \`$HOST\`; ping ${rtt:-?} ms average; $RUNS runs; scale $SCALE."
+  echo "Local: $(uname -sm), remote: $("${SSH[@]}" 'uname -sm; sysctl -n machdep.cpu.brand_string 2>/dev/null' | tr '\n' ' ')over ssh (host left out of the report); ping ${rtt:-?} ms average; $RUNS runs; scale $SCALE."
   echo
 } > "$REPORT"
 

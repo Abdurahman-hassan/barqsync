@@ -74,7 +74,7 @@ fn excludes_and_dry_run_match_rsync() {
         .file("src/main.c", "m")
         .settle_mtimes();
     for d in ["dr", "df"] {
-        Tree::new(tmp.path().join(d)).file("drop.log", "old").file("stale", "s");
+        Tree::new(tmp.path().join(d)).file("drop.log", "old").file("stale", "s").same_mtimes(BASE_TIME + 800_000);
     }
     let before = snapshot(&tmp.path().join("df"), true);
     let args = ["-avn", "--delete", "--include=keep.log", "--exclude=*.log", "--exclude=/build", "src/", "{host}{dst}"];
@@ -153,6 +153,37 @@ fn delta_over_the_wire() {
             assert!(matched > 9 << 20, "{extra:?} pull={pull}: matched {matched}, literal {literal}");
             assert!(literal < 1 << 20, "{extra:?} pull={pull}: literal {literal}");
         }
+    }
+}
+
+/// A database-like file that grew, with small edits all over it: the receiver sends
+/// aligned blocks and chunks, the sender merges both deltas, and only the touched 4 KiB
+/// blocks and the new tail travel (content-defined chunks alone would send the chunks
+/// around every edit).
+#[test]
+fn resized_file_with_scattered_edits_sends_only_changed_blocks() {
+    let base = noise(16 << 20, 21);
+    let mut grown = base.clone();
+    for i in 0..64 {
+        let off = i * 250_000 + 777;
+        grown[off..off + 64].copy_from_slice(&noise(64, 100 + i as u64));
+    }
+    grown.extend(noise(100_000, 22));
+    for pull in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        Tree::new(tmp.path().join("dst")).file("app.db", &base).settle_mtimes();
+        let new = Tree::new(tmp.path().join("src"));
+        new.file("app.db", &grown).settle_mtimes();
+        new.mtime("app.db", BASE_TIME + 900_003);
+        // The block design's sizes and merge (--delta=cdc keeps its fixed chunks).
+        let mut args = vec!["-a", "--stats", "--strategy", "fixed", "--delta", "blocks"];
+        args.extend_from_slice(if pull { &["{host}src/", "dst"] } else { &["src/", "{host}dst"] });
+        let f = barqsync_remote(tmp.path(), &args);
+        assert_eq!(f.code, 0, "pull={pull}\n{}\n{}", f.stdout, f.stderr);
+        assert_eq!(fs::read(tmp.path().join("dst/app.db")).unwrap(), grown, "pull={pull}");
+        let literal = stat_bytes(&f.stdout, "Literal data: ");
+        let most = 64 * 2 * 4096 + 100_000 + 4096;
+        assert!(literal <= most, "pull={pull}: literal {literal} > {most}");
     }
 }
 
@@ -335,6 +366,102 @@ fn quic_falls_back_to_ssh() {
     assert!(f.stdout.contains("QUIC: could not connect") && f.stdout.contains("using the ssh connection"), "{}", f.stdout);
     assert!(started.elapsed() < std::time::Duration::from_secs(15), "fallback took {:?}", started.elapsed());
     assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
+}
+
+/// `--transport auto` through the fake ssh, remembering hosts in `state`. Loopback is far
+/// below the round trip that gets QUIC, so `BARQSYNC_AUTO_RTT_MS` picks the branch.
+fn auto_run(tmp: &std::path::Path, state: &str, rtt_ms: &str, args: &[&str], env: &[(&str, &str)]) -> RunOut {
+    let state = tmp.join(state);
+    let mut all = vec![("BARQSYNC_CACHE_DIR", state.to_str().unwrap()), ("BARQSYNC_AUTO_RTT_MS", rtt_ms)];
+    all.extend_from_slice(env);
+    let mut a = vec!["-avv", "--stats", "--strategy", "fixed", "--transport", "auto"];
+    a.extend_from_slice(args);
+    remote_with_env(tmp, &a, &all)
+}
+
+#[test]
+fn auto_transport_uses_quic_on_long_links() {
+    for pull in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        delta_fixture(tmp.path());
+        let t = Tree::new(tmp.path().join("src"));
+        for i in 0..300 {
+            t.file(&format!("many/f{i:03}"), noise(1000 + i * 13, i as u64));
+        }
+        t.settle_mtimes();
+        let paths: &[&str] = if pull { &["{host}src/", "dst"] } else { &["src/", "{host}dst"] };
+        let f = auto_run(tmp.path(), "state", "0", paths, &[]);
+        assert_eq!(f.code, 0, "pull={pull}\n{}\n{}", f.stdout, f.stderr);
+        assert!(f.stdout.contains("QUIC connected in") && f.stdout.contains("(16 data streams)"), "{}", f.stdout);
+        let mut want = snapshot(&tmp.path().join("src"), true);
+        let got = snapshot(&tmp.path().join("dst"), true);
+        want.get_mut(b".".as_slice()).unwrap().mtime = got[b".".as_slice()].mtime;
+        assert_same_tree(&want, &got);
+        assert!(stat_bytes(&f.stdout, "Matched data: ") > 9 << 20, "delta over QUIC: {}", f.stdout);
+    }
+}
+
+#[test]
+fn auto_transport_stays_on_ssh_on_short_links() {
+    for pull in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        rich_tree(&tmp.path().join("src"));
+        let paths: &[&str] = if pull { &["{host}src/", "dst"] } else { &["src/", "{host}dst"] };
+        let f = auto_run(tmp.path(), "state", "60000", paths, &[]);
+        assert_eq!(f.code, 0, "pull={pull}\n{}\n{}", f.stdout, f.stderr);
+        assert!(f.stdout.contains("round trip, using the ssh connection"), "{}", f.stdout);
+        assert!(!f.stdout.contains("QUIC"), "{}", f.stdout);
+        assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
+        // Only -vv says how it went: -v output stays rsync's.
+        let tmp2 = tempfile::tempdir().unwrap();
+        rich_tree(&tmp2.path().join("src"));
+        let v = remote_with_env(tmp2.path(), &["-av", "--transport", "auto", "src/", "{host}dst"], &[("BARQSYNC_CACHE_DIR", "state")]);
+        assert_eq!(v.code, 0, "{}", v.stderr);
+        assert!(!v.stdout.contains("auto:"), "{}", v.stdout);
+    }
+}
+
+#[test]
+fn auto_transport_falls_back_fast_and_remembers_the_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    rich_tree(&tmp.path().join("src"));
+    let blocked = [("BARQSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")];
+    // The same transfer on the ssh pipe, for comparison (and to have run the binary once:
+    // macOS can take a second or more to start a freshly built one).
+    let started = std::time::Instant::now();
+    let s = remote_with_env(tmp.path(), &["-a", "--transport", "ssh", "src/", "{host}dst0"], &[]);
+    let ssh = started.elapsed();
+    assert_eq!(s.code, 0, "{}", s.stderr);
+    let started = std::time::Instant::now();
+    let f = auto_run(tmp.path(), "state", "0", &["src/", "{host}dst"], &blocked);
+    let took = started.elapsed();
+    assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
+    assert!(f.stdout.contains("auto: QUIC to 127.0.0.1:1 did not connect within 3"), "{}", f.stdout);
+    // --transport quic waits 3 s here; auto 300 ms plus two (loopback) round trips.
+    assert!(took < ssh + std::time::Duration::from_secs(2), "fallback took {took:?}, ssh {ssh:?}");
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
+
+    // The next run to the same host doesn't try, even with QUIC reachable again...
+    let g = auto_run(tmp.path(), "state", "0", &["src/", "{host}dst2"], &[]);
+    assert_eq!(g.code, 0, "{}\n{}", g.stdout, g.stderr);
+    assert!(g.stdout.contains("auto: QUIC to fakehost failed recently, using the ssh connection"), "{}", g.stdout);
+    assert!(!g.stdout.contains("round trip"), "no attempt expected: {}", g.stdout);
+    // ...explicit QUIC still does...
+    let q = remote_with_env(tmp.path(), &["-avv", "--transport", "quic", "src/", "{host}dst3"], &[]);
+    assert!(q.stdout.contains("using QUIC to"), "{}", q.stdout);
+    // ...and other hosts aren't affected (the memory is per host, not per user).
+    let other = auto_run(tmp.path(), "state", "0", &["src/", "otherhost:dst4"], &[]);
+    assert!(other.stdout.contains("using QUIC to"), "{}", other.stdout);
+    let same = auto_run(tmp.path(), "state", "0", &["src/", "me@fakehost:dst5"], &[]);
+    assert!(same.stdout.contains("failed recently"), "{}", same.stdout);
+
+    // Once QUIC works again (after the memory expires, here: removed), it is used and the
+    // host stays usable.
+    std::fs::remove_dir_all(tmp.path().join("state")).unwrap();
+    for dst in ["dst6", "dst7"] {
+        let h = auto_run(tmp.path(), "state", "0", &["src/", &format!("{{host}}{dst}")], &[]);
+        assert!(h.stdout.contains("QUIC connected in"), "{}", h.stdout);
+    }
 }
 
 #[test]

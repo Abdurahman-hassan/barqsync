@@ -29,6 +29,7 @@ use crate::cli::Options;
 use crate::ids::Names;
 use crate::select::Sel;
 use crate::delta::cdc::CdcSig;
+use crate::delta::refine::{GapReq, GapSig, Grain};
 use crate::delta::{BlockSig, ChunkSig, Op};
 use crate::entry::{DirEnt, Meta};
 use crate::xattrs::Xattr;
@@ -46,8 +47,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
-/// 6: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
-pub const VERSION: u32 = 6;
+/// 9: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
+pub const VERSION: u32 = 9;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -82,8 +83,9 @@ pub struct RootInfo {
     pub extra: Option<Box<crate::entry::Extra>>,
 }
 
-/// The receiver's basis-file signature, chosen by the receiver: aligned blocks when the
-/// file kept its size (in-place edits), content-defined chunks when it changed size.
+/// The receiver's coarse basis-file signature, chosen by the receiver: aligned blocks when
+/// the file kept its size (in-place edits), content-defined chunks when it changed size.
+/// What the coarse delta leaves literal can then be refined (`Refine`, `Refined`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Sig {
@@ -153,6 +155,12 @@ pub enum Msg {
     /// Start a delta-encoded file: `copies` come from the receiver's basis, the
     /// remaining ranges arrive as `Data` frames.
     DeltaBegin { id: u64, size: u64, copies: Vec<Op>, xattrs: Option<Vec<Xattr>> },
+    /// Sender → receiver, before `DeltaBegin`: fine signatures wanted for the basis
+    /// stretches the coarse delta left literal (see `delta::refine`).
+    Refine { id: u64, grain: Grain, gaps: Vec<GapReq> },
+    /// Receiver → sender: one fine signature per requested stretch, or none at all if the
+    /// receiver can't refine (the sender then keeps the coarse delta).
+    Refined { id: u64, gaps: Vec<GapSig> },
     FileEnd { id: u64, ok: bool },
     /// Several complete small files: `(id, len)` pairs, contents concatenated in `blob`;
     /// full attribute values for the files that need them (see `FileBegin`).
@@ -680,6 +688,11 @@ mod tests {
         sel.children.insert(b"sub".to_vec(), Sel { contents: true, ..Sel::default() });
         let opts = crate::cli::Options::parse_from(["barqsync", "-a", "--partial-dir=.p", "src/", "dst"]).unwrap();
         let sig = crate::delta::cdc::signature(&[5u8; 300_000], &crate::delta::Params::DEFAULT);
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let p = crate::delta::Params::for_size(data.len() as u64);
+        let chunks = crate::delta::chunk_signature(&data, data.len() as u64, &crate::delta::Params::DEFAULT).unwrap();
+        let reqs = vec![GapReq { off: 4_000, len: 70_000, chunks: true }, GapReq { off: 200_000, len: 9_000, chunks: false }];
+        let fine = crate::delta::refine::basis_sigs(&data, data.len() as u64, &p, &reqs).unwrap();
         // -X/-A data with non-UTF-8 names, both value forms and both ACL flavors.
         use crate::acls::{AclName, Acls, Flavor, RsyncAcl};
         use crate::xattrs::XValue;
@@ -704,6 +717,9 @@ mod tests {
             Msg::Roots(vec![RootInfo { contents: true, meta: Some(meta), items: Vec::new(), sel: Some(sel), extra: Some(Box::new(extra)) }]),
             Msg::DirBatch { root: 1, dir: 2, rel: b"x/y".to_vec(), entries: vec![ent, plain, mac_ent], sums: vec![Some([1; 16])] },
             Msg::Need { dir: 2, files: vec![NeedReq { idx: 0, sig: Some(Sig::Cdc(sig)) }], xattrs: vec![1, 5] },
+            Msg::Need { dir: 3, files: vec![NeedReq { idx: 1, sig: Some(Sig::Chunks(chunks)) }], xattrs: Vec::new() },
+            Msg::Refine { id: file_id(3, 1), grain: Grain::of(&p), gaps: reqs },
+            Msg::Refined { id: file_id(3, 1), gaps: fine },
             Msg::SmallPack { files: vec![(file_id(2, 0), 3)], blob: b"abc".to_vec(), xattrs: vec![(file_id(2, 0), xattrs.clone())] },
             Msg::FileBegin { id: 3, size: 9, xattrs: Some(xattrs.clone()) },
             Msg::Xattrs { id: file_id(2, 1), xattrs: Some(xattrs) },
