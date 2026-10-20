@@ -4,7 +4,7 @@ Status on 20 October 2026.
 
 - **Released:** 0.3.0 (crates.io, and a GitHub release with binaries and installers for
   macOS and Linux). Protocol 9.
-- **On `main`, not released:**
+- **0.4.0, version set on `main`, to be tagged and published:**
   - parallel streams through ssh when a firewall blocks them;
   - `~` in remote paths;
   - clearer errors;
@@ -15,16 +15,12 @@ Status on 20 October 2026.
   - pull `--remove-source-files` reporting its removals;
   - `BARQSYNC_TIMING`.
 
-  The details are in `CHANGELOG.md` under "Unreleased". The protocol is now 10, so the next
-  release can't talk to 0.3.x.
+  The details are in `CHANGELOG.md` under 0.4.0. The protocol is now 10, so 0.4.x can't
+  talk to 0.3.x.
 
 ## Next steps, in order
 
-1. **Release 0.4.0.**
-   - Set `version = "0.4.0"` in `Cargo.toml` and update `Cargo.lock` (`cargo update -p barqsync`).
-   - Rename the CHANGELOG's "Unreleased" heading to "0.4.0 - <date>".
-   - In the README, change "0.3.x uses protocol 9" to "0.4.x uses protocol 10 and cannot
-     communicate with 0.3.x or earlier".
+1. **Publish 0.4.0.** The version, changelog and README are already set.
    - Tag `v0.4.0` and push the tag: the release workflow builds the binaries, installers and
      checksums.
    - Run `cargo publish` from `main`.

@@ -47,7 +47,7 @@ echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc  # 
 ```
 
 To copy to or from another machine, install barqsync there too, from the same release line
-(0.3.x uses protocol 9 and cannot communicate with 0.2.x or earlier releases).
+(0.4.x uses protocol 10 and cannot communicate with 0.3.x or earlier releases).
 
 ## Quick start
 
