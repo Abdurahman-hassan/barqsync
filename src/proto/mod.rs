@@ -14,6 +14,7 @@
 //!   Xattrs (one per entry asked for in a Need) ->   write attribute values
 //!   ScanDone, then SenderDone ----------------->
 //!                                        <-----   ReceiverDone (stats)
+//!   RemovalsDone (pull + --remove-source-files) ->
 //! ```
 //!
 //! Each side runs a dedicated reader thread and writer thread, so neither side can
@@ -48,7 +49,8 @@ use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 9: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
-pub const VERSION: u32 = 9;
+/// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals).
+pub const VERSION: u32 = 10;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -169,6 +171,10 @@ pub enum Msg {
     /// full (`None`: the sender couldn't read them, and said why).
     Xattrs { id: u64, xattrs: Option<Vec<Xattr>> },
     SenderDone { errors: u64 },
+    /// A pull with `--remove-source-files` (see `remote::reports_removals`): the sender's
+    /// last frame, after `ReceiverDone`, once every `Synced` entry is dealt with and its
+    /// output sent. `errors`: failures since `SenderDone`.
+    RemovalsDone { errors: u64 },
 
     // receiver → sender
     /// The answer to one `DirBatch`: which of its files the receiver wants, and (`-X`)
@@ -579,6 +585,11 @@ impl Conn {
         }
     }
 
+    /// The session this connection runs over, if it is a `T` (e.g. a QUIC session).
+    pub fn session<T: 'static>(&self) -> Option<&T> {
+        self.session.as_deref()?.downcast_ref()
+    }
+
     /// Number of attached incoming data streams.
     pub fn data_streams_in(&self) -> usize {
         self.data_in
@@ -618,7 +629,32 @@ impl Conn {
 
     /// Flush everything queued and close our side of the stream. Clones of the sender
     /// may still exist (e.g. in a forwarding `Output`), so closing is an explicit request.
-    pub fn finish(mut self) -> io::Result<()> {
+    ///
+    /// Over QUIC, everything this side sent must reach the peer's application before the
+    /// session closes, and QUIC resends lost packets only while this process lives. So
+    /// this waits (bounded) until the peer has ended too: the peer ends only once it has
+    /// read all it needs. It ends its control stream or closes the session, or, when its
+    /// QUIC close is lost or it exits first, the idle ssh pipe reaches its end.
+    pub fn finish(self) -> io::Result<()> {
+        self.close(false)
+    }
+
+    /// [`Conn::finish`] once the peer has said it has everything this side sent (the
+    /// sender, after `ReceiverDone`; the receiver of a pull with `--remove-source-files`,
+    /// after `RemovalsDone`): nothing left to deliver, so close without waiting.
+    /// The peer, waiting for this side to end, learns a round trip sooner.
+    pub fn finish_confirmed(self) -> io::Result<()> {
+        self.close(true)
+    }
+
+    fn close(mut self, confirmed: bool) -> io::Result<()> {
+        use crate::timing::mark;
+        let quic = self.session.is_some();
+        if quic && confirmed {
+            // Stops the writers too: whatever they still hold, the peer no longer reads.
+            drop(self.session.take());
+            mark("finish: session closed");
+        }
         for tx in self.out.data.iter().flat_map(|d| d.iter()) {
             let _ = tx.send(Vec::new());
         }
@@ -627,18 +663,40 @@ impl Conn {
         }
         let _ = self.out.tx.send(Vec::new());
         let r = self.writer.take().map_or(Ok(()), Joiner::join);
+        // The writers of a closed session fail, as expected.
+        let r = if quic && confirmed { Ok(()) } else { r };
         if self.session.is_some() {
-            // QUIC: wait (bounded) for the peer to end its control stream too. Once both
-            // sides have read each other's end, closing can't cut anything off, and
-            // neither waits on a close notice that a process exiting might never send.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while self.rx.recv_deadline(deadline).is_ok() {}
+            mark("finish: streams ended");
+            let how = self.wait_for_peer(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            mark(format_args!("finish: peer ended ({how})"));
         }
         drop(self.session.take());
         if let Some(under) = self.under.take() {
             let _ = under.finish();
+            mark("finish: ssh pipe closed");
         }
         r
+    }
+
+    /// Wait until the peer has ended: its streams on this connection, or the ssh pipe
+    /// underneath. Frames still arriving are dropped; the caller is done reading.
+    fn wait_for_peer(&self, deadline: std::time::Instant) -> &'static str {
+        let under = self.under.as_ref().map(|u| &u.rx);
+        loop {
+            let mut sel = crossbeam_channel::Select::new();
+            let main = sel.recv(&self.rx);
+            if let Some(u) = under {
+                sel.recv(u);
+            }
+            let Ok(op) = sel.select_deadline(deadline) else { return "timed out" };
+            if op.index() == main {
+                if op.recv(&self.rx).is_err() {
+                    return "quic";
+                }
+            } else if op.recv(under.expect("ssh pipe")).is_err() {
+                return "ssh";
+            }
+        }
     }
 }
 

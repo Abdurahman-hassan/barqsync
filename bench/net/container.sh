@@ -3,6 +3,7 @@
 #
 #   bench/net/container.sh build                 build the image (once)
 #   bench/net/container.sh net [profiles...]     rsync vs barqsync over real ssh, tc-shaped
+#   bench/net/container.sh fixed [profiles...]   per-transfer fixed cost of each transport
 #   bench/net/container.sh syscalls              strace -c syscall counts
 #   bench/net/container.sh firewall              --streams through a firewall that only lets ssh in
 #   bench/net/container.sh flamegraph [workload] perf + inferno flamegraph
@@ -36,6 +37,7 @@ run() {
 case "$cmd" in
   build) "$ENGINE" build -t "$IMAGE" -f "$ROOT/bench/net/Containerfile" "$ROOT/bench/net" ;;
   net) run "$IMAGE" bash bench/net/net_bench.sh "$@" ;;
+  fixed) run "$IMAGE" bash bench/net/fixed_cost.sh "$@" ;;
   syscalls) run "$IMAGE" bash bench/syscalls.sh "$@" ;;
   firewall) run "$IMAGE" bash bench/net/firewall.sh "$@" ;;
   flamegraph) run "$IMAGE" bash bench/flamegraph.sh "$@" ;;

@@ -958,12 +958,14 @@ fn plan_dest(eng: &mut Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -
 }
 
 /// Run the receiving side until the sender is done. Sends `ReceiverDone` with the
-/// final counters and returns the exit code plus those counters.
-pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, StatsSnapshot) {
+/// final counters and returns the exit code plus those counters. `await_removals`: then
+/// read on until the sender's `RemovalsDone` (see [`super::reports_removals`]); the last
+/// value says whether it came, so the sender has nothing more to deliver.
+pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_removals: bool) -> (i32, StatsSnapshot, bool) {
     let fail = |code: i32, msg: String| {
         out.error(&msg);
         let _ = conn.msg(Msg::Fatal { msg });
-        (code, StatsSnapshot::default())
+        (code, StatsSnapshot::default(), false)
     };
     let mut ids = IdMap::default();
     let mut probe = adapt::ProbeReceiver::default();
@@ -984,10 +986,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
             Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
             Ok(Frame::Msg(Msg::Fatal { msg })) => {
                 out.error(format!("remote: {msg}"));
-                return (exit::PROTOCOL, StatsSnapshot::default());
+                return (exit::PROTOCOL, StatsSnapshot::default(), false);
             }
             Ok(other) => return fail(exit::PROTOCOL, format!("protocol error: expected Roots, got {other:?}")),
-            Err(Stop::Interrupted) => return (exit::SIGNAL, StatsSnapshot::default()),
+            Err(Stop::Interrupted) => return (exit::SIGNAL, StatsSnapshot::default(), false),
             Err(Stop::Io(e)) => return fail(exit::PROTOCOL, format!("connection error: {e}")),
         }
     };
@@ -1011,7 +1013,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
         Ok(s) => s,
         Err(code) => {
             let _ = conn.msg(Msg::Fatal { msg: "the receiver could not prepare the destination".into() });
-            return (code, StatsSnapshot::default());
+            return (code, StatsSnapshot::default(), false);
         }
     };
     let mut state = RemoteState::new(conn.out.clone(), opts, ids);
@@ -1105,6 +1107,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
                             Ok(())
                         }
                         Msg::SenderDone { errors } => {
+                            crate::timing::mark("SenderDone received");
                             sender_done = Some(errors);
                             Ok(())
                         }
@@ -1140,7 +1143,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
     if let Some(code) = failure {
         remote.abandon(engine);
         fsops::cleanup_temps();
-        return (code, engine.stats.snapshot());
+        return (code, engine.stats.snapshot(), false);
     }
     let unanswered = remote.needed.lock().unwrap().len() + remote.incoming.lock().unwrap().len();
     if unanswered > 0 {
@@ -1159,6 +1162,41 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output) -> (i32, Sta
     Stats::add(&engine.stats.errors, sender_errors);
     let stats = engine.stats.snapshot();
     let _ = conn.msg(Msg::ReceiverDone { stats: stats.clone() });
+    crate::timing::mark("ReceiverDone sent");
+    if await_removals {
+        match removals_done(conn, out) {
+            Ok(errors) => Stats::add(&engine.stats.errors, errors),
+            Err(code) => return (code, stats, false),
+        }
+    }
     let code = if Stats::get(&engine.stats.errors) > 0 { exit::PARTIAL } else { exit::OK };
-    (code, stats)
+    (code, stats, await_removals)
+}
+
+/// The sender's output for the removals it does after `ReceiverDone`, up to its
+/// `RemovalsDone`. Returns the number of removals that failed.
+fn removals_done(conn: &Conn, out: &Output) -> Result<u64, i32> {
+    loop {
+        match recv(conn) {
+            Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
+            Ok(Frame::Msg(Msg::RemovalsDone { errors })) => {
+                crate::timing::mark("RemovalsDone received");
+                return Ok(errors);
+            }
+            Ok(Frame::Msg(Msg::Fatal { msg })) => {
+                out.error(format!("remote: {msg}"));
+                return Err(exit::PROTOCOL);
+            }
+            Ok(other) => {
+                out.error(format!("protocol error: unexpected {other:?}"));
+                return Err(exit::PROTOCOL);
+            }
+            Err(Stop::Interrupted) => return Err(exit::SIGNAL),
+            Err(Stop::Io(_)) if fsops::interrupted() => return Err(exit::SIGNAL),
+            Err(Stop::Io(e)) => {
+                out.error(format!("connection error: {e}"));
+                return Err(exit::PROTOCOL);
+            }
+        }
+    }
 }

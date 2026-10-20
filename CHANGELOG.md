@@ -2,8 +2,32 @@
 
 ## Unreleased
 
+### Compatibility
+
+- Remote transfers now use protocol 10. Upgrade barqsync on both machines together;
+  this version cannot communicate with 0.3.0 or earlier releases.
+
+### Added
+
+- `BARQSYNC_TIMING=1` prints timestamped milestones of a remote transfer from both sides
+  (handshake, transport setup, done messages, each step of closing), and
+  `bench/net/container.sh fixed` uses it to break a one-file push and pull into connect,
+  setup, transfer and close.
+
+### Changed
+
+- QUIC transfers cost about two round trips more than the SSH pipe instead of three to
+  five: the sender closes as soon as the receiver reports it is done, nothing waits for
+  acknowledgements, and the client no longer waits for the server to acknowledge its
+  connection token.
+- `--transport auto` connects to QUIC while its SSH ping is in flight, and remembers for an
+  hour hosts where a QUIC transfer saw a clean link, which then stay on the SSH pipe without
+  a ping. SSH remains the default.
+
 ### Fixed
 
+- A pull with `--remove-source-files` now prints the sender's removals with `-vv` and exits
+  with code 23 when a removal fails, as rsync does; it used to print nothing and exit 0.
 - Parallel streams (`--streams`, `--transport tcp`) now work behind a firewall that only
   lets ssh in, such as the macOS firewall: when direct connections are refused, the
   streams travel over extra ssh connections instead of falling back to the single ssh

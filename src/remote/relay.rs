@@ -56,16 +56,17 @@ impl Shell {
         Path::new(&self.program).file_name().is_some_and(|n| n == "ssh")
     }
 
-    /// The remote shell running `<remote barqsync> <args>` on the host.
-    fn command(&self, extra: &[&str], args: &str) -> Command {
+    /// The remote shell running `<env><remote barqsync> <args>` on the host.
+    fn command(&self, extra: &[&str], env: &str, args: &str) -> Command {
         let mut c = Command::new(&self.program);
-        c.args(extra).args(&self.args).arg(&self.host).arg(format!("{} {args}", self.remote));
+        c.args(extra).args(&self.args).arg(&self.host).arg(format!("{env}{} {args}", self.remote));
         c
     }
 
-    /// `barqsync --server` on the host.
+    /// `barqsync --server` on the host, passed `BARQSYNC_TIMING` (see [`crate::timing`]).
     pub fn server(&self, net_io_tokio: bool) -> Command {
-        self.command(&[], if net_io_tokio { "--server --net-io=tokio" } else { "--server" })
+        let env = if crate::timing::enabled() { format!("env {}=1 ", crate::timing::VAR) } else { String::new() };
+        self.command(&[], &env, if net_io_tokio { "--server --net-io=tokio" } else { "--server" })
     }
 
     /// A relay to `targets` on the host. ssh options given first win over later ones
@@ -73,7 +74,7 @@ impl Shell {
     fn relay(&self, targets: &str) -> io::Result<Command> {
         let quoted = shlex::try_quote(targets).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let ssh: &[&str] = &["-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ConnectTimeout=10"];
-        Ok(self.command(if self.is_ssh() { ssh } else { &[] }, &format!("--stream-relay {quoted}")))
+        Ok(self.command(if self.is_ssh() { ssh } else { &[] }, "", &format!("--stream-relay {quoted}")))
     }
 }
 

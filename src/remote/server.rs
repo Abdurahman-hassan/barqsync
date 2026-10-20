@@ -7,6 +7,7 @@ use crate::exit;
 use crate::output::Output;
 use crate::proto::async_io::FdIo;
 use crate::proto::{Conn, Frame, MAGIC, Msg, VERSION};
+use crate::timing::mark;
 
 pub fn run() -> i32 {
     let mut conn = match async_stdio() {
@@ -40,6 +41,7 @@ pub fn run() -> i32 {
     conn.set_compression(opts.compression());
     conn.set_wire(opts.wire);
     crate::fsops::cache::set_enabled(opts.drop_cache);
+    mark("handshake done");
     if conn.msg(Msg::HelloAck { version: VERSION }).is_err() {
         return exit::PROTOCOL;
     }
@@ -49,6 +51,7 @@ pub fn run() -> i32 {
         let _ = conn.finish();
         return exit::PROTOCOL;
     }
+    mark("setup done");
     let fwd = conn.out.clone();
     // In a push the items come from this (receiving) side but describe what the
     // client sent, so they are shown as rsync's sender does (`<f...`).
@@ -59,19 +62,25 @@ pub fn run() -> i32 {
             let _ = fwd.msg(Msg::Log { stderr, escape, text: text.to_vec() });
         }),
     );
-    let code = if server_is_sender {
-        sender::run(&conn, &opts, &opts.paths, &out).0
+    // A sender with the receiver's final counters knows the receiver has everything,
+    // unless it reports removals after them: then the client still has to read those.
+    let (code, confirmed) = if server_is_sender {
+        let removals = super::reports_removals(&opts, server_is_sender);
+        let (code, stats) = sender::run(&conn, &opts, &opts.paths, &out, removals);
+        (code, stats.is_some() && !removals)
     } else {
         match opts.paths.first() {
-            Some(dest) => receiver::run(&conn, &opts, dest, &out).0,
+            Some(dest) => (receiver::run(&conn, &opts, dest, &out, false).0, false),
             None => {
                 let _ = conn.msg(Msg::Fatal { msg: "no destination given to the server".into() });
-                exit::SYNTAX
+                (exit::SYNTAX, false)
             }
         }
     };
+    mark("transfer done");
     drop(out);
-    let _ = conn.finish();
+    let _ = if confirmed { conn.finish_confirmed() } else { conn.finish() };
+    mark("connection closed");
     code
 }
 
