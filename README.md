@@ -18,8 +18,8 @@ them, and sends only the parts of a file that changed.
   pieces where it differs (4 KiB up to 256 MiB, larger for larger files). A SQLite database
   after 8,000 changes sends 30 MB; rsync sends 104 MB.
 - **Made for real networks:** ssh by default, parallel TLS streams or QUIC for long or lossy
-  links, or `--transport auto` to use QUIC only where the round trip is long and UDP gets
-  through.
+  links, or `--transport auto` to use QUIC only where the round trip is long, UDP gets
+  through and the link isn't known to be clean.
 
 ## Install
 
@@ -92,7 +92,7 @@ barqsync -a photos  backup/    →  backup/photos/a.jpg  backup/photos/b.jpg   (
 | copy only the files named in a list | `barqsync -a --files-from=list.txt src/ dst/` |
 | use another ssh port or key | `barqsync -a -e "ssh -p 2222" src/ me@server:dst/` |
 | sync over a lossy or long-distance link | `barqsync -a --transport quic data/ me@server:data/` |
-| use QUIC on long links, the ssh pipe on short ones or where UDP is blocked | `barqsync -a --transport auto data/ me@server:data/` |
+| use QUIC on long links, the ssh pipe on short or clean ones or where UDP is blocked | `barqsync -a --transport auto data/ me@server:data/` |
 | fill a fast link with parallel connections | `barqsync -a --streams 8 data/ me@server:data/` |
 | compress automatically to suit a slow link | `barqsync -a --strategy adaptive logs/ me@server:logs/` |
 

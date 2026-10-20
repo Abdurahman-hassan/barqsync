@@ -34,11 +34,12 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M15 | delta block and chunk sizes scale with the file (4–64 KiB); a remote file that changed size got both signatures and a merged delta (protocol 6): 1.4–7.5× faster on small or scattered edits, but 4–22% slower on large appends and in-place runs, so M16 replaced the signature scheme | done |
 | M16 | two-level delta: the coarse signatures of 0.1.1, refined on demand with one round trip where the coarse delta left enough literal data (protocol 7). Over 100 Mbit: as fast as 0.1.1 on appends, in-place runs and small files, 1.3–7.6× faster on everything else (a growing SQLite database 16.7 → 3.2 s, rsync 9.4 s), faster than rsync on 7 of 8 datasets; see [Two-level delta](#two-level-delta-m16). Also fixed a racy test fixture | done |
 | M17 | `--transport auto`: an ssh ping picks QUIC on round trips of 30 ms and more, a short wait for it, hosts where it failed skipped for an hour (protocol 8). As fast as QUIC on the lossy link (2–3× the ssh pipe), 0.5 s lost at most where UDP is blocked, but a round trip more on short links and QUIC's ~3-round-trip setup and close on clean long ones (11–22% slower there on a delta or a no-op), so the ssh pipe stays the default; see [`--transport auto`, measured](#--transport-auto-measured) | done |
+| M18 | QUIC's fixed cost: `BARQSYNC_TIMING` milestones on both sides; the sender closes once it has `ReceiverDone`, nothing waits for acknowledgements, the client doesn't wait for the token's acknowledgement, auto connects alongside its ping, and hosts where QUIC found a clean link stay on the ssh pipe for an hour. On a clean 80 ms link QUIC's cost over the pipe fell from 3–5 round trips per transfer to 2 (auto: delta +9% → +3.5%, no-op +23% → +9%; once the host is known clean, the pipe's own times); the lossy win is unchanged. The ssh pipe stays the default; see [QUIC's fixed cost](#quics-fixed-cost-m18) | done |
 
-The test suite passes on macOS (APFS; 164 tests at M17, 154 at M16, 145 at M14, when it was
-also built as x86_64 and run under Rosetta) and Linux (167 tests at M17 in an aarch64
-container, 157 at M16 on an x86_64 VM, 148 at M14), compared against rsync 3.2.7. Three tests
-are Linux-only.
+The test suite passes on macOS (APFS; 167 tests at M18, 164 at M17, 154 at M16, 145 at M14,
+when it was also built as x86_64 and run under Rosetta) and Linux (170 tests at M18 and 167 at
+M17 in an aarch64 container, 157 at M16 on an x86_64 VM, 148 at M14), compared against rsync
+3.2.7. Three tests are Linux-only.
 
 ## Install
 
@@ -202,7 +203,11 @@ connection the server opens a UDP endpoint on the address the client reached it 
 fresh self-signed certificate (TLS 1.3, ALPN `barqsync`), and sends the address, the
 certificate's BLAKE3 fingerprint and a random token. The client connects within 3 s,
 accepting only that certificate, and presents the token on the first stream; the server
-acknowledges it. Then:
+takes the first connection that presents it (vetting connections side by side, so one that
+never presents a token can't hold up the client's) and acknowledges it with one byte. The
+client doesn't wait for that byte before moving to QUIC: the pinned certificate already
+proves it reached this server, so waiting would cost a round trip for nothing. The byte is
+checked with the first read. Then:
 
 - **Everything moves to QUIC.** Control messages and directory listings use that first
   (bidirectional) stream; file data uses `--streams` unidirectional streams (default 16, up
@@ -211,8 +216,14 @@ acknowledges it. Then:
 - **Fallback.** If UDP doesn't get through in 3 s, both sides carry on over the ssh pipe
   (`-v` says so). A peer that disappears is noticed within 15 s (QUIC idle timeout with
   keep-alives), where ssh would see the pipe close at once.
-- **Clean shutdown.** Each stream is finished and waited for (bounded) until the peer has
-  read it, before the connection closes, so nothing in flight is lost when a process exits.
+- **Clean shutdown.** QUIC resends lost packets only while the process lives, so nothing may
+  close before the peer's application has what it needs. The protocol says when that is:
+  the sender, once it has the receiver's final `ReceiverDone`, knows the receiver has read
+  everything, and closes the session and its ssh pipe at once. The receiver ends its
+  streams and waits (up to 5 s) for the sender to end too: a QUIC close or stream end, or
+  the idle ssh pipe reaching its end, which covers a QUIC close lost on the way (TCP keeps
+  resending after a process exits). Neither side waits for acknowledgements. See
+  [QUIC's fixed cost](#quics-fixed-cost-m18).
 
 quinn drives a connection from one task, which limits QUIC to about 350 MB/s per transfer on
 this Mac over loopback; TLS-over-TCP streams scale with the number of streams.
@@ -226,32 +237,55 @@ percent slower on a LAN, and costs `--transport quic` 3 s wherever UDP is blocke
 1. **Offer.** The server opens its QUIC endpoint and sends the offer over ssh, as for
    `--transport quic`. (The server is told `quic`: an older server can still read the
    handshake and say it speaks another protocol version.)
-2. **Ping.** The client pings the server over ssh. A round trip under 30 ms is a short link:
-   the transfer stays on the ssh pipe, and no UDP packet is ever sent. The ping is all it
-   costs.
-3. **Try QUIC, briefly.** On a longer round trip the client connects to QUIC, with the
-   ping's round trip as QUIC's first estimate, and waits 300 ms plus two round trips (the
-   handshake and token take two). If QUIC connected, and its own handshake also measured
-   30 ms or more (a ping that ssh had to resend looks long), the transfer moves to QUIC,
-   with `--streams` data streams (16 by default). Otherwise it stays on ssh.
-4. **Remember.** A host where QUIC didn't connect is not tried again for an hour. The
-   marker is an empty file per host (named by a hash of the host, without `user@`) in
-   `$XDG_RUNTIME_DIR/barqsync` (gone at logout), else `~/Library/Caches/barqsync` (macOS) or
-   `~/.cache/barqsync`; `BARQSYNC_CACHE_DIR` moves it.
+2. **Ping, and connect.** The client pings the server over ssh and starts connecting to
+   QUIC at the same time, so on a long link the handshake is done about when the pong
+   arrives. A round trip under 30 ms is a short link: the attempt is dropped and the
+   transfer stays on the ssh pipe. The ping is all it costs (the handshake's few UDP
+   packets go out in parallel).
+3. **Wait for QUIC, briefly.** On a longer round trip the client waits for QUIC until 300 ms
+   plus two round trips after the ping went out (the handshake takes one). If QUIC
+   connected, and its own handshake also measured 30 ms or more (a ping that ssh had to
+   resend looks long), the transfer moves to QUIC, with `--streams` data streams (16 by
+   default). Otherwise it stays on ssh.
+4. **Remember.** A host where QUIC didn't connect is not tried again for an hour. Nor is a
+   host where QUIC's last transfer found a clean link (below): those stay on the ssh pipe
+   for an hour, without a ping. The markers are empty files per host (named by a hash of
+   the host, without `user@`) in `$XDG_RUNTIME_DIR/barqsync` (gone at logout), else
+   `~/Library/Caches/barqsync` (macOS) or `~/.cache/barqsync`; `BARQSYNC_CACHE_DIR` moves
+   them.
 
-`-vv` says what auto chose and why, e.g. `auto: 81.2 ms round trip, QUIC connected in 168
+`-vv` says what auto chose and why, e.g. `auto: 81.2 ms round trip, QUIC connected in 85
 ms, using QUIC to 10.0.0.5:50612 (16 data streams)` or `auto: 0.4 ms round trip, using the
-ssh connection`; `-v` output stays rsync's. The QUIC server assumes a 50 ms round trip until
-it has measured one (quinn's default of 333 ms re-sends a lost first flight only after
-~1 s), so one lost handshake packet on a lossy link doesn't miss auto's short wait. The
-setup step is new on the wire: the protocol version is 8, and older servers refuse the
-connection with "protocol version mismatch".
+ssh connection`, and after a QUIC transfer what it learned (`auto: QUIC lost 0 of 11677
+packets, a clean link: the ssh connection next time`); `-v` output stays rsync's. Both QUIC
+ends assume a 50 ms round trip until they have measured one (quinn's default of 333 ms
+re-sends a lost first flight only after ~1 s), so one lost handshake packet on a lossy link
+doesn't miss auto's short wait. The setup step is new on the wire: the protocol version is
+8, and older servers refuse the connection with "protocol version mismatch".
 
-Loss is not measured directly. The handshake is a handful of packets, too few to see a 1%
+Loss can't be measured up front: the handshake is a handful of packets, too few to see a 1%
 loss rate, and a probe burst large enough to see it costs more on a clean WAN than QUIC
-saves there. A long round trip is the signal instead, and that is auto's weakness: on a
-clean long link it picks QUIC, which is slower there. **The ssh pipe stays the default**;
-use `--transport auto` for links that are long and may be lossy (Wi-Fi, mobile, across
+saves there. A long round trip is the first signal. A QUIC transfer then counts its own
+losses, and the client remembers the verdict:
+
+- **Lossy:** any packet lost. QUIC recovers from loss far better than the ssh pipe's single
+  TCP connection, which shrinks its window at every loss and, 80 ms away, takes long to grow
+  it back; so it stays QUIC.
+- **Clean:** no loss in at least 1,000 packets of data this side sent (at the lossy
+  profile's 0.5% a link that size hides all its losses about once in 150), at a rate the
+  ssh pipe can carry: the next hour's transfers to that host stay on the pipe, which then
+  costs nothing over `--transport ssh`.
+- **Fast:** no loss, but more data per round trip than three quarters of the ssh pipe's
+  2 MiB channel window (OpenSSH's default) allows: the pipe would hold it back, so it
+  stays QUIC.
+- **Too few to tell** (a no-op, or a pull, where the client mostly acknowledges): nothing
+  changes.
+
+A clean verdict judged wrongly, or a link that turns lossy within the hour, costs what
+`--transport ssh` would. So does a clean link fast enough to outrun the pipe's window when
+the transfers QUIC saw were too small to show it. **The ssh pipe stays the default** (see
+[QUIC's fixed cost](#quics-fixed-cost-m18) for what keeping auto opt-in costs); use
+`--transport auto` for links that are long and may be lossy (Wi-Fi, mobile, across
 continents), especially where UDP may be blocked. See
 [`--transport auto`, measured](#--transport-auto-measured).
 
@@ -376,6 +410,98 @@ So **the ssh pipe stays the default** and `--transport auto` is opt-in, like
 elsewhere. Reports: `bench/results/net-20261020-070426.md` (lan, wan),
 `-070637.md` (lossy, far), `-071421.md` (UDP blocked), `-071612.md` (GSO off),
 `-073038.md` (lossy, 6 runs).
+
+### QUIC's fixed cost (M18)
+
+M17 measured QUIC and auto costing about three round trips more than the ssh pipe per
+transfer on a clean 80 ms link. To see where, `BARQSYNC_TIMING=1` prints timestamped
+milestones on both sides (the client passes it to the server's command line; the server's
+lines come back through ssh's stderr): the handshake, the transport's setup, `SenderDone`
+and `ReceiverDone`, each step of closing, the remote shell's exit. `bench/net/container.sh
+fixed [profiles]` (`bench/net/fixed_cost.sh`) pushes and pulls one 1 KiB file per transport
+10 times and breaks each run down from both sides' milestones (one clock: both run in the
+container). On `far` (82 ms, no loss), medians in ms, before (`dc4522d`) → after:
+
+| Direction, transport | total | transport setup | transfer | close | over the ssh pipe |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| push, ssh pipe | 1443 → 1438 | 0 | 170 → 169 | 3 → 2 | |
+| push, `--transport quic` | 1693 → **1617** | 175 → **89** | 168 → 170 | 87 → 85 | +250 → **+179** |
+| push, `--transport auto` | 1786 → **1609** | 255 → **89** | 170 → 169 | 88 → 85 | +343 → **+171** |
+| pull, ssh pipe | 1441 → 1435 | 0 | 86 → 85 | 86 → 85 | |
+| pull, `--transport quic` | 1774 → **1620** | 173 → **89** | 169 → 170 | 169 → **88** | +333 → **+185** |
+| pull, `--transport auto` | 1855 → **1616** | 255 → **89** | 169 → 171 | 168 → **87** | +414 → **+181** |
+
+(Connecting ssh itself takes 1.27 s of every run, 15 round trips, whatever the transport.)
+Where the time went, and what changed:
+
+- **Setup, 2 round trips → 1.** The QUIC handshake is one; the client then waited another
+  for the server's one-byte acknowledgement of the token. It doesn't any more (see
+  [QUIC](#quic---transport-quic)): the pinned certificate already proves which server it
+  reached. auto's ping came first, a third round trip; now QUIC connects alongside it.
+- **Closing a pull, 2 round trips → 1, the ssh pipe's own.** The client's stream end waited
+  for an acknowledgement, and the server, once it had `ReceiverDone`, waited for its own
+  end's acknowledgement and for the client's end before exiting. Now the sender closes the
+  moment it has `ReceiverDone` and exits. (The data streams, suspected first, never cost
+  anything: the receiver stops each one as soon as it has read its end marker, which settles
+  the sender's wait at once.)
+- **Closing a push stays at 1 round trip.** The receiver is the server here: it must hear
+  that the client has `ReceiverDone` before it exits, since QUIC resends nothing once the
+  process is gone, and the client sees the remote shell exit half a round trip later. Over
+  the ssh pipe the server exits at once because TCP keeps resending for it. In one lossy run
+  in ten the client's QUIC close was lost on the way, and the ssh pipe's end ended the
+  server's wait just as soon.
+- **Left: about two round trips** per transfer. One is the handshake, which can only start
+  when the offer arrives over ssh. The other is the push's close, or in a pull the server's
+  late start (it learns of the switch over ssh, then its first listing crosses QUIC: the
+  transfer phase above is one round trip longer than over the pipe).
+
+Then **auto remembers clean links** (see [Automatic choice](#automatic-choice---transport-auto)),
+so a host that QUIC found clean costs nothing over the pipe for the next hour. Over the
+network benchmark (`bench/net/net_bench.sh`, `SCALE=0.5`, 3 runs; before = `dc4522d`, run
+right before this branch on the same machine; lossy is noisy for every transport):
+
+| Profile, workload | ssh pipe | `--transport quic` | `--transport auto` | auto, host remembered |
+| --- | ---: | ---: | ---: | ---: |
+| far, 4,000 small files | 3.81 / 3.69 s | 3.65 → 3.49 s | 3.63 → **3.50 s** | 3.64 s¹ |
+| far, 128 MiB delta | 3.11 / 3.15 s | 3.32 → 3.29 s | 3.40 → **3.26 s** | **3.12 s** |
+| far, 3 changed of 20,000 | 1.86 / 1.95 s | 2.20 → 2.12 s | 2.28 → **2.13 s** | **1.88 s** |
+| lossy, 4,000 small files | 36.0 / 45.6 s | 16.3 → 12.5 s | 9.0 → 14.1 s | 14.2 s |
+| lossy, 128 MiB delta | 14.9 / 17.5 s | 6.4 → 10.2 s | 11.4 → 5.9 s | 6.4 s |
+| lossy, 3 changed of 20,000 | 2.23 / 2.05 s | 2.29 → 2.22 s | 2.45 → 2.21 s | 2.22 s |
+| wan, 4,000 small files | 2.04 / 2.06 s | 2.05 → 2.04 s | 2.06 → 2.09 s | 2.06 s |
+| wan, 128 MiB delta | 1.52 / 1.51 s | 1.56 → 1.53 s | 1.55 → 1.58 s | 1.51 s |
+| wan, 3 changed of 20,000 | 0.655 / 0.648 s | 0.737 → 0.701 s | 0.682 → 0.663 s | 0.690 s |
+| lan, 4,000 small files | 0.307 / 0.308 s | 0.319 → 0.311 s | 0.312 → 0.307 s | 0.305 s |
+| lan, 128 MiB delta | 0.303 / 0.296 s | 0.314 → 0.323 s | 0.300 → 0.307 s | 0.306 s |
+| lan, 3 changed of 20,000 | 0.177 / 0.178 s | 0.185 → 0.181 s | 0.175 → 0.178 s | 0.180 s |
+
+The ssh pipe column gives both runs (before / after), since each comparison is with its own
+run. ¹ The first run, before anything was remembered, went over QUIC; it found the link clean
+(`lost 0 of 11677 packets`), so the later runs and the other workloads used the pipe.
+
+- **On the clean long link** auto's cost over the pipe fell from 9% to 3.5% on the delta and
+  from 23% to 9% on the no-op; on the small files it is 5% faster than the pipe. Once the
+  host is remembered clean, it runs at the pipe's speed.
+- **On the lossy link** QUIC and auto stay well ahead of the pipe on small files and the
+  delta (1.3–4× in these runs; one run of a command there can take twice as long as
+  another, so the before/after differences are noise). Every transfer there lost packets
+  (`lost 59 of 11726`), so auto keeps QUIC.
+- **On lan and wan** auto stays on the pipe as before: within noise, plus the ping on the
+  WAN no-op (+2%).
+- **Where UDP is blocked** (the `-noudp` profiles, no-op), first contact now costs 0.42 s on
+  the 80 ms links (it was 0.49 s: the wait starts with the ping now), nothing beyond the ping
+  on the WAN, and nothing once the host is remembered (`net-20261020-090255.md`).
+
+**Is auto the default now?** By these numbers it is close: it never costs more than 9% (a
+no-op on a clean long link, at first contact or once an hour), 2% where it stays on the pipe,
+and is 1.3–4× faster on long lossy links. The ssh pipe stays the default for now, for what the
+numbers don't show: a QUIC endpoint (a UDP port) on every server for every transfer, which
+the macOS application firewall asks about for an unsigned binary; half a second lost on
+first contact where UDP is blocked; and no fast long real link measured yet (1 Gbit at
+80 ms, where the remembered-clean rule is least certain). Reports:
+`bench/results/fixed-cost-20261020-081323.md` (before), `-082035.md` (the close),
+`-082904.md` (the setup); `net-20261020-085043.md` (before), `net-20261020-083939.md` (after),
+`net-20261020-090255.md` (UDP blocked, after).
 
 ### Adaptive strategy (`--strategy adaptive`)
 
@@ -676,7 +802,11 @@ sequences; every delta must rebuild the new file exactly via both rebuild and cl
 `BARQSYNC_SCANNER=jwalk`, `BARQSYNC_TRANSPORT=quic`, `BARQSYNC_TRANSPORT=auto`,
 `BARQSYNC_WIRE=rkyv` and `BARQSYNC_NET_IO=tokio` do the same for the other alternatives.
 The fake ssh is a short link, so auto stays on the pipe there; `BARQSYNC_AUTO_RTT_MS=0`
-lowers its threshold so that it moves to QUIC.
+lowers its threshold so that it moves to QUIC. Every barqsync run in the tests gets its own
+empty `BARQSYNC_CACHE_DIR` unless the test sets one, so what auto remembers about the fake
+host (unreachable, or clean) never carries from one run to the next or into the user's
+cache. `BARQSYNC_TIMING=1` prints when each step of a remote transfer happens, on both sides
+(see [QUIC's fixed cost](#quics-fixed-cost-m18)).
 
 The integration tests run each scenario through the reference rsync 3.x as well (found at
 `/opt/homebrew/bin/rsync`, `/usr/local/bin/rsync` or `/usr/bin/rsync`, or set
@@ -706,6 +836,7 @@ clones, e.g. for copies to another volume.
 ```bash
 bench/net/container.sh build              # Linux image: sshd, tc, strace, perf, inferno
 bench/net/container.sh net lan wan lossy  # rsync vs barqsync over real ssh, tc-shaped links
+bench/net/container.sh fixed far          # each transport's fixed cost, step by step (BARQSYNC_TIMING)
 bench/net/container.sh syscalls           # strace -c syscall counts
 bench/net/container.sh flamegraph copy    # perf flamegraph (copy | noop | delta)
 bench/net/container.sh test               # cargo test + clippy on Linux
@@ -722,6 +853,8 @@ BARQSYNC_TEST_REMOTE=user@host cargo test --test real_remote   # tests over real
   - `lan`: 1 Gbit, ~0.2 ms RTT
   - `wan`: 100 Mbit, ~20 ms RTT
   - `lossy`: 20 Mbit, ~80 ms RTT, ~1% loss
+  - `far`: 100 Mbit, ~80 ms RTT, no loss
+  - `PROFILE-noudp`: the same with every UDP packet dropped (a firewall that blocks QUIC)
 - **Benchmark A** also times `cp -a` and the platform's fastest stock copy (`cp -ac` clones
   on macOS, `--reflink=auto` on Linux).
 - **Not covered:** NFS mounts (they need an NFS server).
