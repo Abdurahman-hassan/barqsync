@@ -970,6 +970,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     let mut ids = IdMap::default();
     let mut probe = adapt::ProbeReceiver::default();
     let mut link = None;
+    let mut io_error = false;
     let mut roots = loop {
         let f = recv(conn);
         if let Ok(f) = &f {
@@ -981,6 +982,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         }
         match f {
             Ok(Frame::Msg(Msg::LinkInfo(l))) => link = Some(l),
+            Ok(Frame::Msg(Msg::IoError)) => io_error = true,
             Ok(Frame::Msg(Msg::Roots(r))) => break r,
             Ok(Frame::Msg(Msg::IdNames { users, groups })) => ids.add(&users, &groups),
             Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
@@ -1002,6 +1004,9 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         root.items.iter_mut().for_each(|e| ids.apply(&mut e.meta));
     }
     let mut engine = Engine::new(opts, filter, out);
+    if io_error {
+        engine.sender_io_error();
+    }
     for root in roots.iter_mut().filter(|_| engine.extras_on()) {
         let mode = root.meta.map_or(0, |m| m.mode);
         root.extra = local_extra(&ids, &engine.xrules, root.extra.take(), mode);
@@ -1104,6 +1109,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                         }
                         Msg::ScanDone { .. } => {
                             remote.on_scan_done();
+                            Ok(())
+                        }
+                        Msg::IoError => {
+                            engine.sender_io_error();
                             Ok(())
                         }
                         Msg::SenderDone { errors } => {

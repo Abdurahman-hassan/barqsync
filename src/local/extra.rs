@@ -118,7 +118,7 @@ impl Engine<'_> {
         if !self.extras_on() {
             return ents;
         }
-        let mut ents = collect(self.opts, &self.xrules, dir, ents, &mut |m| self.err(m));
+        let mut ents = collect(self.opts, &self.xrules, dir, ents, &mut |m| self.src_err(m));
         for e in &mut ents {
             e.extra = to_local(&self.xrules, e.extra.take(), e.meta.mode);
         }
@@ -133,7 +133,7 @@ impl Engine<'_> {
         match read_wire(self.opts, &self.xrules, path, meta.kind, meta.mode, true) {
             Ok(x) => to_local(&self.xrules, x, meta.mode),
             Err(e) => {
-                self.err(path_msg("get_xattr/get_acl \"", path, format!("\" failed: {e}")));
+                self.src_err(path_msg("get_xattr/get_acl \"", path, format!("\" failed: {e}")));
                 None
             }
         }

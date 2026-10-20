@@ -41,6 +41,12 @@
   ("Literal data" was 0 unless a delta was used).
 - Clearer errors: barqsync missing on the remote host (with a hint about `~/.zshenv`), a
   version mismatch (naming both versions), and a host with an empty user name (`@host`).
+- `--delete` no longer deletes after an error reading the source side (a dangling symlink
+  under `-L`, an unreadable entry, attributes or ACLs that can't be read, a missing
+  source): such a listing lacks entries the source has. As rsync does, barqsync prints
+  "IO error encountered -- skipping file deletion", deletes nothing more and exits with
+  code 23, locally and in both directions of a remote transfer. `--scanner=jwalk` also
+  stopped dropping entries it could not stat without a word.
 
 ## 0.3.0 - 2026-10-20
 

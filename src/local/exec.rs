@@ -33,6 +33,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 
 pub struct Engine<'a> {
@@ -60,6 +61,11 @@ pub struct Engine<'a> {
     pub(crate) dst_index: Option<Arc<crate::scan::DstIndex>>,
     /// `-X`: which attribute names take part.
     pub(crate) xrules: crate::xattrs::Rules,
+    /// The source side could not be read completely (rsync's `io_error`): its listings
+    /// may lack entries, so nothing is deleted from now on.
+    io_error: AtomicBool,
+    /// "IO error encountered -- skipping file deletion" was shown.
+    io_warned: AtomicBool,
 }
 
 pub(crate) struct DirJob {
@@ -214,12 +220,38 @@ impl<'a> Engine<'a> {
             pipeline: None,
             dst_index: None,
             xrules: crate::xattrs::Rules { level: opts.xattrs, am_root },
+            io_error: AtomicBool::new(false),
+            io_warned: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn err(&self, msg: impl AsRef<[u8]>) {
         Stats::add(&self.stats.errors, 1);
         self.out.error(msg);
+    }
+
+    /// An error reading the source side (a listing, an entry's metadata or attributes):
+    /// listings may now lack entries the source has, so deletions stop.
+    pub(crate) fn src_err(&self, msg: impl AsRef<[u8]>) {
+        self.io_error.store(true, SeqCst);
+        self.err(msg);
+    }
+
+    /// The remote sender had a source-side error (see [`Engine::src_err`]).
+    pub(crate) fn sender_io_error(&self) {
+        self.io_error.store(true, SeqCst);
+    }
+
+    /// Whether `--delete` may delete now: not after a source-side error, as rsync
+    /// ("IO error encountered -- skipping file deletion", said once).
+    fn may_delete(&self) -> bool {
+        if !self.io_error.load(SeqCst) {
+            return true;
+        }
+        if !self.io_warned.swap(true, SeqCst) {
+            self.out.notice("IO error encountered -- skipping file deletion");
+        }
+        false
     }
 
     pub(crate) fn dry(&self) -> bool {
@@ -307,7 +339,7 @@ impl<'a> Engine<'a> {
                         super::flags::adjust_mode(self.opts, &mut m);
                         m
                     }
-                    Err(e) => return self.err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
+                    Err(e) => return self.src_err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
                 };
                 let extra = self.local_root_extra(src, &src_meta);
                 let job = self.root_job(src.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh, extra);
@@ -323,7 +355,7 @@ impl<'a> Engine<'a> {
                     let meta = match fsops::lstat(&sp) {
                         Ok(m) => m,
                         Err(e) => {
-                            self.err(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
+                            self.src_err(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
                             continue;
                         }
                     };
@@ -348,7 +380,7 @@ impl<'a> Engine<'a> {
                             super::flags::adjust_mode(self.opts, &mut m);
                             m
                         }
-                        Err(e) => return self.err(path_msg("link_stat \"", base, format!("\" failed: {e}"))),
+                        Err(e) => return self.src_err(path_msg("link_stat \"", base, format!("\" failed: {e}"))),
                     };
                     let extra = self.local_root_extra(base, &src_meta);
                     let mut job = self.root_job(base.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh, extra);
@@ -367,7 +399,7 @@ impl<'a> Engine<'a> {
     fn read_selected(&self, dir: &Path, sel: &Sel) -> Vec<DirEnt> {
         let (ents, errs) = select::read_selected(dir, sel);
         for (p, e) in errs {
-            self.err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
+            self.src_err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
         }
         self.adjust_listing(dir, ents)
     }
@@ -488,7 +520,7 @@ impl<'a> Engine<'a> {
             _ => match fsops::read_dir_meta(&job.src) {
                 Ok(v) => self.adjust_listing(&job.src, v),
                 Err(e) => {
-                    self.err(path_msg("opendir \"", &job.src, format!("\" failed: {e}")));
+                    self.src_err(path_msg("opendir \"", &job.src, format!("\" failed: {e}")));
                     return self.push_fixup(&job, false);
                 }
             },
@@ -540,7 +572,7 @@ impl<'a> Engine<'a> {
         };
 
         let mut changed = false;
-        if self.opts.delete && !job.dst_is_new && select::may_delete(job.sel) {
+        if self.opts.delete && !job.dst_is_new && select::may_delete(job.sel) && self.may_delete() {
             changed |= self.delete_extraneous(job, &entries, &dst_map);
         }
         let dst_handle = if job.dst_is_new || dst_metas.is_some() { None } else { fsops::DirHandle::open(&job.dst).ok() };

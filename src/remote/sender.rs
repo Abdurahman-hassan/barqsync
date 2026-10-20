@@ -56,6 +56,9 @@ struct Sender<'a> {
     xrules: Rules,
     /// Deltas waiting for the receiver's answer to a `Refine`: file id -> where it goes.
     refining: Mutex<HashMap<u64, crossbeam_channel::Sender<Vec<GapSig>>>>,
+    /// `IoError` was sent. A lock, not a flag: a listing read after an error must not
+    /// overtake the `IoError` on the wire.
+    io_error: Mutex<bool>,
 }
 
 /// A source argument resolved on disk.
@@ -71,6 +74,17 @@ impl Sender<'_> {
     fn err(&self, msg: impl AsRef<[u8]>) {
         self.errors.fetch_add(1, SeqCst);
         self.out.error(msg);
+    }
+
+    /// An error reading the source: the listings may now lack entries, which the
+    /// receiver must not delete (`IoError`, queued before any later listing).
+    fn scan_err(&self, msg: impl AsRef<[u8]>) {
+        self.err(msg);
+        let mut sent = self.io_error.lock().unwrap();
+        if !*sent {
+            self.send(Msg::IoError);
+            *sent = true;
+        }
     }
 
     fn send(&self, m: Msg) {
@@ -123,8 +137,8 @@ impl Sender<'_> {
 
     /// `-L`/`-k`/`--chmod`, then (`-X`/`-A`) the entries' attributes and ACLs.
     fn listing(&self, dir: &Path, ents: Vec<DirEnt>) -> Vec<DirEnt> {
-        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.err(m));
-        extra::collect(self.opts, &self.xrules, dir, ents, &mut |m| self.err(m))
+        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.scan_err(m));
+        extra::collect(self.opts, &self.xrules, dir, ents, &mut |m| self.scan_err(m))
     }
 
     fn walk_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, path: PathBuf, root_dev: u64, sel: Option<&'static Sel>) {
@@ -135,7 +149,7 @@ impl Sender<'_> {
             Some(sel) if !sel.contents => self.read_selected(&path, sel),
             _ => match fsops::read_dir_meta(&path) {
                 Ok(v) => self.listing(&path, v),
-                Err(e) => return self.err(path_msg("opendir \"", &path, format!("\" failed: {e}"))),
+                Err(e) => return self.scan_err(path_msg("opendir \"", &path, format!("\" failed: {e}"))),
             },
         };
         let ents: Vec<DirEnt> = ents
@@ -159,7 +173,7 @@ impl Sender<'_> {
     fn read_selected(&self, dir: &Path, sel: &Sel) -> Vec<DirEnt> {
         let (ents, errs) = select::read_selected(dir, sel);
         for (p, e) in errs {
-            self.err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
+            self.scan_err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
         }
         self.listing(dir, ents)
     }
@@ -606,7 +620,13 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         bases: roots.iter().map(|r| r.base.clone()).collect(),
         xrules: extra::rules(opts),
         refining: Mutex::new(HashMap::new()),
+        io_error: Mutex::new(false),
     };
+    // Every error so far was about reading a source root.
+    if sender.errors.load(SeqCst) > 0 {
+        *sender.io_error.lock().unwrap() = true;
+        sender.send(Msg::IoError);
+    }
     sender.name_ids(roots.iter().flat_map(|r| {
         let root = r.info.meta.as_ref().map(|m| (m, r.info.extra.as_deref()));
         root.into_iter().chain(r.info.items.iter().map(|e| (&e.meta, e.extra.as_deref())))

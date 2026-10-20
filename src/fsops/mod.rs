@@ -167,8 +167,9 @@ fn bulk_disabled() -> bool {
 
 /// `readdir` + one `fstatat` per entry.
 pub fn read_dir_stat(dir: &Path) -> io::Result<Vec<DirEnt>> {
-    let names: Vec<OsString> =
-        fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
+    // An entry that can't be read fails the listing: a listing missing entries would
+    // have their destination copies deleted.
+    let names: Vec<OsString> = fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name())).collect::<io::Result<_>>()?;
     let handle = DirHandle::open(dir)?;
     let stat_one = |name: OsString| -> Option<io::Result<DirEnt>> {
         let meta = match handle.lstat(&name) {

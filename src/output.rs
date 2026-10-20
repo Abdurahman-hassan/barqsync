@@ -43,6 +43,8 @@ pub struct Output {
     /// stdout is a terminal (progress is redrawn in place only then).
     tty: bool,
     verbose: u8,
+    /// `-q`: no notices either.
+    quiet: bool,
     /// Number of `-i`: at 2+, unchanged items are listed too.
     itemize: u8,
     format: Option<String>,
@@ -120,6 +122,7 @@ impl Output {
             out: Mutex::new(Sink { w: BufWriter::with_capacity(64 * 1024, std::io::stdout()), progress: None }),
             tty: std::io::IsTerminal::is_terminal(&std::io::stdout()),
             verbose: opts.verbose,
+            quiet: opts.quiet,
             itemize: opts.itemize,
             has_i: format.as_deref().is_some_and(|f| f.contains("%i")),
             format,
@@ -309,6 +312,14 @@ impl Output {
     pub fn info(&self, msg: impl AsRef<[u8]>) {
         if self.verbose > 0 || self.itemize > 0 {
             self.escaped_line(msg.as_ref());
+        }
+    }
+
+    /// A notice shown without `-v` but not with `-q` (rsync's `FINFO` messages). Not
+    /// escaped: it must not contain names.
+    pub fn notice(&self, msg: impl AsRef<[u8]>) {
+        if !self.quiet {
+            self.line(msg.as_ref());
         }
     }
 

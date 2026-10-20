@@ -8,6 +8,7 @@
 //! sender                                   receiver
 //!   Roots ------------------------------------>   plan destination
 //!   DirBatch (one per directory, as scanned) ->   diff against local dirs
+//!   IoError (once, on a source read error) --->   delete nothing more
 //!   ...                                  <-----   Need (one per DirBatch: files + basis signatures)
 //!   SmallPack / FileBegin+Data+FileEnd /
 //!   DeltaBegin+Data+FileEnd -------------------->   write files in parallel
@@ -49,7 +50,8 @@ use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 9: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
-/// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals).
+/// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
+/// `IoError` (source read errors stop deletions).
 pub const VERSION: u32 = 10;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
@@ -152,6 +154,10 @@ pub enum Msg {
     /// User and group names for ids in the listings that follow (no `--numeric-ids`).
     IdNames { users: Names, groups: Names },
     ScanDone { dirs: u32 },
+    /// The sender could not read part of its source (rsync's `io_error`): listings sent
+    /// from now on may lack entries, so the receiver deletes nothing more. Sent before
+    /// the listing the error concerns.
+    IoError,
     /// `xattrs`: `-X` attribute values in full, when the listing only had checksums of some.
     FileBegin { id: u64, size: u64, xattrs: Option<Vec<Xattr>> },
     /// Start a delta-encoded file: `copies` come from the receiver's basis, the
