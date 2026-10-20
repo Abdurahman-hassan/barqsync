@@ -2,6 +2,13 @@ use barqsync::cli::Options;
 use barqsync::{exit, fsops};
 
 fn main() {
+    // A relay for parallel streams behind a firewall (started by the client over ssh;
+    // see `remote::relay`). Kept out of the options, which travel in the handshake.
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "--stream-relay") {
+        let targets = args.get(2).and_then(|t| t.to_str()).unwrap_or("");
+        std::process::exit(barqsync::remote::relay::run(targets));
+    }
     let opts = match Options::parse_from(std::env::args_os()) {
         Ok(o) => o,
         Err(e) => match e.downcast::<clap::Error>() {

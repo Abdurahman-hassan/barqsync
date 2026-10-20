@@ -261,7 +261,41 @@ fn bad_remote_path_fails_cleanly() {
         &["-a", "-e", shim.to_str().unwrap(), "--remote-path=/nonexistent/barqsync", "src/", "fakehost:dst"],
     );
     assert_ne!(r.code, 0);
-    assert!(r.stderr.contains("connection unexpectedly closed"), "{}", r.stderr);
+    // The shell's exit status 127 says the command wasn't there.
+    assert!(r.stderr.contains("could not find `/nonexistent/barqsync` (exit 127)"), "{}", r.stderr);
+}
+
+/// `~` in a remote path and in `--remote-path` means the remote home, as with rsync.
+#[test]
+fn tilde_in_remote_paths_is_the_remote_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    rich_tree(&tmp.path().join("src"));
+    // The fake ssh runs the server here, so the "remote home" is this HOME.
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(home.join("bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_barqsync"), home.join("bin/barqsync")).unwrap();
+    let shim = fake_ssh(tmp.path());
+    let run_with_home = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_barqsync"));
+        cmd.arg("-e").arg(&shim).args(args).env("HOME", &home);
+        run(&mut cmd, tmp.path())
+    };
+    let push = run_with_home(&["-a", "--remote-path=~/bin/barqsync", "src/", "fakehost:~/dst/"]);
+    assert_eq!(push.code, 0, "{}", push.stderr);
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&home.join("dst"), true));
+    let pull = run_with_home(&["-a", "--remote-path=~/bin/barqsync", "fakehost:~/dst/", "back/"]);
+    assert_eq!(pull.code, 0, "{}", pull.stderr);
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("back"), true));
+}
+
+#[test]
+fn an_empty_user_is_refused_before_ssh_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("a", "1");
+    let r = barqsync(tmp.path(), &["-a", "-e", "/nonexistent-ssh", "src/", "@somehost:dst"]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("no user name before '@'"), "{}", r.stderr);
 }
 
 /// barqsync through the fake ssh with extra environment (inherited by the server).
@@ -320,6 +354,51 @@ fn parallel_streams_fall_back_to_ssh() {
     );
     assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
     assert!(f.stdout.contains("using the ssh connection"), "{}", f.stdout);
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
+}
+
+/// A firewall that refuses the direct connections: the same streams come through ssh,
+/// each over its own remote-shell connection and a relay on the far side, both ways.
+#[test]
+fn parallel_streams_go_through_ssh_when_blocked() {
+    for pull in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        delta_fixture(tmp.path());
+        let t = Tree::new(tmp.path().join("src"));
+        for i in 0..300 {
+            t.file(&format!("many/f{i:03}"), noise(1000 + i * 13, i as u64));
+        }
+        t.settle_mtimes();
+        let mut args = vec!["-avv", "--stats", "--strategy", "fixed", "--transport", "tcp", "--streams", "3"];
+        args.extend_from_slice(if pull { &["{host}src/", "dst"] } else { &["src/", "{host}dst"] });
+        let f = remote_with_env(tmp.path(), &args, &[("BARQSYNC_TEST_DIRECT_BLOCKED", "1")]);
+        assert_eq!(f.code, 0, "pull={pull}\n{}\n{}", f.stdout, f.stderr);
+        assert!(
+            f.stdout.contains("refused a direct connection (Connection reset by peer (test)), using 3 streams through ssh"),
+            "pull={pull}: {}",
+            f.stdout
+        );
+        let mut want = snapshot(&tmp.path().join("src"), true);
+        let got = snapshot(&tmp.path().join("dst"), true);
+        want.get_mut(b".".as_slice()).unwrap().mtime = got[b".".as_slice()].mtime;
+        assert_same_tree(&want, &got);
+        assert!(stat_bytes(&f.stdout, "Matched data: ") > 9 << 20, "delta through relays: {}", f.stdout);
+    }
+}
+
+/// Neither directly nor through ssh (nothing listens where the server says): the
+/// transfer stays on the ssh pipe and says why.
+#[test]
+fn parallel_streams_fall_back_to_ssh_when_relays_fail_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    rich_tree(&tmp.path().join("src"));
+    let f = remote_with_env(
+        tmp.path(),
+        &["-av", "--transport", "tcp", "--streams", "2", "src/", "{host}dst"],
+        &[("BARQSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")],
+    );
+    assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
+    assert!(f.stdout.contains("; through ssh: ") && f.stdout.contains("using the ssh connection"), "{}", f.stdout);
     assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
 }
 

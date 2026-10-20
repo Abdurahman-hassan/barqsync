@@ -451,7 +451,8 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
 
 - **A fast real link.** The Intel MacBook Pro was tested over Tailscale across the internet
   (real-host tests pass; 1.1–1.5× rsync on a ~4 Mbit/s link, see `IMPLEMENTATION.md`), but not on a
-  LAN, and TCP/QUIC there need its firewall to allow the binary.
+  LAN. Behind its firewall, `--transport tcp` now carries the streams through extra ssh
+  connections; QUIC there still needs the firewall to allow the binary.
 - **Cold-cache runs** (`bench/run.sh DIR all --cold`) need `sudo purge` on macOS.
 - **NFS** isn't covered (no server).
 - **From rsync's feature set:** daemon mode (`rsync://`) and the single-argument listing mode.
