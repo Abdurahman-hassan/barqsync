@@ -141,6 +141,16 @@ pub fn stat(path: &Path) -> io::Result<Meta> {
     Ok(Meta::from_metadata(&fs::metadata(path)?))
 }
 
+/// Whether two entries are one file: the same name, a hard link, or another path to it.
+pub fn same_file(a: &Meta, b: &Meta) -> bool {
+    (a.dev, a.ino) == (b.dev, b.ino)
+}
+
+/// [`same_file`] for two open files.
+pub fn same_open_file(a: &File, b: &File) -> io::Result<bool> {
+    Ok(same_file(&Meta::from_metadata(&a.metadata()?), &Meta::from_metadata(&b.metadata()?)))
+}
+
 /// Read a directory and `lstat` every child. Entries that vanish between `readdir`
 /// and `lstat` are skipped, matching rsync's behaviour for files deleted mid-scan.
 ///
@@ -455,11 +465,18 @@ fn read_full(mut f: &File, buf: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
-/// Overwrite an existing file in place with `src`, expected to be `size` bytes (for `--inplace`).
+/// Overwrite an existing file in place with `src`, expected to be `size` bytes (for
+/// `--inplace`), then cut it to the length copied. When both are the same file (`f f`,
+/// or hard links), nothing is written: it already holds the data, and writing into it
+/// would destroy the source.
 pub fn copy_into_existing(src: &Path, dst: &Path, size: u64) -> io::Result<()> {
     let s = File::open(src)?;
-    let d = fs::OpenOptions::new().write(true).truncate(true).open(dst)?;
-    copy_buffered(&s, &d, size)?;
+    let d = fs::OpenOptions::new().write(true).open(dst)?;
+    if same_open_file(&s, &d)? {
+        return Ok(());
+    }
+    let n = copy_buffered(&s, &d, size)?;
+    d.set_len(n)?;
     Ok(())
 }
 

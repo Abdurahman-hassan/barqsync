@@ -41,6 +41,32 @@
   ("Literal data" was 0 unless a delta was used).
 - Clearer errors: barqsync missing on the remote host (with a hint about `~/.zshenv`), a
   version mismatch (naming both versions), and a host with an empty user name (`@host`).
+- A file synced onto itself (`--inplace -I f f`, another path to it, or a hard link to it
+  in the destination) is left intact; `--inplace` used to empty it. With
+  `--remove-source-files`, a source that is also the destination is kept and reported
+  ("Skipping sender remove of destination file", exit 23), as rsync does; it used to be
+  deleted.
+- `--backup` no longer replaces a file whose backup could not be made: the error is
+  reported (exit 23) and the old version stays. It used to be replaced anyway, losing the
+  old version. A new backup is written under a temporary name and renamed over the
+  previous one, so a failed backup leaves the previous one in place. A backup that would
+  replace the file itself or the source being copied (`-b f~ f`) is refused, and an empty
+  `--suffix` without `--backup-dir` is rejected, as rsync does.
+- With `--backup`, files replaced by a hard link (`-H`) or by a device or special file are
+  now backed up first, as rsync does; their old versions used to be lost.
+- `--remove-source-files` now keeps a source that changed after it was listed even when
+  its size and modification second stayed the same: the sender compares the file type,
+  device and inode, size and modification time to the nanosecond. It used to compare size
+  and whole seconds, and only for regular files.
+
+### Security
+
+- With `--remove-source-files`, the sending side now removes only entries it listed itself
+  in the same run, each at most once, and judges whether they changed by its own records.
+  A request from the receiving side to remove anything else, or any removal request when
+  `--remove-source-files` is off or in a dry run, is refused and nothing is removed.
+  Before, a malicious or compromised receiving side could make the sending side delete
+  files outside the transfer, even without `--remove-source-files`.
 
 ## 0.3.0 - 2026-10-20
 

@@ -52,6 +52,10 @@ struct Sender<'a> {
     ids: Mutex<ids::Sent>,
     /// Each root's base directory (`--remove-source-files` paths are relative to it).
     bases: Vec<PathBuf>,
+    /// `--remove-source-files`: the entries listed so far and not yet removed, by root and
+    /// path, as they were listed. The receiver names what it has; only these may go, and
+    /// whether they changed meanwhile is judged by this record.
+    removable: Mutex<HashMap<(u16, Vec<u8>), Meta>>,
     /// `-X`: which attribute names are sent.
     xrules: Rules,
     /// Deltas waiting for the receiver's answer to a `Refine`: file id -> where it goes.
@@ -81,6 +85,12 @@ impl Sender<'_> {
     fn send_listing(&self, root: u16, rel: Vec<u8>, path: PathBuf, entries: Vec<DirEnt>) {
         let sums = if self.opts.checksum { self.checksums(&path, &entries) } else { Vec::new() };
         let dir = self.next_dir.fetch_add(1, SeqCst);
+        if self.removes() {
+            let mut removable = self.removable.lock().unwrap();
+            for e in entries.iter().filter(|e| e.meta.kind != Kind::Dir) {
+                removable.insert((root, join_rel(&rel, &e.name)), e.meta);
+            }
+        }
         self.listings.lock().unwrap().insert(dir, (path, entries.clone()));
         self.name_ids(entries.iter().map(|e| (&e.meta, e.extra.as_deref())));
         self.send(Msg::DirBatch { root, dir, rel, entries, sums });
@@ -199,14 +209,24 @@ impl Sender<'_> {
         }
     }
 
-    /// `--remove-source-files`: the receiver has these entries now.
+    /// Whether the receiver may report entries for removal (`Synced`).
+    fn removes(&self) -> bool {
+        self.opts.remove_source_files && !self.opts.dry_run
+    }
+
+    /// `--remove-source-files`: the receiver has these entries now. Each must be one this
+    /// run listed and hasn't removed yet; anything else is an error and stays.
     fn remove_synced(&self, root: u16, files: SyncedFiles) {
-        let Some(base) = self.bases.get(root as usize) else {
-            return self.err(format!("protocol error: unknown root {root}"));
-        };
-        for (rel, size, mtime) in files {
+        for rel in files {
+            let key = (root, rel);
+            let listed = self.removable.lock().unwrap().remove(&key);
+            let rel = key.1;
+            let (Some(listed), Some(base)) = (listed, self.bases.get(root as usize)) else {
+                self.err([&b"protocol error: removal of an entry not sent or already removed: "[..], &rel].concat());
+                continue;
+            };
             let path = base.join(OsStr::from_bytes(&rel));
-            match remove_source(self.opts, &path, size, mtime) {
+            match remove_source(self.opts, &path, &listed, None) {
                 Ok(()) if self.out.verbose() >= 2 => self.out.info([&b"sender removed "[..], &rel].concat()),
                 Ok(()) => {}
                 Err(m) => self.err(m),
@@ -604,6 +624,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         reported: AtomicU64::new(0),
         ids: Mutex::new(ids::Sent::default()),
         bases: roots.iter().map(|r| r.base.clone()).collect(),
+        removable: Mutex::new(HashMap::new()),
         xrules: extra::rules(opts),
         refining: Mutex::new(HashMap::new()),
     };
@@ -643,7 +664,13 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
                             let _ = tx.send(gaps);
                         }
                     }
-                    Ok(Frame::Msg(Msg::Synced { root, files })) => s.spawn(move |_| sender.remove_synced(root, files)),
+                    Ok(Frame::Msg(Msg::Synced { root, files })) if sender.removes() => {
+                        s.spawn(move |_| sender.remove_synced(root, files))
+                    }
+                    Ok(Frame::Msg(Msg::Synced { .. })) => {
+                        out.error("protocol error: source removal without --remove-source-files, or in a dry run");
+                        break Err(exit::PROTOCOL);
+                    }
                     Ok(Frame::Msg(Msg::ReceiverDone { stats })) => {
                         crate::timing::mark("ReceiverDone received");
                         break Ok(stats);
