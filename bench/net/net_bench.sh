@@ -20,8 +20,8 @@
 #   mid    push of 40 files of 4 MiB, each with 1 KiB changed (old copies on the remote)
 #
 # VARIANTS picks commands by name (default: all), e.g. VARIANTS="rsync ssh quic".
-# `auto` starts every run without --transport auto's memory of hosts where QUIC failed
-# (the first contact); `auto-warm` keeps it between the runs of one profile.
+# `auto` starts every run without --transport auto's memory of hosts (where QUIC failed or
+# found a clean link: the first contact); `auto-warm` keeps it between the runs of one profile.
 set -euo pipefail
 PROFILES=${*:-lan wan lossy}
 WORKLOADS=${WORKLOADS:-small delta noop}

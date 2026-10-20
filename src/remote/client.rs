@@ -1,7 +1,7 @@
 //! Client side of a remote transfer: start `barqsync --server` through the remote
 //! shell, send it the role, paths and options, then run the opposite role locally.
 
-use super::{Stop, Transport, auto, receiver, recv, sender, streams};
+use super::{Stop, Transport, auto, quic, receiver, recv, sender, streams};
 use crate::cli::Options;
 use crate::exit;
 use crate::output::{Output, Stats};
@@ -107,15 +107,24 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // Hello itself always goes out as postcard; everything after it in this format.
     conn.set_wire(opts.wire);
     conn.set_compression(opts.compression());
-    // `auto`: a host where QUIC just failed stays on the ssh pipe for a while. The server
-    // only needs to know that QUIC may be used.
+    // `auto`: a host where QUIC just failed, or just found a clean link, stays on the ssh
+    // pipe for a while. The server only needs to know that QUIC may be used.
     let memory = auto::Memory::new();
     let mut transport = opts.transport;
-    if transport == Transport::Auto && opts.streams > 0 && memory.unreachable(&host) {
-        if out.verbose() > 1 {
-            out.info(format!("auto: QUIC to {host} failed recently, using the ssh connection"));
+    if transport == Transport::Auto && opts.streams > 0 {
+        let why = if memory.has(auto::Mark::Unreachable, &host) {
+            Some("failed recently")
+        } else if memory.has(auto::Mark::Clean, &host) {
+            Some("lost no packets lately")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            if out.verbose() > 1 {
+                out.info(format!("auto: QUIC to {host} {why}, using the ssh connection"));
+            }
+            transport = Transport::Ssh;
         }
-        transport = Transport::Ssh;
     }
     let mut server_opts = opts.clone();
     server_opts.paths = server_paths;
@@ -149,15 +158,18 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     }
 
-    match streams::setup_client(&mut conn, transport, opts.streams, !server_is_sender, out) {
-        Ok(Some(auto::Outcome::Unreachable)) => memory.remember(&host),
-        Ok(Some(auto::Outcome::Quic)) => memory.forget(&host),
-        Ok(_) => {}
+    let chosen = match streams::setup_client(&mut conn, transport, opts.streams, !server_is_sender, out) {
+        Ok(outcome) => outcome,
         Err(e) => {
             out.error(format!("setting up parallel streams failed: {e}"));
             let _ = child.kill();
             return exit::PROTOCOL;
         }
+    };
+    match chosen {
+        Some(auto::Outcome::Unreachable) => memory.remember(auto::Mark::Unreachable, &host),
+        Some(auto::Outcome::Quic) => memory.forget(auto::Mark::Unreachable, &host),
+        _ => {}
     }
 
     mark("setup done");
@@ -172,6 +184,12 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         r.finish(out);
     }
     mark("transfer done");
+    if chosen == Some(auto::Outcome::Quic)
+        && code != exit::SIGNAL
+        && let Some(session) = conn.session::<quic::Session>()
+    {
+        learn(&memory, &host, &session.seen(), out);
+    }
     // A sender with the receiver's final counters knows the receiver has everything.
     let _ = if !server_is_sender && stats.is_some() { conn.finish_confirmed() } else { conn.finish() };
     mark("connection closed");
@@ -188,4 +206,24 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
     out.flush();
     code
+}
+
+/// `auto`, after a transfer over QUIC: remember a clean link (the ssh pipe is then used for
+/// a while), forget it after a lossy one.
+fn learn(memory: &auto::Memory, host: &str, seen: &auto::Seen, out: &Output) {
+    let verdict = auto::verdict(seen);
+    match verdict {
+        Some(auto::Verdict::Clean) => memory.remember(auto::Mark::Clean, host),
+        Some(auto::Verdict::Lossy | auto::Verdict::Fast) => memory.forget(auto::Mark::Clean, host),
+        None => {}
+    }
+    if out.verbose() > 1 {
+        let next = match verdict {
+            Some(auto::Verdict::Clean) => "a clean link: the ssh connection next time",
+            Some(auto::Verdict::Lossy) => "QUIC next time too",
+            Some(auto::Verdict::Fast) => "faster than the ssh connection's window allows: QUIC next time too",
+            None => "too few to tell",
+        };
+        out.info(format!("auto: QUIC lost {} of {} packets, {next}", seen.lost_packets, seen.sent_packets));
+    }
 }

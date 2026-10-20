@@ -455,13 +455,42 @@ fn auto_transport_falls_back_fast_and_remembers_the_host() {
     let same = auto_run(tmp.path(), "state", "0", &["src/", "me@fakehost:dst5"], &[]);
     assert!(same.stdout.contains("failed recently"), "{}", same.stdout);
 
-    // Once QUIC works again (after the memory expires, here: removed), it is used and the
-    // host stays usable.
+    // Once QUIC works again (after the memory expires, here: removed), it is used, and the
+    // host is no longer taken for unreachable (a clean link may keep it on ssh now).
     std::fs::remove_dir_all(tmp.path().join("state")).unwrap();
-    for dst in ["dst6", "dst7"] {
-        let h = auto_run(tmp.path(), "state", "0", &["src/", &format!("{{host}}{dst}")], &[]);
-        assert!(h.stdout.contains("QUIC connected in"), "{}", h.stdout);
+    let h = auto_run(tmp.path(), "state", "0", &["src/", "{host}dst6"], &[]);
+    assert!(h.stdout.contains("QUIC connected in"), "{}", h.stdout);
+    let h = auto_run(tmp.path(), "state", "0", &["src/", "{host}dst7"], &[]);
+    assert_eq!(h.code, 0, "{}\n{}", h.stdout, h.stderr);
+    assert!(!h.stdout.contains("failed recently"), "{}", h.stdout);
+}
+
+#[test]
+fn auto_transport_remembers_a_clean_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    delta_fixture(tmp.path());
+    // A fresh 16 MiB push over QUIC, then the verdict on what QUIC saw: thousands of
+    // packets, so it has one.
+    let f = auto_run(tmp.path(), "state", "0", &["src/", "{host}fresh"], &[]);
+    assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
+    assert!(f.stdout.contains("QUIC connected in"), "{}", f.stdout);
+    let line = f.stdout.lines().find(|l| l.starts_with("auto: QUIC lost ")).unwrap_or_else(|| panic!("{}", f.stdout));
+    let lost: u64 = line["auto: QUIC lost ".len()..].split(' ').next().unwrap().parse().unwrap();
+    // Loopback rarely loses a packet; when it does, the link counts as lossy.
+    let next = auto_run(tmp.path(), "state", "0", &["src/", "{host}dst2"], &[]);
+    assert_eq!(next.code, 0, "{}\n{}", next.stdout, next.stderr);
+    if lost == 0 {
+        assert!(line.ends_with("a clean link: the ssh connection next time"), "{line}");
+        assert!(next.stdout.contains("auto: QUIC to fakehost lost no packets lately, using the ssh connection"), "{}", next.stdout);
+        assert!(!next.stdout.contains("round trip"), "no attempt expected: {}", next.stdout);
+        // Other hosts aren't affected.
+        let other = auto_run(tmp.path(), "state", "0", &["src/", "otherhost:dst3"], &[]);
+        assert!(other.stdout.contains("QUIC connected in"), "{}", other.stdout);
+    } else {
+        assert!(line.ends_with("QUIC next time too"), "{line}");
+        assert!(next.stdout.contains("QUIC connected in"), "{}", next.stdout);
     }
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst2"), true));
 }
 
 #[test]

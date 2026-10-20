@@ -71,6 +71,7 @@ pub struct Session {
     control: Option<(SendStream, RecvStream)>,
     /// Client side: the server's acknowledgement of the token is still to be read.
     ack_pending: bool,
+    opened: Instant,
 }
 
 /// Server side: the endpoint, waiting for the client.
@@ -161,7 +162,7 @@ impl Pending {
             }
         })?;
         let endpoint = self.endpoint.take().expect("endpoint");
-        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)), ack_pending: false })
+        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)), ack_pending: false, opened: Instant::now() })
     }
 }
 
@@ -195,7 +196,7 @@ pub fn start(offer: &StreamOffer, initial_rtt: Option<Duration>) -> io::Result<A
         let conn = endpoint.connect(addr, CERT_NAME).map_err(io::Error::other)?.await.map_err(io::Error::other)?;
         let (mut send, recv) = conn.open_bi().await.map_err(io::Error::other)?;
         send.write_all(&token).await.map_err(io::Error::other)?;
-        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)), ack_pending: true })
+        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)), ack_pending: true, opened: Instant::now() })
     });
     Ok(Attempt { task: Some(task) })
 }
@@ -251,6 +252,18 @@ impl Session {
     /// The shortest round trip measured so far.
     pub fn min_rtt(&self) -> Duration {
         self.conn.min_rtt()
+    }
+
+    /// What this side has seen of the link so far (for `--transport auto`'s memory).
+    pub fn seen(&self) -> super::auto::Seen {
+        let s = self.conn.stats();
+        super::auto::Seen {
+            sent_packets: s.frame_tx.stream,
+            lost_packets: s.path.lost_packets,
+            sent_bytes: s.udp_tx.bytes,
+            min_rtt: self.conn.min_rtt(),
+            open: self.opened.elapsed(),
+        }
     }
 
     /// The control stream as blocking halves.

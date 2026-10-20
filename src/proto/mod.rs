@@ -568,6 +568,11 @@ impl Conn {
         }
     }
 
+    /// The session this connection runs over, if it is a `T` (e.g. a QUIC session).
+    pub fn session<T: 'static>(&self) -> Option<&T> {
+        self.session.as_deref()?.downcast_ref()
+    }
+
     /// Number of attached incoming data streams.
     pub fn data_streams_in(&self) -> usize {
         self.data_in
