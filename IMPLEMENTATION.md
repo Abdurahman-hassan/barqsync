@@ -37,8 +37,8 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M18 | `-X/--xattrs` (`-XX`) and `-A/--acls` with rsync's semantics, locally and remote (protocol 9): rsync's namespace rules on each system, long values sent as checksums and fetched only when needed, POSIX ACLs on Linux and extended ACLs on macOS, `x`/`a` item columns, attribute-only updates; APFS clones no longer keep attributes without `-X`; see [Extended attributes and ACLs](#extended-attributes-and-acls--x--a) | done |
 | M19 | QUIC's fixed cost: `BARQSYNC_TIMING` milestones on both sides; the sender closes once it has `ReceiverDone`, nothing waits for acknowledgements, the client doesn't wait for the token's acknowledgement, auto connects alongside its ping, and hosts where QUIC found a clean link stay on the ssh pipe for an hour. On a clean 80 ms link QUIC's cost over the pipe fell from 3–5 round trips per transfer to 2 (auto: delta +9% → +3.5%, no-op +23% → +9%; once the host is known clean, the pipe's own times); the lossy win is unchanged. The ssh pipe stays the default; see [QUIC's fixed cost](#quics-fixed-cost-m19). Also: a pull with `--remove-source-files` prints the sender's removals and exits 23 when one fails, as rsync does (protocol 10) | done |
 
-The test suite passes on macOS (APFS; 188 tests at M19, 164 at M17, 154 at M16, 145 at M14,
-when it was also built as x86_64 and run under Rosetta) and Linux (191 tests at M19 and 167 at
+The test suite passes on macOS (APFS; 198 tests at M19, 164 at M17, 154 at M16, 145 at M14,
+when it was also built as x86_64 and run under Rosetta) and Linux (201 tests at M19 and 167 at
 M17 in an aarch64 container, 157 at M16 on an x86_64 VM, 148 at M14), compared against rsync
 3.2.7. Three tests are Linux-only.
 
@@ -262,8 +262,21 @@ connections and control messages stay on ssh:
 3. **Use.** Every frame of a file goes over the same stream, so it stays in order. Small-file
    packs spread across streams. Each stream ends with an end-of-stream marker, and the
    receiver finishes only after all of them and the sender's final ssh message.
-4. **Fall back.** If no stream can be opened within 5 s (a firewall, NAT, a non-routable
-   server address), both sides carry on over the ssh pipe; `-v` says so.
+4. **Through ssh when blocked.** If no direct connection opens within 5 s (a firewall on the
+   server, NAT, a VPN that only lets ssh in), the client opens the same N streams over N
+   extra ssh connections instead. Each runs `barqsync --stream-relay` on the server, which
+   passes bytes between its stdin/stdout and the stream listener on that machine (the
+   listener also listens on loopback, on the same port, for this). TLS with the pinned
+   certificate and the token still runs end to end, so the relay only sees ciphertext. No
+   firewall rule is needed, and several TCP connections still carry the data. With ssh as
+   the remote shell, relays never prompt (`BatchMode`) and never share a multiplexed master
+   (`ControlPath=none`), so they need key or agent authentication; `-v` says when they are
+   used. The relay copies with plain reads and writes: with `io::copy`, which splices between
+   pipe and socket on Linux, the TLS handshake stalled after the server's first flight.
+   `bench/net/container.sh firewall` checks all this with real OpenSSH behind an iptables rule
+   that resets everything but ssh.
+5. **Fall back.** If the relays fail too, both sides carry on over the ssh pipe, and the
+   message says why each way failed.
 
 `-vv` reports how many streams are in use. Encryption and `-z` compression then run on one
 thread per stream instead of in a single ssh process. `--streams N` on its own means
@@ -1002,6 +1015,8 @@ measured time for the round trip, so a jittery link reads as slow instead of abs
 With both, the probe measured this link at 0.1 Mbit/s with one 16 KiB burst. `--transport
 tcp` and `quic` fell back to ssh here: the MacBook's firewall blocks incoming connections to
 an unsigned binary (`socketfilterfw --unblockapp ~/bin/barqsync` on the remote allows it).
+Since then, `--transport tcp` carries its streams through extra ssh connections when that
+happens (see "Parallel data streams"); QUIC still needs the firewall to allow it.
 
 ### Page-cache hints
 

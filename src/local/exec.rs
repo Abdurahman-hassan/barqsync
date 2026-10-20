@@ -1375,8 +1375,9 @@ impl<'a> Engine<'a> {
             return;
         }
         self.backup_existing_file(job);
-        let r = self.write_file(job);
-        crate::progress::done(job.meta.size);
+        // A big copy moves the progress line as it goes, not only once it is done.
+        let (r, counted) = crate::progress::tracking(|| self.write_file(job));
+        crate::progress::done(job.meta.size.saturating_sub(counted));
         match r {
             Ok(()) => self.file_written(job),
             Err(e) if !fsops::interrupted() => {

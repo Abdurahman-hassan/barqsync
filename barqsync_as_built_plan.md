@@ -398,7 +398,7 @@ one file use the same stream, so they stay in order.
 - **Coverage:** 145 tests on macOS (arm64, and x86_64 under Rosetta: BLAKE3/zstd x86 SIMD
   paths, `getattrlistbulk` on Intel builds) and 148 on Linux (aarch64 container, glibc rsync
   3.2.7) at M14; at M16, 157 on Linux (x86_64 VM, rsync 3.2.7) and 154 on macOS; at M17,
-  167 on Linux (aarch64 container) and 164 on macOS; at M19, 191 on Linux and 188 on macOS. The
+  167 on Linux (aarch64 container) and 164 on macOS; at M19, 201 on Linux and 198 on macOS. The
   whole suite also runs with each alternative design as the default
   (`BARQSYNC_DELTA`, `_SCANNER`, `_TRANSPORT` (`quic`, `auto`), `_WIRE`, `_STRATEGY`,
   `_NET_IO`, `_IO_URING`).
@@ -494,7 +494,8 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
 
 - **A fast real link.** The Intel MacBook Pro was tested over Tailscale across the internet
   (real-host tests pass; 1.1–1.5× rsync on a ~4 Mbit/s link, see `IMPLEMENTATION.md`), but not on a
-  LAN, and TCP/QUIC there need its firewall to allow the binary.
+  LAN. Behind its firewall, `--transport tcp` now carries the streams through extra ssh
+  connections; QUIC there still needs the firewall to allow the binary.
 - **Cold-cache runs** (`bench/run.sh DIR all --cold`) need `sudo purge` on macOS.
 - **NFS** isn't covered (no server).
 - **From rsync's feature set:** daemon mode (`rsync://`) and the single-argument listing mode.

@@ -406,6 +406,7 @@ pub(crate) fn copy_buffered(mut src: &File, mut dst: &File, size: u64) -> io::Re
             };
             dst.write_all(&buf[..n])?;
             total += n as u64;
+            crate::progress::copied(n as u64);
         }
     })
 }
@@ -431,6 +432,7 @@ fn copy_uncached(src: &File, dst: &File, size: u64) -> io::Result<u64> {
         let (w, r) = rayon::join(write, || read_full(src, &mut next));
         w?;
         written += n as u64;
+        crate::progress::copied(n as u64);
         writer.written_to(dst, written);
         n = r?;
         read += n as u64;

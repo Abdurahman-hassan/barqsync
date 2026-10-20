@@ -21,11 +21,16 @@ pub fn run() -> i32 {
     let (server_is_sender, opts) = match conn.recv() {
         Ok(Frame::Msg(Msg::Hello { magic, version, server_is_sender, opts })) => {
             if magic != MAGIC || version != VERSION {
-                let msg = format!("protocol version mismatch: client speaks {version}, server speaks {VERSION}");
+                let msg = format!(
+                    "protocol version mismatch: client speaks {version}, server speaks {VERSION} (barqsync {})",
+                    env!("CARGO_PKG_VERSION")
+                );
                 let _ = conn.msg(Msg::Fatal { msg });
                 let _ = conn.finish();
                 return exit::INCOMPATIBLE;
             }
+            let mut opts = opts;
+            opts.paths = opts.paths.into_iter().map(expand_tilde).collect();
             (server_is_sender, opts)
         }
         _ => {
@@ -90,4 +95,64 @@ fn async_stdio() -> Option<std::io::Result<(FdIo, FdIo)>> {
         if d < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(d) }) }
     };
     Some((|| Ok((FdIo::new(dup(0)?)?, FdIo::new(dup(1)?)?)))())
+}
+
+/// A leading `~` or `~user` in a path from the client, as the remote shell would have
+/// expanded it (rsync's paths go through it; ours arrive in the handshake). Left alone
+/// when there's no such user.
+fn expand_tilde(p: std::ffi::OsString) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let b = p.as_bytes();
+    if b.first() != Some(&b'~') {
+        return p;
+    }
+    let end = b.iter().position(|&c| c == b'/').unwrap_or(b.len());
+    let user = &b[1..end];
+    let home = if user.is_empty() {
+        std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| h.into_vec()).or_else(|| home_of(None))
+    } else {
+        home_of(Some(user))
+    };
+    match home {
+        Some(mut h) => {
+            h.extend_from_slice(&b[end..]);
+            std::ffi::OsString::from_vec(h)
+        }
+        None => p,
+    }
+}
+
+/// A user's home directory from the password database (`None`: this process's user).
+fn home_of(user: Option<&[u8]>) -> Option<Vec<u8>> {
+    let pw = match user {
+        Some(u) => {
+            let name = std::ffi::CString::new(u).ok()?;
+            unsafe { libc::getpwnam(name.as_ptr()) }
+        }
+        None => unsafe { libc::getpwuid(libc::geteuid()) },
+    };
+    if pw.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+    Some(dir.to_bytes().to_vec()).filter(|d| !d.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn tilde_paths_are_expanded_like_a_shell_would() {
+        let home = std::env::var("HOME").unwrap();
+        let x = |s: &str| expand_tilde(OsString::from(s)).into_string().unwrap();
+        assert_eq!(x("~"), home);
+        assert_eq!(x("~/dir/"), format!("{home}/dir/"));
+        assert_eq!(x("dir/~x"), "dir/~x");
+        assert_eq!(x("~no-such-user-here/x"), "~no-such-user-here/x");
+        let me = unsafe { std::ffi::CStr::from_ptr((*libc::getpwuid(libc::geteuid())).pw_name) }.to_str().unwrap().to_string();
+        let mine = home_of(None).map(|h| String::from_utf8(h).unwrap()).unwrap();
+        assert_eq!(x(&format!("~{me}/a")), format!("{mine}/a"));
+    }
 }

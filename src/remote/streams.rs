@@ -10,8 +10,12 @@
 //!    and presents the token plus a stream index inside TLS;
 //! 3. the server acknowledges each authenticated stream; the client reports how many
 //!    it got. Zero means both sides stay on the ssh pipe.
+//!
+//! When no direct connection opens (a firewall on the server, say), the client carries
+//! the streams over extra ssh connections instead (see [`relay`]); the listener also
+//! listens on loopback, with the same port, for them.
 
-use super::{Transport, auto, quic};
+use super::{Transport, auto, quic, relay};
 use crate::proto::async_io;
 use crate::output::Output;
 use crate::proto::{Conn, Frame, Msg, StreamOffer};
@@ -21,7 +25,7 @@ use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signat
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, ServerConfig, ServerConnection, SignatureScheme, StreamOwned};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -57,6 +61,36 @@ pub(crate) fn listen_ip() -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
+/// Loopback in the family of `ip`.
+pub(crate) fn loopback_for(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    }
+}
+
+/// The listeners: on [`listen_ip`], and on loopback with the same port for relays (left
+/// out when that port can't be had there).
+fn bind() -> io::Result<Vec<TcpListener>> {
+    bind_on(listen_ip())
+}
+
+fn bind_on(ip: IpAddr) -> io::Result<Vec<TcpListener>> {
+    let lo = loopback_for(ip);
+    let mut main = TcpListener::bind((ip, 0))?;
+    if ip == lo {
+        return Ok(vec![main]);
+    }
+    for _ in 0..8 {
+        match TcpListener::bind((lo, main.local_addr()?.port())) {
+            Ok(l) => return Ok(vec![main, l]),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => main = TcpListener::bind((ip, 0))?,
+            Err(_) => break,
+        }
+    }
+    Ok(vec![main])
+}
+
 /// An authenticated data stream: blocking, or driven by tokio (`BARQSYNC_NET_IO=tokio`).
 pub enum DataStream {
     Sync(Box<dyn Stream>),
@@ -79,8 +113,8 @@ pub fn listen(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
     if async_io::enabled() {
         return listen_async(max);
     }
-    let listener = TcpListener::bind((listen_ip(), 0))?;
-    let addr = listener.local_addr()?;
+    let listeners = bind()?;
+    let addr = listeners[0].local_addr()?;
     let certified = rcgen::generate_simple_self_signed(vec![CERT_NAME.to_string()]).map_err(tls_err)?;
     let cert = certified.cert.der().clone();
     let fingerprint = *blake3::hash(&cert).as_bytes();
@@ -97,22 +131,27 @@ pub fn listen(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
             .map_err(tls_err)?,
     );
 
-    listener.set_nonblocking(true)?;
+    for l in &listeners {
+        l.set_nonblocking(true)?;
+    }
     let accepted: Accepted = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
         let (accepted, stop) = (accepted.clone(), stop.clone());
         std::thread::Builder::new().name("barqsync-accept".into()).spawn(move || {
             while !stop.load(Ordering::SeqCst) && accepted.0.lock().unwrap().len() < max {
-                match listener.accept() {
-                    Ok((sock, _)) => {
+                let mut idle = true;
+                for l in &listeners {
+                    if let Ok((sock, _)) = l.accept() {
+                        idle = false;
                         if let Ok((idx, s)) = authenticate(sock, config.clone(), &token) {
                             accepted.0.lock().unwrap().push((idx, DataStream::Sync(s)));
                             accepted.1.notify_all();
                         }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
-                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+                if idle {
+                    std::thread::sleep(Duration::from_millis(5));
                 }
             }
         })?
@@ -218,19 +257,28 @@ impl ServerCertVerifier for Pinned {
     }
 }
 
-/// Client side: open up to `n` authenticated streams in parallel. Failed ones are
-/// dropped; if none opens, the error says why (the caller then uses the ssh pipe).
-pub fn connect(offer: &StreamOffer, n: usize) -> io::Result<Vec<DataStream>> {
-    let addr = offer.addr.parse::<SocketAddr>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+/// The client's TLS configuration: only the offered certificate is accepted.
+pub(crate) fn client_config(offer: &StreamOffer) -> io::Result<Arc<ClientConfig>> {
     let provider = provider();
-    let config = Arc::new(
+    Ok(Arc::new(
         ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(tls_err)?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(Pinned { fingerprint: offer.fingerprint, provider }))
             .with_no_client_auth(),
-    );
+    ))
+}
+
+/// Client side: open up to `n` authenticated streams in parallel. Failed ones are
+/// dropped; if none opens, the error says why (the caller then tries relays, then uses
+/// the ssh pipe).
+pub fn connect(offer: &StreamOffer, n: usize) -> io::Result<Vec<DataStream>> {
+    if std::env::var_os("BARQSYNC_TEST_DIRECT_BLOCKED").is_some() {
+        return Err(io::Error::new(io::ErrorKind::ConnectionReset, "Connection reset by peer (test)"));
+    }
+    let addr = offer.addr.parse::<SocketAddr>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let config = client_config(offer)?;
     let results = if async_io::enabled() {
         connect_async(addr, config, offer.token, n)
     } else {
@@ -256,10 +304,8 @@ pub fn connect(offer: &StreamOffer, n: usize) -> io::Result<Vec<DataStream>> {
 fn listen_async(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let _rt = async_io::rt().enter();
-    let std_listener = TcpListener::bind((listen_ip(), 0))?;
-    std_listener.set_nonblocking(true)?;
-    let addr = std_listener.local_addr()?;
-    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+    let std_listeners = bind()?;
+    let addr = std_listeners[0].local_addr()?;
     let certified = rcgen::generate_simple_self_signed(vec![CERT_NAME.to_string()]).map_err(tls_err)?;
     let cert = certified.cert.der().clone();
     let fingerprint = *blake3::hash(&cert).as_bytes();
@@ -276,8 +322,10 @@ fn listen_async(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     let accepted: Accepted = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
     let stop = Arc::new(AtomicBool::new(false));
-    {
-        let (accepted, stop) = (accepted.clone(), stop.clone());
+    for l in std_listeners {
+        l.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(l)?;
+        let (accepted, stop, acceptor) = (accepted.clone(), stop.clone(), acceptor.clone());
         async_io::rt().spawn(async move {
             while !stop.load(Ordering::SeqCst) && accepted.0.lock().unwrap().len() < max {
                 let Ok(Ok((sock, _))) = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await else { continue };
@@ -350,6 +398,20 @@ fn connect_one(addr: SocketAddr, config: Arc<ClientConfig>, token: &[u8; 32], id
     sock.set_nodelay(true)?;
     sock.set_read_timeout(Some(CONNECT_TIMEOUT))?;
     sock.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+    let tls = client_handshake(sock, config, token, idx)?;
+    tls.sock.set_read_timeout(None)?;
+    tls.sock.set_write_timeout(None)?;
+    Ok(Box::new(tls))
+}
+
+/// TLS over `sock` (a TCP connection, or a relay's pipes), then the token and the stream
+/// index; the server acknowledges with one byte.
+pub(crate) fn client_handshake<S: Read + Write>(
+    sock: S,
+    config: Arc<ClientConfig>,
+    token: &[u8; 32],
+    idx: u16,
+) -> io::Result<StreamOwned<ClientConnection, S>> {
     let name = ServerName::try_from(CERT_NAME.to_string()).map_err(tls_err)?;
     let conn = ClientConnection::new(config, name).map_err(tls_err)?;
     let mut tls = StreamOwned::new(conn, sock);
@@ -362,9 +424,7 @@ fn connect_one(addr: SocketAddr, config: Arc<ClientConfig>, token: &[u8; 32], id
     if ack[0] != 1 {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "stream rejected"));
     }
-    tls.sock.set_read_timeout(None)?;
-    tls.sock.set_write_timeout(None)?;
-    Ok(Box::new(tls))
+    Ok(tls)
 }
 
 /// Wait for one frame during setup, with a deadline (the main connection isn't sealed
@@ -478,6 +538,7 @@ pub fn setup_client(
     transport: Transport,
     want: usize,
     sending: bool,
+    shell: Option<&relay::Shell>,
     out: &Output,
 ) -> io::Result<Option<auto::Outcome>> {
     let r = (|| {
@@ -508,6 +569,7 @@ pub fn setup_client(
                 Ok(None)
             }
             Frame::Msg(Msg::StreamOffer(offer)) => {
+                let why = |r: io::Result<Vec<DataStream>>| r.err().map_or_else(|| "no stream opened".to_string(), |e| e.to_string());
                 match connect(&offer, want) {
                     Ok(streams) if !streams.is_empty() => {
                         let n = streams.len();
@@ -517,13 +579,31 @@ pub fn setup_client(
                         }
                         attach(conn, streams, sending);
                     }
-                    r => {
-                        conn.msg(Msg::StreamsReady { count: 0 })?;
-                        let why = r.err().map_or_else(|| "no stream opened".to_string(), |e| e.to_string());
-                        out.info(format!(
-                            "parallel streams: could not connect to {} ({why}), using the ssh connection",
-                            offer.addr
-                        ));
+                    direct => {
+                        // Blocked, most likely by a firewall: the same streams through ssh.
+                        let direct = why(direct);
+                        match shell.map(|s| relay::connect(s, &offer, want)) {
+                            Some(Ok(streams)) if !streams.is_empty() => {
+                                let n = streams.len();
+                                conn.msg(Msg::StreamsReady { count: n as u16 })?;
+                                if out.verbose() > 0 {
+                                    out.info(format!(
+                                        "parallel streams: {} refused a direct connection ({direct}), \
+                                         using {n} streams through ssh",
+                                        offer.addr
+                                    ));
+                                }
+                                attach(conn, streams, sending);
+                            }
+                            relayed => {
+                                conn.msg(Msg::StreamsReady { count: 0 })?;
+                                let relayed = relayed.map_or(String::new(), |r| format!("; through ssh: {}", why(r)));
+                                out.info(format!(
+                                    "parallel streams: could not connect to {} ({direct}{relayed}), using the ssh connection",
+                                    offer.addr
+                                ));
+                            }
+                        }
                     }
                 }
                 Ok(None)
@@ -639,6 +719,18 @@ mod tests {
         offer.token[31] ^= 1;
         assert!(connect(&offer, 1).is_err());
         assert!(acceptor.take(1, Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn the_listener_also_listens_on_loopback_with_the_same_port() {
+        let one = bind_on(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        assert_eq!(one.len(), 1);
+        // Any other local address will do; Linux has all of 127/8 (macOS only 127.0.0.1).
+        let Ok(two) = bind_on("127.0.0.2".parse().unwrap()) else { return };
+        assert_eq!(two.len(), 2);
+        let (a, b) = (two[0].local_addr().unwrap(), two[1].local_addr().unwrap());
+        assert_eq!((a.ip().to_string().as_str(), b.ip()), ("127.0.0.2", IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(a.port(), b.port());
     }
 
     #[test]

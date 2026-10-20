@@ -5,6 +5,7 @@
 #   bench/net/container.sh net [profiles...]     rsync vs barqsync over real ssh, tc-shaped
 #   bench/net/container.sh fixed [profiles...]   per-transfer fixed cost of each transport
 #   bench/net/container.sh syscalls              strace -c syscall counts
+#   bench/net/container.sh firewall              --streams through a firewall that only lets ssh in
 #   bench/net/container.sh flamegraph [workload] perf + inferno flamegraph
 #   bench/net/container.sh test                  cargo test + clippy on Linux
 #   bench/net/container.sh shell                 interactive shell
@@ -38,6 +39,7 @@ case "$cmd" in
   net) run "$IMAGE" bash bench/net/net_bench.sh "$@" ;;
   fixed) run "$IMAGE" bash bench/net/fixed_cost.sh "$@" ;;
   syscalls) run "$IMAGE" bash bench/syscalls.sh "$@" ;;
+  firewall) run "$IMAGE" bash bench/net/firewall.sh "$@" ;;
   flamegraph) run "$IMAGE" bash bench/flamegraph.sh "$@" ;;
   test) run "$IMAGE" bash -c 'cargo test 2>&1 | grep -E "^test result|FAILED|panicked|^error"; cargo clippy --all-targets 2>&1 | grep -cE "^(warning|error)"' ;;
   shell) run -it "$IMAGE" bash ;;

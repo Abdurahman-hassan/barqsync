@@ -12,6 +12,7 @@
 //! the final line shows the average speed and the total time.
 
 use crate::output::{Output, human_num};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,6 +34,30 @@ pub fn planned(size: u64) {
 /// big file moves the line while it travels instead of all at once at the end.
 pub fn bytes(n: u64) {
     DONE_BYTES.fetch_add(n, Relaxed);
+}
+
+thread_local! {
+    /// Bytes counted so far for the file [`tracking`] writes on this thread.
+    static TRACKED: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Run `f`, which writes one planned file on this thread, counting the bytes the copy
+/// loops report with [`copied`] as they go; returns `f`'s result and that count. Other
+/// copies (backups, `--link-dest` copies) aren't tracked, so they never count.
+pub fn tracking<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    TRACKED.with(|t| t.set(Some(0)));
+    let r = f();
+    (r, TRACKED.with(|t| t.take()).unwrap_or(0))
+}
+
+/// A copy loop wrote `n` more bytes (counted only inside [`tracking`]).
+pub fn copied(n: u64) {
+    TRACKED.with(|t| {
+        if let Some(c) = t.get() {
+            t.set(Some(c + n));
+            DONE_BYTES.fetch_add(n, Relaxed);
+        }
+    });
 }
 
 /// A planned file has been written (or sent, on a sending client); `rest` is the part of
@@ -161,8 +186,31 @@ impl Drop for Reporter {
 
 #[cfg(test)]
 mod tests {
-    use super::{Speed, clock, grouped};
+    use super::{Speed, clock, copied, grouped, tracking};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn only_tracked_copies_count() {
+        copied(5);
+        let ((), n) = tracking(|| {
+            copied(64 << 20);
+            copied(36 << 20);
+        });
+        assert_eq!(n, 100 << 20);
+        // The next tracked file starts from zero.
+        assert_eq!(tracking(|| copied(1)).1, 1);
+    }
+
+    #[test]
+    fn a_big_local_copy_counts_as_it_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
+        std::fs::write(&src, vec![7u8; 3 << 20]).unwrap();
+        // Through a buffer, as to a disk without clones.
+        let (r, n) = tracking(|| crate::fsops::copy_new(&src, &dst, 3 << 20, false, 0o644));
+        r.unwrap();
+        assert_eq!(n, 3 << 20);
+    }
 
     #[test]
     fn speed_follows_the_last_seconds() {

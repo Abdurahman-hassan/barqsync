@@ -28,6 +28,17 @@
 
 - A pull with `--remove-source-files` now prints the sender's removals with `-vv` and exits
   with code 23 when a removal fails, as rsync does; it used to print nothing and exit 0.
+- Parallel streams (`--streams`, `--transport tcp`) now work behind a firewall that only
+  lets ssh in, such as the macOS firewall: when direct connections are refused, the
+  streams travel over extra ssh connections instead of falling back to the single ssh
+  pipe. No firewall exception is needed. This needs ssh keys or an agent on the remote
+  host, and barqsync with this fix on both machines.
+- `~` at the start of a remote path (`host:~/dir/`) or of `--remote-path` now means the
+  remote home directory, as with rsync.
+- A big local copy to a disk without clones now moves the progress line as it is copied,
+  not only when it is done.
+- Clearer errors: barqsync missing on the remote host (with a hint about `~/.zshenv`), a
+  version mismatch (naming both versions), and a host with an empty user name (`@host`).
 
 ## 0.3.0 - 2026-10-20
 

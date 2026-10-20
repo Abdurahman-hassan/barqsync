@@ -1,7 +1,7 @@
 //! Client side of a remote transfer: start `barqsync --server` through the remote
 //! shell, send it the role, paths and options, then run the opposite role locally.
 
-use super::{Stop, Transport, auto, quic, receiver, recv, sender, streams};
+use super::{Stop, Transport, auto, quic, receiver, recv, relay, sender, streams};
 use crate::cli::Options;
 use crate::exit;
 use crate::output::{Output, Stats};
@@ -10,35 +10,27 @@ use crate::proto::{Conn, Frame, MAGIC, Msg, VERSION};
 use crate::timing::mark;
 use std::ffi::OsString;
 use std::io;
-use std::process::{Child, Command, Stdio};
-use std::time::Instant;
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
 
 /// Start the remote shell running `<remote-path> --server` on `host`.
-fn spawn_server(opts: &Options, host: &str) -> io::Result<Child> {
-    let rsh = opts
-        .rsh
-        .clone()
-        .or_else(|| std::env::var("BARQSYNC_RSH").ok())
-        .unwrap_or_else(|| "ssh".to_string());
-    let mut argv = shlex::split(&rsh)
-        .filter(|a| !a.is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("cannot parse remote shell {rsh:?}")))?;
-    let program = argv.remove(0);
-    let remote = opts.remote_path.clone().unwrap_or_else(|| "barqsync".to_string());
-    let quoted = shlex::try_quote(&remote)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad --remote-path: {e}")))?;
-    let mut command = if opts.net_io_tokio { format!("{quoted} --server --net-io=tokio") } else { format!("{quoted} --server") };
-    if crate::timing::enabled() {
-        command = format!("env {}=1 {command}", crate::timing::VAR);
+fn spawn_server(shell: &relay::Shell, opts: &Options) -> io::Result<Child> {
+    shell.server(opts.net_io_tokio).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+}
+
+/// What to tell the user when the server's side ended before the handshake: the remote
+/// shell's exit status says whether barqsync was there at all.
+fn no_handshake_message(status: Option<i32>, remote: &str) -> String {
+    match status {
+        Some(127) => format!(
+            "the remote shell could not find `{remote}` (exit 127): install barqsync there, or give its \
+             full path with --remote-path (a PATH set in ~/.zshrc or ~/.bashrc isn't read for ssh commands; \
+             ~/.zshenv is)"
+        ),
+        _ => "connection unexpectedly closed before the handshake \
+              (is barqsync installed on the remote host? see --remote-path)"
+            .to_string(),
     }
-    Command::new(program)
-        .args(argv)
-        .arg(host)
-        .arg(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
 }
 
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
@@ -80,7 +72,18 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     };
 
-    let mut child = match spawn_server(opts, &host) {
+    if host.starts_with('@') {
+        out.error(format!("no user name before '@' in {host:?} (an empty variable?)"));
+        return exit::SYNTAX;
+    }
+    let shell = match relay::Shell::new(opts, &host) {
+        Ok(s) => s,
+        Err(e) => {
+            out.error(format!("failed to run the remote shell: {e}"));
+            return exit::IPC;
+        }
+    };
+    let mut child = match spawn_server(&shell, opts) {
         Ok(c) => c,
         Err(e) => {
             out.error(format!("failed to run the remote shell: {e}"));
@@ -135,6 +138,12 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         Ok(Frame::Msg(Msg::HelloAck { .. })) => mark("handshake done"),
         Ok(Frame::Msg(Msg::Fatal { msg })) => {
             out.error(format!("remote: {msg}"));
+            if msg.contains("version mismatch") {
+                out.error(format!(
+                    "this side is barqsync {} (protocol {VERSION}): install the same version on both machines",
+                    env!("CARGO_PKG_VERSION")
+                ));
+            }
             let _ = child.kill();
             return exit::INCOMPATIBLE;
         }
@@ -150,15 +159,12 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         Err(Stop::Io(_)) => {
             drop(conn);
             let status = child.wait().ok().and_then(|s| s.code());
-            out.error(
-                "connection unexpectedly closed before the handshake \
-                 (is barqsync installed on the remote host? see --remote-path)",
-            );
+            out.error(no_handshake_message(status, opts.remote_path.as_deref().unwrap_or("barqsync")));
             return if status == Some(255) { exit::RSH } else { exit::PROTOCOL };
         }
     }
 
-    let chosen = match streams::setup_client(&mut conn, transport, opts.streams, !server_is_sender, out) {
+    let chosen = match streams::setup_client(&mut conn, transport, opts.streams, !server_is_sender, Some(&shell), out) {
         Ok(outcome) => outcome,
         Err(e) => {
             out.error(format!("setting up parallel streams failed: {e}"));
@@ -200,6 +206,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     mark("connection closed");
     let _ = child.wait();
     mark("remote shell exited");
+    relay::reap(Duration::from_secs(5));
     out.flush();
     if let Some(s) = stats
         && (opts.stats || opts.verbose > 0)
