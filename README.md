@@ -1,5 +1,6 @@
 # barqsync
 
+[![CI](https://github.com/Abdurahman-hassan/barqsync/actions/workflows/ci.yml/badge.svg)](https://github.com/Abdurahman-hassan/barqsync/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/barqsync.svg)](https://crates.io/crates/barqsync)
 [![downloads](https://img.shields.io/crates/d/barqsync.svg)](https://crates.io/crates/barqsync)
 [![license](https://img.shields.io/crates/l/barqsync.svg)](#license)
@@ -21,6 +22,17 @@ them, and sends only the parts of a file that changed.
   through.
 
 ## Install
+
+Prebuilt binaries for macOS (arm64, x86_64) and Linux (x86_64, aarch64; glibc) are attached
+to each [GitHub release](https://github.com/Abdurahman-hassan/barqsync/releases) as
+`.tar.gz` archives with SHA-256 checksums. To install one:
+
+```bash
+cargo binstall barqsync     # with https://github.com/cargo-bins/cargo-binstall
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Abdurahman-hassan/barqsync/releases/latest/download/barqsync-installer.sh | sh
+```
+
+Or build it from source:
 
 ```bash
 cargo install barqsync
