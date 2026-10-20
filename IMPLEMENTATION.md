@@ -63,8 +63,9 @@ If `barqsync` is not found after installing, ensure Cargo's binary directory (`~
   ```
 
 macOS and Linux only. For remote transfers, barqsync has to be installed on both machines
-(like rsync), or pointed to with `--remote-path`, in the same release line: 0.2 changed the
-wire protocol, so 0.2.x and 0.1.x refuse each other ("protocol version mismatch").
+(like rsync), or pointed to with `--remote-path`, in the same release line. Version 0.3
+uses wire protocol 9 for extended attributes and ACLs, so 0.3.x cannot communicate with
+0.2.x or earlier releases ("protocol version mismatch"). Upgrade both ends together.
 
 ## Build from source
 
