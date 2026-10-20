@@ -1,11 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-10-20
 
 ### Compatibility
 
 - Remote transfers now use protocol 10. Upgrade barqsync on both machines together;
-  this version cannot communicate with 0.3.0 or earlier releases.
+  0.4.x cannot communicate with 0.3.x or earlier releases.
 
 ### Added
 
