@@ -5,9 +5,12 @@
 //!    fresh self-signed certificate (ALPN `barqsync`, TLS 1.3), and sends the address,
 //!    the certificate's BLAKE3 fingerprint and a random token;
 //! 2. the client connects within 3 s, accepting only that certificate, opens the
-//!    bidirectional control stream and writes the token on it;
-//! 3. the server accepts the connection whose control stream carries the token and
-//!    acknowledges with one byte. If anything fails, both sides stay on the ssh pipe.
+//!    bidirectional control stream and writes the token on it. If it can't connect, both
+//!    sides stay on the ssh pipe;
+//! 3. the server takes the first connection whose control stream carries the token and
+//!    acknowledges it with one byte. The client doesn't wait for that byte before using
+//!    the session (it is checked with the first read): the pinned certificate already
+//!    proves the client reached this server, so waiting would only cost a round trip.
 //!
 //! Then control messages, metadata batches included, move to the control stream, and
 //! file data travels on unidirectional streams (one per `--streams`), routed by file id
@@ -29,6 +32,8 @@ use tokio_util::io::SyncIoBridge;
 const ALPN: &[u8] = b"barqsync";
 /// The client gives up on QUIC (and stays on ssh) after this long.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the server gives a connection to present the token.
+const VET_TIMEOUT: Duration = Duration::from_secs(10);
 /// The round trip the server assumes until the handshake measures one: a lost first
 /// flight is sent again after about three times this (~150 ms) instead of quinn's ~1 s,
 /// which matters to `--transport auto`'s short wait. A path that is actually longer only
@@ -64,6 +69,8 @@ pub struct Session {
     _endpoint: Endpoint,
     conn: Connection,
     control: Option<(SendStream, RecvStream)>,
+    /// Client side: the server's acknowledgement of the token is still to be read.
+    ack_pending: bool,
 }
 
 /// Server side: the endpoint, waiting for the client.
@@ -101,23 +108,34 @@ pub fn listen() -> io::Result<(StreamOffer, Listener)> {
 
 impl Listener {
     /// Start accepting the client in the background: the first connection whose
-    /// control stream starts with the token (others are closed). The client only reports
-    /// success over ssh after this side has acknowledged it, so it must not wait for ssh.
+    /// control stream starts with the token (others are closed). Connections are vetted
+    /// side by side, so one that never presents a token can't hold up the client's. The
+    /// client connects before it reports over ssh, so this must not wait for ssh.
     pub fn accept(self) -> Pending {
         let Listener { endpoint, token } = self;
         let ep = endpoint.clone();
         let task = rt().spawn(async move {
-            while let Some(incoming) = ep.accept().await {
-                let Ok(conn) = incoming.await else { continue };
-                let Ok((mut send, mut recv)) = conn.accept_bi().await else { continue };
-                let mut hello = [0u8; 32];
-                if recv.read_exact(&mut hello).await.is_ok() && ct_eq(&hello, &token) {
-                    send.write_all(&[1]).await.map_err(io::Error::other)?;
-                    return Ok((conn, send, recv));
+            let (won, mut winner) = tokio::sync::mpsc::channel(1);
+            let accepting = tokio::spawn(async move {
+                while let Some(incoming) = ep.accept().await {
+                    let won = won.clone();
+                    tokio::spawn(tokio::time::timeout(VET_TIMEOUT, async move {
+                        let Ok(conn) = incoming.await else { return };
+                        let Ok((mut send, mut recv)) = conn.accept_bi().await else { return };
+                        let mut hello = [0u8; 32];
+                        if recv.read_exact(&mut hello).await.is_ok() && ct_eq(&hello, &token) {
+                            if send.write_all(&[1]).await.is_ok() {
+                                let _ = won.send((conn, send, recv)).await;
+                            }
+                            return;
+                        }
+                        conn.close(1u32.into(), b"bad token");
+                    }));
                 }
-                conn.close(1u32.into(), b"bad token");
-            }
-            Err(io::Error::other("QUIC endpoint closed"))
+            });
+            let accepted = winner.recv().await;
+            accepting.abort();
+            accepted.ok_or_else(|| io::Error::other("QUIC endpoint closed"))
         });
         Pending { endpoint: Some(endpoint), task: Some(task) }
     }
@@ -143,7 +161,7 @@ impl Pending {
             }
         })?;
         let endpoint = self.endpoint.take().expect("endpoint");
-        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)) })
+        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)), ack_pending: false })
     }
 }
 
@@ -171,6 +189,19 @@ pub struct Attempt {
 
 /// Start connecting to `offer` without waiting (see [`connect`]).
 pub fn start(offer: &StreamOffer, initial_rtt: Option<Duration>) -> io::Result<Attempt> {
+    let (endpoint, addr) = client_endpoint(offer, initial_rtt)?;
+    let token = offer.token;
+    let task = rt().spawn(async move {
+        let conn = endpoint.connect(addr, CERT_NAME).map_err(io::Error::other)?.await.map_err(io::Error::other)?;
+        let (mut send, recv) = conn.open_bi().await.map_err(io::Error::other)?;
+        send.write_all(&token).await.map_err(io::Error::other)?;
+        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)), ack_pending: true })
+    });
+    Ok(Attempt { task: Some(task) })
+}
+
+/// A client endpoint that accepts only the offer's certificate, and the address to dial.
+fn client_endpoint(offer: &StreamOffer, initial_rtt: Option<Duration>) -> io::Result<(Endpoint, SocketAddr)> {
     let addr: SocketAddr = offer.addr.parse().map_err(|_| io::Error::other("bad QUIC address"))?;
     let provider = provider();
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -188,19 +219,7 @@ pub fn start(offer: &StreamOffer, initial_rtt: Option<Duration>) -> io::Result<A
         Endpoint::client(local.parse().expect("bind address"))?
     };
     endpoint.set_default_client_config(config);
-    let token = offer.token;
-    let task = rt().spawn(async move {
-        let conn = endpoint.connect(addr, CERT_NAME).map_err(io::Error::other)?.await.map_err(io::Error::other)?;
-        let (mut send, mut recv) = conn.open_bi().await.map_err(io::Error::other)?;
-        send.write_all(&token).await.map_err(io::Error::other)?;
-        let mut ack = [0u8; 1];
-        recv.read_exact(&mut ack).await.map_err(io::Error::other)?;
-        if ack[0] != 1 {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "QUIC session rejected"));
-        }
-        Ok(Session { _endpoint: endpoint, conn, control: Some((send, recv)) })
-    });
-    Ok(Attempt { task: Some(task) })
+    Ok((endpoint, addr))
 }
 
 impl Attempt {
@@ -240,7 +259,9 @@ impl Session {
         // Listings and requests go ahead of queued file data: every round trip of the
         // protocol waits on them.
         let _ = send.set_priority(1);
-        (Box::new(SyncIoBridge::new_with_handle(recv, rt().handle().clone())), Box::new(QuicWrite::new(send)))
+        let recv = SyncIoBridge::new_with_handle(recv, rt().handle().clone());
+        let recv: Box<dyn Read + Send> = if self.ack_pending { Box::new(Acked { inner: recv, checked: false }) } else { Box::new(recv) };
+        (recv, Box::new(QuicWrite::new(send)))
     }
 
     /// `n` streams to send file data on.
@@ -308,6 +329,28 @@ impl Drop for QuicWrite {
         if let Some(bridge) = self.inner.take() {
             let _ = bridge.into_inner().finish();
         }
+    }
+}
+
+/// The client's control stream: the server's acknowledgement of the token comes first.
+/// A server that refused closes the connection instead, so this rarely fails; when it
+/// does, the transfer fails with it (the client has moved to QUIC by then).
+struct Acked<R> {
+    inner: R,
+    checked: bool,
+}
+
+impl<R: Read> Read for Acked<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.checked {
+            let mut ack = [0u8; 1];
+            self.inner.read_exact(&mut ack)?;
+            if ack[0] != 1 {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "QUIC session rejected"));
+            }
+            self.checked = true;
+        }
+        self.inner.read(buf)
     }
 }
 
@@ -385,8 +428,32 @@ mod tests {
         let (mut offer, listener) = listen().unwrap();
         let pending = listener.accept();
         offer.token[31] ^= 1;
-        assert!(connect(&offer).is_err());
+        // The client doesn't wait for the acknowledgement: it learns on its first read.
+        let mut client = connect(&offer).unwrap();
+        let (mut r, _w) = client.control();
+        assert!(r.read(&mut [0u8; 1]).is_err());
         assert!(pending.wait(Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn a_connection_without_a_token_does_not_hold_up_the_client() {
+        let (offer, listener) = listen().unwrap();
+        let pending = listener.accept();
+        // Connects but never opens the control stream.
+        let (endpoint, addr) = client_endpoint(&offer, None).unwrap();
+        let _idle = rt().block_on(async { endpoint.connect(addr, CERT_NAME).unwrap().await.unwrap() });
+        let mut client = connect(&offer).unwrap();
+        let mut server = pending.wait(Duration::from_secs(5)).unwrap();
+        let (mut cr, mut cw) = client.control();
+        let (mut sr, mut sw) = server.control();
+        cw.write_all(b"ping").unwrap();
+        cw.flush().unwrap();
+        let mut buf = [0u8; 4];
+        sr.read_exact(&mut buf).unwrap();
+        sw.write_all(b"pong").unwrap();
+        sw.flush().unwrap();
+        cr.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
     }
 
     #[test]
