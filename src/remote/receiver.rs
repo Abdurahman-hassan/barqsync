@@ -6,7 +6,7 @@
 //! arrived and its parent has created it (see [`Slot`]); file data is assembled from
 //! `SmallPack`, `FileBegin`/`DeltaBegin` + `Data` + `FileEnd` frames.
 
-use super::{MAX_PACKS_IN_FLIGHT, Stop, Strategy, WORKER_STACK, adapt, recv};
+use super::{MAX_PACKS_IN_FLIGHT, SendFailure, Stop, Strategy, WORKER_STACK, adapt, check, recv, recv_unless};
 use crate::cli::Options;
 use crate::checksum::Sum;
 use crate::delta::refine::{self, GapReq, Grain};
@@ -27,7 +27,7 @@ use crate::proto::{Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, Synced
 use crate::scan::{DstIndex, Scanner};
 use std::sync::Arc;
 use rayon::Scope;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
@@ -104,7 +104,7 @@ impl Incoming {
 }
 
 /// Tracks the contiguous received prefix of a file: copy ranges are in place from the
-/// start, literal data arrives in order.
+/// start, literal data arrives in order and exactly fills the ranges between them.
 #[derive(Default)]
 struct Prefix {
     done: u64,
@@ -113,10 +113,9 @@ struct Prefix {
 }
 
 impl Prefix {
+    /// `ops`: copies in order, not overlapping (see [`check::copies`]).
     fn with_copies(ops: &[Op]) -> Prefix {
-        let mut copies: Vec<(u64, u64)> = ops.iter().map(|o| (o.off(), o.len())).collect();
-        copies.sort_unstable();
-        let mut p = Prefix { done: 0, copies: copies.into() };
+        let mut p = Prefix { done: 0, copies: ops.iter().map(|o| (o.off(), o.len())).collect() };
         p.advance();
         p
     }
@@ -130,10 +129,17 @@ impl Prefix {
         }
     }
 
-    fn data(&mut self, off: u64, len: u64) {
-        if off <= self.done {
-            self.done = self.done.max(off + len);
-            self.advance();
+    /// Literal data at `off`: whether it is the range due next, before the next copy and
+    /// within the file's `size`.
+    fn data(&mut self, off: u64, len: u64, size: u64) -> bool {
+        let limit = self.copies.front().map_or(size, |&(o, _)| o);
+        match off.checked_add(len) {
+            Some(end) if off == self.done && end <= limit => {
+                self.done = end;
+                self.advance();
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -167,6 +173,66 @@ pub struct RemoteState {
     /// `--remove-source-files`: entries (by root and name) whose source must stay until
     /// their deferred attribute values are written.
     held: Mutex<HashMap<(u16, Vec<u8>), Held>>,
+    /// Files that failed on this side after their data began (already reported): the
+    /// rest of their data is dropped.
+    lost: Mutex<HashSet<u64>>,
+    /// A message too large to send stops the transfer.
+    failed: SendFailure,
+    /// Several roots write into the destination (see [`Overlap`]).
+    pub(crate) overlap: Option<Overlap>,
+}
+
+/// Several roots write into one destination (rsync merges its roots into one list
+/// instead), so an entry of one can be where another has a directory. The receiver
+/// writes into a directory by path, so a symlink put in its place would have the rest of
+/// that directory's entries written wherever it points. A directory taken here (for its
+/// entries and its attributes) stays: no symlink replaces it afterwards, and it is only
+/// taken while it still is a directory. With `-K`, a symlink this transfer made never
+/// stands in for one.
+#[derive(Default)]
+pub(crate) struct Overlap(Mutex<Taken>);
+
+#[derive(Default)]
+struct Taken {
+    dirs: HashSet<PathBuf>,
+    links: HashSet<PathBuf>,
+}
+
+impl Overlap {
+    /// Take the directory at `path` (`kept`: with `-K`, a symlink to one).
+    pub(crate) fn take_dir(&self, path: &Path, kept: bool) -> io::Result<()> {
+        let mut t = self.0.lock().unwrap();
+        let ok = match fsops::lstat(path) {
+            Ok(m) if !kept => m.kind == Kind::Dir,
+            Ok(m) => m.kind == Kind::Symlink && !t.links.contains(path) && fsops::stat(path).is_ok_and(|m| m.kind == Kind::Dir),
+            Err(_) => false,
+        };
+        if !ok {
+            return Err(io::Error::other("another source replaced it"));
+        }
+        t.dirs.insert(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Put a symlink at `path` with `place`, unless a directory there was taken.
+    pub(crate) fn place_link(&self, path: &Path, place: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let mut t = self.0.lock().unwrap();
+        if t.dirs.contains(path) {
+            return Err(io::Error::other("another source has a directory there"));
+        }
+        t.links.insert(path.to_path_buf());
+        place()
+    }
+
+    /// Whether this transfer made the symlink at `path`.
+    pub(crate) fn made_link(&self, path: &Path) -> bool {
+        self.0.lock().unwrap().links.contains(path)
+    }
+
+    /// Whether the directory at `path` was taken.
+    pub(crate) fn taken(&self, path: &Path) -> bool {
+        self.0.lock().unwrap().dirs.contains(path)
+    }
 }
 
 /// An entry waiting for its attribute values.
@@ -215,7 +281,14 @@ impl RemoteState {
             xattr_wait: Mutex::new(HashMap::new()),
             xattr_reqs: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
+            lost: Mutex::new(HashSet::new()),
+            failed: SendFailure::default(),
+            overlap: None,
         }
+    }
+
+    fn send(&self, m: Msg) {
+        self.failed.send(&self.out, m, || b"a message".to_vec());
     }
 
     /// `-X`: entry `idx` of listing `dir` (at `path`) needs attribute values only the
@@ -306,14 +379,14 @@ impl RemoteState {
         if v.len() >= 1000 {
             let files = std::mem::take(v);
             drop(map);
-            let _ = self.out.msg(Msg::Synced { root, files });
+            self.send(Msg::Synced { root, files });
         }
     }
 
     fn flush_synced(&self) {
         for (root, files) in self.synced.lock().unwrap().drain() {
             if !files.is_empty() {
-                let _ = self.out.msg(Msg::Synced { root, files });
+                self.send(Msg::Synced { root, files });
             }
         }
     }
@@ -441,7 +514,7 @@ impl RemoteState {
             .collect();
         for k in orphans {
             if let Some(Slot::Batch { dir, .. }) = slots.remove(&k) {
-                let _ = self.out.msg(Msg::Need { dir, files: Vec::new(), xattrs: Vec::new() });
+                self.send(Msg::Need { dir, files: Vec::new(), xattrs: Vec::new() });
             }
         }
     }
@@ -452,6 +525,7 @@ impl RemoteState {
 
     /// Ask the sender for the changed files of one listing (exactly one `Need` per listing).
     pub(crate) fn request(&self, eng: &Engine, wire_dir: u32, files: Vec<FileJob>) {
+        let dir = files.first().map(|j| split_dst(&j.dst_path).0.to_path_buf()).unwrap_or_default();
         let mut reqs = Vec::with_capacity(files.len());
         for job in files {
             if fsops::interrupted() {
@@ -468,7 +542,8 @@ impl RemoteState {
             self.needed.lock().unwrap().insert(file_id(wire_dir, job.idx), job);
         }
         let xattrs = self.xattr_reqs.lock().unwrap().remove(&wire_dir).unwrap_or_default();
-        let _ = self.out.msg(Msg::Need { dir: wire_dir, files: reqs, xattrs });
+        let need = Msg::Need { dir: wire_dir, files: reqs, xattrs };
+        self.failed.send(&self.out, need, || path_msg("the request for files in \"", &dir, "\""));
     }
 
     // -----------------------------------------------------------------------
@@ -486,7 +561,7 @@ impl RemoteState {
                 let size = f.metadata().ok()?.len();
                 refine::basis_sigs(&f, size, &p, &gaps).ok()
             })();
-            let _ = self.out.msg(Msg::Refined { id, gaps: sigs.unwrap_or_default() });
+            self.send(Msg::Refined { id, gaps: sigs.unwrap_or_default() });
         });
     }
 
@@ -528,8 +603,21 @@ impl RemoteState {
         Ok(job)
     }
 
-    fn file_begin(&self, eng: &Engine, id: u64, size: u64, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
+    /// Start receiving file `id`, opened by `begin`. A file that fails to open is
+    /// reported, and the rest of its data dropped.
+    fn begin(&self, eng: &Engine, id: u64, xattrs: Option<Vec<Xattr>>, begin: impl FnOnce(FileJob) -> io::Result<()>) -> io::Result<()> {
         let job = self.take_job_with(eng, id, xattrs)?;
+        let dst = job.dst_path.clone();
+        if let Err(e) = begin(job) {
+            self.lost.lock().unwrap().insert(id);
+            if !fsops::interrupted() {
+                eng.err(path_msg("receiving \"", &dst, format!("\" failed: {e}")));
+            }
+        }
+        Ok(())
+    }
+
+    fn file_begin(&self, eng: &Engine, id: u64, size: u64, job: FileJob) -> io::Result<()> {
         // A whole file is all literal data, as rsync counts it.
         Stats::add(&eng.stats.literal_bytes, size);
         eng.backup_existing_file(&job);
@@ -554,10 +642,11 @@ impl RemoteState {
         Ok(())
     }
 
-    fn delta_begin(&self, eng: &Engine, id: u64, size: u64, copies: Vec<Op>, xattrs: Option<Vec<Xattr>>) -> io::Result<()> {
-        let job = self.take_job_with(eng, id, xattrs)?;
-        eng.backup_existing_file(&job);
+    fn delta_begin(&self, eng: &Engine, id: u64, size: u64, copies: Vec<Op>, job: FileJob) -> io::Result<()> {
         let basis = File::open(job.basis_path())?;
+        let basis_size = basis.metadata()?.len();
+        check::copies(&copies, size, basis_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid delta: {e}")))?;
+        eng.backup_existing_file(&job);
         let d = Delta { size, ops: copies };
         let matched: u64 = d.ops.iter().map(Op::len).sum();
         Stats::add(&eng.stats.delta_files, 1);
@@ -589,9 +678,8 @@ impl RemoteState {
             }
         };
         let r = if eng.opts.delta == DeltaMode::Cdc {
-            basis.metadata().and_then(|m| cdc::Mapped::new(&basis, m.len())).and_then(|m| apply(&d, &m, &NoLiteral, &file, has_basis))
+            cdc::Mapped::new(&basis, basis_size).and_then(|m| apply(&d, &m, &NoLiteral, &file, has_basis))
         } else {
-            let basis_size = job.dst_meta.map_or(0, |m| m.size);
             apply(&d, &ReadOnce::new(&basis, basis_size), &NoLiteral, &file, has_basis)
         };
         if let Err(e) = r {
@@ -622,31 +710,61 @@ impl RemoteState {
 
     fn data(&self, eng: &Engine, id: u64, off: u64, bytes: &[u8]) -> io::Result<()> {
         let mut incoming = self.incoming.lock().unwrap();
-        match incoming.get_mut(&id) {
-            Some(inc) => {
-                if eng.opts.sparse && inc.created && !inc.delta {
-                    write_sparse_at(&inc.file, bytes, off)?;
-                    inc.hint.written_to(&inc.file, off + bytes.len() as u64);
-                } else {
-                    inc.write(off, bytes)?;
-                }
-                inc.prefix.data(off, bytes.len() as u64);
-                inc.counted += bytes.len() as u64;
-                crate::progress::bytes(bytes.len() as u64);
-                Ok(())
+        let Some(inc) = incoming.get_mut(&id) else {
+            // A file that failed on our side has had its error reported already.
+            return match self.lost.lock().unwrap().contains(&id) {
+                true => Ok(()),
+                false => Err(io::Error::new(io::ErrorKind::InvalidData, format!("data for unrequested file {id:#x}"))),
+            };
+        };
+        let len = bytes.len() as u64;
+        let r = if !inc.prefix.data(off, len, inc.size) {
+            let want = inc.prefix.done;
+            let size = inc.size;
+            Err(io::Error::new(io::ErrorKind::InvalidData, format!("data for bytes {off}..{} where byte {want} of {size} was due", off.saturating_add(len))))
+        } else if eng.opts.sparse && inc.created && !inc.delta {
+            write_sparse_at(&inc.file, bytes, off).map(|()| inc.hint.written_to(&inc.file, off + len))
+        } else {
+            inc.write(off, bytes)
+        };
+        if let Err(e) = r {
+            // Whatever comes next, this file misses data: it is never completed.
+            let inc = incoming.remove(&id).expect("incoming file");
+            drop(incoming);
+            self.lost.lock().unwrap().insert(id);
+            if inc.registered {
+                fsops::drop_temp(&inc.path);
             }
-            // The file failed to open on our side; its error was already reported.
-            None => Ok(()),
+            if !fsops::interrupted() {
+                eng.err(path_msg("receiving \"", &inc.job.dst_path, format!("\" failed: {e}")));
+            }
+            return Ok(());
         }
+        inc.counted += len;
+        crate::progress::bytes(len);
+        Ok(())
     }
 
     fn file_end(&self, eng: &Engine, id: u64, ok: bool) {
         let Some(inc) = self.incoming.lock().unwrap().remove(&id) else {
-            // Never started: the sender couldn't read it (and reported why).
-            self.needed.lock().unwrap().remove(&id);
+            if self.lost.lock().unwrap().remove(&id) {
+                return;
+            }
+            match self.needed.lock().unwrap().remove(&id) {
+                // Never started: the sender couldn't read it (and reported why).
+                Some(_) if !ok => {}
+                Some(job) => eng.err(path_msg("receiving \"", &job.dst_path, "\" failed: no data was sent")),
+                None => eng.err(format!("protocol error: end of unrequested file {id:#x}")),
+            }
             return;
         };
-        if !ok {
+        // The sender failed to read it (and reported why), or its data is incomplete:
+        // the file isn't put in place.
+        if !ok || inc.prefix.done != inc.size {
+            if ok {
+                let msg = format!("\" failed: only {} of {} bytes were sent", inc.prefix.done, inc.size);
+                eng.err(path_msg("receiving \"", &inc.job.dst_path, msg));
+            }
             if inc.registered {
                 fsops::drop_temp(&inc.path);
             }
@@ -709,6 +827,16 @@ impl RemoteState {
     }
 
     fn small_pack(&self, eng: &Engine, files: Vec<(u64, u32)>, blob: Vec<u8>, xattrs: Vec<(u64, Vec<Xattr>)>) {
+        if let Err(e) = check::pack(&files, &blob, &xattrs) {
+            // Nothing in it can be trusted to be complete: none of its files is written.
+            for (id, _) in files {
+                match self.needed.lock().unwrap().remove(&id) {
+                    Some(job) => eng.err(path_msg("receiving \"", &job.dst_path, format!("\" failed: invalid small-file pack: {e}"))),
+                    None => eng.err(format!("protocol error: data for unrequested file {id:#x}")),
+                }
+            }
+            return;
+        }
         let mut xattrs: HashMap<u64, Vec<Xattr>> = xattrs.into_iter().collect();
         #[cfg(target_os = "linux")]
         if eng.opts.io_uring && !eng.opts.inplace && !eng.opts.sparse && fsops::uring::available() {
@@ -716,7 +844,8 @@ impl RemoteState {
         }
         let mut off = 0usize;
         for (id, len) in files {
-            let bytes = blob.get(off..off + len as usize).unwrap_or(&[]);
+            // In range: the pack was checked.
+            let bytes = &blob[off..off + len as usize];
             off += len as usize;
             if fsops::interrupted() {
                 return;
@@ -754,7 +883,7 @@ impl RemoteState {
         let mut jobs = Vec::with_capacity(files.len());
         let mut off = 0usize;
         for (id, len) in files {
-            let bytes = blob.get(off..off + len as usize).unwrap_or(&[]);
+            let bytes = &blob[off..off + len as usize];
             off += len as usize;
             match self.take_job_with(eng, id, xattrs.remove(&id)) {
                 Ok(job) => {
@@ -993,6 +1122,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             Err(Stop::Io(e)) => return fail(exit::PROTOCOL, format!("connection error: {e}")),
         }
     };
+    // Before anything is written: the roots decide where everything goes.
+    if let Err(e) = check::roots(&roots) {
+        return fail(exit::PROTOCOL, format!("protocol error: {e}"));
+    }
     let filter = match Filter::new(&opts.filter_rules) {
         Ok(f) => f,
         Err(e) => return fail(exit::SYNTAX, format!("{e:#}")),
@@ -1019,7 +1152,9 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     let mut state = RemoteState::new(conn.out.clone(), opts, ids);
     // Adaptive strategy: route by the measured link unless -W / --no-whole-file decided.
     state.link = link.filter(|_| opts.strategy == Strategy::Adaptive && opts.whole_file.is_none());
+    state.overlap = (roots.len() > 1 && !opts.dry_run).then(Overlap::default);
     engine.remote = Some(state);
+    let mut listings = check::Listings::new(&roots);
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
         .thread_name(|i| format!("barqsync-recv-{i}"))
@@ -1059,11 +1194,15 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                 {
                     break (errors, None);
                 }
-                let frame = match recv(conn) {
+                let frame = match recv_unless(conn, &remote.failed) {
                     Ok(f) => f,
                     // After Ctrl-C, which also stops ssh, a closed connection is expected.
                     Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
                     Err(Stop::Io(_)) if fsops::interrupted() => break (0, Some(exit::SIGNAL)),
+                    Err(Stop::Io(_)) if remote.failed.reason().is_some() => {
+                        out.error(remote.failed.reason().unwrap_or_default());
+                        break (0, Some(exit::PROTOCOL));
+                    }
                     Err(Stop::Io(e)) => {
                         out.error(format!("connection error: {e}"));
                         break (0, Some(exit::PROTOCOL));
@@ -1072,16 +1211,26 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                 let r = match frame {
                     Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
                     Frame::Msg(m) => match m {
-                        Msg::DirBatch { root, dir, rel, entries, sums } => {
-                            remote.on_batch(s, engine, root, dir, rel, entries, sums);
-                            Ok(())
-                        }
+                        Msg::DirBatch { root, dir, rel, entries, sums } => match listings.take(root, dir, &rel, &entries, &sums) {
+                            Ok(()) => {
+                                remote.on_batch(s, engine, root, dir, rel, entries, sums);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                let msg = format!("protocol error: {e}");
+                                out.error(&msg);
+                                let _ = conn.msg(Msg::Fatal { msg });
+                                break (0, Some(exit::PROTOCOL));
+                            }
+                        },
                         Msg::IdNames { users, groups } => {
                             remote.ids.lock().unwrap().add(&users, &groups);
                             Ok(())
                         }
-                        Msg::FileBegin { id, size, xattrs } => remote.file_begin(engine, id, size, xattrs),
-                        Msg::DeltaBegin { id, size, copies, xattrs } => remote.delta_begin(engine, id, size, copies, xattrs),
+                        Msg::FileBegin { id, size, xattrs } => remote.begin(engine, id, xattrs, |job| remote.file_begin(engine, id, size, job)),
+                        Msg::DeltaBegin { id, size, copies, xattrs } => {
+                            remote.begin(engine, id, xattrs, |job| remote.delta_begin(engine, id, size, copies, job))
+                        }
                         Msg::Xattrs { id, xattrs } => {
                             remote.on_xattrs(engine, id, xattrs);
                             Ok(())

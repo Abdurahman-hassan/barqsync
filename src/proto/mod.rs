@@ -1,6 +1,7 @@
 //! Wire protocol between a sender and a receiver over one duplex byte stream (the ssh
 //! pipe). Frames are length-prefixed; control messages are postcard-encoded, file data
-//! travels in raw `Data` frames. With `-z` each frame body is zstd-compressed.
+//! travels in raw `Data` frames. With `-z` each frame body is zstd-compressed. A message
+//! larger than a frame may be (64 MiB) is cut into several, up to 1 GiB in all.
 //!
 //! A transfer, after the handshake:
 //!
@@ -51,8 +52,12 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 9: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
 /// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals).
 pub const VERSION: u32 = 10;
-/// Upper bound on a decoded frame body; anything larger is a corrupt stream.
+/// Upper bound on a frame body, and on what a compressed one decompresses to; anything
+/// larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
+/// Upper bound on one message. One larger than a frame (the listing of a huge directory,
+/// signatures of many big files) goes as several frames (see `KIND_PART`).
+pub const MAX_MESSAGE: usize = 1 << 30;
 /// File data is sent in pieces of this size.
 pub const DATA_CHUNK: usize = 1 << 20;
 /// Files up to this size are packed many-per-frame instead of streamed one by one.
@@ -197,6 +202,9 @@ const KIND_MSG: u8 = 0;
 const KIND_DATA: u8 = 1;
 /// An rkyv-encoded message (`--wire=rkyv`).
 const KIND_RKYV: u8 = 2;
+/// A piece of a message larger than [`MAX_FRAME`]: its frames follow one another, each
+/// piece but the last of this kind, the last one of the message's own kind.
+const KIND_PART: u8 = 3;
 const FLAG_ZSTD: u8 = 0x80;
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -205,7 +213,8 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 
 /// Encode a frame: `u32 LE body length`, `u8 kind`, body. Compressed bodies are
 /// `u32 LE raw length` + zstd stream. `Hello` is always postcard, so a peer of any
-/// version can read it before the session's [`Wire`] is agreed.
+/// version can read it before the session's [`Wire`] is agreed. A message larger than
+/// [`MAX_FRAME`] becomes several frames, each piece compressed on its own.
 pub fn encode(frame: &Frame, level: Option<i32>, wire: Wire) -> io::Result<Vec<u8>> {
     let (kind, body) = match frame {
         Frame::Msg(m) if wire == Wire::Rkyv && !matches!(m, Msg::Hello { .. }) => {
@@ -220,45 +229,111 @@ pub fn encode(frame: &Frame, level: Option<i32>, wire: Wire) -> io::Result<Vec<u
             (KIND_DATA, b)
         }
     };
-    let (kind, body) = if let Some(level) = level.filter(|_| body.len() >= 256) {
-        let z = zstd::bulk::compress(&body, level)?;
-        if z.len() + 4 < body.len() {
-            let mut b = Vec::with_capacity(4 + z.len());
-            b.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            b.extend_from_slice(&z);
-            (kind | FLAG_ZSTD, b)
-        } else {
-            (kind, body)
-        }
-    } else {
-        (kind, body)
-    };
-    if body.len() > MAX_FRAME {
-        return Err(invalid("frame too large"));
+    if body.len() > MAX_MESSAGE {
+        return Err(invalid(format!("message too large to send: {} MiB (the limit is {} MiB)", body.len() >> 20, MAX_MESSAGE >> 20)));
     }
-    let mut out = Vec::with_capacity(5 + body.len());
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.push(kind);
-    out.extend_from_slice(&body);
+    let piece = piece_size();
+    let mut out = Vec::with_capacity(body.len() + 5 * body.len().div_ceil(piece).max(1));
+    let mut pieces = body.chunks(piece).peekable();
+    if body.is_empty() {
+        push_frame(&mut out, kind, &body, level)?;
+    }
+    while let Some(piece) = pieces.next() {
+        let k = if pieces.peek().is_some() { KIND_PART } else { kind };
+        push_frame(&mut out, k, piece, level)?;
+    }
     Ok(out)
+}
+
+/// The size messages are cut into frames at: [`MAX_FRAME`], or `BARQSYNC_TEST_FRAME_PIECE`
+/// bytes (tests: small messages then cross as several frames too).
+fn piece_size() -> usize {
+    static PIECE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let n = std::env::var("BARQSYNC_TEST_FRAME_PIECE").ok().and_then(|v| v.parse().ok());
+        n.map_or(MAX_FRAME, |n: usize| n.clamp(1, MAX_FRAME))
+    });
+    *PIECE
+}
+
+/// Append one frame of at most [`MAX_FRAME`] bytes, compressed when that makes it smaller.
+fn push_frame(out: &mut Vec<u8>, kind: u8, body: &[u8], level: Option<i32>) -> io::Result<()> {
+    let z = match level.filter(|_| body.len() >= 256) {
+        Some(level) => Some(zstd::bulk::compress(body, level)?).filter(|z| z.len() + 4 < body.len()),
+        None => None,
+    };
+    match z {
+        Some(z) => {
+            out.extend_from_slice(&((4 + z.len()) as u32).to_le_bytes());
+            out.push(kind | FLAG_ZSTD);
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&z);
+        }
+        None => {
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.push(kind);
+            out.extend_from_slice(body);
+        }
+    }
+    Ok(())
 }
 
 /// Read one frame. `Ok(None)` on a clean end of stream between frames.
 pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
-    let mut hdr = [0u8; 5];
-    let mut got = 0;
-    while got < hdr.len() {
-        match r.read(&mut hdr[got..]) {
-            Ok(0) if got == 0 => return Ok(None),
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => got += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+    let mut pieces = Pieces::default();
+    loop {
+        let mut hdr = [0u8; 5];
+        let mut got = 0;
+        while got < hdr.len() {
+            match r.read(&mut hdr[got..]) {
+                Ok(0) if got == 0 && !pieces.pending() => return Ok(None),
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => got += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut body = vec![0u8; body_len(&hdr)?];
+        r.read_exact(&mut body)?;
+        if let Some(f) = pieces.add(hdr[4], body)? {
+            return Ok(Some(f));
         }
     }
-    let mut body = vec![0u8; body_len(&hdr)?];
-    r.read_exact(&mut body)?;
-    decode_body(hdr[4], body).map(Some)
+}
+
+/// The pieces of a message that arrives as several frames, collected until its last one.
+#[derive(Default)]
+pub(crate) struct Pieces {
+    buf: Vec<u8>,
+    pending: bool,
+}
+
+impl Pieces {
+    /// Take one frame's body. Returns the frame once its message is complete.
+    pub(crate) fn add(&mut self, kind: u8, body: Vec<u8>) -> io::Result<Option<Frame>> {
+        let body = unpack(kind, body)?;
+        if self.buf.len() + body.len() > MAX_MESSAGE {
+            return Err(invalid(format!("message exceeds the limit of {} MiB", MAX_MESSAGE >> 20)));
+        }
+        if kind & !FLAG_ZSTD == KIND_PART {
+            self.buf.extend_from_slice(&body);
+            self.pending = true;
+            return Ok(None);
+        }
+        let body = if self.pending {
+            self.pending = false;
+            let mut all = std::mem::take(&mut self.buf);
+            all.extend_from_slice(&body);
+            all
+        } else {
+            body
+        };
+        decode(kind & !FLAG_ZSTD, body).map(Some)
+    }
+
+    /// Part of a message has arrived: the stream must not end here.
+    pub(crate) fn pending(&self) -> bool {
+        self.pending
+    }
 }
 
 /// Body length from a frame header, checked against [`MAX_FRAME`].
@@ -270,16 +345,21 @@ pub(crate) fn body_len(hdr: &[u8; 5]) -> io::Result<usize> {
     Ok(len)
 }
 
-/// Decode a frame body of the given kind.
-pub(crate) fn decode_body(kind: u8, mut body: Vec<u8>) -> io::Result<Frame> {
-    if kind & FLAG_ZSTD != 0 {
-        let raw = u32::from_le_bytes(body.get(..4).ok_or_else(|| invalid("short frame"))?.try_into().unwrap());
-        if raw as usize > MAX_FRAME {
-            return Err(invalid("compressed frame too large"));
-        }
-        body = zstd::bulk::decompress(&body[4..], raw as usize)?;
+/// A frame body of the given kind, decompressed.
+fn unpack(kind: u8, body: Vec<u8>) -> io::Result<Vec<u8>> {
+    if kind & FLAG_ZSTD == 0 {
+        return Ok(body);
     }
-    match kind & !FLAG_ZSTD {
+    let raw = u32::from_le_bytes(body.get(..4).ok_or_else(|| invalid("short frame"))?.try_into().unwrap());
+    if raw as usize > MAX_FRAME {
+        return Err(invalid("compressed frame too large"));
+    }
+    zstd::bulk::decompress(&body[4..], raw as usize)
+}
+
+/// Decode a message body of the given kind.
+fn decode(kind: u8, mut body: Vec<u8>) -> io::Result<Frame> {
+    match kind {
         KIND_MSG => Ok(Frame::Msg(postcard::from_bytes(&body).map_err(|e| invalid(e.to_string()))?)),
         KIND_RKYV => {
             // Validated (bytecheck) before use; the archive needs aligned storage.
@@ -823,6 +903,26 @@ mod tests {
                 b[i] ^= 0xA5;
                 let _ = read_frame(&mut &b[..]);
             }
+        }
+    }
+
+    #[test]
+    fn messages_larger_than_a_frame_go_in_pieces() {
+        let bytes: Vec<u8> = (0..MAX_FRAME as u32 + (5 << 20)).map(|i| (i % 251) as u8).collect();
+        for level in [None, Some(1)] {
+            let buf = encode(&Frame::Data { id: 7, off: 9, bytes: bytes.clone() }, level, Wire::Postcard).unwrap();
+            // Two frames: a part of at most MAX_FRAME, then the rest with the real kind.
+            let first = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+            assert!(first <= MAX_FRAME && buf[4] & !FLAG_ZSTD == KIND_PART, "{level:?}");
+            assert_eq!(buf[5 + first + 4] & !FLAG_ZSTD, KIND_DATA, "{level:?}");
+            let mut r = &buf[..];
+            match read_frame(&mut r).unwrap().unwrap() {
+                Frame::Data { id, off, bytes: b } => assert!((id, off) == (7, 9) && b == bytes, "{level:?}"),
+                other => panic!("{other:?}"),
+            }
+            assert!(read_frame(&mut r).unwrap().is_none());
+            // A stream that ends after a part is cut short, not cleanly closed.
+            assert_eq!(read_frame(&mut &buf[..5 + first]).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
         }
     }
 

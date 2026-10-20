@@ -5,7 +5,7 @@
 //! out packed many-per-frame, larger ones as `Data` streams, and files the receiver
 //! already has an old version of as deltas against the signature it sent.
 
-use super::{Stop, Strategy, WORKER_STACK, adapt, recv};
+use super::{SendFailure, Stop, Strategy, WORKER_STACK, adapt, recv_unless};
 use crate::cli::Options;
 use crate::checksum::{self, Sum};
 use crate::delta::refine::{self, GapSig, Grain};
@@ -56,6 +56,8 @@ struct Sender<'a> {
     xrules: Rules,
     /// Deltas waiting for the receiver's answer to a `Refine`: file id -> where it goes.
     refining: Mutex<HashMap<u64, crossbeam_channel::Sender<Vec<GapSig>>>>,
+    /// A message too large to send stops the transfer.
+    failed: SendFailure,
 }
 
 /// A source argument resolved on disk.
@@ -73,17 +75,23 @@ impl Sender<'_> {
         self.out.error(msg);
     }
 
-    fn send(&self, m: Msg) {
-        let _ = self.out_frames.msg(m);
+    fn send(&self, m: Msg) -> bool {
+        self.failed.send(&self.out_frames, m, || b"a message".to_vec())
+    }
+
+    /// [`Sender::send`] a message about `path`: `what` (`"the listing of \""`) names it
+    /// in an error.
+    fn send_for(&self, m: Msg, what: &str, path: &Path) -> bool {
+        self.failed.send(&self.out_frames, m, || path_msg(what, path, "\""))
     }
 
     /// Register a listing and send it. Registered first, so a quick `Need` finds it.
     fn send_listing(&self, root: u16, rel: Vec<u8>, path: PathBuf, entries: Vec<DirEnt>) {
         let sums = if self.opts.checksum { self.checksums(&path, &entries) } else { Vec::new() };
         let dir = self.next_dir.fetch_add(1, SeqCst);
-        self.listings.lock().unwrap().insert(dir, (path, entries.clone()));
+        self.listings.lock().unwrap().insert(dir, (path.clone(), entries.clone()));
         self.name_ids(entries.iter().map(|e| (&e.meta, e.extra.as_deref())));
-        self.send(Msg::DirBatch { root, dir, rel, entries, sums });
+        self.send_for(Msg::DirBatch { root, dir, rel, entries, sums }, "the listing of \"", &path);
     }
 
     /// `-c`: checksums of the listing's regular files, hashed in parallel.
@@ -257,8 +265,9 @@ impl Sender<'_> {
                 self.err(format!("protocol error: request for unknown entry {dir}/{idx}"));
                 continue;
             };
-            let xattrs = self.full_xattrs(&base.join(&e.name));
-            self.send(Msg::Xattrs { id: file_id(dir, idx), xattrs });
+            let path = base.join(&e.name);
+            let xattrs = self.full_xattrs(&path);
+            self.send_for(Msg::Xattrs { id: file_id(dir, idx), xattrs }, "the attributes of \"", &path);
         }
     }
 
@@ -297,7 +306,8 @@ impl Sender<'_> {
             }
         }
         if !small.is_empty() {
-            self.send_small(small);
+            // Files that grew past the small-file size since they were listed go whole.
+            large.extend(self.send_small(small).into_iter().map(|(id, path, full)| (id, path, None, full)));
         }
         for (id, path, sig, full) in large {
             self.pending_files.fetch_add(1, SeqCst);
@@ -315,7 +325,7 @@ impl Sender<'_> {
                         // A failed file doesn't count as transferred; after Ctrl-C the
                         // closed connection is expected, not worth a message.
                         Err(e) => {
-                            if !fsops::interrupted() {
+                            if !fsops::interrupted() && self.failed.reason().is_none() {
                                 self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
                             }
                             self.send(Msg::FileEnd { id, ok: false });
@@ -329,15 +339,18 @@ impl Sender<'_> {
     }
 
     /// Read small files in parallel and send them packed into frames of ~4 MiB.
-    /// `full`: the file's attribute values go along in full.
-    fn send_small(&self, files: Vec<(u64, PathBuf, bool)>) {
-        let read = files.into_iter().map(|(id, path, full)| (id, std::fs::read(&path), path, full));
+    /// `full`: the file's attribute values go along in full. Returns the files that are
+    /// no longer small.
+    fn send_small(&self, files: Vec<(u64, PathBuf, bool)>) -> Vec<(u64, PathBuf, bool)> {
+        let read = files.into_iter().map(|(id, path, full)| (id, read_small(&path), path, full));
         let mut pack: Vec<(u64, u32)> = Vec::new();
         let mut blob: Vec<u8> = Vec::new();
         let mut xattrs: Vec<(u64, Vec<Xattr>)> = Vec::new();
+        let mut grown = Vec::new();
         for (id, data, path, full) in read {
             match data {
-                Ok(d) => {
+                Ok(None) => grown.push((id, path, full)),
+                Ok(Some(d)) => {
                     crate::progress::done(d.len() as u64);
                     if !blob.is_empty() && blob.len() + d.len() > proto::PACK_BYTES {
                         self.send(Msg::SmallPack {
@@ -361,6 +374,7 @@ impl Sender<'_> {
         if !pack.is_empty() {
             self.send(Msg::SmallPack { files: pack, blob, xattrs });
         }
+        grown
     }
 
     fn send_range(&self, f: &dyn ReadAt, id: u64, off: u64, len: u64) -> io::Result<()> {
@@ -386,7 +400,9 @@ impl Sender<'_> {
 
     fn send_whole_file(&self, id: u64, f: &File, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
         let size = f.metadata()?.len();
-        self.send(Msg::FileBegin { id, size, xattrs });
+        if !self.send(Msg::FileBegin { id, size, xattrs }) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+        }
         self.send_range(&ReadOnce::new(f, size), id, 0, size)?;
         self.send(Msg::FileEnd { id, ok: true });
         Ok(size)
@@ -422,19 +438,24 @@ impl Sender<'_> {
             }
             Sig::Cdc(_) => unreachable!(),
         };
-        let d = self.refine(id, &f, size, basis_size, unit, d)?;
+        let d = self.refine(id, path, &f, size, basis_size, unit, d)?;
         self.send_ops(id, &file, &d, &f, xattrs)
     }
 
     /// Refine a coarse delta where it is worth it ([`refine::plan`]): ask the receiver for
     /// fine signatures of the basis stretches between matched ranges, hash this file's side
     /// meanwhile, then combine. One round trip, which an append (nothing to refine) skips.
-    fn refine(&self, id: u64, new: &dyn ReadAt, size: u64, basis_size: u64, unit: usize, d: Delta) -> io::Result<Delta> {
+    #[allow(clippy::too_many_arguments)]
+    fn refine(&self, id: u64, path: &Path, new: &dyn ReadAt, size: u64, basis_size: u64, unit: usize, d: Delta) -> io::Result<Delta> {
         let p = Params::for_size(basis_size);
         let Some(gaps) = refine::plan(&d, basis_size, unit, &p, refine::REFINE_MIN) else { return Ok(d) };
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.refining.lock().unwrap().insert(id, tx);
-        self.send(Msg::Refine { id, grain: Grain::of(&p), gaps: gaps.iter().map(refine::Gap::request).collect() });
+        let req = Msg::Refine { id, grain: Grain::of(&p), gaps: gaps.iter().map(refine::Gap::request).collect() };
+        if !self.send_for(req, "the delta request for \"", path) {
+            // No answer will come.
+            self.refining.lock().unwrap().remove(&id);
+        }
         let ours = refine::new_side(new, size, basis_size, &p, &gaps);
         // No answer (the connection ended): keep the coarse delta, sending will fail anyway.
         let theirs = rx.recv().unwrap_or_default();
@@ -449,7 +470,9 @@ impl Sender<'_> {
         }
         let size = d.size;
         let copies: Vec<Op> = d.ops.iter().copied().filter(|o| matches!(o, Op::Copy { .. })).collect();
-        self.send(Msg::DeltaBegin { id, size, copies, xattrs });
+        if !self.send(Msg::DeltaBegin { id, size, copies, xattrs }) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+        }
         crate::progress::bytes(d.matched_bytes());
         for op in &d.ops {
             if let Op::Literal { off, len } = *op {
@@ -459,6 +482,15 @@ impl Sender<'_> {
         self.send(Msg::FileEnd { id, ok: true });
         Ok(size)
     }
+}
+
+/// A file listed as small, read whole; `None` if it has grown past the small-file size
+/// since (it is then sent like a large file).
+fn read_small(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut d = Vec::new();
+    File::open(path)?.take(proto::SMALL_FILE + 1).read_to_end(&mut d)?;
+    Ok((d.len() as u64 <= proto::SMALL_FILE).then_some(d))
 }
 
 /// `-R`/`--files-from` roots: each base directory with its selected paths.
@@ -606,12 +638,13 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         bases: roots.iter().map(|r| r.base.clone()).collect(),
         xrules: extra::rules(opts),
         refining: Mutex::new(HashMap::new()),
+        failed: SendFailure::default(),
     };
     sender.name_ids(roots.iter().flat_map(|r| {
         let root = r.info.meta.as_ref().map(|m| (m, r.info.extra.as_deref()));
         root.into_iter().chain(r.info.items.iter().map(|e| (&e.meta, e.extra.as_deref())))
     }));
-    sender.send(Msg::Roots(roots.iter().map(|r| r.info.clone()).collect()));
+    sender.failed.send(&sender.out_frames, Msg::Roots(roots.iter().map(|r| r.info.clone()).collect()), || b"the list of sources".to_vec());
 
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
@@ -636,7 +669,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
                 sender.check_done();
             });
             let r = loop {
-                match recv(conn) {
+                match recv_unless(conn, &sender.failed) {
                     Ok(Frame::Msg(Msg::Need { dir, files, xattrs })) => s.spawn(move |s| sender.serve(s, dir, files, xattrs)),
                     Ok(Frame::Msg(Msg::Refined { id, gaps })) => {
                         if let Some(tx) = sender.refining.lock().unwrap().remove(&id) {
@@ -660,6 +693,10 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
                     // After Ctrl-C, which also stops ssh, a closed connection is expected.
                     Err(Stop::Interrupted) => break Err(exit::SIGNAL),
                     Err(Stop::Io(_)) if fsops::interrupted() => break Err(exit::SIGNAL),
+                    Err(Stop::Io(_)) if sender.failed.reason().is_some() => {
+                        out.error(sender.failed.reason().unwrap_or_default());
+                        break Err(exit::PROTOCOL);
+                    }
                     Err(Stop::Io(e)) => {
                         out.error(format!("connection error: {e}"));
                         break Err(exit::PROTOCOL);
