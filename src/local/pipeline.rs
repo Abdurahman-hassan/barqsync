@@ -59,16 +59,29 @@ pub(crate) struct Receivers {
 /// Jobs queued per worker before Stage 2 waits for the workers to catch up.
 const QUEUE_PER_WORKER: usize = 64;
 
+/// A source directory's place in the feed.
 enum Slot {
-    /// The directory exists on the destination side, waiting for its listing.
-    Job(Box<DirJob>),
+    /// A directory job (by id in [`FeedState::waiting`]) waits for this listing, its
+    /// sources' listing number `.1`.
+    Wait(u64, usize),
     /// The listing arrived first.
     Listing(Vec<DirEnt>),
 }
 
+/// A directory that exists on the destination side, waiting for its sources' listings
+/// (more than one when several SRC arguments merge into it).
+struct Waiting {
+    job: DirJob,
+    lists: Vec<Option<Vec<DirEnt>>>,
+    missing: usize,
+}
+
+/// Listings and jobs, by source directory.
 #[derive(Default)]
 struct FeedState {
-    slots: HashMap<Vec<u8>, Slot>,
+    slots: HashMap<PathBuf, Slot>,
+    waiting: HashMap<u64, Waiting>,
+    next: u64,
     /// The scan has emitted every listing it will.
     done: bool,
 }
@@ -190,35 +203,53 @@ impl Pipeline {
     }
 
     /// A directory is ready (created or found on the destination side): process it
-    /// with its scanned listing, now or once the listing arrives.
+    /// with its sources' scanned listings, now or once they have arrived. A source the
+    /// scan is over without listing is read directly.
     pub(crate) fn expect_dir<'s, 'a: 's>(&self, s: &Scope<'s>, eng: &'s Engine<'a>, job: DirJob) {
+        let paths: Vec<PathBuf> = std::iter::once(&job.src).chain(job.more.iter().map(|d| &d.path)).cloned().collect();
         let mut feed = self.feed.lock().unwrap();
-        match feed.slots.remove(&job.rel) {
-            Some(Slot::Listing(ents)) => {
-                drop(feed);
-                s.spawn(move |s| eng.process_scanned(s, job, ents));
+        let id = feed.next;
+        feed.next += 1;
+        let mut lists = vec![None; paths.len()];
+        let mut missing = 0;
+        for (i, path) in paths.into_iter().enumerate() {
+            match feed.slots.remove(&path) {
+                Some(Slot::Listing(ents)) => lists[i] = Some(ents),
+                Some(wait) => {
+                    // Another job's source (never expected): leave it alone, read this one.
+                    feed.slots.insert(path, wait);
+                }
+                None if !feed.done => {
+                    feed.slots.insert(path, Slot::Wait(id, i));
+                    missing += 1;
+                }
+                None => {}
             }
-            // The scan is over and never listed it: read it directly.
-            _ if feed.done => {
-                drop(feed);
-                s.spawn(move |s| eng.process_dir(s, job));
-            }
-            _ => {
-                feed.slots.insert(job.rel.clone(), Slot::Job(Box::new(job)));
-            }
+        }
+        if missing == 0 {
+            drop(feed);
+            s.spawn(move |s| eng.process_sources(s, job, lists));
+        } else {
+            feed.waiting.insert(id, Waiting { job, lists, missing });
         }
     }
 
     /// A listing from the scan.
-    pub(crate) fn on_listing<'s, 'a: 's>(&self, s: &Scope<'s>, eng: &'s Engine<'a>, rel: Vec<u8>, ents: Vec<DirEnt>) {
+    pub(crate) fn on_listing<'s, 'a: 's>(&self, s: &Scope<'s>, eng: &'s Engine<'a>, dir: PathBuf, ents: Vec<DirEnt>) {
         let mut feed = self.feed.lock().unwrap();
-        match feed.slots.remove(&rel) {
-            Some(Slot::Job(job)) => {
-                drop(feed);
-                s.spawn(move |s| eng.process_scanned(s, *job, ents));
+        match feed.slots.remove(&dir) {
+            Some(Slot::Wait(id, i)) => {
+                let w = feed.waiting.get_mut(&id).expect("waiting job");
+                w.lists[i] = Some(ents);
+                w.missing -= 1;
+                if w.missing == 0 {
+                    let w = feed.waiting.remove(&id).expect("waiting job");
+                    drop(feed);
+                    s.spawn(move |s| eng.process_sources(s, w.job, w.lists));
+                }
             }
             _ => {
-                feed.slots.insert(rel, Slot::Listing(ents));
+                feed.slots.insert(dir, Slot::Listing(ents));
             }
         }
     }
@@ -227,41 +258,43 @@ impl Pipeline {
     /// the scan, unreadable, or reached through a symlink with `-L`/`-k`): they are
     /// read directly. Listings not claimed yet stay for their directories' jobs.
     pub(crate) fn scan_done<'s, 'a: 's>(&self, s: &Scope<'s>, eng: &'s Engine<'a>) {
-        let waiting: Vec<DirJob> = {
+        let waiting: Vec<Waiting> = {
             let mut feed = self.feed.lock().unwrap();
             feed.done = true;
-            let rels: Vec<Vec<u8>> =
-                feed.slots.iter().filter(|(_, v)| matches!(v, Slot::Job(_))).map(|(k, _)| k.clone()).collect();
-            rels.into_iter()
-                .filter_map(|k| match feed.slots.remove(&k) {
-                    Some(Slot::Job(j)) => Some(*j),
-                    _ => None,
-                })
-                .collect()
+            feed.slots.retain(|_, v| matches!(v, Slot::Listing(_)));
+            feed.waiting.drain().map(|(_, w)| w).collect()
         };
-        for job in waiting {
-            s.spawn(move |s| eng.process_dir(s, job));
+        for w in waiting {
+            s.spawn(move |s| eng.process_sources(s, w.job, w.lists));
         }
     }
 }
 
-/// Sync one transfer root through the pipeline: scan its source and destination trees
+/// Sync the transfer roots (merged when there are several, see
+/// [`Engine::run_roots`]) through the pipeline: scan their source and destination trees
 /// while the engine works through the listings, then wait for the queues to drain.
-pub(crate) fn run_root(eng: &Engine, p: &Pipeline, root: &Root, dest_exists: bool, fresh: bool) {
+pub(crate) fn run_roots(eng: &Engine, p: &Pipeline, roots: &[Root], dest_exists: bool, fresh: bool) {
     p.begin_root();
     let threads = eng.opts.threads;
     // (source directory, its path relative to the transfer root, destination directory)
-    let tops: Vec<(PathBuf, Vec<u8>, PathBuf)> = match root {
-        Root::Contents { src, dst } => vec![(src.clone(), Vec::new(), dst.clone())],
-        Root::Items { src_dir, dst_dir, items } => items
-            .iter()
-            .filter(|(s, _)| fsops::lstat(&src_dir.join(s)).is_ok_and(|m| m.kind == Kind::Dir))
-            .map(|(s, d)| (src_dir.join(s), s.as_bytes().to_vec(), dst_dir.join(d)))
-            .collect(),
-        Root::Select { .. } => Vec::new(),
-    };
+    let mut tops: Vec<(PathBuf, Vec<u8>, PathBuf)> = Vec::new();
+    for root in roots {
+        match root {
+            Root::Contents { src, dst } => tops.push((src.clone(), Vec::new(), dst.clone())),
+            Root::Items { src_dir, dst_dir, items } => tops.extend(
+                items
+                    .iter()
+                    .filter(|(s, _)| fsops::lstat(&src_dir.join(s)).is_ok_and(|m| m.kind == Kind::Dir))
+                    .map(|(s, d)| (src_dir.join(s), s.as_bytes().to_vec(), dst_dir.join(d))),
+            ),
+            Root::Select { .. } => {}
+        }
+    }
+    // The same source given twice is scanned once.
+    let mut seen = std::collections::HashSet::new();
+    tops.retain(|(src, _, _)| seen.insert(src.clone()));
 
-    let (tx, rx) = unbounded::<Option<(Vec<u8>, Vec<DirEnt>)>>();
+    let (tx, rx) = unbounded::<Option<(PathBuf, Vec<DirEnt>)>>();
     let filter = Arc::new(Filter::new(&eng.opts.filter_rules).unwrap_or_default());
     let one_fs = eng.opts.one_file_system;
     let src_tops: Vec<(PathBuf, Vec<u8>)> = tops.iter().map(|(s, r, _)| (s.clone(), r.clone())).collect();
@@ -274,15 +307,18 @@ pub(crate) fn run_root(eng: &Engine, p: &Pipeline, root: &Root, dest_exists: boo
                 !(fsops::interrupted() || filter.is_excluded(rel, true) || (one_fs && Some(meta.dev) != root_dev))
             });
             let tx = tx.clone();
-            let emit: Emit = Arc::new(move |_, rel, ents| {
-                let _ = tx.send(Some((rel, ents)));
+            let emit: Emit = Arc::new(move |dir, _, ents| {
+                let _ = tx.send(Some((dir.to_path_buf(), ents)));
             });
             scan::walk(&top, &rel, threads, descend, emit);
         }
         let _ = tx.send(None);
     });
-    let dst_tops: Vec<(PathBuf, Vec<u8>)> =
+    let mut dst_tops: Vec<(PathBuf, Vec<u8>)> =
         if dest_exists && !fresh { tops.into_iter().map(|(_, r, d)| (d, r)).collect() } else { Vec::new() };
+    // Several roots writing into one destination directory: it is indexed once.
+    let mut seen = std::collections::HashSet::new();
+    dst_tops.retain(|(dst, _)| seen.insert(dst.clone()));
     let index = Arc::clone(&p.index);
     let dst_scan = std::thread::spawn(move || {
         for (top, rel) in dst_tops {
@@ -292,9 +328,9 @@ pub(crate) fn run_root(eng: &Engine, p: &Pipeline, root: &Root, dest_exists: boo
     });
 
     rayon::scope(|s| {
-        eng.run_root(s, root, dest_exists, fresh);
-        while let Ok(Some((rel, ents))) = rx.recv() {
-            p.on_listing(s, eng, rel, ents);
+        eng.run_roots(s, roots, dest_exists, fresh);
+        while let Ok(Some((dir, ents))) = rx.recv() {
+            p.on_listing(s, eng, dir, ents);
         }
         p.scan_done(s, eng);
     });

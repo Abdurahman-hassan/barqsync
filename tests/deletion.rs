@@ -135,3 +135,147 @@ fn entries_that_cannot_be_read_stop_deletion() {
         assert_eq!(r.code, 23, "{mode}: {}{}", r.stdout, r.stderr);
     }
 }
+
+/// Every entry below `dir`: `name/` for a directory, `name=content` for a file.
+fn tree(dir: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            if p.is_dir() {
+                out.push(format!("{rel}/"));
+                walk(root, &p, out);
+            } else {
+                out.push(format!("{rel}={}", fs::read_to_string(&p).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+fn files(root: &Path, list: &[(&str, &str)]) {
+    for (rel, content) in list {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, content).unwrap();
+    }
+}
+
+#[test]
+fn several_sources_into_one_destination_merge_like_rsync() {
+    for mode in MODES {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        fake_ssh(t);
+        files(t, &[
+            ("a/dup", "from-a"),
+            ("a/fd", "file in a"),
+            ("a/mm/p", "p"),
+            ("a/mm/n/deep", "deep"),
+            ("a/df/q", "q"),
+            ("a/only-a", "A"),
+            ("b/dup", "from-b, longer"),
+            ("b/fd/inner", "dir in b"),
+            ("b/mm/q2", "q2"),
+            ("b/mm/n/other", "other"),
+            ("b/df", "file in b"),
+            ("b/only-b", "B"),
+            ("b/skip-b", "excluded"),
+            ("dst/dup", "old"),
+            ("dst/stale", "gone"),
+            ("dst/mm/old", "gone"),
+            ("dst/mm/n/gone", "gone"),
+            ("dst/skip-x", "excluded, kept"),
+        ]);
+        fs::set_permissions(t.join("a/mm"), fs::Permissions::from_mode(0o700)).unwrap();
+        let args = ["-a", "--delete", "--exclude=skip-*"];
+        let r = run_mode(t, mode, &args, &["a/", "b/"], "dst/");
+        assert_eq!(r.code, 0, "{mode}: {}{}", r.stdout, r.stderr);
+        // First source wins, a directory wins over a file, directories merge, and only
+        // what neither source has is deleted.
+        let want = [
+            "df/", "df/q=q", "dup=from-a", "fd/", "fd/inner=dir in b", "mm/", "mm/n/", "mm/n/deep=deep",
+            "mm/n/other=other", "mm/p=p", "mm/q2=q2", "only-a=A", "only-b=B", "skip-x=excluded, kept",
+        ];
+        assert_eq!(tree(&t.join("dst")), want, "{mode}: {}{}", r.stdout, r.stderr);
+        // A merged directory has the first source's attributes.
+        assert_eq!(fs::metadata(t.join("dst/mm")).unwrap().permissions().mode() & 0o777, 0o700, "{mode}");
+        // Nothing left to do: the sources no longer undo each other.
+        let mut again = args.to_vec();
+        again.push("-i");
+        let r = run_mode(t, mode, &again, &["a/", "b/"], "dst/");
+        assert_eq!((r.code, r.stdout.as_str()), (0, ""), "{mode}: {}", r.stderr);
+        assert_eq!(tree(&t.join("dst")), want, "{mode}");
+    }
+}
+
+#[test]
+fn named_items_merge_with_contents_and_each_other() {
+    for mode in MODES {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        fake_ssh(t);
+        files(t, &[
+            ("a/x", "x"),
+            ("c/e/z", "z"),
+            ("dst/c/e/zz", "gone"),
+            ("dst/stale", "gone"),
+            ("p/y/one", "1"),
+            ("q/y/two", "2"),
+            ("dst2/y/three", "gone"),
+            ("dst2/keep", "named items leave the destination's own entries alone"),
+        ]);
+        // `src/` with a named directory: the named one is merged into the contents.
+        let r = run_mode(t, mode, &["-a", "--delete"], &["a/", "c"], "dst/");
+        assert_eq!(r.code, 0, "{mode}: {}{}", r.stdout, r.stderr);
+        assert_eq!(tree(&t.join("dst")), ["c/", "c/e/", "c/e/z=z", "x=x"], "{mode}");
+        // The same into a destination that doesn't exist yet.
+        let r = run_mode(t, mode, &["-a", "--delete"], &["a/", "c"], "new/");
+        assert_eq!(r.code, 0, "{mode}: {}{}", r.stdout, r.stderr);
+        assert_eq!(tree(&t.join("new")), ["c/", "c/e/", "c/e/z=z", "x=x"], "{mode}");
+        // Two named directories of one name merge.
+        let r = run_mode(t, mode, &["-a", "--delete"], &["p/y", "q/y"], "dst2/");
+        assert_eq!(r.code, 0, "{mode}: {}{}", r.stdout, r.stderr);
+        let want = ["keep=named items leave the destination's own entries alone", "y/", "y/one=1", "y/two=2"];
+        assert_eq!(tree(&t.join("dst2")), want, "{mode}");
+    }
+}
+
+#[test]
+fn relative_paths_from_several_bases_merge() {
+    for mode in MODES {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        fake_ssh(t);
+        files(t, &[
+            ("a/m/one", "1"),
+            ("a/m/n/three", "3"),
+            ("b/m/two", "2"),
+            ("b/m/n/four", "4"),
+            ("dst/m/gone", "x"),
+            ("dst/m/n/gone", "x"),
+            ("dst/keep", "outside the named paths"),
+        ]);
+        let r = run_mode(t, mode, &["-aR", "--delete"], &["a/./m/", "b/./m/"], "dst/");
+        assert_eq!(r.code, 0, "{mode}: {}{}", r.stdout, r.stderr);
+        let want = ["keep=outside the named paths", "m/", "m/n/", "m/n/four=4", "m/n/three=3", "m/one=1", "m/two=2"];
+        assert_eq!(tree(&t.join("dst")), want, "{mode}");
+    }
+}
+
+#[test]
+fn a_missing_source_among_several_stops_deletion() {
+    for mode in MODES {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        fake_ssh(t);
+        files(t, &[("a/x", "x"), ("dst/stale", "kept: the other source is missing"), ("dst/sub/f", "kept")]);
+        let r = run_mode(t, mode, &["-a", "--delete"], &["a/", "missing/"], "dst/");
+        assert_eq!(tree(&t.join("dst")), ["stale=kept: the other source is missing", "sub/", "sub/f=kept", "x=x"], "{mode}: {}{}", r.stdout, r.stderr);
+        assert_eq!(r.code, 23, "{mode}: {}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains(SKIPPING), "{mode}: {}", r.stdout);
+    }
+}

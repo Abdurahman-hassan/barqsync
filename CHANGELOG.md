@@ -66,6 +66,13 @@
   "IO error encountered -- skipping file deletion", deletes nothing more and exits with
   code 23, locally and in both directions of a remote transfer. `--scanner=jwalk` also
   stopped dropping entries it could not stat without a word.
+- Several sources into one destination (`barqsync -a --delete a/ b/ dst/`) are now one
+  tree, as in rsync: `--delete` keeps whatever any source has, a name in several comes
+  from the first one, a directory wins over a file of the same name, and directories of
+  the same name merge their contents. Each source used to be synced on its own, so
+  `--delete` removed the other sources' files (only `b`'s survived), and remotely the
+  sources raced each other. This covers local transfers with both scanners, pushes and
+  pulls, named items (`a/ c dst/`) and `-R` paths from several bases.
 
 ### Security
 
