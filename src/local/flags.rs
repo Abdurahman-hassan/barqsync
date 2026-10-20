@@ -343,7 +343,7 @@ impl Engine<'_> {
             Stats::add(&self.stats.created, 1);
             let (dir, name) = split_dst(dst_path);
             let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&p, tmp))
-                .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, dst_path)));
+                .and_then(|(tmp, ())| finish_temp(&tmp, self.place_link(&tmp, dst_path)));
             if let Err(e) = r {
                 self.err(path_msg("link \"", dst_path, format!("\" failed: {e}")));
             }

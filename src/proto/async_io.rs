@@ -7,7 +7,7 @@
 //! hidden `--net-io=tokio`. The thread-based layer stays the default: it measured as
 //! fast or faster (see the README).
 
-use super::{Frame, decode_body, body_len};
+use super::{Frame, Pieces, body_len};
 use crossbeam_channel::Sender;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -46,14 +46,20 @@ pub fn enabled() -> bool {
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Frame>> {
-    let mut hdr = [0u8; 5];
-    match r.read(&mut hdr[..1]).await? {
-        0 => return Ok(None),
-        _ => r.read_exact(&mut hdr[1..]).await?,
-    };
-    let mut body = vec![0u8; body_len(&hdr)?];
-    r.read_exact(&mut body).await?;
-    decode_body(hdr[4], body).map(Some)
+    let mut pieces = Pieces::default();
+    loop {
+        let mut hdr = [0u8; 5];
+        match r.read(&mut hdr[..1]).await? {
+            0 if !pieces.pending() => return Ok(None),
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            _ => r.read_exact(&mut hdr[1..]).await?,
+        };
+        let mut body = vec![0u8; body_len(&hdr)?];
+        r.read_exact(&mut body).await?;
+        if let Some(f) = pieces.add(hdr[4], body)? {
+            return Ok(Some(f));
+        }
+    }
 }
 
 /// Writer task: drains queued frames into `w`. An empty buffer is the close request.
