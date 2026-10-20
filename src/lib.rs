@@ -56,7 +56,17 @@ pub fn run(opts: Options) -> i32 {
     }
     let (sources, dest) = paths.split_at(paths.len() - 1);
     let dest = &dest[0];
-    let any_remote = paths.iter().any(|p| matches!(parse_location(p), Location::Remote { .. }));
+    let mut any_remote = false;
+    for path in paths {
+        match parse_location(path) {
+            Ok(Location::Remote { .. }) => any_remote = true,
+            Ok(Location::Local(_)) => {}
+            Err(e) => {
+                eprintln!("barqsync: {e}");
+                return exit::SYNTAX;
+            }
+        }
+    }
     if any_remote {
         return remote::client::run(&opts, sources, dest);
     }

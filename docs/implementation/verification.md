@@ -30,5 +30,14 @@ could not create TCP/UDP sockets; the same tests passed with local networking
 permitted. No firewall configuration was changed.
 
 The three `real_remote` tests return early without `BARQSYNC_TEST_REMOTE`; their
-reported success is **not evidence of real-host testing**. Linux and real Mac
-firewall acceptance remain separate from these local results.
+reported success is **not evidence of real-host testing**. Real Mac firewall
+acceptance remains separate from these results.
+
+## Checkpoint CI and merge
+
+[PR 15](https://github.com/Abdurahman-hassan/barqsync/pull/15) passed
+[CI](https://github.com/Abdurahman-hassan/barqsync/actions/runs/39486494027)
+on macOS and Linux before merging into `main` at `b1b257a`. Both jobs built all
+targets, ran the full suite and Clippy. Linux also ran the suite with
+`BARQSYNC_TRANSPORT=quic`. These CI results add Linux coverage to the local
+verification above; they do not establish real-host/firewall acceptance.

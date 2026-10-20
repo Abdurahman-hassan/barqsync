@@ -40,8 +40,16 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // Push (local sources, remote destination) or pull (remote sources on one host,
     // local destination). An empty remote path means the remote home directory.
     let remote_path = |p: OsString| if p.is_empty() { OsString::from(".") } else { p };
-    let src_locs: Vec<Location> = sources.iter().map(|s| parse_location(s)).collect();
-    let (host, server_is_sender, server_paths) = match parse_location(dest) {
+    let locations = sources.iter().chain(std::iter::once(dest))
+        .map(|p| parse_location(p)).collect::<io::Result<Vec<_>>>();
+    let mut src_locs = match locations {
+        Ok(locations) => locations,
+        Err(e) => {
+            out.error(e.to_string());
+            return exit::SYNTAX;
+        }
+    };
+    let (host, server_is_sender, server_paths) = match src_locs.pop().expect("destination") {
         Location::Remote { host, path } => {
             if src_locs.iter().any(|l| matches!(l, Location::Remote { .. })) {
                 out.error("source and destination cannot both be remote");
@@ -72,10 +80,6 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     };
 
-    if host.starts_with('@') {
-        out.error(format!("no user name before '@' in {host:?} (an empty variable?)"));
-        return exit::SYNTAX;
-    }
     let shell = match relay::Shell::new(opts, &host) {
         Ok(s) => s,
         Err(e) => {

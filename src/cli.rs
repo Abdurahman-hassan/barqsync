@@ -581,7 +581,7 @@ fn read_files_from(file: &OsString, from0: bool) -> Result<Vec<Vec<u8>>> {
         std::io::stdin().read_to_end(&mut v).context("reading --files-from from stdin")?;
         v
     } else {
-        if let crate::paths::Location::Remote { .. } = crate::paths::parse_location(file) {
+        if let crate::paths::Location::Remote { .. } = crate::paths::parse_location(file)? {
             bail!("a remote --files-from list is not supported");
         }
         std::fs::read(file).with_context(|| format!("failed to open files-from file {}", file.to_string_lossy()))?
