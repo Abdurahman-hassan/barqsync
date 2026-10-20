@@ -3,7 +3,9 @@
 #
 #   bench/net/container.sh build                 build the image (once)
 #   bench/net/container.sh net [profiles...]     rsync vs barqsync over real ssh, tc-shaped
+#   bench/net/container.sh fixed [profiles...]   per-transfer fixed cost of each transport
 #   bench/net/container.sh syscalls              strace -c syscall counts
+#   bench/net/container.sh firewall              --streams through a firewall that only lets ssh in
 #   bench/net/container.sh flamegraph [workload] perf + inferno flamegraph
 #   bench/net/container.sh test                  cargo test + clippy on Linux
 #   bench/net/container.sh shell                 interactive shell
@@ -35,9 +37,11 @@ run() {
 case "$cmd" in
   build) "$ENGINE" build -t "$IMAGE" -f "$ROOT/bench/net/Containerfile" "$ROOT/bench/net" ;;
   net) run "$IMAGE" bash bench/net/net_bench.sh "$@" ;;
+  fixed) run "$IMAGE" bash bench/net/fixed_cost.sh "$@" ;;
   syscalls) run "$IMAGE" bash bench/syscalls.sh "$@" ;;
+  firewall) run "$IMAGE" bash bench/net/firewall.sh "$@" ;;
   flamegraph) run "$IMAGE" bash bench/flamegraph.sh "$@" ;;
   test) run "$IMAGE" bash -c 'cargo test 2>&1 | grep -E "^test result|FAILED|panicked|^error"; cargo clippy --all-targets 2>&1 | grep -cE "^(warning|error)"' ;;
   shell) run -it "$IMAGE" bash ;;
-  *) sed -n '2,13p' "$0"; exit 1 ;;
+  *) sed -n '2,14p' "$0"; exit 1 ;;
 esac

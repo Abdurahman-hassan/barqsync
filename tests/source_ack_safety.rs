@@ -44,7 +44,7 @@ fn hostile_acknowledgements_preserve_sources_and_outside_sentinels() {
             let (result_tx, result_rx) = mpsc::channel();
             let handle = std::thread::spawn(move || {
                 let out = Output::new(&opts);
-                let code = sender::run(&actual, &opts, &sources, &out).0;
+                let code = sender::run(&actual, &opts, &sources, &out, false).0;
                 let _ = actual.finish();
                 result_tx.send(code).unwrap();
             });

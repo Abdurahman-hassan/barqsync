@@ -46,6 +46,8 @@ struct Sender<'a> {
     scan_done: AtomicBool,
     done_sent: AtomicBool,
     errors: AtomicU64,
+    /// Errors counted in `SenderDone`.
+    reported: AtomicU64,
     /// Ids already named to the receiver (no `--numeric-ids`).
     ids: Mutex<ids::Sent>,
     /// Sender-owned deletion authority. Peer-supplied paths and timestamps are
@@ -254,7 +256,10 @@ impl Sender<'_> {
             if let Err(e) = self.out_frames.end_data_streams() {
                 self.err(format!("closing data streams failed: {e}"));
             }
-            self.send(Msg::SenderDone { errors: self.errors.load(SeqCst) });
+            let errors = self.errors.load(SeqCst);
+            self.reported.store(errors, SeqCst);
+            self.send(Msg::SenderDone { errors });
+            crate::timing::mark("SenderDone sent");
         }
     }
 
@@ -585,8 +590,9 @@ fn root_extra(opts: &Options, r: &Rules, path: &Path, meta: &Meta, err: &mut dyn
 }
 
 /// Run the sending side until the receiver reports completion. Returns the exit code
-/// and the receiver's counters (when it got that far).
-pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (i32, Option<StatsSnapshot>) {
+/// and the receiver's counters (when it got that far). `report_removals`: end with
+/// `RemovalsDone` (see [`super::reports_removals`]).
+pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, report_removals: bool) -> (i32, Option<StatsSnapshot>) {
     let filter = match Filter::new(&opts.filter_rules) {
         Ok(f) => f,
         Err(e) => {
@@ -625,6 +631,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
         scan_done: AtomicBool::new(false),
         done_sent: AtomicBool::new(false),
         errors,
+        reported: AtomicU64::new(0),
         ids: Mutex::new(ids::Sent::default()),
         removals: Mutex::new(RemovalLedger::default()),
         xrules: extra::rules(opts),
@@ -669,6 +676,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
                 }
                 Ok(Frame::Msg(Msg::Synced { root, files })) => sender.remove_synced(root, files),
                 Ok(Frame::Msg(Msg::ReceiverDone { stats })) => {
+                    crate::timing::mark("ReceiverDone received");
                     if !sender.done_sent.load(SeqCst) {
                         sender.err("protocol error: receiver completed before the sender");
                     }
@@ -702,6 +710,12 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output) -> (
             // retry. The peer's `(size, mtime)` fields carry no deletion authority.
             if stats.errors() == 0 && sender.errors.load(SeqCst) == 0 {
                 sender.finish_removals();
+            }
+            // Report removal errors and forwarded output before the pull closes.
+            if report_removals {
+                let errors = sender.errors.load(SeqCst) - sender.reported.load(SeqCst);
+                sender.send(Msg::RemovalsDone { errors });
+                crate::timing::mark("RemovalsDone sent");
             }
             let failed = stats.errors() > 0 || sender.errors.load(SeqCst) > 0;
             (if failed { exit::PARTIAL } else { exit::OK }, Some(stats))

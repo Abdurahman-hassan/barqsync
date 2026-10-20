@@ -3,7 +3,11 @@
 Reviewed **20 October 2026** against **v0.3.0**, commit
 `f9f8d8d87855c3ac8d24c8d852ca6c37a80ecc69`.
 The existing checkout matched the public repository's HEAD, verified with
-`git ls-remote`. This document proposes fixes; production code has not been changed.
+`git ls-remote`. At the time of this review, this document proposed fixes and production code
+had not been changed. Current implementation status and verification are tracked
+in [docs/implementation](docs/implementation/README.md); the checkout has since
+been reconciled with v0.4.0. The findings and evidence below retain their original
+v0.3.0 context.
 
 The first release should address the confirmed security and data-loss bugs below.
 The macOS streaming fix should provide parallel data channels through SSH so a
@@ -683,7 +687,11 @@ passing regression tests and must be converted into assertions when fixes land.
 All mutations use newly created temporary trees. No real remote host is used.
 The CLI probe kills only its own process group when a test exceeds its deadline.
 
-From the repository root:
+These historical probes target the audited v0.3.0 commit (`f9f8d8d`), including
+its public Rust APIs. Run them in a separate checkout of that revision. Current
+regression tests and commands are listed in [the work records](docs/implementation/README.md).
+
+From the audit checkout root:
 
 ```bash
 cargo build --locked

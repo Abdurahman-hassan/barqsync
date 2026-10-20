@@ -126,6 +126,43 @@ fn stat_bytes(stdout: &str, label: &str) -> u64 {
         .unwrap_or_else(|| panic!("no {label:?} in:\n{stdout}"))
 }
 
+/// "Literal data" and "Matched data" as rsync counts them: a file sent whole (copied
+/// locally, a whole file or one in a small-file pack over the wire) is all literal data.
+#[test]
+fn whole_file_stats_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let num = |out: &RunOut, label: &str| -> u64 {
+        out.stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(label))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.replace(',', "").parse().ok())
+            .unwrap_or_else(|| panic!("no {label:?} in:\n{}", out.stdout))
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    t.file("big", noise(300_000, 1)).file("sub/mid", noise(70_000, 2)).file("small", "s\n");
+    t.settle_mtimes();
+    let runs: [(&[&str], bool); 3] = [
+        (&["-a", "--stats", "src/", "{dst}"], false),
+        (&["-a", "--stats", "src/", "{host}{dst}"], true),
+        (&["-a", "--stats", "{host}src/", "{dst}"], true),
+    ];
+    for (args, remote) in runs {
+        let (r, f) = if remote { both_remote(tmp.path(), args, "r", "f") } else { both(tmp.path(), args, "r", "f") }.unwrap();
+        assert_eq!((r.code, f.code), (0, 0), "{args:?}\n{}", f.stderr);
+        for label in ["Literal data: ", "Matched data: "] {
+            assert_eq!(num(&r, label), num(&f, label), "{args:?} {label}\nrsync:\n{}\nbarqsync:\n{}", r.stdout, f.stdout);
+        }
+        assert_eq!(num(&f, "Literal data: "), 300_000 + 70_000 + 2, "{args:?}");
+        for d in ["r", "f"] {
+            fs::remove_dir_all(tmp.path().join(d)).unwrap();
+        }
+    }
+}
+
 #[test]
 fn delta_over_the_wire() {
     let modes: [&[&str]; 7] =
@@ -261,7 +298,41 @@ fn bad_remote_path_fails_cleanly() {
         &["-a", "-e", shim.to_str().unwrap(), "--remote-path=/nonexistent/barqsync", "src/", "fakehost:dst"],
     );
     assert_ne!(r.code, 0);
-    assert!(r.stderr.contains("connection unexpectedly closed"), "{}", r.stderr);
+    // The shell's exit status 127 says the command wasn't there.
+    assert!(r.stderr.contains("could not find `/nonexistent/barqsync` (exit 127)"), "{}", r.stderr);
+}
+
+/// `~` in a remote path and in `--remote-path` means the remote home, as with rsync.
+#[test]
+fn tilde_in_remote_paths_is_the_remote_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    rich_tree(&tmp.path().join("src"));
+    // The fake ssh runs the server here, so the "remote home" is this HOME.
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(home.join("bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_barqsync"), home.join("bin/barqsync")).unwrap();
+    let shim = fake_ssh(tmp.path());
+    let run_with_home = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_barqsync"));
+        cmd.arg("-e").arg(&shim).args(args).env("HOME", &home);
+        run(&mut cmd, tmp.path())
+    };
+    let push = run_with_home(&["-a", "--remote-path=~/bin/barqsync", "src/", "fakehost:~/dst/"]);
+    assert_eq!(push.code, 0, "{}", push.stderr);
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&home.join("dst"), true));
+    let pull = run_with_home(&["-a", "--remote-path=~/bin/barqsync", "fakehost:~/dst/", "back/"]);
+    assert_eq!(pull.code, 0, "{}", pull.stderr);
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("back"), true));
+}
+
+#[test]
+fn an_empty_user_is_refused_before_ssh_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("a", "1");
+    let r = barqsync(tmp.path(), &["-a", "-e", "/nonexistent-ssh", "src/", "@somehost:dst"]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("no user name before '@'"), "{}", r.stderr);
 }
 
 /// barqsync through the fake ssh with extra environment (inherited by the server).
@@ -320,6 +391,51 @@ fn parallel_streams_fall_back_to_ssh() {
     );
     assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
     assert!(f.stdout.contains("using the ssh connection"), "{}", f.stdout);
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
+}
+
+/// A firewall that refuses the direct connections: the same streams come through ssh,
+/// each over its own remote-shell connection and a relay on the far side, both ways.
+#[test]
+fn parallel_streams_go_through_ssh_when_blocked() {
+    for pull in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        delta_fixture(tmp.path());
+        let t = Tree::new(tmp.path().join("src"));
+        for i in 0..300 {
+            t.file(&format!("many/f{i:03}"), noise(1000 + i * 13, i as u64));
+        }
+        t.settle_mtimes();
+        let mut args = vec!["-avv", "--stats", "--strategy", "fixed", "--transport", "tcp", "--streams", "3"];
+        args.extend_from_slice(if pull { &["{host}src/", "dst"] } else { &["src/", "{host}dst"] });
+        let f = remote_with_env(tmp.path(), &args, &[("BARQSYNC_TEST_DIRECT_BLOCKED", "1")]);
+        assert_eq!(f.code, 0, "pull={pull}\n{}\n{}", f.stdout, f.stderr);
+        assert!(
+            f.stdout.contains("refused a direct connection (Connection reset by peer (test)), using 3 streams through ssh"),
+            "pull={pull}: {}",
+            f.stdout
+        );
+        let mut want = snapshot(&tmp.path().join("src"), true);
+        let got = snapshot(&tmp.path().join("dst"), true);
+        want.get_mut(b".".as_slice()).unwrap().mtime = got[b".".as_slice()].mtime;
+        assert_same_tree(&want, &got);
+        assert!(stat_bytes(&f.stdout, "Matched data: ") > 9 << 20, "delta through relays: {}", f.stdout);
+    }
+}
+
+/// Neither directly nor through ssh (nothing listens where the server says): the
+/// transfer stays on the ssh pipe and says why.
+#[test]
+fn parallel_streams_fall_back_to_ssh_when_relays_fail_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    rich_tree(&tmp.path().join("src"));
+    let f = remote_with_env(
+        tmp.path(),
+        &["-av", "--transport", "tcp", "--streams", "2", "src/", "{host}dst"],
+        &[("BARQSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")],
+    );
+    assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
+    assert!(f.stdout.contains("; through ssh: ") && f.stdout.contains("using the ssh connection"), "{}", f.stdout);
     assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst"), true));
 }
 
@@ -455,13 +571,42 @@ fn auto_transport_falls_back_fast_and_remembers_the_host() {
     let same = auto_run(tmp.path(), "state", "0", &["src/", "me@fakehost:dst5"], &[]);
     assert!(same.stdout.contains("failed recently"), "{}", same.stdout);
 
-    // Once QUIC works again (after the memory expires, here: removed), it is used and the
-    // host stays usable.
+    // Once QUIC works again (after the memory expires, here: removed), it is used, and the
+    // host is no longer taken for unreachable (a clean link may keep it on ssh now).
     std::fs::remove_dir_all(tmp.path().join("state")).unwrap();
-    for dst in ["dst6", "dst7"] {
-        let h = auto_run(tmp.path(), "state", "0", &["src/", &format!("{{host}}{dst}")], &[]);
-        assert!(h.stdout.contains("QUIC connected in"), "{}", h.stdout);
+    let h = auto_run(tmp.path(), "state", "0", &["src/", "{host}dst6"], &[]);
+    assert!(h.stdout.contains("QUIC connected in"), "{}", h.stdout);
+    let h = auto_run(tmp.path(), "state", "0", &["src/", "{host}dst7"], &[]);
+    assert_eq!(h.code, 0, "{}\n{}", h.stdout, h.stderr);
+    assert!(!h.stdout.contains("failed recently"), "{}", h.stdout);
+}
+
+#[test]
+fn auto_transport_remembers_a_clean_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    delta_fixture(tmp.path());
+    // A fresh 16 MiB push over QUIC, then the verdict on what QUIC saw: thousands of
+    // packets, so it has one.
+    let f = auto_run(tmp.path(), "state", "0", &["src/", "{host}fresh"], &[]);
+    assert_eq!(f.code, 0, "{}\n{}", f.stdout, f.stderr);
+    assert!(f.stdout.contains("QUIC connected in"), "{}", f.stdout);
+    let line = f.stdout.lines().find(|l| l.starts_with("auto: QUIC lost ")).unwrap_or_else(|| panic!("{}", f.stdout));
+    let lost: u64 = line["auto: QUIC lost ".len()..].split(' ').next().unwrap().parse().unwrap();
+    // Loopback rarely loses a packet; when it does, the link counts as lossy.
+    let next = auto_run(tmp.path(), "state", "0", &["src/", "{host}dst2"], &[]);
+    assert_eq!(next.code, 0, "{}\n{}", next.stdout, next.stderr);
+    if lost == 0 {
+        assert!(line.ends_with("a clean link: the ssh connection next time"), "{line}");
+        assert!(next.stdout.contains("auto: QUIC to fakehost lost no packets lately, using the ssh connection"), "{}", next.stdout);
+        assert!(!next.stdout.contains("round trip"), "no attempt expected: {}", next.stdout);
+        // Other hosts aren't affected.
+        let other = auto_run(tmp.path(), "state", "0", &["src/", "otherhost:dst3"], &[]);
+        assert!(other.stdout.contains("QUIC connected in"), "{}", other.stdout);
+    } else {
+        assert!(line.ends_with("QUIC next time too"), "{line}");
+        assert!(next.stdout.contains("QUIC connected in"), "{}", next.stdout);
     }
+    assert_same_tree(&snapshot(&tmp.path().join("src"), true), &snapshot(&tmp.path().join("dst2"), true));
 }
 
 #[test]

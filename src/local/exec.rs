@@ -1394,10 +1394,13 @@ impl<'a> Engine<'a> {
             crate::progress::done(job.meta.size);
             return;
         }
-        let r = self.check_distinct(&job.src_path, &job.dst_path)
-            .and_then(|()| self.backup_existing_file(job))
-            .and_then(|()| self.write_file(job));
-        crate::progress::done(job.meta.size);
+        // Preserve live progress while refusing unsafe writes before they begin.
+        let (r, counted) = crate::progress::tracking(|| {
+            self.check_distinct(&job.src_path, &job.dst_path)
+                .and_then(|()| self.backup_existing_file(job))
+                .and_then(|()| self.write_file(job))
+        });
+        crate::progress::done(job.meta.size.saturating_sub(counted));
         match r {
             Ok(()) => self.file_written(job),
             Err(e) if !fsops::interrupted() => {
@@ -1421,6 +1424,8 @@ impl<'a> Engine<'a> {
                 Err(_) => {}
             }
         }
+        // All of a file sent whole is literal data, as rsync counts it.
+        Stats::add(&self.stats.literal_bytes, src.size);
 
         if self.opts.inplace && job.dst_meta.is_some_and(|d| d.kind == Kind::File) {
             fsops::copy_into_existing(&job.src_path, &job.dst_path, src.size)?;

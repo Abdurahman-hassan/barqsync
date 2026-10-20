@@ -170,7 +170,7 @@ fn failed_backup_copy_keeps_prior_backup_and_successful_retry_replaces_it() {
     fs::write(tmp.path().join("src/f"), b"new version").unwrap();
     fs::write(tmp.path().join("dst/f"), b"original").unwrap();
     fs::write(tmp.path().join("dst/f~"), b"prior backup").unwrap();
-    fs::set_permissions(tmp.path().join("dst/f"), fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(tmp.path().join("dst/f"), fs::Permissions::from_mode(0o0)).unwrap();
     let args = ["-aI", "-b", "--inplace", "src/", "dst/"];
     let (code, text) = run(tmp.path(), &args, "threads");
     fs::set_permissions(tmp.path().join("dst/f"), fs::Permissions::from_mode(0o600)).unwrap();

@@ -52,6 +52,7 @@ pub fn copy_new(src: &File, tmp: &Path, size: u64, mode: u32) -> io::Result<Copi
         }
         if n > 0 {
             copied += n as u64;
+            crate::progress::copied(n as u64);
             reader.read_to(src, copied);
             writer.written_to(&dst, copied);
             // A short copy means EOF; once the expected size is in, skip the extra call that

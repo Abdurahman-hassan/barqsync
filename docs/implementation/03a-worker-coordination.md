@@ -2,7 +2,7 @@
 
 Date: 20 October 2026.
 
-Status: in progress.
+Status: implemented; see [checkpoint verification](verification.md).
 
 Finding: NET-02.
 
@@ -16,7 +16,8 @@ pool. The user's worker count is preserved.
 
 `tests/remote_lifecycle.rs` exercises push and pull with one and two workers,
 threaded and Tokio I/O, postcard and rkyv, small-file packs, a large whole file,
-a no-op and a subsequent delta. Each CLI invocation has a 20-second deadline;
+a no-op and a subsequent delta. A separate case checks one-worker hard links,
+symlinks and source removal after deferred xattr updates. Each CLI invocation has a 20-second deadline;
 the test harness kills and reaps its owned process group on timeout.
 
 This part does not establish bounded cancellation, slow-peer behavior, metadata
