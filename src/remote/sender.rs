@@ -23,8 +23,8 @@ use crate::output::{Output, StatsSnapshot, path_msg};
 use crate::paths::{join_rel, split_source, wants_contents};
 use crate::proto::{self, Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
 use rayon::Scope;
-use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -50,12 +50,19 @@ struct Sender<'a> {
     reported: AtomicU64,
     /// Ids already named to the receiver (no `--numeric-ids`).
     ids: Mutex<ids::Sent>,
-    /// Each root's base directory (`--remove-source-files` paths are relative to it).
-    bases: Vec<PathBuf>,
+    /// Sender-owned deletion authority. Peer-supplied paths and timestamps are
+    /// never used to resolve a file or decide whether it is unchanged.
+    removals: Mutex<RemovalLedger>,
     /// `-X`: which attribute names are sent.
     xrules: Rules,
     /// Deltas waiting for the receiver's answer to a `Refine`: file id -> where it goes.
     refining: Mutex<HashMap<u64, crossbeam_channel::Sender<Vec<GapSig>>>>,
+}
+
+#[derive(Default)]
+struct RemovalLedger {
+    entries: HashMap<(u16, Vec<u8>), (PathBuf, Meta)>,
+    acknowledged: HashSet<(u16, Vec<u8>)>,
 }
 
 /// A source argument resolved on disk.
@@ -74,13 +81,21 @@ impl Sender<'_> {
     }
 
     fn send(&self, m: Msg) {
-        let _ = self.out_frames.msg(m);
+        if let Err(e) = self.out_frames.msg(m) {
+            self.err(format!("sending protocol message failed: {e}"));
+        }
     }
 
     /// Register a listing and send it. Registered first, so a quick `Need` finds it.
     fn send_listing(&self, root: u16, rel: Vec<u8>, path: PathBuf, entries: Vec<DirEnt>) {
         let sums = if self.opts.checksum { self.checksums(&path, &entries) } else { Vec::new() };
         let dir = self.next_dir.fetch_add(1, SeqCst);
+        if self.opts.remove_source_files && !self.opts.dry_run {
+            let mut ledger = self.removals.lock().unwrap();
+            for e in entries.iter().filter(|e| e.meta.kind != Kind::Dir) {
+                ledger.entries.insert((root, join_rel(&rel, &e.name)), (path.join(&e.name), e.meta));
+            }
+        }
         self.listings.lock().unwrap().insert(dir, (path, entries.clone()));
         self.name_ids(entries.iter().map(|e| (&e.meta, e.extra.as_deref())));
         self.send(Msg::DirBatch { root, dir, rel, entries, sums });
@@ -199,15 +214,30 @@ impl Sender<'_> {
         }
     }
 
-    /// `--remove-source-files`: the receiver has these entries now.
+    /// Record acknowledgements only for entries this sender actually listed.
+    /// Deletion waits for successful session completion so an acknowledgement
+    /// cannot race outstanding data or deferred metadata work.
     fn remove_synced(&self, root: u16, files: SyncedFiles) {
-        let Some(base) = self.bases.get(root as usize) else {
-            return self.err(format!("protocol error: unknown root {root}"));
-        };
-        for (rel, size, mtime) in files {
-            let path = base.join(OsStr::from_bytes(&rel));
-            match remove_source(self.opts, &path, size, mtime) {
-                Ok(()) if self.out.verbose() >= 2 => self.out.info([&b"sender removed "[..], &rel].concat()),
+        if !self.opts.remove_source_files || self.opts.dry_run {
+            return self.err("protocol error: source removal is not authorized");
+        }
+        let mut ledger = self.removals.lock().unwrap();
+        for (rel, _, _) in files {
+            let key = (root, rel);
+            if !ledger.entries.contains_key(&key) {
+                self.err("protocol error: source acknowledgement for an unlisted entry");
+            } else if !ledger.acknowledged.insert(key) {
+                self.err("protocol error: duplicate source acknowledgement");
+            }
+        }
+    }
+
+    fn finish_removals(&self) {
+        let ledger = std::mem::take(&mut *self.removals.lock().unwrap());
+        for key in ledger.acknowledged {
+            let (path, meta) = &ledger.entries[&key];
+            match remove_source(self.opts, path, meta) {
+                Ok(()) if self.out.verbose() >= 2 => self.out.info([&b"sender removed "[..], &key.1].concat()),
                 Ok(()) => {}
                 Err(m) => self.err(m),
             }
@@ -603,7 +633,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         errors,
         reported: AtomicU64::new(0),
         ids: Mutex::new(ids::Sent::default()),
-        bases: roots.iter().map(|r| r.base.clone()).collect(),
+        removals: Mutex::new(RemovalLedger::default()),
         xrules: extra::rules(opts),
         refining: Mutex::new(HashMap::new()),
     };
@@ -627,53 +657,61 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
     };
     let sender = &sender;
     let roots = &roots;
-    let result = pool.install(|| {
-        rayon::scope(|s| {
-            s.spawn(move |_| {
-                rayon::scope(|ws| sender.walk_roots(ws, roots));
-                sender.send(Msg::ScanDone { dirs: sender.next_dir.load(SeqCst) });
-                sender.scan_done.store(true, SeqCst);
-                sender.check_done();
-            });
-            let r = loop {
-                match recv(conn) {
-                    Ok(Frame::Msg(Msg::Need { dir, files, xattrs })) => s.spawn(move |s| sender.serve(s, dir, files, xattrs)),
-                    Ok(Frame::Msg(Msg::Refined { id, gaps })) => {
-                        if let Some(tx) = sender.refining.lock().unwrap().remove(&id) {
-                            let _ = tx.send(gaps);
-                        }
-                    }
-                    Ok(Frame::Msg(Msg::Synced { root, files })) => s.spawn(move |_| sender.remove_synced(root, files)),
-                    Ok(Frame::Msg(Msg::ReceiverDone { stats })) => {
-                        crate::timing::mark("ReceiverDone received");
-                        break Ok(stats);
-                    }
-                    Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
-                    Ok(Frame::Msg(Msg::Fatal { msg })) => {
-                        out.error(format!("remote: {msg}"));
-                        break Err(exit::PROTOCOL);
-                    }
-                    Ok(other) => {
-                        out.error(format!("protocol error: unexpected {other:?}"));
-                        break Err(exit::PROTOCOL);
-                    }
-                    // After Ctrl-C, which also stops ssh, a closed connection is expected.
-                    Err(Stop::Interrupted) => break Err(exit::SIGNAL),
-                    Err(Stop::Io(_)) if fsops::interrupted() => break Err(exit::SIGNAL),
-                    Err(Stop::Io(e)) => {
-                        out.error(format!("connection error: {e}"));
-                        break Err(exit::PROTOCOL);
+    // Keep blocking protocol coordination on the caller; every configured
+    // worker remains available for finite scan, hash and write tasks.
+    let result = pool.in_place_scope(|s| {
+        s.spawn(move |_| {
+            rayon::scope(|ws| sender.walk_roots(ws, roots));
+            sender.send(Msg::ScanDone { dirs: sender.next_dir.load(SeqCst) });
+            sender.scan_done.store(true, SeqCst);
+            sender.check_done();
+        });
+        let r = loop {
+            match recv(conn) {
+                Ok(Frame::Msg(Msg::Need { dir, files, xattrs })) => s.spawn(move |s| sender.serve(s, dir, files, xattrs)),
+                Ok(Frame::Msg(Msg::Refined { id, gaps })) => {
+                    if let Some(tx) = sender.refining.lock().unwrap().remove(&id) {
+                        let _ = tx.send(gaps);
                     }
                 }
-            };
-            // Release deltas still waiting for an answer that won't come.
-            sender.refining.lock().unwrap().clear();
-            r
-        })
+                Ok(Frame::Msg(Msg::Synced { root, files })) => sender.remove_synced(root, files),
+                Ok(Frame::Msg(Msg::ReceiverDone { stats })) => {
+                    crate::timing::mark("ReceiverDone received");
+                    if !sender.done_sent.load(SeqCst) {
+                        sender.err("protocol error: receiver completed before the sender");
+                    }
+                    break Ok(stats);
+                }
+                Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
+                Ok(Frame::Msg(Msg::Fatal { msg })) => {
+                    out.error(format!("remote: {msg}"));
+                    break Err(exit::PROTOCOL);
+                }
+                Ok(other) => {
+                    out.error(format!("protocol error: unexpected {other:?}"));
+                    break Err(exit::PROTOCOL);
+                }
+                // After Ctrl-C, which also stops ssh, a closed connection is expected.
+                Err(Stop::Interrupted) => break Err(exit::SIGNAL),
+                Err(Stop::Io(_)) if fsops::interrupted() => break Err(exit::SIGNAL),
+                Err(Stop::Io(e)) => {
+                    out.error(format!("connection error: {e}"));
+                    break Err(exit::PROTOCOL);
+                }
+            }
+        };
+        // Release deltas still waiting for an answer that won't come.
+        sender.refining.lock().unwrap().clear();
+        r
     });
     match result {
         Ok(stats) => {
-            // The scope has waited for the removals; their output went out before this.
+            // Fail closed: a partial transfer leaves every source available for
+            // retry. The peer's `(size, mtime)` fields carry no deletion authority.
+            if stats.errors() == 0 && sender.errors.load(SeqCst) == 0 {
+                sender.finish_removals();
+            }
+            // Report removal errors and forwarded output before the pull closes.
             if report_removals {
                 let errors = sender.errors.load(SeqCst) - sender.reported.load(SeqCst);
                 sender.send(Msg::RemovalsDone { errors });
