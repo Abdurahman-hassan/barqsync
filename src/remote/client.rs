@@ -174,11 +174,17 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
 
     mark("setup done");
     let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));
-    let (code, stats) = if server_is_sender {
-        let (code, stats) = receiver::run(&conn, opts, dest, out);
-        (code, Some(stats))
+    // `confirmed`: this side has the peer's last frame, so the peer has everything this
+    // side sent: the sender (of a push) once it has `ReceiverDone`, the receiver of a pull
+    // that reports removals once it has `RemovalsDone`.
+    let (code, stats, confirmed) = if server_is_sender {
+        let removals = super::reports_removals(opts, server_is_sender);
+        let (code, stats, confirmed) = receiver::run(&conn, opts, dest, out, removals);
+        (code, Some(stats), confirmed)
     } else {
-        sender::run(&conn, opts, sources, out)
+        let (code, stats) = sender::run(&conn, opts, sources, out, false);
+        let confirmed = stats.is_some();
+        (code, stats, confirmed)
     };
     if let Some(r) = reporter {
         r.finish(out);
@@ -190,8 +196,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     {
         learn(&memory, &host, &session.seen(), out);
     }
-    // A sender with the receiver's final counters knows the receiver has everything.
-    let _ = if !server_is_sender && stats.is_some() { conn.finish_confirmed() } else { conn.finish() };
+    let _ = if confirmed { conn.finish_confirmed() } else { conn.finish() };
     mark("connection closed");
     let _ = child.wait();
     mark("remote shell exited");

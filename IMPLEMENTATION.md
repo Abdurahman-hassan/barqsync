@@ -223,7 +223,11 @@ checked with the first read. Then:
   streams and waits (up to 5 s) for the sender to end too: a QUIC close or stream end, or
   the idle ssh pipe reaching its end, which covers a QUIC close lost on the way (TCP keeps
   resending after a process exits). Neither side waits for acknowledgements. See
-  [QUIC's fixed cost](#quics-fixed-cost-m18).
+  [QUIC's fixed cost](#quics-fixed-cost-m18). One exception: in a pull with
+  `--remove-source-files` the server (the sender) removes the last files after
+  `ReceiverDone`, so it ends with `RemovalsDone`, after their `-vv` lines and errors, which
+  the client reads before finishing; then the client closes at once and the server waits.
+  Over QUIC that costs such a pull a round trip; the ssh pipe doesn't wait (protocol 9).
 
 quinn drives a connection from one task, which limits QUIC to about 350 MB/s per transfer on
 this Mac over loopback; TLS-over-TCP streams scale with the number of streams.

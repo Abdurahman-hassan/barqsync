@@ -13,6 +13,7 @@
 //!   DeltaBegin+Data+FileEnd -------------------->   write files in parallel
 //!   ScanDone, then SenderDone ----------------->
 //!                                        <-----   ReceiverDone (stats)
+//!   RemovalsDone (pull + --remove-source-files) ->
 //! ```
 //!
 //! Each side runs a dedicated reader thread and writer thread, so neither side can
@@ -45,7 +46,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 /// Upper bound on a decoded frame body; anything larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
 /// File data is sent in pieces of this size.
@@ -159,6 +160,10 @@ pub enum Msg {
     /// Several complete small files: `(id, len)` pairs, contents concatenated in `blob`.
     SmallPack { files: Vec<(u64, u32)>, blob: Vec<u8> },
     SenderDone { errors: u64 },
+    /// A pull with `--remove-source-files` (see `remote::reports_removals`): the sender's
+    /// last frame, after `ReceiverDone`, once every `Synced` entry is dealt with and its
+    /// output sent. `errors`: failures since `SenderDone`.
+    RemovalsDone { errors: u64 },
 
     // receiver → sender
     /// The answer to one `DirBatch`: which of its files the receiver wants.
@@ -623,7 +628,8 @@ impl Conn {
     }
 
     /// [`Conn::finish`] once the peer has said it has everything this side sent (the
-    /// sender, after `ReceiverDone`): nothing left to deliver, so close without waiting.
+    /// sender, after `ReceiverDone`; the receiver of a pull with `--remove-source-files`,
+    /// after `RemovalsDone`): nothing left to deliver, so close without waiting.
     /// The peer, waiting for this side to end, learns a round trip sooner.
     pub fn finish_confirmed(self) -> io::Result<()> {
         self.close(true)

@@ -57,12 +57,15 @@ pub fn run() -> i32 {
             let _ = fwd.msg(Msg::Log { stderr, escape, text: text.to_vec() });
         }),
     );
+    // A sender with the receiver's final counters knows the receiver has everything,
+    // unless it reports removals after them: then the client still has to read those.
     let (code, confirmed) = if server_is_sender {
-        let (code, stats) = sender::run(&conn, &opts, &opts.paths, &out);
-        (code, stats.is_some())
+        let removals = super::reports_removals(&opts, server_is_sender);
+        let (code, stats) = sender::run(&conn, &opts, &opts.paths, &out, removals);
+        (code, stats.is_some() && !removals)
     } else {
         match opts.paths.first() {
-            Some(dest) => (receiver::run(&conn, &opts, dest, &out).0, false),
+            Some(dest) => (receiver::run(&conn, &opts, dest, &out, false).0, false),
             None => {
                 let _ = conn.msg(Msg::Fatal { msg: "no destination given to the server".into() });
                 (exit::SYNTAX, false)
@@ -71,7 +74,6 @@ pub fn run() -> i32 {
     };
     mark("transfer done");
     drop(out);
-    // A sender with the receiver's final counters knows the receiver has everything.
     let _ = if confirmed { conn.finish_confirmed() } else { conn.finish() };
     mark("connection closed");
     code

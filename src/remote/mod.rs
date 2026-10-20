@@ -64,6 +64,15 @@ impl crate::cli::Options {
     }
 }
 
+/// `--remove-source-files` in a pull: the sender (the server) removes the last files after
+/// the receiver's final `ReceiverDone`, so their output and errors would never reach the
+/// client. The sender then ends with `RemovalsDone`, which the client reads before it
+/// finishes, and the two swap who closes first. A push removes on the client, which
+/// prints them itself.
+pub(crate) fn reports_removals(opts: &crate::cli::Options, server_is_sender: bool) -> bool {
+    server_is_sender && opts.remove_source_files && !opts.dry_run
+}
+
 /// Worker stack size. Tasks block on the connection's backpressure, and rayon lets a
 /// waiting thread run other tasks on its stack, so allow for deep nesting.
 pub(crate) const WORKER_STACK: usize = 32 << 20;

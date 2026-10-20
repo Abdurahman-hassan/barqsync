@@ -787,3 +787,44 @@ fn remove_source_files_matches_rsync() {
         assert!(!sb.join("f1").exists() && sb.join("sub").is_dir());
     }
 }
+
+/// In a pull the server removes the last files after the client's final message: their
+/// `-vv` lines and errors must still reach the client, as rsync's do.
+#[test]
+fn remove_source_files_pull_reports_removals_like_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let removed = |o: &RunOut| -> Vec<String> {
+        let mut v: Vec<String> = o.stdout.lines().filter(|l| l.starts_with("sender removed ")).map(str::to_string).collect();
+        v.sort();
+        v
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let pull = ["-a", "-vv", "--remove-source-files", "{host}{dst}-src/", "{dst}"];
+    for d in ["lr", "lf"] {
+        removal_source(tmp.path(), &format!("{d}-src"));
+    }
+    let (r, f) = both_remote(tmp.path(), &pull, "lr", "lf").unwrap();
+    assert_eq!((r.code, f.code), (0, 0), "rsync stderr: {}\nbarqsync stderr: {}", r.stderr, f.stderr);
+    assert_eq!(removed(&r), removed(&f), "barqsync stdout:\n{}", f.stdout);
+    assert!(removed(&f).contains(&"sender removed sub/f2".to_string()), "{}", f.stdout);
+    assert_same_tree(&snap(&tmp.path().join("lr"), true), &snap(&tmp.path().join("lf"), true));
+
+    // A removal that fails: reported, and the exit code says so (23).
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for d in ["lr2", "lf2"] {
+        removal_source(tmp.path(), &format!("{d}-src"));
+        fs::set_permissions(tmp.path().join(format!("{d}-src/sub")), fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    let (r, f) = both_remote(tmp.path(), &pull, "lr2", "lf2").unwrap();
+    for d in ["lr2", "lf2"] {
+        fs::set_permissions(tmp.path().join(format!("{d}-src/sub")), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!((r.code, f.code), (23, 23), "rsync stderr: {}\nbarqsync stderr: {}", r.stderr, f.stderr);
+    assert_eq!(removed(&r), removed(&f), "barqsync stdout:\n{}", f.stdout);
+    assert!(f.stderr.contains("sub/f2"), "{}", f.stderr);
+    assert!(tmp.path().join("lf2-src/sub/f2").exists());
+}
