@@ -1,6 +1,7 @@
 //! Local (disk-to-disk) sync: argument planning and the run loop.
 
 pub mod exec;
+pub mod extra;
 pub mod flags;
 pub mod pipeline;
 

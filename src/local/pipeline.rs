@@ -36,6 +36,9 @@ pub(crate) struct AttrJob {
     pub(crate) rel: Vec<u8>,
     pub(crate) meta: Meta,
     pub(crate) diff: AttrDiff,
+    pub(crate) extra: Option<Box<crate::entry::Extra>>,
+    /// What the destination has (`-X`/`-A`), read when the file was compared.
+    pub(crate) have: Option<super::extra::DstExtra>,
 }
 
 struct Senders {

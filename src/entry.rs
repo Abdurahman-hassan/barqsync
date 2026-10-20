@@ -88,4 +88,29 @@ pub struct DirEnt {
     /// Symlink target, read at scan time so a listing is self-contained (it may be
     /// applied on another machine).
     pub link: Option<Vec<u8>>,
+    /// `-X`/`-A`: extended attributes and ACLs (`None`: none, or not asked for).
+    pub extra: Option<Box<Extra>>,
+}
+
+impl DirEnt {
+    pub fn new(name: OsString, meta: Meta, link: Option<Vec<u8>>) -> DirEnt {
+        DirEnt { name, meta, link, extra: None }
+    }
+}
+
+/// An entry's extended attributes (`-X`, sorted by name) and ACLs (`-A`; `None` when the
+/// mode says it all). In a listing they are in the sender's form (wire names, condensed
+/// ACLs); the engine works with the receiver's form (see `Engine::local_extra`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct Extra {
+    pub xattrs: Vec<crate::xattrs::Xattr>,
+    pub acl: Option<crate::acls::Acls>,
+}
+
+impl Extra {
+    /// Boxed, or `None` when there is nothing to carry.
+    pub fn boxed(self) -> Option<Box<Extra>> {
+        (self != Extra::default()).then(|| Box::new(self))
+    }
 }

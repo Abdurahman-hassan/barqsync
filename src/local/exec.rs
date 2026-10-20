@@ -15,8 +15,9 @@
 use super::Root;
 use crate::cli::Options;
 use crate::delta::{self, DeltaMode, apply::apply, cdc};
-use crate::diff::{AttrDiff, DiffRules, FileAction, file_action_sum};
-use crate::entry::{DirEnt, Kind, Meta};
+use super::extra::{DstExtra, Src, XSource};
+use crate::diff::{AttrDiff, DiffRules, FileAction, file_action_ext};
+use crate::entry::{DirEnt, Extra, Kind, Meta};
 use crate::filter::Filter;
 use crate::fsops::{self, Copied};
 use crate::output::{Change, Link, Output, Stats, path_msg};
@@ -57,6 +58,8 @@ pub struct Engine<'a> {
     pub(crate) pipeline: Option<super::pipeline::Pipeline>,
     /// `--scanner=jwalk`: destination entries scanned ahead (local and remote receiver).
     pub(crate) dst_index: Option<Arc<crate::scan::DstIndex>>,
+    /// `-X`: which attribute names take part.
+    pub(crate) xrules: crate::xattrs::Rules,
 }
 
 pub(crate) struct DirJob {
@@ -110,12 +113,27 @@ pub(crate) struct FileJob {
     pub(crate) alt: Option<Meta>,
     /// `--partial-dir` file to remove once the file is written.
     pub(crate) partial: Option<PathBuf>,
+    /// `-X`/`-A`: the source's attributes and ACLs (receiver's form).
+    pub(crate) extra: Option<Box<Extra>>,
+    /// Remote: the attribute values in full, sent with the data when the listing only
+    /// had checksums of some.
+    pub(crate) full_xattrs: Option<Vec<crate::xattrs::Xattr>>,
 }
 
 impl FileJob {
     /// The file a delta is computed against.
     pub(crate) fn basis_path(&self) -> &Path {
         self.basis.as_deref().unwrap_or(&self.dst_path)
+    }
+
+    /// The source side, for writing its attributes onto the new file.
+    pub(crate) fn src(&self, remote: bool) -> Src<'_> {
+        let from = match (&self.full_xattrs, remote) {
+            (Some(f), _) => XSource::Full(f),
+            (None, false) => XSource::Local(&self.src_path),
+            (None, true) => XSource::Full(&[]),
+        };
+        Src { kind: Kind::File, meta: &self.meta, extra: self.extra.as_deref(), from }
     }
 }
 
@@ -129,6 +147,9 @@ struct HardGroup {
     leader_dst: PathBuf,
     leader_rel: Vec<u8>,
     followers: Vec<Follower>,
+    /// `-X`: the leader's attributes were updated in place, so names already linked to
+    /// it had the old ones too (see [`Follower::xattr`]).
+    xattr: bool,
 }
 
 struct Follower {
@@ -137,6 +158,10 @@ struct Follower {
     dst_path: PathBuf,
     rel: Vec<u8>,
     meta: Meta,
+    /// `-X`: the destination name's attributes differed when it was reached. rsync shows
+    /// that on a name already linked to its leader too (its receiver writes attributes
+    /// after the generator has looked at every name, unlike modes and ACLs).
+    xattr: bool,
 }
 
 struct DirFixup {
@@ -188,6 +213,7 @@ impl<'a> Engine<'a> {
             backup_root: None,
             pipeline: None,
             dst_index: None,
+            xrules: crate::xattrs::Rules { level: opts.xattrs, am_root },
         }
     }
 
@@ -215,7 +241,7 @@ impl<'a> Engine<'a> {
 
     /// Report a directory: new (`cd+++++++++`), or what differs. Plain `-v` shows it
     /// only when new or its time differs.
-    fn report_dir(&self, rel: &[u8], src: &Meta, pre: Option<&Meta>) {
+    fn report_dir(&self, rel: &[u8], src: &Meta, pre: Option<&Meta>, (xattr, acl): (bool, bool)) {
         if pre.is_none()
             && let Some(alt) = self.alt_dir_meta(rel)
         {
@@ -231,7 +257,7 @@ impl<'a> Engine<'a> {
             None => (Change::new_local(), true),
             Some(p) => {
                 let differs = self.dir_times() && !self.rules.same_mtime(src, p);
-                (Change { time: differs, ..self.attr_change(src, p, false) }, differs)
+                (Change { time: differs, xattr, acl, ..self.attr_change(src, p, false) }, differs)
             }
         };
         self.out.item(rel, Kind::Dir, Link::None, change, significant);
@@ -246,6 +272,25 @@ impl<'a> Engine<'a> {
     /// Permissions for a newly written file or directory.
     pub(crate) fn new_mode(&self, src: &Meta) -> u32 {
         if self.opts.perms { src.mode } else { src.mode & 0o777 & !self.umask }
+    }
+
+    /// `p` for an in-place update of a non-directory. rsync on Linux writes a changed
+    /// access ACL before it itemizes the entry, and that write sets the permission bits:
+    /// only setuid, setgid and sticky can still differ then.
+    fn perms_shown(&self, src: &Meta, dst: &Meta, perms: bool, acl_rewritten: bool) -> bool {
+        if acl_rewritten && crate::acls::Flavor::native() == crate::acls::Flavor::Posix {
+            perms && src.mode & 0o7000 != dst.mode & 0o7000
+        } else {
+            perms
+        }
+    }
+
+    /// Where an entry's full attribute values come from (see [`XSource`]).
+    fn xsource<'p>(&self, ctx: &Ctx, idx: u32, src_path: &'p Path, rel: &'p [u8], dst_path: &'p Path) -> XSource<'p> {
+        match self.remote {
+            Some(_) => XSource::Remote { dir: ctx.wire_dir, idx, root: ctx.root, rel, dst: dst_path },
+            None => XSource::Local(src_path),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -264,7 +309,8 @@ impl<'a> Engine<'a> {
                     }
                     Err(e) => return self.err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
                 };
-                let job = self.root_job(src.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh);
+                let extra = self.local_root_extra(src, &src_meta);
+                let job = self.root_job(src.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh, extra);
                 match &self.pipeline {
                     Some(p) => p.expect_dir(s, self, job),
                     None => s.spawn(move |s| self.process_dir(s, job)),
@@ -282,7 +328,7 @@ impl<'a> Engine<'a> {
                         }
                     };
                     let link = if meta.kind == Kind::Symlink { fsops::read_link_bytes(&sp).ok() } else { None };
-                    ents.push(DirEnt { name: sname.clone(), meta, link });
+                    ents.push(DirEnt::new(sname.clone(), meta, link));
                 }
                 let ents = self.adjust_listing(src_dir, ents);
                 let entries = ents
@@ -304,7 +350,8 @@ impl<'a> Engine<'a> {
                         }
                         Err(e) => return self.err(path_msg("link_stat \"", base, format!("\" failed: {e}"))),
                     };
-                    let mut job = self.root_job(base.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh);
+                    let extra = self.local_root_extra(base, &src_meta);
+                    let mut job = self.root_job(base.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh, extra);
                     job.sel = sel.at_root(self.opts.recursive);
                     s.spawn(move |s| self.process_dir(s, job));
                 } else {
@@ -327,10 +374,30 @@ impl<'a> Engine<'a> {
 
     /// The job for a `src/` root: `dst` itself gets the source directory's attributes
     /// (shown as `./`). `check_dst`: `dst` may already exist (it wasn't just created).
-    pub(crate) fn root_job(&self, src: PathBuf, dst: PathBuf, src_meta: Meta, root: u16, check_dst: bool) -> DirJob {
+    /// `extra`: the root's attributes and ACLs, with attribute values in full.
+    pub(crate) fn root_job(
+        &self,
+        src: PathBuf,
+        dst: PathBuf,
+        src_meta: Meta,
+        root: u16,
+        check_dst: bool,
+        extra: Option<Box<Extra>>,
+    ) -> DirJob {
         Stats::add(&self.stats.dirs, 1);
         let pre = if check_dst { fsops::lstat(&dst).ok().filter(|m| m.kind == Kind::Dir) } else { None };
-        self.report_dir(b"", &src_meta, pre.as_ref());
+        let x = Src { kind: Kind::Dir, meta: &src_meta, extra: extra.as_deref(), from: XSource::Full(extra.as_ref().map_or(&[][..], |e| &e.xattrs)) };
+        let (ext, have) = match &pre {
+            Some(p) => self.extra_change(&x, &dst, p),
+            None => ((false, false), None),
+        };
+        self.report_dir(b"", &src_meta, pre.as_ref(), ext);
+        if !self.dry() && self.extras_on() && (pre.is_none() || ext.0 || ext.1) {
+            let cur = pre.map_or(0o777 & !self.umask, |p| p.mode);
+            if let Err(e) = self.apply_extra(&dst, &x, have, cur) {
+                self.err(path_msg("set_xattr/set_acl \"", &dst, format!("\" failed: {e}")));
+            }
+        }
         DirJob {
             src,
             dst,
@@ -600,23 +667,35 @@ impl<'a> Engine<'a> {
 
     /// `-H`: true if this name leads its hard-link group (and is transferred normally);
     /// otherwise it is queued to be linked to the leader at the end.
-    fn claim_leader(&self, root: u16, meta: &Meta, src_path: &Path, dst_path: &Path, rel: &[u8]) -> bool {
+    fn claim_leader(&self, root: u16, x: &Src, src_path: &Path, dst_path: &Path, rel: &[u8]) -> bool {
+        let meta = x.meta;
         let mut groups = self.hardlinks.lock().unwrap();
         match groups.entry((meta.dev, meta.ino)) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(HardGroup { leader_dst: dst_path.to_path_buf(), leader_rel: rel.to_vec(), followers: Vec::new() });
+                v.insert(HardGroup { leader_dst: dst_path.to_path_buf(), leader_rel: rel.to_vec(), followers: Vec::new(), xattr: false });
                 true
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
+                let xattr = self.want_xattrs(Kind::File)
+                    && self.out.itemizes()
+                    && fsops::lstat(dst_path).is_ok_and(|d| d.kind == Kind::File && self.extra_change(x, dst_path, &d).0.0);
                 o.get_mut().followers.push(Follower {
                     root,
                     src_path: src_path.to_path_buf(),
                     dst_path: dst_path.to_path_buf(),
                     rel: rel.to_vec(),
                     meta: *meta,
+                    xattr,
                 });
                 false
             }
+        }
+    }
+
+    /// `-H`: the leader of `meta`'s group gets its attributes updated in place.
+    fn leader_xattrs_changed(&self, meta: &Meta) {
+        if let Some(g) = self.hardlinks.lock().unwrap().get_mut(&(meta.dev, meta.ino)) {
+            g.xattr = true;
         }
     }
 
@@ -637,7 +716,11 @@ impl<'a> Engine<'a> {
                 if let (Some(l), Some(d)) = (leader, dst)
                     && (l.dev, l.ino) == (d.dev, d.ino)
                 {
-                    self.out.item(&f.rel, Kind::File, Link::Hard(&g.leader_rel), Change::default(), false);
+                    // Already linked: rsync shows `hf` without naming the leader.
+                    let change = Change { hardlink: true, xattr: f.xattr || g.xattr, ..Change::default() };
+                    if change.xattr || self.opts.itemize >= 2 {
+                        self.out.item(&f.rel, Kind::File, Link::None, change, false);
+                    }
                     self.source_done(f.root, &f.src_path, &f.rel, &f.meta);
                     continue;
                 }
@@ -656,6 +739,8 @@ impl<'a> Engine<'a> {
                             basis: None,
                             alt: None,
                             partial: None,
+                            extra: None,
+                            full_xattrs: None,
                         };
                         self.transfer_file(&job);
                     } else {
@@ -747,14 +832,18 @@ impl<'a> Engine<'a> {
                 continue;
             }
             match e.meta.kind {
-                Kind::Dir => changed |= self.handle_dir(s, ctx, e.meta, rel, src_path, dst_path, dst_kind),
+                Kind::Dir => changed |= self.handle_dir(s, ctx, e.meta, e.extra.as_deref(), idx, rel, src_path, dst_path, dst_kind),
                 Kind::File => {
                     Stats::add(&self.stats.files, 1);
                     Stats::add(&self.stats.total_size, e.meta.size);
                     if self.size_filtered(&e.meta, &rel) {
                         continue;
                     }
-                    if self.opts.hard_links && e.meta.nlink > 1 && !self.claim_leader(ctx.root, &e.meta, &src_path, &dst_path, &rel) {
+                    let leads = || {
+                        let x = Src { kind: Kind::File, meta: &e.meta, extra: e.extra.as_deref(), from: XSource::Full(&[]) };
+                        self.claim_leader(ctx.root, &x, &src_path, &dst_path, &rel)
+                    };
+                    if self.opts.hard_links && e.meta.nlink > 1 && !leads() {
                         // Linked at the end, which modifies this directory.
                         changed = true;
                         continue;
@@ -777,14 +866,22 @@ impl<'a> Engine<'a> {
                         },
                         None => {}
                     }
-                    let action = file_action_sum(&e.meta, dst_meta.as_ref(), &self.rules, same_sums.contains(&idx));
+                    let from = self.xsource(ctx, idx, &src_path, &rel, &dst_path);
+                    let src = Src { kind: Kind::File, meta: &e.meta, extra: e.extra.as_deref(), from };
+                    let mut have: Option<DstExtra> = None;
+                    let action = file_action_ext(&e.meta, dst_meta.as_ref(), &self.rules, same_sums.contains(&idx), &mut || {
+                        let Some(d) = &dst_meta else { return (false, false) };
+                        let (diff, h) = self.extra_change(&src, &dst_path, d);
+                        have = h;
+                        diff
+                    });
                     let mut alt = None;
                     if !self.alt_dirs.is_empty()
                         && action == FileAction::Transfer
                         && dst_meta.is_none_or(|d| d.kind == Kind::File)
                     {
                         let mut src_sum = || self.src_sum(ctx.wire_dir, idx, &src_path);
-                        match self.try_alt_file(ctx.root, &e.meta, &rel, &src_path, &dst_path, dst_meta.as_ref(), &mut src_sum) {
+                        match self.try_alt_file(ctx.root, &src, &rel, &src_path, &dst_path, dst_meta.as_ref(), &mut src_sum) {
                             super::flags::AltFile::Done => {
                                 changed = true;
                                 continue;
@@ -799,8 +896,13 @@ impl<'a> Engine<'a> {
                             self.source_done(ctx.root, &src_path, &rel, &e.meta);
                         }
                         FileAction::Attrs(a) => {
+                            if a.xattr && self.opts.hard_links && e.meta.nlink > 1 {
+                                self.leader_xattrs_changed(&e.meta);
+                            }
                             if let Some(d) = &dst_meta {
-                                self.out.item(&rel, Kind::File, Link::None, self.attr_change(&e.meta, d, false), false);
+                                let mut change = Change { xattr: a.xattr, acl: a.acl, ..self.attr_change(&e.meta, d, false) };
+                                change.perms = self.perms_shown(&e.meta, d, change.perms, a.acl);
+                                self.out.item(&rel, Kind::File, Link::None, change, false);
                             }
                             if !self.dry() {
                                 match &self.pipeline {
@@ -811,9 +913,11 @@ impl<'a> Engine<'a> {
                                         rel,
                                         meta: e.meta,
                                         diff: a,
+                                        extra: e.extra,
+                                        have,
                                     }),
                                     None => {
-                                        if self.fix_attrs(&dst_path, &e.meta, a) {
+                                        if self.fix_attrs(&dst_path, &src, a, have) {
                                             self.source_done(ctx.root, &src_path, &rel, &e.meta);
                                         }
                                     }
@@ -837,6 +941,8 @@ impl<'a> Engine<'a> {
                                 basis,
                                 alt,
                                 partial: None,
+                                extra: e.extra,
+                                full_xattrs: None,
                             };
                             self.find_partial(&mut job);
                             files.push(job);
@@ -849,7 +955,7 @@ impl<'a> Engine<'a> {
                         self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
-                    changed |= self.handle_symlink(ctx.root, &e, &rel, &src_path, &dst_path, dst_kind);
+                    changed |= self.handle_symlink(ctx.root, &e, self.xsource(ctx, idx, &src_path, &rel, &dst_path), &rel, &src_path, &dst_path, dst_kind);
                 }
                 kind => {
                     Stats::add(&self.stats.specials, 1);
@@ -862,7 +968,8 @@ impl<'a> Engine<'a> {
                         self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
-                    changed |= self.handle_special(ctx.root, &e.meta, &rel, &src_path, &dst_path, dst_kind);
+                    let src = Src { kind, meta: &e.meta, extra: e.extra.as_deref(), from: self.xsource(ctx, idx, &src_path, &rel, &dst_path) };
+                    changed |= self.handle_special(ctx.root, &src, &rel, &src_path, &dst_path, dst_kind);
                 }
             }
         }
@@ -923,6 +1030,8 @@ impl<'a> Engine<'a> {
         s: &Scope<'s>,
         ctx: &Ctx,
         meta: Meta,
+        extra: Option<&Extra>,
+        idx: u32,
         rel: Vec<u8>,
         src_path: PathBuf,
         dst_path: PathBuf,
@@ -965,7 +1074,12 @@ impl<'a> Engine<'a> {
             None => {}
         }
         let is_new = pre.is_none();
-        self.report_dir(&rel, &meta, pre.as_ref());
+        let x = Src { kind: Kind::Dir, meta: &meta, extra, from: self.xsource(ctx, idx, &src_path, &rel, &dst_path) };
+        let (ext, have) = match &pre {
+            Some(p) if kept_link.is_none() => self.extra_change(&x, &dst_path, p),
+            _ => ((false, false), None),
+        };
+        self.report_dir(&rel, &meta, pre.as_ref(), ext);
         if is_new {
             Stats::add(&self.stats.created, 1);
             if !self.dry() {
@@ -975,6 +1089,14 @@ impl<'a> Engine<'a> {
                     return changed;
                 }
                 changed = true;
+            }
+        }
+        // Like rsync, a directory gets its attributes and ACLs right away; the ACL keeps
+        // the current (owner-writable) mode bits, the mode itself is fixed up last.
+        if !self.dry() && self.extras_on() && kept_link.is_none() && (is_new || ext.0 || ext.1) {
+            let cur = pre.map_or(0o700 | self.new_mode(&meta), |p| p.mode);
+            if let Err(e) = self.apply_extra(&dst_path, &x, have, cur) {
+                self.err(path_msg("set_xattr/set_acl \"", &dst_path, format!("\" failed: {e}")));
             }
         }
         let root_dev = ctx.root_dev.unwrap_or(meta.dev);
@@ -1010,8 +1132,19 @@ impl<'a> Engine<'a> {
         changed
     }
 
-    fn handle_symlink(&self, root: u16, e: &DirEnt, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn handle_symlink(
+        &self,
+        root: u16,
+        e: &DirEnt,
+        from: XSource,
+        rel: &[u8],
+        src_path: &Path,
+        dst_path: &Path,
+        dst_kind: Option<Kind>,
+    ) -> bool {
         let meta = &e.meta;
+        let x = Src { kind: Kind::Symlink, meta, extra: e.extra.as_deref(), from };
         let Some(target) = e.link.as_deref().map(|t| PathBuf::from(OsStr::from_bytes(t))) else {
             self.err(path_msg("readlink \"", src_path, "\" failed"));
             return false;
@@ -1020,9 +1153,13 @@ impl<'a> Engine<'a> {
             Some(Kind::Symlink) => {
                 if fs::read_link(dst_path).is_ok_and(|cur| cur == target) {
                     let d = fsops::lstat(dst_path).ok();
+                    let ((xattr, _), have) = match &d {
+                        Some(d) => self.extra_change(&x, dst_path, d),
+                        None => ((false, false), None),
+                    };
                     let change = d.map(|d| self.attr_change(meta, &d, false)).unwrap_or_default();
                     // Symlink permissions aren't synced.
-                    let change = Change { perms: false, ..change };
+                    let change = Change { perms: false, xattr, ..change };
                     self.out.item(rel, Kind::Symlink, Link::Sym(target.as_os_str().as_bytes()), change, false);
                     if !self.dry()
                         && let Some(d) = d
@@ -1030,6 +1167,9 @@ impl<'a> Engine<'a> {
                         let a = self.rules.attrs_differ(meta, &d);
                         if a.owner {
                             let _ = fsops::lchown(dst_path, self.rules.wanted_uid(meta), self.rules.wanted_gid(meta));
+                        }
+                        if xattr && let Err(e) = self.apply_extra(dst_path, &x, have, d.mode) {
+                            self.err(path_msg("set_xattr \"", dst_path, format!("\" failed: {e}")));
                         }
                         if a.mtime {
                             let _ = fsops::set_symlink_mtime(dst_path, meta.mtime, meta.mtime_ns);
@@ -1049,7 +1189,10 @@ impl<'a> Engine<'a> {
         let change = match dst_kind {
             // The target changed: rsync shows `cLc` plus the attributes that differ.
             Some(Kind::Symlink) => match fsops::lstat(dst_path) {
-                Ok(d) => Change { local: true, value: true, perms: false, ..self.attr_change(meta, &d, false) },
+                Ok(d) => {
+                    let xattr = self.out.itemizes() && self.extra_change(&x, dst_path, &d).0.0;
+                    Change { local: true, value: true, perms: false, xattr, ..self.attr_change(meta, &d, false) }
+                }
                 Err(_) => Change::new_local(),
             },
             _ => Change::new_local(),
@@ -1077,20 +1220,31 @@ impl<'a> Engine<'a> {
         });
         match res {
             Err(e) => self.err(path_msg("symlink \"", dst_path, format!("\" failed: {e}"))),
-            Ok(()) => self.source_done(root, src_path, rel, meta),
+            Ok(()) => {
+                if self.want_xattrs(Kind::Symlink)
+                    && let Err(e) = self.apply_extra(dst_path, &x, None, 0o777)
+                {
+                    self.err(path_msg("set_xattr \"", dst_path, format!("\" failed: {e}")));
+                }
+                self.source_done(root, src_path, rel, meta)
+            }
         }
         true
     }
 
-    fn handle_special(&self, root: u16, meta: &Meta, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>) -> bool {
+    fn handle_special(&self, root: u16, x: &Src, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>) -> bool {
+        let meta = x.meta;
         match dst_kind {
             Some(k) if k == meta.kind => {
                 if let Ok(d) = fsops::lstat(dst_path)
                     && d.rdev == meta.rdev
                 {
-                    self.out.item(rel, meta.kind, Link::None, self.attr_change(meta, &d, false), false);
-                    let a = self.rules.attrs_differ(meta, &d);
-                    if !a.any() || self.dry() || self.fix_attrs(dst_path, meta, a) {
+                    let ((xattr, acl), have) = self.extra_change(x, dst_path, &d);
+                    let mut change = Change { xattr, acl, ..self.attr_change(meta, &d, false) };
+                    change.perms = self.perms_shown(meta, &d, change.perms, acl);
+                    self.out.item(rel, meta.kind, Link::None, change, false);
+                    let a = AttrDiff { xattr, acl, ..self.rules.attrs_differ(meta, &d) };
+                    if !a.any() || self.dry() || self.fix_attrs(dst_path, x, a, have) {
                         self.source_done(root, src_path, rel, meta);
                     }
                     return false;
@@ -1119,6 +1273,11 @@ impl<'a> Engine<'a> {
             },
         );
         if res.is_ok() {
+            if self.extras_on()
+                && let Err(e) = self.apply_extra(dst_path, x, None, self.new_mode(meta))
+            {
+                self.err(path_msg("set_xattr/set_acl \"", dst_path, format!("\" failed: {e}")));
+            }
             self.source_done(root, src_path, rel, meta);
         }
         if let Err(e) = res {
@@ -1130,15 +1289,21 @@ impl<'a> Engine<'a> {
     /// Returns whether the attributes were set.
     /// Queue A: a metadata-only fix.
     pub(crate) fn attr_job(&self, j: super::pipeline::AttrJob) {
-        if self.fix_attrs(&j.dst_path, &j.meta, j.diff) {
+        let x = Src { kind: Kind::File, meta: &j.meta, extra: j.extra.as_deref(), from: XSource::Local(&j.src_path) };
+        if self.fix_attrs(&j.dst_path, &x, j.diff, j.have) {
             self.source_done(j.root, &j.src_path, &j.rel, &j.meta);
         }
     }
 
-    fn fix_attrs(&self, path: &Path, src: &Meta, a: AttrDiff) -> bool {
+    /// Owner, `-X`/`-A`, mode and time, in that order (as rsync's `set_file_attrs`).
+    fn fix_attrs(&self, path: &Path, x: &Src, a: AttrDiff, have: Option<DstExtra>) -> bool {
+        let src = x.meta;
         let r = (|| {
             if a.owner {
                 fsops::lchown(path, self.rules.wanted_uid(src), self.rules.wanted_gid(src))?;
+            }
+            if a.xattr || a.acl {
+                self.fix_extra(path, x, have)?;
             }
             if a.mode {
                 fsops::chmod(path, src.mode)?;
@@ -1163,12 +1328,22 @@ impl<'a> Engine<'a> {
     pub(crate) fn note_transfer(&self, job: &FileJob) {
         // With -c, rsync marks a rewritten file's checksum as changed (`>fc`).
         let change = match job.dst_meta.filter(|d| d.kind == Kind::File).or(job.alt) {
-            Some(d) => Change {
-                transfer: true,
-                value: self.opts.checksum,
-                size: d.size != job.meta.size,
-                ..self.attr_change(&job.meta, &d, true)
-            },
+            Some(d) => {
+                // -X/-A differences of the old file only matter for the item line.
+                let (xattr, acl) = if self.out.itemizes() && self.extras_on() {
+                    self.extra_change(&job.src(true), job.basis_path(), &d).0
+                } else {
+                    (false, false)
+                };
+                Change {
+                    transfer: true,
+                    value: self.opts.checksum,
+                    size: d.size != job.meta.size,
+                    xattr,
+                    acl,
+                    ..self.attr_change(&job.meta, &d, true)
+                }
+            }
             None => Change { new: true, transfer: true, ..Change::default() },
         };
         self.out.item(&job.rel, Kind::File, Link::None, change, true);
@@ -1229,6 +1404,7 @@ impl<'a> Engine<'a> {
         if self.opts.inplace && job.dst_meta.is_some_and(|d| d.kind == Kind::File) {
             fsops::copy_into_existing(&job.src_path, &job.dst_path, src.size)?;
             fsops::lchown(&job.dst_path, uid, gid)?;
+            self.written_extra(&job.dst_path, job, mode)?;
             fsops::chmod(&job.dst_path, mode)?;
             if self.opts.times {
                 fsops::set_mtime(&job.dst_path, src.mtime, src.mtime_ns)?;
@@ -1249,7 +1425,7 @@ impl<'a> Engine<'a> {
             fsops::register_temp(&job.dst_path);
             let r = self
                 .copy_new(&job.src_path, &job.dst_path, src.size, allow_fast, mode)
-                .and_then(|copied| self.apply_new_file_attrs(&job.dst_path, copied, mode, uid, gid, mtime))
+                .and_then(|copied| self.apply_new_file_attrs(&job.dst_path, copied, mode, uid, gid, mtime, Some(&job.src(false))))
                 .and_then(|()| fsops::check_interrupt());
             return self.finish_or_keep(&job.dst_path, job, r);
         }
@@ -1263,7 +1439,7 @@ impl<'a> Engine<'a> {
             })
         })?;
         let r = self
-            .apply_new_file_attrs(&tmp, copied, mode, uid, gid, mtime)
+            .apply_new_file_attrs(&tmp, copied, mode, uid, gid, mtime, Some(&job.src(false)))
             .and_then(|()| fsops::check_interrupt())
             .and_then(|()| fs::rename(&tmp, &job.dst_path));
         self.finish_or_keep(&tmp, job, r)
@@ -1311,7 +1487,7 @@ impl<'a> Engine<'a> {
         if self.opts.inplace && d.is_in_place() && job.basis.is_none() {
             let out = fs::OpenOptions::new().write(true).open(&job.dst_path)?;
             apply(&d, basis_r, new_r, &out, true)?;
-            self.finish_delta_file(&out, &job.meta, mode, uid, gid)?;
+            self.finish_delta_file(&out, &job.meta, mode, uid, gid, Some((&job.dst_path, &job.src(false))))?;
             return Ok(true);
         }
 
@@ -1325,11 +1501,12 @@ impl<'a> Engine<'a> {
         })?;
         if cloned {
             Stats::add(&self.stats.cloned, 1);
+            self.cloned(&tmp);
         }
         let r = (|| {
             let out = fs::OpenOptions::new().write(true).open(&tmp)?;
             apply(&d, basis_r, new_r, &out, cloned)?;
-            self.finish_delta_file(&out, &job.meta, mode, uid, gid)?;
+            self.finish_delta_file(&out, &job.meta, mode, uid, gid, Some((&tmp, &job.src(false))))?;
             drop(out);
             fsops::check_interrupt()?;
             fs::rename(&tmp, &job.dst_path)
@@ -1338,9 +1515,22 @@ impl<'a> Engine<'a> {
     }
 
     /// Attributes for a delta-built file. It may be a clone of the old file, which
-    /// carries the old mode and mtime, so both are always set.
-    pub(crate) fn finish_delta_file(&self, f: &fs::File, src: &Meta, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    /// carries the old mode and mtime, so both are always set. `ext`: the file's path
+    /// and source, for `-X`/`-A`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_delta_file(
+        &self,
+        f: &fs::File,
+        src: &Meta,
+        mode: u32,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        ext: Option<(&Path, &Src)>,
+    ) -> io::Result<()> {
         fsops::fchown(f, uid, gid)?;
+        if let Some((path, x)) = ext {
+            self.apply_extra(path, x, None, mode)?;
+        }
         fsops::fchmod(f, mode)?;
         if self.opts.times {
             fsops::set_fd_mtime(f, src.mtime, src.mtime_ns)?;
@@ -1356,6 +1546,8 @@ impl<'a> Engine<'a> {
     /// Set owner, mode and mtime on a freshly written file, by descriptor when we
     /// still hold one (one metadata update each, no path lookups).
     /// Owner, mode and time of a file this run created and wrote, through its descriptor.
+    /// `ext`: the file's path and source, for `-X`/`-A`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_written_attrs(
         &self,
         f: &fs::File,
@@ -1363,12 +1555,17 @@ impl<'a> Engine<'a> {
         uid: Option<u32>,
         gid: Option<u32>,
         mtime: Option<(i64, u32)>,
+        ext: Option<(&Path, &Src)>,
     ) -> io::Result<()> {
         fsops::fchown(f, uid, gid)?;
+        if let Some((path, x)) = ext {
+            self.apply_extra(path, x, None, mode)?;
+        }
         // open() already applied `mode & !umask`; only fix up what it couldn't set:
         // bits masked by the umask, and setuid/setgid/sticky (which also covers the
-        // bits chown clears).
-        if mode & !self.umask & 0o777 != mode {
+        // bits chown clears). With -A a parent's default ACL may have masked the mode
+        // instead of the umask.
+        if mode & !self.umask & 0o777 != mode || self.opts.acls {
             fsops::fchmod(f, mode)?;
         }
         if let Some((s, ns)) = mtime {
@@ -1380,6 +1577,8 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// `src`: the source, for `-X`/`-A`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_new_file_attrs(
         &self,
         path: &Path,
@@ -1388,12 +1587,17 @@ impl<'a> Engine<'a> {
         uid: Option<u32>,
         gid: Option<u32>,
         mtime: Option<(i64, u32)>,
+        src: Option<&Src>,
     ) -> io::Result<()> {
         match copied {
-            Copied::Written(f) => self.set_written_attrs(&f, mode, uid, gid, mtime),
+            Copied::Written(f) => self.set_written_attrs(&f, mode, uid, gid, mtime, src.map(|x| (path, x))),
             Copied::Clone => {
                 Stats::add(&self.stats.cloned, 1);
+                self.cloned(path);
                 fsops::lchown(path, uid, gid)?;
+                if let Some(x) = src {
+                    self.apply_extra(path, x, None, mode)?;
+                }
                 fsops::chmod(path, mode)?;
                 match mtime {
                     Some((s, ns)) => fsops::set_mtime(path, s, ns)?,

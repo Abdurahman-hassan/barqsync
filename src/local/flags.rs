@@ -4,6 +4,7 @@
 //! with the remote sender.
 
 use super::exec::{Engine, FileJob, finish_temp, split_dst};
+use super::extra::Src;
 use crate::checksum::{self, Sum};
 use crate::cli::Options;
 use crate::entry::{DirEnt, Kind, Meta};
@@ -138,8 +139,11 @@ impl Engine<'_> {
         self.backup_root = self.opts.backup_dir.as_deref().map(resolve);
     }
 
+    /// `-L`/`-k`/`--chmod`, then (`-X`/`-A`) the entries' attributes and ACLs, for a
+    /// listing read on this machine.
     pub(crate) fn adjust_listing(&self, dir: &Path, ents: Vec<DirEnt>) -> Vec<DirEnt> {
-        adjust_listing(self.opts, dir, ents, &mut |m| self.err(m))
+        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.err(m));
+        self.local_listing(dir, ents)
     }
 
     /// `--max-size` / `--min-size`: regular files outside the range are skipped.
@@ -191,13 +195,14 @@ impl Engine<'_> {
     pub(crate) fn try_alt_file(
         &self,
         root: u16,
-        src: &Meta,
+        x: &Src,
         rel: &[u8],
         src_path: &Path,
         dst_path: &Path,
         dst_meta: Option<&Meta>,
         src_sum: &mut dyn FnMut() -> Option<Sum>,
     ) -> AltFile {
+        let src = x.meta;
         let dest_rel = self.dest_rel(dst_path);
         let mut basis: Option<(PathBuf, Meta)> = None;
         let mut same_data: Option<(PathBuf, Meta)> = None;
@@ -216,7 +221,8 @@ impl Engine<'_> {
             if !self.alt_data_same(src, &m, &p, &mut cached) {
                 continue;
             }
-            if !self.rules.attrs_differ(src, &m).any() {
+            // rsync's unchanged_attrs: with -X/-A the attributes and ACLs must match too.
+            if !self.rules.attrs_differ(src, &m).any() && self.extra_change(x, &p, &m).0 == (false, false) {
                 exact = Some((p, m));
                 break;
             }
@@ -249,16 +255,19 @@ impl Engine<'_> {
             return AltFile::Done;
         }
         if let Some((p, m)) = same_data {
-            let change = Change { local: true, ..self.attr_change(src, &m, false) };
+            // Compared with the alt file it is copied from, as rsync does.
+            let (xattr, acl) = self.extra_change(x, &p, &m).0;
+            let change = Change { local: true, xattr, acl, ..self.attr_change(src, &m, false) };
             self.out.item(rel, Kind::File, Link::None, change, true);
             if dst_meta.is_none() {
                 Stats::add(&self.stats.created, 1);
             }
             if !self.dry()
-                && let Err(e) = self.copy_alt(&p, dst_path, src)
+                && let Err(e) = self.copy_alt(&p, dst_path, x)
             {
                 let to = path_msg("\" -> \"", dst_path, format!("\" failed: {e}"));
                 self.err(path_msg("copy \"", &p, to));
+                self.not_written(x);
                 return AltFile::Done;
             }
             self.source_done(root, src_path, rel, src);
@@ -271,7 +280,8 @@ impl Engine<'_> {
     }
 
     /// Copy an alt-dest file with identical data into place, with the source's attributes.
-    fn copy_alt(&self, alt: &Path, dst_path: &Path, src: &Meta) -> io::Result<()> {
+    fn copy_alt(&self, alt: &Path, dst_path: &Path, x: &Src) -> io::Result<()> {
+        let src = x.meta;
         let mode = self.new_mode(src);
         let (uid, gid) = (self.rules.wanted_uid(src), self.rules.wanted_gid(src));
         let mtime = self.opts.times.then_some((src.mtime, src.mtime_ns));
@@ -279,7 +289,7 @@ impl Engine<'_> {
         let (tmp, copied) =
             fsops::with_temp(dir, name, |tmp| fsops::copy_new(alt, tmp, src.size, !self.opts.no_clone, mode))?;
         let r = self
-            .apply_new_file_attrs(&tmp, copied, mode, uid, gid, mtime)
+            .apply_new_file_attrs(&tmp, copied, mode, uid, gid, mtime, Some(x))
             .and_then(|()| fs::rename(&tmp, dst_path));
         finish_temp(&tmp, r)
     }

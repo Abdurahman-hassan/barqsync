@@ -1,5 +1,6 @@
 //! barqsync: a parallel, rsync-compatible file synchronizer.
 
+pub mod acls;
 pub mod checksum;
 pub mod chmod;
 pub mod cli;
@@ -18,6 +19,7 @@ pub mod remote;
 pub mod scan;
 pub mod select;
 pub mod timing;
+pub mod xattrs;
 
 use cli::Options;
 use paths::{Location, parse_location};

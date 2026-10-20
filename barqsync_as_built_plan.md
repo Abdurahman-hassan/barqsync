@@ -195,11 +195,15 @@ one file use the same stream, so they stay in order.
   older peers are refused with "protocol version mismatch".
 - **Threads:** each side has a dedicated reader thread and writer thread, so neither side can
   deadlock waiting for the other to drain the pipe.
-- **Closing over QUIC** (M18): the sender, once it has `ReceiverDone`, closes the session and
+- **Closing over QUIC** (M19): the sender, once it has `ReceiverDone`, closes the session and
   its ssh pipe at once; the receiver waits (up to 5 s) for the sender's end, over QUIC or as
   the ssh pipe's end. Nobody waits for acknowledgements, and the client doesn't wait for the
   server's acknowledgement of the QUIC token (the pinned certificate already authenticates
   the server).
+- **Removals in a pull** (M19): with `--remove-source-files` the server, as the sender,
+  removes the last files after `ReceiverDone`, so it ends with `RemovalsDone` (the failures
+  since `SenderDone`), after their `-vv` lines and errors; the client reads up to it before
+  it closes. Protocol version 10.
 
 ---
 
@@ -356,7 +360,7 @@ one file use the same stream, so they stay in order.
   on Linux) passes as is, with `BARQSYNC_TRANSPORT=auto`, and with auto forced onto QUIC
   (`BARQSYNC_AUTO_RTT_MS=0`).
 
-### M18: QUIC's fixed cost (branch `feat/quic-close-cost`)
+### M19: QUIC's fixed cost (branch `feat/confident-williams-07be06`)
 
 - `BARQSYNC_TIMING=1`: timestamped milestones on both sides of a remote transfer (the
   server's through ssh's stderr); `bench/net/container.sh fixed` breaks a one-file push and
@@ -383,13 +387,18 @@ one file use the same stream, so they stay in order.
   verdicts, per-mark memory, a remote test of the clean-link memory; the harness gives every
   run its own `BARQSYNC_CACHE_DIR`. The suite (167 tests on macOS, 170 on Linux) passes as
   is, with `BARQSYNC_TRANSPORT=quic`, `=auto`, and auto forced onto QUIC; clippy clean.
+- Found on the way: in a pull with `--remove-source-files`, the server's "sender removed"
+  lines and removal failures came after the client had stopped reading, on every transport
+  (rsync prints them and exits 23 when a removal fails; barqsync printed nothing and exited
+  0). Such a pull now ends with the server's `RemovalsDone` (protocol 10); over QUIC that
+  costs it a round trip. Differential test with and without a removal that fails.
 
 ### Testing
 
 - **Coverage:** 145 tests on macOS (arm64, and x86_64 under Rosetta: BLAKE3/zstd x86 SIMD
   paths, `getattrlistbulk` on Intel builds) and 148 on Linux (aarch64 container, glibc rsync
   3.2.7) at M14; at M16, 157 on Linux (x86_64 VM, rsync 3.2.7) and 154 on macOS; at M17,
-  167 on Linux (aarch64 container) and 164 on macOS; at M18, 170 on Linux and 167 on macOS. The
+  167 on Linux (aarch64 container) and 164 on macOS; at M19, 191 on Linux and 188 on macOS. The
   whole suite also runs with each alternative design as the default
   (`BARQSYNC_DELTA`, `_SCANNER`, `_TRANSPORT` (`quic`, `auto`), `_WIRE`, `_STRATEGY`,
   `_NET_IO`, `_IO_URING`).
@@ -468,7 +477,7 @@ selectable.
 |---|---|---|---|
 | FastCDC for every delta, 16 MB regions merged at the boundaries, xxh3 + BLAKE3, mmap | `--delta=cdc` (M9) | 4–7× slower on a 10 GiB file (mmap faults and page-cache pressure; hashing itself is faster); faster only for a shifted file that fits in RAM. Its exact region stitching sends 21× less on shifted files than forced segment cuts, so `blocks` adopted it | `blocks` |
 | jwalk + DashMap, queues A–D | `--scanner=jwalk` (M10) | 9–11% slower locally on macOS (no `getattrlistbulk`), 1.6–2.1× slower on Linux; 7% faster for a macOS remote no-op | `dirtask` |
-| QUIC (quinn), up to 128 streams, ssh bootstrap and fallback | `--transport quic` (M11); `--transport auto` (M17) picks it by round trip, and (M18) stays on the pipe where QUIC found a clean link | Ties the ssh pipe on a clean WAN, 2–8% slower on a LAN, **2–4× faster on a lossy link**; up to 3 s lost where UDP is blocked. auto keeps the lossy win and loses 0.5 s at most where UDP is blocked; it costs a round trip on short links (2% on a WAN no-op) and, since M18, ~2 round trips per transfer on clean long ones until it has seen them clean (3.5–9% on a delta or a no-op; was 11–22%) | ssh pipe |
+| QUIC (quinn), up to 128 streams, ssh bootstrap and fallback | `--transport quic` (M11); `--transport auto` (M17) picks it by round trip, and (M19) stays on the pipe where QUIC found a clean link | Ties the ssh pipe on a clean WAN, 2–8% slower on a LAN, **2–4× faster on a lossy link**; up to 3 s lost where UDP is blocked. auto keeps the lossy win and loses 0.5 s at most where UDP is blocked; it costs a round trip on short links (2% on a WAN no-op) and, since M18, ~2 round trips per transfer on clean long ones until it has seen them clean (3.5–9% on a delta or a no-op; was 11–22%) | ssh pipe |
 | rkyv | `--wire rkyv` (M11) | Within noise of postcard (messages are decoded into owned structures either way) | postcard |
 | tokio owns network I/O | `--net-io=tokio` (M11, hidden; QUIC always on tokio) | Within noise of threads for the ssh pipe and TCP streams | threads |
 | Adaptive strategy: link probe, size routing, pack compression, adaptive zstd | `--strategy adaptive` (M12) | **1.4–7.6× faster on compressible data**, 4–22% slower on incompressible data (probe and wasted compression) | `fixed` |
@@ -488,18 +497,15 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
   LAN, and TCP/QUIC there need its firewall to allow the binary.
 - **Cold-cache runs** (`bench/run.sh DIR all --cold`) need `sudo purge` on macOS.
 - **NFS** isn't covered (no server).
-- **From rsync's feature set:** xattrs and ACLs (`-X`, `-A`), daemon mode (`rsync://`), and the
-  single-argument listing mode.
-- **Worth trying next:** QUIC still costs ~2 round trips per transfer over the pipe (M18):
+- **From rsync's feature set:** daemon mode (`rsync://`) and the single-argument listing mode.
+  (`-X`/`-A` are done: see `IMPLEMENTATION.md`, M18.)
+- **Worth trying next:** QUIC still costs ~2 round trips per transfer over the pipe (M19):
   the handshake, and a push's close or a pull's late start. The pull's could go (start the
   listing on the ssh pipe and switch mid-stream). Whether `--transport auto` becomes the
   default is open: the numbers are close (at most +9% on clean long links at first contact,
   1.3–4× faster on lossy ones), but it opens a UDP port on every server and hasn't met a
   fast real long link. And a cheaper probe so `--strategy adaptive` stops costing 4–22% on
   incompressible data.
-- **Server messages after `ReceiverDone` are lost in pulls:** with `--remove-source-files
-  -vv`, rsync prints the sender's "sender removed" lines; barqsync's server sends them after
-  the client has stopped reading, over every transport (found during M18, not fixed).
 - **The refinement threshold is fixed** (64 KiB of basis data per file). With
   `--strategy adaptive` the measured round trip could set it: a smaller gap is worth
   refining on a LAN, not on a long link.

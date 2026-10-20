@@ -176,7 +176,7 @@ pub fn read_selected(dir: &Path, sel: &Sel) -> (Vec<DirEnt>, Vec<(PathBuf, io::E
         match fsops::lstat(&p) {
             Ok(meta) => {
                 let link = if meta.kind == Kind::Symlink { fsops::read_link_bytes(&p).ok() } else { None };
-                ents.push(DirEnt { name: OsStr::from_bytes(name).to_os_string(), meta, link });
+                ents.push(DirEnt::new(OsStr::from_bytes(name).to_os_string(), meta, link));
             }
             Err(e) => errs.push((p, e)),
         }
