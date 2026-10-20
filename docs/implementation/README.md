@@ -12,7 +12,7 @@ a part does not close other acceptance criteria in the audit.
 | 3. Runtime and protocol | 3A: move coordination outside Rayon. 3B: cancellation and bounded shutdown. 3C: metadata chunking, error propagation and bounded stream admission. | 3A implemented; 3B/3C pending | One-worker transfers finish; disconnects and oversized frames cannot hang a session. |
 | 4. SSH data streams | 4A: versioned session negotiation and private Unix socket helpers. 4B: SSH lifecycle, fallback and diagnostics. 4C: signed release integration and real Mac acceptance. | Pending | Push/pull on two Macs with firewalls enabled, no public data listener and no leaked helpers. |
 | 5. Resource safety and performance | 5A: byte-based memory budget. 5B: safe CDC reads of mutable files. 5C: measured large-file scheduling and live progress. | Pending | Bounded memory and clean source-change failures; publish measured performance tradeoffs. |
-| 6. Compatibility and maintenance | 6A: remote path/IPv6 parsing. 6B: CI, dependency audits and fault injection. 6C: diagnostics, durability documentation and release verification. | Pending | Compatibility matrix, CI and packaged artifact checks pass. |
+| 6. Compatibility and maintenance | 6A: remote path/IPv6 parsing. 6B: CI, dependency audits and fault injection. 6C: diagnostics, durability documentation and release verification. | 6A implemented; 6B/6C pending | Compatibility matrix, CI and packaged artifact checks pass. |
 
 Dependencies follow the audit: milestone 4 requires milestones 1–3; performance
 changes depend on correctness and cancellation. Keep wire-format changes together
@@ -22,6 +22,7 @@ with an explicit protocol version change and compatibility tests.
 
 - [Part 1A: mutation safety](01a-mutation-safety.md).
 - [Part 3A: worker coordination](03a-worker-coordination.md).
+- [Part 6A: remote locations and filename compatibility](06a-remote-locations.md).
 - [Checkpoint verification](verification.md).
 
 ## Baseline reconciliation
@@ -32,6 +33,11 @@ home-relative paths, progress and removal reporting must be preserved. The
 audit's proposed `ssh-streams` transport and private Unix rendezvous are still
 separate work; milestone 4 must assess the existing relay before adding another
 transport. Milestone 6 must build on the existing tilde/host fixes.
+
+The checkpoint was merged as [PR 15](https://github.com/Abdurahman-hassan/barqsync/pull/15)
+at `b1b257a`, after macOS and Linux CI passed (including Linux QUIC). Part 6A
+starts from that merge. The three active P1 worktrees remain with their owners;
+their unfinished drafts were not included in this checkpoint or modified here.
 
 ## Verification outside this checkout
 

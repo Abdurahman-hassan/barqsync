@@ -1,13 +1,15 @@
 //! Disposable CLI probes with a deadline that also terminates owned descendants.
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub fn run(dir: &Path, args: &[&str], backend: &str) -> (i32, String) {
+pub fn run(dir: &Path, args: &[impl AsRef<OsStr> + std::fmt::Debug], backend: &str) -> (i32, String) {
     let log = tempfile::tempfile().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_barqsync"));
     cmd.current_dir(dir)
@@ -17,7 +19,7 @@ pub fn run(dir: &Path, args: &[&str], backend: &str) -> (i32, String) {
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log.try_clone().unwrap()))
         .process_group(0);
-    if !args.iter().any(|a| a.starts_with("--threads=")) {
+    if !args.iter().any(|a| a.as_ref().as_bytes().starts_with(b"--threads=")) {
         cmd.arg("--threads=2");
     }
     let mut child = cmd.spawn().unwrap();
