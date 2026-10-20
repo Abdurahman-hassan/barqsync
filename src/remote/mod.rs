@@ -10,6 +10,7 @@ pub mod receiver;
 pub mod sender;
 pub mod server;
 pub mod quic;
+pub mod relay;
 pub mod streams;
 
 use crate::fsops;
