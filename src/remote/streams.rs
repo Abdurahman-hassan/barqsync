@@ -412,12 +412,16 @@ fn quic_switch(conn: &mut Conn, mut session: quic::Session, n: usize, sending: b
     Ok(())
 }
 
-/// `--transport auto`, client side: ping over ssh; on a long round trip, try QUIC for a
-/// short while and use it if it connects and measures a long round trip too, else stay on
-/// the ssh pipe (see [`auto`]). The server answers the ping and waits for `StreamsReady`.
+/// `--transport auto`, client side: ping over ssh while QUIC connects; on a long round
+/// trip, give QUIC a short while and use it if it connects and measures a long round trip
+/// too, else stay on the ssh pipe (see [`auto`]). The server answers the ping and waits
+/// for `StreamsReady`.
 fn auto_client(conn: &mut Conn, offer: &StreamOffer, want: usize, sending: bool, out: &Output) -> io::Result<auto::Outcome> {
     let started = Instant::now();
     conn.msg(Msg::Ping)?;
+    // Connecting alongside the ping hides the handshake behind it on a long link; on a
+    // short one the attempt is dropped once the pong is back.
+    let attempt = quic::start(offer, Some(quic::INITIAL_RTT));
     match recv_setup(conn, Duration::from_secs(60))? {
         Frame::Msg(Msg::Pong) => {}
         other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected a pong, got {other:?}"))),
@@ -434,14 +438,12 @@ fn auto_client(conn: &mut Conn, offer: &StreamOffer, want: usize, sending: bool,
         Ok(())
     };
     if !auto::wants_quic(rtt, threshold) {
+        drop(attempt);
         stay(conn, format!("{:.1} ms round trip", ms(rtt)))?;
         return Ok(auto::Outcome::Ssh);
     }
-    // The ping's round trip is QUIC's first guess, so a lost handshake packet is sent
-    // again in time.
     let limit = auto::deadline(rtt);
-    let tried = Instant::now();
-    let attempt = quic::start(offer, Some(rtt)).and_then(|a| a.wait(tried + limit));
+    let attempt = attempt.and_then(|a| a.wait(started + limit));
     mark(format_args!("auto: QUIC attempt ended ({})", if attempt.is_ok() { "connected" } else { "failed" }));
     match attempt {
         // A ping that looked long because ssh resent it: QUIC's own measurement decides.
@@ -455,7 +457,7 @@ fn auto_client(conn: &mut Conn, offer: &StreamOffer, want: usize, sending: bool,
                 out.info(format!(
                     "auto: {:.1} ms round trip, QUIC connected in {:.0} ms, using QUIC to {} ({want} data streams)",
                     ms(rtt),
-                    ms(tried.elapsed()),
+                    ms(started.elapsed()),
                     offer.addr
                 ));
             }

@@ -7,12 +7,13 @@
 //! 1. the server opens its QUIC endpoint and sends the offer, as for `--transport quic`
 //!    (the server is told `quic`, so a server of an older protocol version can still read
 //!    the handshake and say it is one);
-//! 2. the client pings the server over ssh. A round trip under [`QUIC_FROM_RTT`] means a
-//!    short link: the transfer stays on the ssh pipe, and no UDP packet is ever sent;
-//! 3. otherwise the client connects to QUIC, with the ping's round trip as QUIC's first
-//!    estimate, and waits for it until [`deadline`] (300 ms plus two round trips). If it
-//!    connected and its own handshake measured a long round trip too, the transfer moves
-//!    to QUIC; if not, it stays on ssh.
+//! 2. the client pings the server over ssh and starts connecting to QUIC at the same time,
+//!    so on a long link the handshake is done about when the pong arrives. A round trip
+//!    under [`QUIC_FROM_RTT`] means a short link: the attempt is dropped and the transfer
+//!    stays on the ssh pipe;
+//! 3. otherwise the client waits for QUIC until [`deadline`] (300 ms plus two round trips
+//!    from the ping). If it connected and its own handshake measured a long round trip
+//!    too, the transfer moves to QUIC; if not, it stays on ssh.
 //!
 //! A host where QUIC didn't connect is remembered for [`FORGET_AFTER`] (see [`Memory`]),
 //! and not tried again meanwhile.
@@ -48,9 +49,10 @@ pub fn wants_quic(rtt: Duration, threshold: Duration) -> bool {
     rtt >= threshold
 }
 
-/// How long a QUIC attempt may take on a link with this round trip: the handshake and the
-/// token take two round trips; the slack covers crypto, scheduling and one lost packet
-/// (sent again after about three round trips by the client, 150 ms by the server).
+/// How long a QUIC attempt may take on a link with this round trip, counted from its start
+/// (with the ping): the handshake takes a round trip; another and the slack cover crypto,
+/// scheduling and one lost packet (sent again after about 150 ms by either side, both
+/// assuming a 50 ms round trip until they have measured one).
 pub fn deadline(rtt: Duration) -> Duration {
     SLACK + 2 * rtt
 }
@@ -152,10 +154,11 @@ mod tests {
         // QUIC, up to satellite round trips.
         assert!(ms(600) + deadline(ms(600)) < super::super::quic::CONNECT_TIMEOUT);
         // One lost handshake packet on a lossy 80 ms link is sent again in time: the
-        // client's after three round trips (its first estimate is the ping's), the
-        // server's first flight after three of its 50 ms guesses.
-        for resend in [3 * ms(80), ms(40) + 3 * super::super::quic::INITIAL_RTT] {
-            assert!(resend + 2 * ms(80) < deadline(ms(80)), "{resend:?}");
+        // client's Initial after three of its 50 ms guesses, the server's first flight
+        // (half a round trip in) likewise.
+        let guess = 3 * super::super::quic::INITIAL_RTT;
+        for resend in [guess, ms(40) + guess] {
+            assert!(resend + ms(80) < deadline(ms(80)), "{resend:?}");
         }
     }
 
