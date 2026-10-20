@@ -1,7 +1,7 @@
 //! Client side of a remote transfer: start `barqsync --server` through the remote
 //! shell, send it the role, paths and options, then run the opposite role locally.
 
-use super::{Stop, receiver, recv, sender, streams};
+use super::{Stop, Transport, auto, receiver, recv, sender, streams};
 use crate::cli::Options;
 use crate::exit;
 use crate::output::{Output, Stats};
@@ -101,8 +101,19 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // Hello itself always goes out as postcard; everything after it in this format.
     conn.set_wire(opts.wire);
     conn.set_compression(opts.compression());
+    // `auto`: a host where QUIC just failed stays on the ssh pipe for a while. The server
+    // only needs to know that QUIC may be used.
+    let memory = auto::Memory::new();
+    let mut transport = opts.transport;
+    if transport == Transport::Auto && opts.streams > 0 && memory.unreachable(&host) {
+        if out.verbose() > 1 {
+            out.info(format!("auto: QUIC to {host} failed recently, using the ssh connection"));
+        }
+        transport = Transport::Ssh;
+    }
     let mut server_opts = opts.clone();
     server_opts.paths = server_paths;
+    server_opts.transport = if transport == Transport::Auto { Transport::Quic } else { transport };
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };
     let handshake = conn.msg(hello).map_err(Stop::Io).and_then(|()| recv(&conn));
     match handshake {
@@ -132,10 +143,15 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     }
 
-    if let Err(e) = streams::setup_client(&mut conn, opts.transport, opts.streams, !server_is_sender, out) {
-        out.error(format!("setting up parallel streams failed: {e}"));
-        let _ = child.kill();
-        return exit::PROTOCOL;
+    match streams::setup_client(&mut conn, transport, opts.streams, !server_is_sender, out) {
+        Ok(Some(auto::Outcome::Unreachable)) => memory.remember(&host),
+        Ok(Some(auto::Outcome::Quic)) => memory.forget(&host),
+        Ok(_) => {}
+        Err(e) => {
+            out.error(format!("setting up parallel streams failed: {e}"));
+            let _ = child.kill();
+            return exit::PROTOCOL;
+        }
     }
 
     let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));

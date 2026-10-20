@@ -329,13 +329,37 @@ one file use the same stream, so they stay in order.
 - The test suite passes on macOS (154 tests, APFS). The macOS benchmarks (A–D) were not
   re-run: the transfer measurements above are from the Linux VM.
 
+### M17: `--transport auto` (branch `feat/modest-mclean-c43905`)
+
+- Before the first listing the client pings the server over ssh. Under 30 ms it stays on the
+  pipe (no UDP sent); otherwise it tries QUIC for 300 ms plus two round trips, with the ping
+  as QUIC's first estimate, and uses it if it connects and its own handshake measures a long
+  round trip too. A host where QUIC failed is skipped for an hour (a marker file in
+  `$XDG_RUNTIME_DIR` or the user's cache directory). The QUIC server now assumes a 50 ms
+  round trip until measured, so a lost first flight is re-sent within that wait. Protocol 8.
+- Measured (container, `SCALE=0.5`): stays on ssh on lan and wan (+1 round trip: WAN no-op
+  0.65 against 0.63 s); on the lossy link as fast as QUIC, 2.2–3.0× faster than the pipe
+  (small files 13.0 s against 38.8 s); with UDP blocked +0.5 s on first contact
+  (`--transport quic`: +3 s), nothing once remembered. But on a clean 80 ms link it picks
+  QUIC, whose setup and close cost ~3 round trips there with nothing gained at 100 Mbit:
+  11–22% slower on the delta and the no-op. **Not the default**; the ssh pipe stays.
+- `bench/net`: `auto`/`auto-warm` variants, a `far` profile, `-noudp` profiles, `GSO=off`
+  (with GSO, netem drops TCP's 44-packet segments whole; without it the pipe is slower still
+  on the lossy link, so QUIC's lead there is real), per-checkout target volumes.
+- Tests: decision, wait and memory unit tests; three remote tests (QUIC on long links, ssh
+  on short ones, fast fallback that remembers the host). The suite (164 tests on macOS, 167
+  on Linux) passes as is, with `BARQSYNC_TRANSPORT=auto`, and with auto forced onto QUIC
+  (`BARQSYNC_AUTO_RTT_MS=0`).
+
 ### Testing
 
 - **Coverage:** 145 tests on macOS (arm64, and x86_64 under Rosetta: BLAKE3/zstd x86 SIMD
   paths, `getattrlistbulk` on Intel builds) and 148 on Linux (aarch64 container, glibc rsync
-  3.2.7) at M14; at M16, 157 on Linux (x86_64 VM, rsync 3.2.7) and 154 on macOS. The
+  3.2.7) at M14; at M16, 157 on Linux (x86_64 VM, rsync 3.2.7) and 154 on macOS; at M17,
+  167 on Linux (aarch64 container) and 164 on macOS. The
   whole suite also runs with each alternative design as the default
-  (`BARQSYNC_DELTA`, `_SCANNER`, `_TRANSPORT`, `_WIRE`, `_STRATEGY`, `_NET_IO`, `_IO_URING`).
+  (`BARQSYNC_DELTA`, `_SCANNER`, `_TRANSPORT` (`quic`, `auto`), `_WIRE`, `_STRATEGY`,
+  `_NET_IO`, `_IO_URING`).
 - **Differential tests:** most tests run the same command through rsync and barqsync and
   require identical printed items and identical trees (content, mode, mtime, symlink targets,
   hard-link groups).
@@ -410,7 +434,7 @@ selectable.
 |---|---|---|---|
 | FastCDC for every delta, 16 MB regions merged at the boundaries, xxh3 + BLAKE3, mmap | `--delta=cdc` (M9) | 4–7× slower on a 10 GiB file (mmap faults and page-cache pressure; hashing itself is faster); faster only for a shifted file that fits in RAM. Its exact region stitching sends 21× less on shifted files than forced segment cuts, so `blocks` adopted it | `blocks` |
 | jwalk + DashMap, queues A–D | `--scanner=jwalk` (M10) | 9–11% slower locally on macOS (no `getattrlistbulk`), 1.6–2.1× slower on Linux; 7% faster for a macOS remote no-op | `dirtask` |
-| QUIC (quinn), up to 128 streams, ssh bootstrap and fallback | `--transport quic` (M11) | Ties the ssh pipe on a clean WAN, 2–8% slower on a LAN, **2–4× faster on a lossy link**; up to 3 s lost where UDP is blocked | ssh pipe |
+| QUIC (quinn), up to 128 streams, ssh bootstrap and fallback | `--transport quic` (M11); `--transport auto` (M17) picks it by round trip | Ties the ssh pipe on a clean WAN, 2–8% slower on a LAN, **2–4× faster on a lossy link**; up to 3 s lost where UDP is blocked. auto keeps the lossy win and loses 0.5 s at most where UDP is blocked, but costs a round trip on short links and picks QUIC on clean long ones, where it is 11–22% slower on a delta or a no-op | ssh pipe |
 | rkyv | `--wire rkyv` (M11) | Within noise of postcard (messages are decoded into owned structures either way) | postcard |
 | tokio owns network I/O | `--net-io=tokio` (M11, hidden; QUIC always on tokio) | Within noise of threads for the ssh pipe and TCP streams | threads |
 | Adaptive strategy: link probe, size routing, pack compression, adaptive zstd | `--strategy adaptive` (M12) | **1.4–7.6× faster on compressible data**, 4–22% slower on incompressible data (probe and wasted compression) | `fixed` |
@@ -432,9 +456,11 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
 - **NFS** isn't covered (no server).
 - **From rsync's feature set:** xattrs and ACLs (`-X`, `-A`), daemon mode (`rsync://`), and the
   single-argument listing mode.
-- **Worth trying next:** making QUIC the default where UDP is known to work (it is 2–4×
-  faster on lossy links), and a cheaper probe so `--strategy adaptive` stops costing 4–22%
-  on incompressible data.
+- **Worth trying next:** cutting QUIC's fixed cost (about three round trips for setup and
+  close, measured on a clean 80 ms link) and telling clean long links from lossy ones
+  (e.g. remembering per host the loss QUIC saw on the last transfer): together these keep
+  `--transport auto` from being the default. And a cheaper probe so `--strategy adaptive`
+  stops costing 4–22% on incompressible data.
 - **The refinement threshold is fixed** (64 KiB of basis data per file). With
   `--strategy adaptive` the measured round trip could set it: a smaller gap is worth
   refining on a LAN, not on a long link.

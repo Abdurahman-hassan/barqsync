@@ -7,6 +7,8 @@
 #   lan    1 Gbit,  0.1 ms each way  (~0.2 ms RTT)
 #   wan    100 Mbit, 10 ms each way  (~20 ms RTT)
 #   lossy  20 Mbit,  40 ms each way, 0.5% loss each way (~80 ms RTT, ~1% per round trip)
+#   far    100 Mbit, 40 ms each way  (~80 ms RTT, no loss)
+#   PROFILE-noudp  the same, with every UDP packet dropped (a firewall that blocks QUIC)
 #
 # Source and destination live on tmpfs (see container.sh), so the link is what's measured.
 #
@@ -18,10 +20,12 @@
 #   mid    push of 40 files of 4 MiB, each with 1 KiB changed (old copies on the remote)
 #
 # VARIANTS picks commands by name (default: all), e.g. VARIANTS="rsync ssh quic".
+# `auto` starts every run without --transport auto's memory of hosts where QUIC failed
+# (the first contact); `auto-warm` keeps it between runs.
 set -euo pipefail
 PROFILES=${*:-lan wan lossy}
 WORKLOADS=${WORKLOADS:-small delta noop}
-VARIANTS=${VARIANTS:-rsync ssh ssh-tokio tcp tcp-tokio quic quic-rkyv}
+VARIANTS=${VARIANTS:-rsync ssh ssh-tokio tcp tcp-tokio quic quic-rkyv auto}
 RUNS=${RUNS:-3}
 SCALE=${SCALE:-1}
 FR=/target/release/barqsync
@@ -103,26 +107,42 @@ FAST_SSH_TOKIO="$FR -a -e ssh --net-io=tokio"
 FAST_TCP_TOKIO="$FR -a -e ssh --net-io=tokio --transport tcp --streams 4"
 FAST_QUIC="$FR -a -e ssh --transport quic"
 FAST_QUIC_RKYV="$FR -a -e ssh --transport quic --wire rkyv"
+AUTO_COLD=/tmp/auto-cold
+AUTO_WARM=/tmp/auto-warm
+FAST_AUTO="env BARQSYNC_CACHE_DIR=$AUTO_COLD $FR -a -e ssh --transport auto"
+FAST_AUTO_WARM="env BARQSYNC_CACHE_DIR=$AUTO_WARM $FR -a -e ssh --transport auto"
 
 # Loopback's 64 KiB MTU makes netem drop whole bursts and stall TCP on retransmission
 # timeouts; use an Ethernet MTU and a queue deep enough for the bandwidth-delay product.
 ip link set dev lo mtu 1500
+# TCP still hands netem segments of up to 44 packets (GSO), and a loss drops all of them.
+# GSO=off makes TCP send single packets, so its losses are as random as a real link's
+# (quinn's UDP batches of up to 10 packets stay batched: that errs in TCP's favor).
+if [[ ${GSO:-on} == off ]]; then
+  ip link set dev lo gso_max_segs 1
+fi
 shape() {
   tc qdisc del dev lo root 2>/dev/null || true
-  case "$1" in
+  tc qdisc del dev lo ingress 2>/dev/null || true
+  case "${1%-noudp}" in
     lan) tc qdisc add dev lo root netem delay 0.1ms rate 1gbit limit 20000 ;;
     wan) tc qdisc add dev lo root netem delay 10ms rate 100mbit limit 20000 ;;
     lossy) tc qdisc add dev lo root netem delay 40ms rate 20mbit loss 0.5% limit 20000 ;;
+    far) tc qdisc add dev lo root netem delay 40ms rate 100mbit limit 20000 ;;
     none) ;;
     *) echo "unknown profile $1" >&2; exit 1 ;;
   esac
+  if [[ $1 == *-noudp ]]; then
+    tc qdisc add dev lo handle ffff: ingress
+    tc filter add dev lo parent ffff: protocol ip u32 match ip protocol 17 0xff action drop
+  fi
 }
-trap 'tc qdisc del dev lo root 2>/dev/null || true' EXIT
+trap 'tc qdisc del dev lo root 2>/dev/null || true; tc qdisc del dev lo ingress 2>/dev/null || true' EXIT
 
 {
   echo "# Network benchmarks ($tag)"
   echo
-  echo "rsync $(rsync --version | head -1 | awk '{print $3}') vs barqsync, real sshd on loopback shaped with tc netem; $RUNS runs each."
+  echo "rsync $(rsync --version | head -1 | awk '{print $3}') vs barqsync, real sshd on loopback shaped with tc netem; $RUNS runs each; SCALE=$SCALE; GSO ${GSO:-on}."
   echo
 } > "$REPORT"
 
@@ -162,12 +182,23 @@ for p in $PROFILES; do
         fixed) cmds+=(-n "barqsync --strategy fixed" "$FAST_FIXED $args") ;;
         adaptive) cmds+=(-n "barqsync --strategy adaptive" "$FAST_ADAPT $args") ;;
         quic-adaptive) cmds+=(-n "barqsync quic, adaptive" "$FAST_QUIC_ADAPT $args") ;;
+        auto) cmds+=(-n "barqsync --transport auto" "$FAST_AUTO $args") ;;
+        auto-warm) cmds+=(-n "barqsync auto, host remembered" "$FAST_AUTO_WARM $args") ;;
         *) echo "unknown variant $v" >&2; exit 1 ;;
       esac
     done
+    if [[ " $VARIANTS " == *" auto"* ]]; then
+      # What auto chose on this link, once (-vv; the transfer itself as in the runs).
+      rm -rf "$AUTO_COLD"
+      bash -c "$prep" >/dev/null
+      choice=$($FAST_AUTO -vv $args 2>&1 | grep '^auto:' || true)
+      rm -rf "$AUTO_COLD"
+      echo "   $choice"
+      prep="$prep; rm -rf $AUTO_COLD"
+    fi
     hyperfine --runs "$RUNS" --warmup 0 --prepare "$prep" --style basic "${cmds[@]}" \
       --export-markdown "/tmp/$p-$wl.md" 2>&1 | grep -E "Benchmark|Time|±" || true
-    { echo; echo "### $wl"; echo; cat "/tmp/$p-$wl.md"; } >> "$REPORT"
+    { echo; echo "### $wl"; echo; [[ -n ${choice:-} ]] && { echo "$choice"; echo; }; cat "/tmp/$p-$wl.md"; } >> "$REPORT"
   done
   echo >> "$REPORT"
 done

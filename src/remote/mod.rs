@@ -4,6 +4,7 @@
 //! run the same [`sender`] and [`receiver`] code.
 
 pub mod adapt;
+pub mod auto;
 pub mod client;
 pub mod receiver;
 pub mod sender;
@@ -28,6 +29,8 @@ pub enum Transport {
     /// A QUIC connection: control and metadata on one stream, file data on `--streams`
     /// more; ssh only to start it.
     Quic,
+    /// QUIC on long links when it connects quickly, the ssh pipe otherwise (see [`auto`]).
+    Auto,
 }
 
 impl Transport {
@@ -35,6 +38,11 @@ impl Transport {
     pub const TCP_STREAMS: usize = 4;
     pub const QUIC_STREAMS: usize = 16;
     pub const MAX_STREAMS: usize = 128;
+
+    /// Whether this transport can end up on QUIC (and takes QUIC's stream count).
+    pub fn quic(self) -> bool {
+        matches!(self, Transport::Quic | Transport::Auto)
+    }
 }
 
 /// `--strategy`: adapt routing and compression to a measured link (see [`adapt`]), or not.
