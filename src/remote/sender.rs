@@ -111,7 +111,10 @@ impl Sender<'_> {
     }
 
     fn send(&self, m: Msg) {
-        if let Err(e) = self.out_frames.msg(m) {
+        // Once the run is stopping, failed sends are expected.
+        if let Err(e) = self.out_frames.msg(m)
+            && !self.out_frames.stopped()
+        {
             self.err(format!("sending protocol message failed: {e}"));
         }
     }
@@ -296,7 +299,9 @@ impl Sender<'_> {
         {
             // Data streams first: the receiver finishes once it has seen every
             // stream's end as well as SenderDone (which travels on the ssh connection).
-            if let Err(e) = self.out_frames.end_data_streams() {
+            if let Err(e) = self.out_frames.end_data_streams()
+                && !self.out_frames.stopped()
+            {
                 self.err(format!("closing data streams failed: {e}"));
             }
             let errors = self.errors.load(SeqCst);
@@ -385,10 +390,10 @@ impl Sender<'_> {
                     match r {
                         // Sent bytes were counted as they went.
                         Ok(sent) => crate::progress::done(size.saturating_sub(sent)),
-                        // A failed file doesn't count as transferred; after Ctrl-C the
-                        // closed connection is expected, not worth a message.
+                        // A failed file doesn't count as transferred; once the run is
+                        // stopping (Ctrl-C, a failed peer) that is expected, not worth a message.
                         Err(e) => {
-                            if !fsops::interrupted() {
+                            if !self.out_frames.stopped() {
                                 self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
                             }
                             self.send(Msg::FileEnd { id, ok: false });
@@ -799,8 +804,12 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
                 }
             }
         };
-        // Release deltas still waiting for an answer that won't come.
+        // Release deltas still waiting for an answer that won't come, and tasks waiting to
+        // send to a peer that may no longer read.
         sender.refining.lock().unwrap().clear();
+        if r.is_err() {
+            sender.out_frames.cancel();
+        }
         r
     });
     match result {

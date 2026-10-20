@@ -199,6 +199,11 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     if let Some(r) = reporter {
         r.finish(out);
     }
+    // Interrupted (here, or the server said so), the run ends with 20 even if the transfer
+    // loop saw the peer finish first.
+    let code = if crate::fsops::interrupted() { exit::SIGNAL } else { code };
+    // A run that stopped early waits for nothing it doesn't have to.
+    let clean = code == exit::OK || code == exit::PARTIAL;
     mark("transfer done");
     if chosen == Some(auto::Outcome::Quic)
         && code != exit::SIGNAL
@@ -208,9 +213,9 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
     let _ = if confirmed { conn.finish_confirmed() } else { conn.finish() };
     mark("connection closed");
-    let _ = child.wait();
+    end_shell(&mut child, Duration::from_secs(if clean { 30 } else { 2 }));
     mark("remote shell exited");
-    relay::reap(Duration::from_secs(5));
+    relay::reap(Duration::from_secs(if clean { 5 } else { 1 }));
     out.flush();
     if let Some(s) = stats
         && (opts.stats || opts.verbose > 0)
@@ -222,6 +227,27 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
     out.flush();
     code
+}
+
+/// Wait for the remote shell to exit, at most `grace` (the server exits once its side is
+/// closed); then stop it: SIGTERM, and SIGKILL a second later. A server that stopped
+/// responding must not keep the client.
+fn end_shell(child: &mut Child, grace: Duration) {
+    let exited_by = |child: &mut Child, deadline: Instant| loop {
+        match child.try_wait() {
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => return false,
+            _ => return true,
+        }
+    };
+    if exited_by(child, Instant::now() + grace) {
+        return;
+    }
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    if !exited_by(child, Instant::now() + Duration::from_secs(1)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// `auto`, after a transfer over QUIC: remember a clean link (the ssh pipe is then used for

@@ -77,6 +77,8 @@ pub fn run() -> i32 {
             }
         }
     };
+    // Interrupted (here, or the client said so): 20, whatever the transfer loop saw.
+    let code = if crate::fsops::interrupted() { exit::SIGNAL } else { code };
     mark("transfer done");
     drop(out);
     let _ = if confirmed { conn.finish_confirmed() } else { conn.finish() };

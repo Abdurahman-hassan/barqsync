@@ -1068,7 +1068,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         }
         let mut streams_ended = 0;
         let mut sender_done: Option<u64> = None;
-        loop {
+        let r = loop {
             if let Some(errors) = sender_done
                 && streams_ended == streams
             {
@@ -1151,7 +1151,12 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             if let Err(e) = r {
                 engine.err(format!("receiving file data failed: {e}"));
             }
+        };
+        // Stopping early: tasks waiting to send to a peer that may no longer read give up.
+        if r.1.is_some() {
+            conn.out.cancel();
         }
+        r
     });
 
     if let Some((index, scan)) = dst_scan {

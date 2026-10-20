@@ -73,6 +73,14 @@
   `--delete` removed the other sources' files (only `b`'s survived), and remotely the
   sources raced each other. This covers local transfers with both scanners, pushes and
   pulls, named items (`a/ c dst/`) and `-R` paths from several bases.
+- Ctrl-C and a lost connection now end a remote transfer within a few seconds on both
+  sides, with rsync's exit codes, and leave no `barqsync --server` or `--stream-relay`
+  running. Ctrl-C with a server that stopped reading used to hang the client forever;
+  an interrupted client could exit 0, and a client whose server was interrupted exited 12
+  (both now 20, as rsync does). An interrupted side now tells the other one, which stops
+  as well. A connection whose writing side fails (a pipe cut between the two) is now
+  noticed instead of waiting forever for answers; closing a connection and waiting for
+  the remote shell and the stream relays are bounded.
 
 ### Security
 
