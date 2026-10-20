@@ -53,13 +53,18 @@ pub fn adjust_listing(opts: &Options, dir: &Path, ents: Vec<DirEnt>, err: &mut d
         .collect()
 }
 
-/// `--remove-source-files`: delete a source file the receiver now has, unless it changed
-/// since it was listed (rsync's check). Returns the error message on failure.
-pub fn remove_source(opts: &Options, path: &Path, size: u64, mtime: i64) -> Result<(), Vec<u8>> {
+/// `--remove-source-files`: delete an unchanged source using the sender's own
+/// metadata snapshot, never facts provided by the peer. Path confinement and
+/// protection against concurrent directory replacement are separate concerns.
+pub fn remove_source(opts: &Options, path: &Path, expected: &Meta) -> Result<(), Vec<u8>> {
+    if !opts.remove_source_files || opts.dry_run {
+        return Err(path_msg("source removal is not authorized: ", path, ""));
+    }
     let cur = if opts.copy_links { fsops::stat(path) } else { fsops::lstat(path) };
     match cur {
         Ok(c) if c.kind == Kind::Dir => return Err(path_msg("sender failed to remove ", path, ": Is a directory")),
-        Ok(c) if c.kind != Kind::File || (c.size == size && c.mtime == mtime) => {}
+        Ok(c) if (c.kind, c.dev, c.ino, c.size, c.mtime, c.mtime_ns)
+            == (expected.kind, expected.dev, expected.ino, expected.size, expected.mtime, expected.mtime_ns) => {}
         Ok(_) => return Err(path_msg("ERROR: Skipping sender remove for changed file: ", path, "")),
         Err(e) => return Err(path_msg("sender failed to remove ", path, format!(": {e}"))),
     }
@@ -118,6 +123,21 @@ pub(crate) enum AltFile {
 }
 
 impl Engine<'_> {
+    /// Local sources and destinations share an inode namespace. Remote source
+    /// paths are display paths, so their dev/ino values must never be compared
+    /// with this machine's filesystem identities.
+    pub(crate) fn check_distinct(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        if self.remote.is_some() {
+            return Ok(());
+        }
+        let source = if self.opts.copy_links { fsops::stat(src)? } else { fsops::lstat(src)? };
+        match fsops::lstat(dst) {
+            Ok(destination) => fsops::ensure_distinct(&source, &destination),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Record the destination directory and resolve the directories that are relative
     /// to it (`--link-dest`, `--compare-dest`, `--backup-dir`).
     pub fn set_dest(&mut self, dest_root: &Path) {
@@ -238,7 +258,8 @@ impl Engine<'_> {
                 }
                 if !self.dry() {
                     let (dir, name) = split_dst(dst_path);
-                    let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&p, tmp))
+                    let r = self.backup_if_present(dst_path, false)
+                        .and_then(|()| fsops::with_temp(dir, name, |tmp| fs::hard_link(&p, tmp)))
                         .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, dst_path)));
                     if let Err(e) = r {
                         self.err(path_msg("link \"", dst_path, format!("\" failed: {e}")));
@@ -247,11 +268,14 @@ impl Engine<'_> {
                 }
             } else {
                 self.out.item(rel, Kind::File, Link::None, Change::default(), false);
-                if dst_meta.is_some() && !self.dry() {
-                    let _ = fs::remove_file(dst_path);
+                if dst_meta.is_some() && !self.dry()
+                    && let Err(e) = self.remove_or_backup(dst_path)
+                {
+                    self.err(path_msg("remove \"", dst_path, format!("\" failed: {e}")));
+                    return AltFile::Done;
                 }
             }
-            self.source_done(root, src_path, rel, src);
+            self.source_done(root, src_path, dst_path, rel, src);
             return AltFile::Done;
         }
         if let Some((p, m)) = same_data {
@@ -270,7 +294,7 @@ impl Engine<'_> {
                 self.not_written(x);
                 return AltFile::Done;
             }
-            self.source_done(root, src_path, rel, src);
+            self.source_done(root, src_path, dst_path, rel, src);
             return AltFile::Done;
         }
         match basis {
@@ -281,6 +305,7 @@ impl Engine<'_> {
 
     /// Copy an alt-dest file with identical data into place, with the source's attributes.
     fn copy_alt(&self, alt: &Path, dst_path: &Path, x: &Src) -> io::Result<()> {
+        self.backup_if_present(dst_path, false)?;
         let src = x.meta;
         let mode = self.new_mode(src);
         let (uid, gid) = (self.rules.wanted_uid(src), self.rules.wanted_gid(src));
@@ -388,7 +413,7 @@ impl Engine<'_> {
                 let _ = fs::remove_dir(dir);
             }
         }
-        self.source_done(job.root, &job.src_path, &job.rel, &job.meta);
+        self.source_done(job.root, &job.src_path, &job.dst_path, &job.rel, &job.meta);
     }
 
     // -----------------------------------------------------------------------
@@ -396,14 +421,17 @@ impl Engine<'_> {
     // -----------------------------------------------------------------------
 
     /// The receiver has this entry: with `--remove-source-files`, the sender removes it.
-    pub(crate) fn source_done(&self, root: u16, src_path: &Path, rel: &[u8], meta: &Meta) {
+    pub(crate) fn source_done(&self, root: u16, src_path: &Path, dst_path: &Path, rel: &[u8], meta: &Meta) {
         if !self.opts.remove_source_files || self.dry() {
             return;
         }
         if let Some(r) = &self.remote {
             return r.synced(root, rel, meta);
         }
-        match remove_source(self.opts, src_path, meta.size, meta.mtime) {
+        if let Err(e) = self.check_distinct(src_path, dst_path) {
+            return self.err(path_msg("sender failed to remove ", src_path, format!(": {e}")));
+        }
+        match remove_source(self.opts, src_path, meta) {
             Ok(()) if self.out.verbose() >= 2 => self.out.info([b"sender removed ", rel].concat()),
             Ok(()) => {}
             Err(m) => self.err(m),
@@ -434,14 +462,16 @@ impl Engine<'_> {
 
     fn prepare_backup(&self, dst: &Path) -> io::Result<PathBuf> {
         let b = self.backup_path(dst);
+        let original = fsops::lstat(dst)?;
+        match fsops::lstat(&b) {
+            Ok(backup) => fsops::ensure_distinct(&original, &backup)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         if self.backup_root.is_some()
             && let Some(parent) = b.parent()
         {
             fs::create_dir_all(parent)?;
-        }
-        match fs::remove_file(&b) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
         }
         Ok(b)
     }
@@ -457,29 +487,54 @@ impl Engine<'_> {
     /// `--backup` before `dst` is replaced: keep the old version under its backup name.
     /// It is hard-linked (or copied, with `copy` or across filesystems), so `dst` stays in
     /// place until the new version is renamed over it.
-    pub(crate) fn backup_existing(&self, dst: &Path, copy: bool) {
+    pub(crate) fn backup_existing(&self, dst: &Path, copy: bool) -> io::Result<()> {
         if !self.opts.backup || self.dry() {
-            return;
+            return Ok(());
         }
-        let r = self.prepare_backup(dst).and_then(|b| {
-            let linked = !copy && fs::hard_link(dst, &b).is_ok();
-            if !linked {
-                fs::copy(dst, &b)?;
-                if let Ok(m) = fsops::lstat(dst) {
-                    fsops::set_mtime(&b, m.mtime, m.mtime_ns)?;
-                }
+        let b = self.prepare_backup(dst)?;
+        let m = fsops::lstat(dst)?;
+        let (dir, name) = split_dst(&b);
+        // Keep the previous backup until its replacement has been fully made.
+        let (tmp, ()) = fsops::with_temp(dir, name, |tmp| {
+            if !copy && fs::hard_link(dst, tmp).is_ok() {
+                return Ok(());
             }
-            Ok(b)
-        });
-        match r {
-            Ok(b) => self.report_backup(dst, &b),
-            Err(e) => self.err(path_msg("make_backup \"", dst, format!("\" failed: {e}"))),
-        }
+            match m.kind {
+                Kind::File => {
+                    let source = File::open(dst)?;
+                    let target = fsops::create_new(tmp, m.mode)?;
+                    io::copy(&mut &source, &mut &target)?;
+                    fsops::fchmod(&target, m.mode)?;
+                    fsops::set_fd_mtime(&target, m.mtime, m.mtime_ns)?;
+                    if self.opts.fsync {
+                        target.sync_all()?;
+                    }
+                }
+                Kind::Symlink => std::os::unix::fs::symlink(fs::read_link(dst)?, tmp)?,
+                Kind::Fifo | Kind::CharDev | Kind::BlockDev => fsops::mknod(tmp, m.kind, m.mode, m.rdev)?,
+                _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported backup file type")),
+            }
+            Ok(())
+        })?;
+        finish_temp(&tmp, fsops::check_interrupt().and_then(|()| fs::rename(&tmp, &b)))?;
+        self.report_backup(dst, &b);
+        Ok(())
     }
 
-    pub(crate) fn backup_existing_file(&self, job: &FileJob) {
-        if self.opts.backup && job.dst_meta.is_some_and(|d| d.kind != Kind::Dir) {
-            self.backup_existing(&job.dst_path, self.opts.inplace);
+    pub(crate) fn backup_existing_file(&self, job: &FileJob) -> io::Result<()> {
+        self.backup_if_present(&job.dst_path, self.opts.inplace)
+    }
+
+    /// Recheck at replacement time; the planning snapshot may be stale.
+    pub(crate) fn backup_if_present(&self, dst: &Path, copy: bool) -> io::Result<()> {
+        if !self.opts.backup || self.dry() {
+            return Ok(());
+        }
+        match fsops::lstat(dst) {
+            Ok(m) if m.kind != Kind::Dir => self.backup_existing(dst, copy),
+            Ok(_) => Err(io::Error::new(io::ErrorKind::IsADirectory, "cannot back up a directory as a file")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         }
     }
 

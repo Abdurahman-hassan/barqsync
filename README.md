@@ -149,6 +149,12 @@ Every option, and where barqsync differs from rsync:
 - **macOS and Linux only.**
 - **Remote copies need barqsync on both machines,** like rsync, or `--remote-path` to point
   at it. Both ends must run the same release line.
+- **Remote paths:** use `host:path` or `'user@[::1]:path'` for IPv6 (quote brackets in
+  your shell). Scoped IPv6 such as `'[fe80::1%en0]:path'` is supported. An empty path
+  means the remote home; `~/` and known `~user/` prefixes resolve on the remote host.
+  Spaces, quotes and other filename bytes are literal. Prefix local names containing
+  a colon with `./`. User names and host aliases accept ASCII letters, digits and
+  `._-+`, with no leading `-`; configure other login names in SSH configuration.
 - **Not supported yet:** daemon mode (`rsync://`, `host::module`) and a few rarer flags such
   as `--bwlimit` and `--fuzzy`.
 - **`-X` and `-A` follow rsync's rules** on each system (which attribute namespaces are

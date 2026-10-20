@@ -114,7 +114,8 @@ pub struct StreamOffer {
     pub token: [u8; 32],
 }
 
-/// `--remove-source-files`: `(rel, size, mtime)` of entries the receiver now has.
+/// Protocol 10 acknowledgement payload. The sender uses `rel` only as a ledger key;
+/// peer-supplied `size` and `mtime` are retained for compatibility, not authority.
 pub type SyncedFiles = Vec<(Vec<u8>, u64, i64)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,7 +187,8 @@ pub enum Msg {
     /// which entries' attribute values it needs in full to update them in place.
     Need { dir: u32, files: Vec<NeedReq>, xattrs: Vec<u32> },
     /// `--remove-source-files`: these entries are on the receiver now. `(rel, size, mtime)`
-    /// relative to the root; the sender removes them unless they changed meanwhile.
+    /// relative to the root. The sender validates its own ledger and defers removal
+    /// until successful session completion.
     Synced { root: u16, files: SyncedFiles },
     ReceiverDone { stats: StatsSnapshot },
 }

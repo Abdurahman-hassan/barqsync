@@ -620,7 +620,7 @@ impl RemoteState {
     fn file_begin(&self, eng: &Engine, id: u64, size: u64, job: FileJob) -> io::Result<()> {
         // A whole file is all literal data, as rsync counts it.
         Stats::add(&eng.stats.literal_bytes, size);
-        eng.backup_existing_file(&job);
+        eng.backup_existing_file(&job)?;
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let hint = cache::Writer::new(&file, size);
@@ -646,7 +646,7 @@ impl RemoteState {
         let basis = File::open(job.basis_path())?;
         let basis_size = basis.metadata()?.len();
         check::copies(&copies, size, basis_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid delta: {e}")))?;
-        eng.backup_existing_file(&job);
+        eng.backup_existing_file(&job)?;
         let d = Delta { size, ops: copies };
         let matched: u64 = d.ops.iter().map(Op::len).sum();
         Stats::add(&eng.stats.delta_files, 1);
@@ -889,7 +889,10 @@ impl RemoteState {
                 Ok(job) => {
                     crate::progress::done(job.meta.size);
                     Stats::add(&eng.stats.literal_bytes, len as u64);
-                    eng.backup_existing_file(&job);
+                    if let Err(e) = eng.backup_existing_file(&job) {
+                        report(&job.dst_path, e);
+                        continue;
+                    }
                     let (dir, name) = split_dst(&job.dst_path);
                     let tmp = dir.join(fsops::temp_name(name));
                     fsops::register_temp(&tmp);
@@ -944,7 +947,7 @@ impl RemoteState {
     }
 
     fn write_small(&self, eng: &Engine, job: FileJob, bytes: &[u8]) -> io::Result<()> {
-        eng.backup_existing_file(&job);
+        eng.backup_existing_file(&job)?;
         let (mode, _, _) = eng.target_attrs(&job);
         let (file, path, rename, registered, created) = self.open_target(eng, &job, mode)?;
         let size = bytes.len() as u64;
@@ -1178,111 +1181,111 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     let engine = &engine;
     let remote = engine.remote.as_ref().unwrap();
     let streams = conn.data_streams_in();
-    let (sender_errors, failure) = pool.install(|| {
-        rayon::scope(|s| {
-            {
-                let mut map = remote.slots.lock().unwrap();
-                for (r, slot) in slots {
-                    map.insert((r, Vec::new()), slot);
-                }
+    // Keep blocking protocol coordination on the caller; every configured
+    // worker remains available for finite scan, hash and write tasks.
+    let (sender_errors, failure) = pool.in_place_scope(|s| {
+        {
+            let mut map = remote.slots.lock().unwrap();
+            for (r, slot) in slots {
+                map.insert((r, Vec::new()), slot);
             }
-            let mut streams_ended = 0;
-            let mut sender_done: Option<u64> = None;
-            loop {
-                if let Some(errors) = sender_done
-                    && streams_ended == streams
-                {
-                    break (errors, None);
+        }
+        let mut streams_ended = 0;
+        let mut sender_done: Option<u64> = None;
+        loop {
+            if let Some(errors) = sender_done
+                && streams_ended == streams
+            {
+                break (errors, None);
+            }
+            let frame = match recv_unless(conn, &remote.failed) {
+                Ok(f) => f,
+                // After Ctrl-C, which also stops ssh, a closed connection is expected.
+                Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
+                Err(Stop::Io(_)) if fsops::interrupted() => break (0, Some(exit::SIGNAL)),
+                Err(Stop::Io(_)) if remote.failed.reason().is_some() => {
+                    out.error(remote.failed.reason().unwrap_or_default());
+                    break (0, Some(exit::PROTOCOL));
                 }
-                let frame = match recv_unless(conn, &remote.failed) {
-                    Ok(f) => f,
-                    // After Ctrl-C, which also stops ssh, a closed connection is expected.
-                    Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
-                    Err(Stop::Io(_)) if fsops::interrupted() => break (0, Some(exit::SIGNAL)),
-                    Err(Stop::Io(_)) if remote.failed.reason().is_some() => {
-                        out.error(remote.failed.reason().unwrap_or_default());
-                        break (0, Some(exit::PROTOCOL));
-                    }
-                    Err(Stop::Io(e)) => {
-                        out.error(format!("connection error: {e}"));
-                        break (0, Some(exit::PROTOCOL));
-                    }
-                };
-                let r = match frame {
-                    Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
-                    Frame::Msg(m) => match m {
-                        Msg::DirBatch { root, dir, rel, entries, sums } => match listings.take(root, dir, &rel, &entries, &sums) {
-                            Ok(()) => {
-                                remote.on_batch(s, engine, root, dir, rel, entries, sums);
-                                Ok(())
-                            }
-                            Err(e) => {
-                                let msg = format!("protocol error: {e}");
-                                out.error(&msg);
-                                let _ = conn.msg(Msg::Fatal { msg });
-                                break (0, Some(exit::PROTOCOL));
-                            }
-                        },
-                        Msg::IdNames { users, groups } => {
-                            remote.ids.lock().unwrap().add(&users, &groups);
+                Err(Stop::Io(e)) => {
+                    out.error(format!("connection error: {e}"));
+                    break (0, Some(exit::PROTOCOL));
+                }
+            };
+            let r = match frame {
+                Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
+                Frame::Msg(m) => match m {
+                    Msg::DirBatch { root, dir, rel, entries, sums } => match listings.take(root, dir, &rel, &entries, &sums) {
+                        Ok(()) => {
+                            remote.on_batch(s, engine, root, dir, rel, entries, sums);
                             Ok(())
                         }
-                        Msg::FileBegin { id, size, xattrs } => remote.begin(engine, id, xattrs, |job| remote.file_begin(engine, id, size, job)),
-                        Msg::DeltaBegin { id, size, copies, xattrs } => {
-                            remote.begin(engine, id, xattrs, |job| remote.delta_begin(engine, id, size, copies, job))
-                        }
-                        Msg::Xattrs { id, xattrs } => {
-                            remote.on_xattrs(engine, id, xattrs);
-                            Ok(())
-                        }
-                        Msg::Refine { id, grain, gaps } => {
-                            remote.refine(s, id, grain, gaps);
-                            Ok(())
-                        }
-                        Msg::FileEnd { id, ok } => {
-                            remote.file_end(engine, id, ok);
-                            Ok(())
-                        }
-                        Msg::SmallPack { files, blob, xattrs } => {
-                            remote.acquire_pack();
-                            s.spawn(move |_| {
-                                remote.small_pack(engine, files, blob, xattrs);
-                                remote.release_pack();
-                            });
-                            Ok(())
-                        }
-                        Msg::ScanDone { .. } => {
-                            remote.on_scan_done();
-                            Ok(())
-                        }
-                        Msg::SenderDone { errors } => {
-                            crate::timing::mark("SenderDone received");
-                            sender_done = Some(errors);
-                            Ok(())
-                        }
-                        Msg::StreamEnd => {
-                            streams_ended += 1;
-                            Ok(())
-                        }
-                        Msg::Log { stderr, escape, text } => {
-                            out.print_forwarded(stderr, escape, &text);
-                            Ok(())
-                        }
-                        Msg::Fatal { msg } => {
-                            out.error(format!("remote: {msg}"));
-                            break (0, Some(exit::PROTOCOL));
-                        }
-                        other => {
-                            out.error(format!("protocol error: unexpected {other:?}"));
+                        Err(e) => {
+                            let msg = format!("protocol error: {e}");
+                            out.error(&msg);
+                            let _ = conn.msg(Msg::Fatal { msg });
                             break (0, Some(exit::PROTOCOL));
                         }
                     },
-                };
-                if let Err(e) = r {
-                    engine.err(format!("receiving file data failed: {e}"));
-                }
+                    Msg::IdNames { users, groups } => {
+                        remote.ids.lock().unwrap().add(&users, &groups);
+                        Ok(())
+                    }
+                    Msg::FileBegin { id, size, xattrs } => remote.begin(engine, id, xattrs, |job| remote.file_begin(engine, id, size, job)),
+                    Msg::DeltaBegin { id, size, copies, xattrs } => {
+                        remote.begin(engine, id, xattrs, |job| remote.delta_begin(engine, id, size, copies, job))
+                    }
+                    Msg::Xattrs { id, xattrs } => {
+                        remote.on_xattrs(engine, id, xattrs);
+                        Ok(())
+                    }
+                    Msg::Refine { id, grain, gaps } => {
+                        remote.refine(s, id, grain, gaps);
+                        Ok(())
+                    }
+                    Msg::FileEnd { id, ok } => {
+                        remote.file_end(engine, id, ok);
+                        Ok(())
+                    }
+                    Msg::SmallPack { files, blob, xattrs } => {
+                        remote.acquire_pack();
+                        s.spawn(move |_| {
+                            remote.small_pack(engine, files, blob, xattrs);
+                            remote.release_pack();
+                        });
+                        Ok(())
+                    }
+                    Msg::ScanDone { .. } => {
+                        remote.on_scan_done();
+                        Ok(())
+                    }
+                    Msg::SenderDone { errors } => {
+                        crate::timing::mark("SenderDone received");
+                        sender_done = Some(errors);
+                        Ok(())
+                    }
+                    Msg::StreamEnd => {
+                        streams_ended += 1;
+                        Ok(())
+                    }
+                    Msg::Log { stderr, escape, text } => {
+                        out.print_forwarded(stderr, escape, &text);
+                        Ok(())
+                    }
+                    Msg::Fatal { msg } => {
+                        out.error(format!("remote: {msg}"));
+                        break (0, Some(exit::PROTOCOL));
+                    }
+                    other => {
+                        out.error(format!("protocol error: unexpected {other:?}"));
+                        break (0, Some(exit::PROTOCOL));
+                    }
+                },
+            };
+            if let Err(e) = r {
+                engine.err(format!("receiving file data failed: {e}"));
             }
-        })
+        }
     });
 
     if let Some((index, scan)) = dst_scan {
