@@ -540,13 +540,18 @@ impl Engine<'_> {
                     Kind::File => {
                         drop(fsops::copy_new(dst, tmp, d.size, !self.opts.no_clone, d.mode)?);
                         fsops::chmod(tmp, d.mode)?;
-                        fsops::set_mtime(tmp, d.mtime, d.mtime_ns)
+                        fsops::set_mtime(tmp, d.mtime, d.mtime_ns)?;
+                        if self.opts.fsync {
+                            fsops::fsync_path(tmp)?;
+                        }
+                        Ok(())
                     }
                     Kind::Symlink => std::os::unix::fs::symlink(fs::read_link(dst)?, tmp),
                     kind => fsops::mknod(tmp, kind, d.mode, d.rdev),
                 }
             })?;
-            finish_temp(&tmp, fs::rename(&tmp, &b))?;
+            // Interrupted: the previous backup stays.
+            finish_temp(&tmp, fsops::check_interrupt().and_then(|()| fs::rename(&tmp, &b)))?;
         }
         self.report_backup(dst, &b);
         Ok(())
