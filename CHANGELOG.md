@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.4.1 - 2026-10-21
+## Unreleased
+
+### Fixed
+
+- A remote transfer whose other side was interrupted now ends with exit 20, as rsync
+  does. Before, it could end with exit 12 and a connection error such as `peer closed
+  connection without sending TLS close_notify`. This happened with parallel streams
+  (`--streams`, relayed streams, QUIC) when the data streams' end arrived before the
+  interrupt notice on the control connection. Over the ssh pipe alone, the same
+  happened when a write to the stopped side failed first. Now a data stream that ends
+  early, or a failed write, waits up to 2 seconds for the control connection to say why
+  (interrupted, a fatal error, or closed). A side that stops also sends its notice
+  before it closes its data streams.
 
 ### Fixed
 

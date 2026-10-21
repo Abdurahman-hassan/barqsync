@@ -16,7 +16,6 @@ pub mod streams;
 
 use crate::fsops;
 use crate::proto::{Conn, Frame, FrameSender, Msg};
-use crossbeam_channel::RecvTimeoutError;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::time::Duration;
@@ -152,24 +151,16 @@ fn recv_checked(conn: &Conn, deadline: Option<std::time::Instant>, failed: Optio
         if let Some(why) = failed.and_then(SendFailure::reason) {
             return Err(Stop::Io(io::Error::other(String::from_utf8_lossy(why).into_owned())));
         }
-        match conn.rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(Frame::Msg(Msg::Interrupted))) => {
+        match conn.recv_timeout(Duration::from_millis(200)) {
+            Ok(Some(Frame::Msg(Msg::Interrupted))) => {
                 PEER_INTERRUPTED.store(true, SeqCst);
                 fsops::raise_interrupt();
                 eprintln!("barqsync: the remote side was interrupted");
                 return Err(Stop::Interrupted);
             }
-            Ok(Ok(f)) => return Ok(f),
-            Ok(Err(e)) => return Err(Stop::Io(e)),
-            // Nothing pending: a peer this side can no longer write to won't answer.
-            Err(RecvTimeoutError::Timeout) => {
-                if let Some(e) = conn.out.write_failure() {
-                    return Err(Stop::Io(e));
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(Stop::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed by peer")));
-            }
+            Ok(Some(f)) => return Ok(f),
+            Ok(None) => {}
+            Err(e) => return Err(Stop::Io(e)),
         }
     }
 }
