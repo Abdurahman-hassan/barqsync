@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time setup (as root, once per boot) for the fast_rsync comparison in
-# fast_rsync_comparison.md: builds barqsync and the harness, puts the datasets on a tmpfs
+# docs/fast-rsync-comparison.md: builds barqsync and the harness, puts the datasets on a tmpfs
 # at $W, and starts an sshd in its own network namespace ("remote") reached over a veth
 # pair, plus a relay that adds 10 ms each way for the wan profile.
 #

@@ -1,11 +1,16 @@
 # barqsync: audit findings and implementation plan
 
+> **Status, 21 October 2026:** all 12 P1 findings are fixed in 0.4.0 (PRs 15–19). Some parts
+> are partial, and the P2 and P3 items are still open. The [tracker](README.md) shows the
+> state of each part, and [p1-coordination.md](p1-coordination.md) shows where each finding
+> landed. The text below is the audit as written against v0.3.0.
+
 Reviewed **20 October 2026** against **v0.3.0**, commit
 `f9f8d8d87855c3ac8d24c8d852ca6c37a80ecc69`.
 The existing checkout matched the public repository's HEAD, verified with
 `git ls-remote`. At the time of this review, this document proposed fixes and production code
 had not been changed. Current implementation status and verification are tracked
-in [docs/implementation](docs/implementation/README.md); the checkout has since
+in [docs/audit](README.md); the checkout has since
 been reconciled with v0.4.0. The findings and evidence below retain their original
 v0.3.0 context.
 
@@ -26,7 +31,7 @@ working SSH connection is sufficient; disabling the firewall must never be requi
   are environment restrictions, not product bugs.
 - Additional isolated probes reproduced failures outside the existing test coverage.
   Their source and observed output are in
-  [docs/review/2026-10-20](docs/review/2026-10-20/).
+  [review/2026-10-20](review/2026-10-20/).
 - Checked all **203 registry package versions** in `Cargo.lock` against OSV.
   The only returned advisory was the informational, unmaintained
   `atomic-polyfill` advisory discussed under MAINT-01.
@@ -689,25 +694,25 @@ The CLI probe kills only its own process group when a test exceeds its deadline.
 
 These historical probes target the audited v0.3.0 commit (`f9f8d8d`), including
 its public Rust APIs. Run them in a separate checkout of that revision. Current
-regression tests and commands are listed in [the work records](docs/implementation/README.md).
+regression tests and commands are listed in [the work records](README.md).
 
 From the audit checkout root:
 
 ```bash
 cargo build --locked
 
-rustc --edition=2024 docs/review/2026-10-20/protocol_probes.rs \
+rustc --edition=2024 docs/audit/review/2026-10-20/protocol_probes.rs \
   -L dependency=target/debug/deps \
   --extern barqsync=target/debug/libbarqsync.rlib \
   -o /tmp/barqsync-review-protocol-probes
 /tmp/barqsync-review-protocol-probes
 
 # Set RSYNC if the first rsync on PATH is not rsync 3.x.
-python3 docs/review/2026-10-20/cli_probes.py
+python3 docs/audit/review/2026-10-20/cli_probes.py
 
 env -u BARQSYNC_TEST_REMOTE cargo test --locked --offline
 cargo clippy --locked --offline --all-targets -- -D warnings
 ```
 
-See [recorded results](docs/review/2026-10-20/results.txt) for the original
+See [recorded results](review/2026-10-20/results.txt) for the original
 outputs, including the dependency query and environment limits.

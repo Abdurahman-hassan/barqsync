@@ -3,7 +3,7 @@
 An investigation of how barqsync 0.1.1 (this repository at `c18f18d`) compares with
 [fast_rsync](https://crates.io/crates/fast_rsync) 0.2.0, first by reading both crates, then by
 measuring real transfers of the same data over a shaped link, with rsync 3.2.7 as a reference.
-Done on 2026-10-18. The harness is in [`bench/fast_rsync/`](bench/fast_rsync/), the raw results in
+Done on 2026-10-18. The harness is in [`bench/fast_rsync/`](../bench/fast_rsync/), the raw results in
 `bench/results/fast_rsync-*-20261018.*`. Sections 1–8 describe barqsync 0.1.1. The fixes they
 led to came in two steps: M15 ([section 9](#9-after-the-fixes-m15)) fixed scattered edits but
 slowed appends, and M16 ([section 10](#10-two-level-delta-m16)), the current design, is as fast
@@ -79,7 +79,7 @@ core and can patch a clone instead of rewriting the file.
 
 ### Harness: `frsync`
 
-fast_rsync has no transport, so [`frsync`](bench/fast_rsync/src/bin/frsync.rs) wraps it in the
+fast_rsync has no transport, so [`frsync`](../bench/fast_rsync/src/bin/frsync.rs) wraps it in the
 smallest fair push tool, using the same ssh pipe as barqsync and rsync and one round trip for
 the whole transfer:
 
@@ -95,7 +95,7 @@ the whole transfer:
 Signatures, diffs and applies run in parallel across files with rayon; each file's diff is
 single-threaded, as fast_rsync is.
 
-[`engine`](bench/fast_rsync/src/bin/engine.rs) compares the two delta engines in-process on one
+[`engine`](../bench/fast_rsync/src/bin/engine.rs) compares the two delta engines in-process on one
 file pair, without the network: for barqsync it makes the same signature and diff calls as a
 remote push (receiver's basis signature, sender's signature and diff), then rebuilds the new
 file from the delta.
@@ -107,13 +107,13 @@ file from the delta.
 - **lan**: 1 Gbit, no added delay.
 - **wan**: 100 Mbit, 20 ms round trip.
 - The VM's kernel has no `netem`. Bandwidth is limited with `tbf` on both veth ends; the wan
-  delay comes from [`relay.py`](bench/fast_rsync/relay.py), a TCP relay in front of sshd that
+  delay comes from [`relay.py`](../bench/fast_rsync/relay.py), a TCP relay in front of sshd that
   holds every chunk for 10 ms in each direction. That models round-trip latency but not TCP slow
   start or loss on a long path; it affects the three tools alike.
 - Checked with `ssh … cat`: 50 MB took 4.76 s at 100 Mbit (4.2 s of data plus ssh setup), 0.73 s
   at 1 Gbit and 0.44 s unshaped; the relay adds ~160 ms to an ssh login.
 
-### Datasets ([`gen.py`](bench/fast_rsync/gen.py))
+### Datasets ([`gen.py`](../bench/fast_rsync/gen.py))
 
 | Name | Old copy on the receiver | New copy on the sender |
 | --- | --- | --- |
@@ -217,7 +217,7 @@ does not match and the checksum rolls byte by byte. barqsync's signature diff ta
 
 ## 5. Why barqsync sends more: granularity
 
-[`granularity`](bench/fast_rsync/src/bin/granularity.rs) runs barqsync's own delta functions
+[`granularity`](../bench/fast_rsync/src/bin/granularity.rs) runs barqsync's own delta functions
 with smaller units on the same files (literal bytes the sender would send; signature size as a
 raw estimate):
 
@@ -335,7 +335,7 @@ Conclusions (1) and (2) are implemented:
 To avoid tuning on the very datasets being reported, three more were added to `gen.py`:
 `tar` (a 54 MB archive of 4,000 text files, 1–10 lines inserted into 50 of them), `csv` (78 MB,
 300 rows rewritten with fields of another length) and `scatter` (256 MiB, 3,000 writes of 64
-bytes in place). [`rules`](bench/fast_rsync/src/bin/rules.rs) then ran barqsync's own signature,
+bytes in place). [`rules`](../bench/fast_rsync/src/bin/rules.rs) then ran barqsync's own signature,
 diff and merge functions with five sizing rules and measured what would cross the link: the
 postcard-encoded signature plus literal data and ops (`bench/results/fast_rsync-rules-20261018.tsv`).
 Three of the rules, for what barqsync sends (blocks for a same-size file; for a resized one,
@@ -460,7 +460,7 @@ every dataset but `append`, where they are equal.
 - **Local deltas:** a 1 GiB file with 50 × 1 MiB overwritten, synced locally with
   `--no-whole-file`, took the same time before and after (medians 1.82 and 1.85 s over 6
   alternating runs, VM noise 0.7–4.2 s) with 5% less literal data.
-- **The 6 MiB examples** (`IMPLEMENTATION.md`, Delta transfer), re-measured on the same files with both builds: 4 KiB
+- **The 6 MiB examples** ([implementation.md](implementation.md#delta-transfer), Delta transfer), re-measured on the same files with both builds: 4 KiB
   overwritten 64 KiB → 8 KiB, 777 bytes inserted 57.6 → 8.0 KB, 12 KB removed 344.7 → 4.6 KB,
   appends and truncation unchanged.
 - **Tests:** 152 pass (4 new: the sizing rule, chunk-size validation, a grown file with

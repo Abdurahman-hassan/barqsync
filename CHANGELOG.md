@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- All documentation except the README and this changelog moved into `docs/`, with an index
+  in `docs/README.md`:
+  - `IMPLEMENTATION.md` is now `docs/implementation.md`;
+  - `IMPLEMENTATION_PLAN.md` is now `docs/audit/findings.md`;
+  - `REMAINING.md` is now `docs/remaining.md`;
+  - the original and as-built plans and the fast_rsync comparison have shorter names;
+  - the audit's work records and probes are under `docs/audit/`.
+
 ## 0.4.0 - 2026-10-21
 
 ### Compatibility

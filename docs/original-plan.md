@@ -1,3 +1,7 @@
+> The original plan barqsync started from, kept as written. What was actually built and
+> measured, section by section, is in [as-built-plan.md](as-built-plan.md). How it works
+> today is in [implementation.md](implementation.md).
+
 # Project Blueprint: Building a Faster-Than-`rsync` Engine in Rust
 
 ## 1. Executive Summary & Performance Targets
