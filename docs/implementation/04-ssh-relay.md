@@ -57,8 +57,10 @@ connections instead (`src/remote/relay.rs`):
 - **Messages.** `-v` says "… refused a direct connection (…), using N streams through ssh".
   When relays fail too, the message gives both reasons:
   "could not connect to … (…; through ssh: …), using the ssh connection".
-- **Protocol.** No protocol change. A 0.3.0 server doesn't know `--stream-relay`, so a
-  newer client falls back to the ssh pipe as before.
+- **Protocol.** The relay changed no wire format, and every 0.4.x client and server knows
+  `--stream-relay`. It doesn't reach older servers, though: 0.4.0 also moved to protocol
+  10 (PR 12). A 0.4.x client and a 0.3.x server therefore stop at the handshake with a
+  version mismatch, before any stream is set up. Both machines need 0.4.x.
 
 ### A bug found on the way: `io::copy` in the relay
 

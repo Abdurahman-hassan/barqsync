@@ -123,29 +123,51 @@ All run on `main` at `2a8794a`, from a clean checkout.
   "Connection reset by peer"), so all 4 streams went through ssh. On this fast link, the
   streams' setup cost about cancels their gain at 57 MB. On the slower link of 20 October
   they were 1.4 to 1.7 times faster ([04-ssh-relay.md](04-ssh-relay.md)).
-- **`cargo publish --dry-run`:** packaged and verified 0.4.0 (95 files, 368 KiB compressed).
-  `IMPLEMENTATION_PLAN.md` and `REMAINING.md` are now excluded from the crate.
-- **The CHANGELOG** is dated 2026-10-21.
+- **`cargo publish --dry-run`:** packaged and verified 0.4.0 at `2a8794a` (95 files, 368 KiB
+  compressed).
 
-## Releasing 0.4.0
+## How 0.4.0 was released
 
-1. Wait for CI on `main` to pass after #19.
-2. Run the audit's probes and the three reproductions above on `main`. Each must now fail
-   safely or match rsync.
-3. Check on the real Mac (Tailscale, firewall on): push and pull with `--streams 4`, plus a
-   plain ssh push and pull.
-4. Run `cargo publish --dry-run` from a clean checkout of `main`.
-5. Set the CHANGELOG date to the release day.
-6. Tag and publish from a clean worktree, never the main checkout:
+0.4.0 was tagged and published on 21 October from `main` at `2a8794a`, before PR 20 was
+merged:
+
+- The tag `v0.4.0` points at `2a8794a`.
+- crates.io has had 0.4.0 since 08:25 UTC.
+- The release workflow built the binaries from the tag.
+
+The published crate is the code checked above, but two things in it differ from PR 20:
+
+- Its `CHANGELOG.md` still dates 0.4.0 2026-10-20.
+- It includes `IMPLEMENTATION_PLAN.md` and `REMAINING.md`.
+
+Neither affects the program. A published crate version can't be replaced, so they stay.
+PR 20 dates the changelog 2026-10-21, the day 0.4.0 was published, and its `Cargo.toml`
+exclusion applies from the next release.
+
+The earlier version of the steps below caused this. They changed the date only in a pull
+request, then tagged `origin/main`, so the tag never contained the change. They also ran
+the dry run before the package contents changed.
+
+## Releasing next time
+
+1. Put everything the release changes (version, CHANGELOG date, README, package contents)
+   in one pull request, and merge it.
+2. Fetch and note the exact commit to release. Check that CI passed on that commit.
 
    ```bash
-   git fetch origin && git tag -a v0.4.0 -m "barqsync 0.4.0" origin/main && git push origin v0.4.0
+   git fetch origin && git rev-parse origin/main
    ```
+
+3. Run the release checks and the dry run in a clean worktree of **that commit**:
 
    ```bash
-   git worktree add /tmp/barqsync-v0.4.0 v0.4.0 && cd /tmp/barqsync-v0.4.0 && cargo publish
+   git worktree add /tmp/barqsync-release <commit> && cd /tmp/barqsync-release && cargo publish --dry-run
    ```
 
-7. Publish a GitHub security advisory for SEC-01 and SEC-02: 0.1.0 to 0.3.0 affected,
-   fixed in 0.4.0. Whether to yank 0.1 to 0.3 on crates.io because of the data-loss bugs is
-   the user's call.
+4. Tag that same commit by its hash, not by `origin/main`, which may have moved since:
+
+   ```bash
+   git tag -a vX.Y.Z -m "barqsync X.Y.Z" <commit> && git push origin vX.Y.Z
+   ```
+
+5. Publish from the same worktree: `cargo publish`.

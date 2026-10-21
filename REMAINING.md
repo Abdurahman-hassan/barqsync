@@ -2,12 +2,10 @@
 
 Status on 21 October 2026.
 
-- **Released:** 0.3.0 (crates.io, and a GitHub release with binaries and installers for
-  macOS and Linux). Protocol 9.
-- **0.4.0, on `main`, ready to tag: its release checks passed.** It contains
-  every P1 fix from [the audit](IMPLEMENTATION_PLAN.md) (PRs 15–19) plus PRs 11–13. The
-  changes are listed in `CHANGELOG.md` under 0.4.0. The protocol is 10, so 0.4.x can't
-  talk to 0.3.x.
+- **Released: 0.4.0** on 21 October: crates.io, and a GitHub release built from the tag
+  `v0.4.0` (`2a8794a`). It contains every P1 fix from [the audit](IMPLEMENTATION_PLAN.md)
+  (PRs 15–19) plus PRs 11–13; the changes are listed in `CHANGELOG.md` under 0.4.0. The
+  protocol is 10, so 0.4.x can't talk to 0.3.x: upgrade both ends.
 
 How the P1 work was organized, and where each finding landed:
 [docs/implementation/p1-coordination.md](docs/implementation/p1-coordination.md). The
@@ -15,24 +13,24 @@ milestone tracker is [docs/implementation/README.md](docs/implementation/README.
 
 ## Next steps, in order
 
-1. **Release checks for 0.4.0: all passed on 21 October** (CI, the three data-loss
-   reproductions, the audit's probes, a real-Mac push and pull with `--streams 4` and plain
-   ssh, and `cargo publish --dry-run`). The results are in `p1-coordination.md`.
-2. **Publish 0.4.0** from a clean worktree, never the main checkout. Tag `origin/main`, then
-   run `cargo publish` from that worktree. The commands are in `p1-coordination.md`; the
-   tag starts the release workflow (binaries, installers, checksums).
-3. **Security advisory** on GitHub for SEC-01 and SEC-02: versions up to 0.3.0 affected,
+1. **Security advisory** on GitHub for SEC-01 and SEC-02: versions up to 0.3.0 affected,
    fixed in 0.4.0. Yanking 0.1 to 0.3 on crates.io because of the data-loss bugs is your
    call.
-4. **Install 0.4.0 on both Macs.** Then delete the old copies on the second Mac:
-   `~/bin/barqsync-pr11` (a test build) and `~/bin/barqsync` (0.1.0).
-5. **Tidy up:**
+2. **Install 0.4.0 on both Macs.** Then delete the old copies on the second Mac:
+   `~/bin/barqsync-pr11` and `~/bin/barqsync-0.4.0-rc` (test builds), and `~/bin/barqsync`
+   (0.1.0). Its firewall exceptions for those are no longer needed for `--streams`.
+3. **Tidy up:**
    - The main checkout still holds Codex's original uncommitted edits on top of v0.3.0.
      They're now on `main` (PRs 15–17) and kept on the local branch `audit/codex-wip`, so
      the checkout can be reset to `main` once you've checked nothing else is in it.
    - Delete merged and superseded branches: the milestone branches, the PR branches,
      `p1-base`, and the worktrees under `.claude/worktrees/`.
+   - Remove the release worktree `/tmp/barqsync-v0.4.0`
+     (`git worktree remove /tmp/barqsync-v0.4.0`).
    - PRs 11–19 went in without a Codex review (usage limit). Ask for one once it resets.
+4. **Next releases:** follow "Releasing next time" in `p1-coordination.md`. 0.4.0 was tagged
+   before its release PR merged, so the published crate's changelog says 2026-10-20 and the
+   crate includes `IMPLEMENTATION_PLAN.md` and `REMAINING.md`.
 
 ## Still open after 0.4.0
 
