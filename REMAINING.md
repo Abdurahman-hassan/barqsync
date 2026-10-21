@@ -4,7 +4,7 @@ Status on 21 October 2026.
 
 - **Released:** 0.3.0 (crates.io, and a GitHub release with binaries and installers for
   macOS and Linux). Protocol 9.
-- **0.4.0, on `main` (`2a8794a`), held until the release checks below pass.** It contains
+- **0.4.0, on `main`, ready to tag: its release checks passed.** It contains
   every P1 fix from [the audit](IMPLEMENTATION_PLAN.md) (PRs 15–19) plus PRs 11–13. The
   changes are listed in `CHANGELOG.md` under 0.4.0. The protocol is 10, so 0.4.x can't
   talk to 0.3.x.
@@ -15,13 +15,9 @@ milestone tracker is [docs/implementation/README.md](docs/implementation/README.
 
 ## Next steps, in order
 
-1. **Release checks for 0.4.0:**
-   - CI green on `main`.
-   - The audit's probes and the three data-loss reproductions now fail safely or match
-     rsync.
-   - A real-Mac push and pull (`--streams 4` and plain ssh).
-   - `cargo publish --dry-run` from a clean checkout.
-   - The CHANGELOG date set to the release day.
+1. **Release checks for 0.4.0: all passed on 21 October** (CI, the three data-loss
+   reproductions, the audit's probes, a real-Mac push and pull with `--streams 4` and plain
+   ssh, and `cargo publish --dry-run`). The results are in `p1-coordination.md`.
 2. **Publish 0.4.0** from a clean worktree, never the main checkout. Tag `origin/main`, then
    run `cargo publish` from that worktree. The commands are in `p1-coordination.md`; the
    tag starts the release workflow (binaries, installers, checksums).

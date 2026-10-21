@@ -85,6 +85,48 @@ both.
   paths, clearer errors, local copy progress, literal-data stats.
 - [PR 14](https://github.com/Abdurahman-hassan/barqsync/pull/14): 0.4.0 version bump.
 
+## Release checks, 21 October 2026
+
+All run on `main` at `2a8794a`, from a clean checkout.
+
+- **CI on `main`:** passed.
+- **The three data-loss reproductions** now match rsync 3.5.1:
+  - `--inplace -I f f` leaves `f` intact;
+  - `--remove-source-files g g` keeps `g` and reports "Skipping sender remove of
+    destination file" (exit 23);
+  - `--delete a/ b/ dst/` keeps `alpha` and `beta`.
+- **The audit's CLI probes** (`cli_probes.py`):
+  - `--delete` across several sources, and after a read error: the same as rsync,
+    including "IO error encountered -- skipping file deletion" and exit 23;
+  - same-file `--inplace` and `--remove-source-files`: the same as rsync;
+  - a failed backup keeps the old file. The exit code is 23, where rsync stops the whole run
+    with 11;
+  - `--threads=1` and `2` remote runs finish.
+- **The audit's protocol probes** (`protocol_probes.rs`), ported to the current API: its
+  `run` functions take one more argument, and `Synced` now carries only paths.
+  - A listing naming `../escaped` is refused (exit 12) and nothing is written.
+  - A file with no data, or a pack shorter than announced, is discarded (exit 23).
+  - `Synced` without `--remove-source-files` or in a dry run is refused (exit 12).
+  - `Synced` for a file outside the transfer while `--remove-source-files` is on is refused
+    ("removal of an entry not sent or already removed"). In all three cases the file is kept.
+  - A source changed within the same second is kept.
+- **Real Mac** (Intel MacBook Pro, macOS 15.8, firewall on, this build installed at a new path
+  with no exception, Tailscale directly over the LAN at a 6 ms round trip), 57 MB in 30
+  files, all identical after each run, nothing left running:
+
+  | | plain ssh | `--streams 4` |
+  | --- | ---: | ---: |
+  | push | 4.7 s | 5.3 s |
+  | pull | 7.0 s | 6.1 s |
+
+  For `--streams 4`, the direct connection was refused ("unexpected end of file" and
+  "Connection reset by peer"), so all 4 streams went through ssh. On this fast link, the
+  streams' setup cost about cancels their gain at 57 MB. On the slower link of 20 October
+  they were 1.4 to 1.7 times faster ([04-ssh-relay.md](04-ssh-relay.md)).
+- **`cargo publish --dry-run`:** packaged and verified 0.4.0 (95 files, 368 KiB compressed).
+  `IMPLEMENTATION_PLAN.md` and `REMAINING.md` are now excluded from the crate.
+- **The CHANGELOG** is dated 2026-10-21.
+
 ## Releasing 0.4.0
 
 1. Wait for CI on `main` to pass after #19.

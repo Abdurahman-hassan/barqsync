@@ -10,7 +10,7 @@ repository = "https://github.com/Abdurahman-hassan/barqsync"
 readme = "README.md"
 keywords = ["rsync", "sync", "backup", "file-transfer", "quic"]
 categories = ["command-line-utilities", "filesystem", "network-programming"]
-exclude = ["bench/results/*", "docs/*", "rust_rsync_replacement_master_plan.md", ".gitignore", ".github/", "dist-workspace.toml"]
+exclude = ["bench/results/*", "docs/*", "IMPLEMENTATION_PLAN.md", "REMAINING.md", "rust_rsync_replacement_master_plan.md", ".gitignore", ".github/", "dist-workspace.toml"]
 
 # `cargo binstall barqsync`: the archives the release workflow (dist) attaches to each
 # GitHub Release.
