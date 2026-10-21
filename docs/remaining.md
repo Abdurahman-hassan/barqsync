@@ -60,6 +60,9 @@ entries before a later scan failure. Pending deletions now wait for a successful
 
 ### Rough edges found earlier
 
+- **Intermittent macOS shutdown test failure.** One release-PR run ended the SSH
+  push client by an unreported signal. The merged main's CI and local shutdown
+  checks passed; the cause remains unconfirmed. See the [release evidence](releases/0.4.2.md#intermittent-test-failure-to-investigate).
 - **QUIC behind a firewall.** UDP can't go through ssh, so `--transport quic` and `auto` fall
   back to the single ssh pipe. A better fallback would be relayed TCP streams, which needs
   the server to offer both (a protocol change).
