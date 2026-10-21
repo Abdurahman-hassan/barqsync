@@ -58,7 +58,7 @@ see [04-ssh-relay.md](04-ssh-relay.md).
 | SEC-02: unauthorized source removal | #15, #17 | – |
 | DATA-01: same-file copies | #15, #17 | A remote transfer to the same host (`localhost:`) isn't detected; rsync doesn't detect it either |
 | DATA-02: several roots with `--delete` | #19 | – |
-| DATA-03: deletion after scan errors | #19 stops deletion after reported errors; [unreleased follow-up](02a-deletion-barrier.md) defers it until scanning succeeds | Released 0.4.0 can still delete before a later source-read error |
+| DATA-03: deletion after scan errors | #19 stops deletion after reported errors; [#22, released in 0.4.1](02a-deletion-barrier.md), defers it until scanning succeeds | 0.4.0 can still delete before a later source-read error; upgrade to 0.4.1 or later |
 | DATA-04: backup failures | #15, #17 | – |
 | DATA-05: missing or malformed file data | #18 | An end-to-end content hash (2B) |
 | DATA-06: source-removal change detection | #17 | A change between the check and the unlink; ctime isn't compared |

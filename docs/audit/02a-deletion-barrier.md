@@ -1,6 +1,6 @@
 # Part 2A follow-up: scan completion before deletion
 
-Date: 21 October 2026. Finding: DATA-03. Status: implemented in the current tree,
+Date: 21 October 2026. Finding: DATA-03. Status: released in 0.4.1 through PR 22;
 not part of the published 0.4.0 release.
 
 ## Baseline review

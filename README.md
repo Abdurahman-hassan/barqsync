@@ -147,8 +147,10 @@ Every option, and where barqsync differs from rsync:
 ## Good to know
 
 - **macOS and Linux only.**
-- **Upgrade from 0.3.x or earlier.** 0.4.0 fixes security and data-loss bugs found in an
-  audit (see the [changelog](CHANGELOG.md)). Its protocol changed, so upgrade both machines.
+- **Upgrade both machines to 0.4.2.** The 0.4.x line fixes security and data-loss bugs
+  found in an audit; 0.4.1 adds the complete-scan deletion barrier and 0.4.2 improves
+  remote interruption and shutdown. See the [changelog](CHANGELOG.md). Protocol 10
+  cannot communicate with 0.3.x or earlier.
 - **Remote copies need barqsync on both machines,** like rsync, or `--remote-path` to point
   at it. Both ends must run the same release line.
 - **Remote paths:** use `host:path` or `'user@[::1]:path'` for IPv6 (quote brackets in
@@ -172,8 +174,8 @@ All documentation is in [`docs/`](docs/README.md):
   measured and improved against fast_rsync and rsync.
 - [As-built plan](docs/as-built-plan.md): the architecture, and the original plan next to
   what was built.
-- [The October 2026 audit](docs/audit/README.md): the security and data-loss findings fixed
-  in 0.4.0, and what remains.
+- [The October 2026 audit](docs/audit/README.md): the security and data-loss fixes in
+  0.4.x, and what remains.
 - [What's left](docs/remaining.md).
 
 ## License

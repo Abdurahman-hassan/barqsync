@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.4.2 - 2026-10-21
+
+### Compatibility
+
+- Remote transfers continue to use protocol 10. Upgrade both ends to 0.4.2 to get
+  the improved interruption and shutdown behavior on both machines.
+
 ### Fixed
 
 - A remote transfer whose other side was interrupted now ends with exit 20, as rsync
