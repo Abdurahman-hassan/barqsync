@@ -44,6 +44,19 @@ Pending records use memory proportional to the number of deletion candidates, an
 space occupied by those entries is reclaimed at the end rather than during scanning.
 The byte-based memory budget in milestone 5A remains open.
 
+## CI follow-up: interruption during cleanup
+
+The first Linux CI run passed the deletion regressions but exposed a late-interrupt
+race in the existing shutdown tests: Ctrl-C during relay cleanup could return exit
+12 even though the interrupt handler had run. The client chose its exit status
+before closing connections and reaping the remote shell.
+
+A deterministic regression holds the remote shell open after a lost connection,
+waits for the client's connection-close marker, then sends SIGINT. It failed with
+exit 12 on the first PR commit. The final interrupt check now runs immediately
+before process exit, preserving exit 20 when interruption arrives during cleanup.
+The regression exercises push/pull with threaded and Tokio I/O.
+
 ## Verification
 
 - `tests/deletion.rs`: a nested scan failure preserves earlier candidates in local
@@ -55,10 +68,30 @@ The byte-based memory budget in milestone 5A remains open.
 - Existing deletion tests cover merged roots, filters, named/relative sources and
   directory metadata.
 - On macOS arm64, `env -u BARQSYNC_TEST_REMOTE cargo test --locked --offline`
-  reported 255 passed, 0 failed. Three real-host cases returned early because no
-  external test host was configured; 252 tests exercised their checks.
+  reported 256 passed, 0 failed. Three real-host cases returned early in this run;
+  253 tests exercised their checks. Those three cases passed separately against
+  the real Intel Mac below.
 - `cargo clippy --locked --offline --all-targets -- -D warnings` and
   `git diff --check` passed. Linux and QUIC verification run in the PR's CI.
+
+### Real Mac over SSH
+
+The current source was cross-compiled for `x86_64-apple-darwin` and copied into an
+isolated temporary directory on the provided Intel Mac. Its installed binary was
+left in place. The remote firewall was enabled; the local arm64 Mac's firewall was
+disabled. Neither firewall's configuration was changed.
+
+- All three `real_remote` cases passed with the temporary build: round trips with
+  SSH, TCP and QUIC options, delta transfer, and comparison with rsync 3.5.1.
+- Verbose push/pull probes confirmed that direct TCP was refused and two data
+  streams succeeded through SSH relays. QUIC could not connect and successfully
+  fell back to the SSH connection. These results verify firewall fallback, not
+  direct QUIC connectivity on this Mac.
+- Additional real SSH push/pull checks with threaded and Tokio I/O preserved root
+  and nested deletion candidates after a late source-scan error (exit 23). Removing
+  the dangling source symlink and retrying succeeded and deleted both candidates.
+
+The temporary remote binary and fixtures were removed after verification.
 
 ## Repository housekeeping
 
