@@ -64,7 +64,7 @@ see [04-ssh-relay.md](04-ssh-relay.md).
 | DATA-06: source-removal change detection | #17 | A change between the check and the unlink; ctime isn't compared |
 | NET-01: streams behind a firewall | #11 | No public listener (4A); see 04-ssh-relay.md |
 | NET-02: `--threads=1` deadlock | #15 | – |
-| NET-03: cancellation and disconnects | #19; after 0.4.1, a peer's interrupt notice is no longer overtaken by its data streams' end (exit 20, not 12) | No `--timeout` for a peer that stays connected but stops responding; SIGTERM and SIGHUP aren't handled like SIGINT. Over QUIC, a dead server is noticed only by QUIC's idle timeout (15–18 s), and closing a stopped run waits up to 5 s for a peer that doesn't answer |
+| NET-03: cancellation and disconnects | #19; after 0.4.1, a peer's interrupt notice is no longer overtaken by its data streams' end (exit 20, not 12). QUIC now meets the same bounds: a dead server is noticed by its ssh pipe's end (about 2–4 s, was 15–18 s), the transfer ends when the ssh connection drops, and a stopped run's close waits only while the peer answers (Ctrl-C with a stopped server: about 3–4 s, was 7–9 s) | No `--timeout` for a peer that stays connected but stops responding (over QUIC, its idle timeout ends the transfer after 15 s); SIGTERM and SIGHUP aren't handled like SIGINT |
 | PROTO-01: oversized messages | #18 | Bounded stream admission (NET-04) and a memory budget (PERF-01) are P2 |
 
 Final test counts in the last lane (#19): macOS 249 and Linux 253 passed, clippy clean on

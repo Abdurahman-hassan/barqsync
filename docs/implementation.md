@@ -309,15 +309,25 @@ checked with the first read. Then:
   to 128), routed by file id exactly as over TCP. The ssh connection stays open, idle, until
   the end.
 - **Fallback.** If UDP doesn't get through in 3 s, both sides carry on over the ssh pipe
-  (`-v` says so). A peer that disappears is noticed within 15 s (QUIC idle timeout with
-  keep-alives), where ssh would see the pipe close at once.
+  (`-v` says so).
+- **Lost peers.** The idle ssh pipe is still watched. A peer that dies ends it at once, and
+  the transfer ends with exit 12 after the control stream has had 2 s to say why, as when a
+  data stream ends early. The same happens when only the ssh connection drops while QUIC
+  stays up: rsync dies with its ssh, the server's stderr reaches the user only through it,
+  and the user stops a remote side through it. A peer that stays connected but no longer
+  answers is noticed by QUIC's idle timeout (15 s, with keep-alives).
 - **Clean shutdown.** QUIC resends lost packets only while the process lives, so nothing may
   close before the peer's application has what it needs. The protocol says when that is:
   the sender, once it has the receiver's final `ReceiverDone`, knows the receiver has read
   everything, and closes the session and its ssh pipe at once. The receiver ends its
   streams and waits (up to 5 s) for the sender to end too: a QUIC close or stream end, or
   the idle ssh pipe reaching its end, which covers a QUIC close lost on the way (TCP keeps
-  resending after a process exits). Neither side waits for acknowledgements. See
+  resending after a process exits). Neither side waits for acknowledgements. A side that
+  stopped (interrupted, or failed) waits the same way, so that its notice gets resent until
+  the peer has it, but it also stops waiting once nothing at all has arrived from the peer
+  for 1 s (or three round trips). A running peer acknowledges what is outstanding within a
+  round trip, so such a peer either has everything or is stopped or gone. Ctrl-C with a
+  stopped server then ends within about 4 s over QUIC, as over ssh. See
   [QUIC's fixed cost](#quics-fixed-cost-m19). One exception: in a pull with
   `--remove-source-files` the server (the sender) removes the last files after
   `ReceiverDone`, so it ends with `RemovalsDone`, after their `-vv` lines and errors, which

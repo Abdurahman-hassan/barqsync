@@ -402,8 +402,9 @@ fn decode(kind: u8, mut body: Vec<u8>) -> io::Result<Frame> {
     }
 }
 
-/// A data stream's failure or early end, told apart from the control stream's end,
-/// which alone means the peer is gone (see [`Conn::recv_timeout`]).
+/// A data stream's failure or early end, or the end of the ssh pipe under a QUIC
+/// session, told apart from the control stream's end, which alone means the peer is
+/// gone at once (see [`Conn::recv_timeout`]).
 #[derive(Debug)]
 struct StreamLost(io::Error);
 
@@ -582,9 +583,24 @@ const CLOSE_WAIT: Duration = Duration::from_secs(30);
 /// The same for a run that was stopped (interrupted, or failed): what is left is
 /// best-effort.
 const STOPPED_CLOSE_WAIT: Duration = Duration::from_secs(2);
-/// How long a data stream's early end, or a failed write, waits for the control stream
-/// to say why (see [`Conn::recv_timeout`]).
+/// How long a data stream's early end, the ssh pipe's end under QUIC, or a failed write,
+/// waits for the control stream to say why (see [`Conn::recv_timeout`]).
 const SETTLE: Duration = Duration::from_secs(2);
+/// How long closing a QUIC session waits for the peer to end (see [`Conn::finish`]).
+const PEER_WAIT: Duration = Duration::from_secs(5);
+/// When closing a stopped run, a peer from which nothing at all arrives for this long, or
+/// three round trips if longer, needs nothing more resent (see [`Conn::wait_for_peer`]).
+/// A running peer acknowledges what it receives within a round trip, and QUIC probes
+/// again sooner than this when a packet or its acknowledgement is lost.
+const SILENT: Duration = Duration::from_secs(1);
+
+/// What a connection runs over and must outlive it: a QUIC session.
+pub trait Carrier: std::any::Any + Send + Sync {
+    /// Datagrams received from the peer so far.
+    fn received(&self) -> u64;
+    /// The round trip to the peer, as measured so far.
+    fn rtt(&self) -> Duration;
+}
 
 /// Cloneable handle for sending frames. Frames are encoded (and compressed) on the
 /// calling thread, so many tasks can compress in parallel; writer threads only write.
@@ -710,10 +726,13 @@ pub struct Conn {
     data_writers: Vec<Joiner>,
     data_in: usize,
     /// What this connection runs over and must outlive it (a QUIC session).
-    session: Option<Box<dyn std::any::Any + Send + Sync>>,
+    session: Option<Box<dyn Carrier>>,
     /// The connection this one replaced (the ssh pipe, once control moved to QUIC):
-    /// idle, but kept open until this one finishes.
+    /// idle, but kept open until this one finishes. Its end ends this one too (see
+    /// [`Conn::recv_timeout`]).
     under: Option<Box<Conn>>,
+    /// The ssh pipe in `under` has ended (it is no longer watched).
+    under_ended: AtomicBool,
     /// The first data stream failure or failed write, and until when the control stream
     /// may still say why (see [`Conn::recv_timeout`]).
     lost: std::sync::Mutex<Option<(io::Error, Instant)>>,
@@ -826,6 +845,7 @@ impl Conn {
             data_in: 0,
             session: None,
             under: None,
+            under_ended: AtomicBool::new(false),
             lost: Default::default(),
         }
     }
@@ -852,6 +872,7 @@ impl Conn {
             data_in: 0,
             session: None,
             under: None,
+            under_ended: AtomicBool::new(false),
             lost: Default::default(),
         }
     }
@@ -879,7 +900,7 @@ impl Conn {
     /// Carry this connection on new streams from now on (control moving to QUIC). The
     /// current one stays open, idle, until [`Conn::finish`]; `session` is closed after
     /// everything sent on the new streams has been delivered.
-    pub fn switch(&mut self, reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, session: Box<dyn std::any::Any + Send + Sync>) {
+    pub fn switch(&mut self, reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, session: Box<dyn Carrier>) {
         let mut new = Conn::start_with(reader, writer, false, self.out.stop.clone());
         new.out.wire = self.out.wire;
         new.out.comp = self.out.comp.clone();
@@ -936,7 +957,8 @@ impl Conn {
 
     /// The session this connection runs over, if it is a `T` (e.g. a QUIC session).
     pub fn session<T: 'static>(&self) -> Option<&T> {
-        self.session.as_deref()?.downcast_ref()
+        let session: &dyn std::any::Any = self.session.as_deref()?;
+        session.downcast_ref()
     }
 
     /// Number of attached incoming data streams.
@@ -977,6 +999,11 @@ impl Conn {
     /// that fails, ends the connection only once the control stream has had [`SETTLE`]
     /// to deliver that reason or its own end. File data arriving meanwhile is dropped:
     /// the transfer can't complete any more, and the frames behind it may be the reason.
+    ///
+    /// Over QUIC, the end of the ssh pipe underneath counts the same way: a peer that
+    /// dies ends its ssh pipe at once, while QUIC would notice only after its idle
+    /// timeout. Like rsync, which dies with its ssh, the transfer then stops even if the
+    /// QUIC session itself is still up.
     pub fn recv_timeout(&self, wait: Duration) -> io::Result<Option<Frame>> {
         let lost = || self.lost.lock().unwrap_or_else(|e| e.into_inner());
         let settling = lost().as_ref().map(|&(_, until)| until);
@@ -987,7 +1014,7 @@ impl Conn {
         };
         // The connection ended on the control stream: the first failure says how.
         let ended = |e: io::Error| lost().take().map_or(e, |(first, _)| first);
-        match self.rx.recv_timeout(wait) {
+        match self.next(wait) {
             Ok(Ok(f)) if settling.is_some() && carries_file_data(&f) => Ok(None),
             Ok(Ok(f)) => Ok(Some(f)),
             Ok(Err(e)) if is_stream_lost(&e) => {
@@ -1008,6 +1035,29 @@ impl Conn {
         }
     }
 
+    /// The next item from this connection or, until it ends, from the ssh pipe underneath,
+    /// waiting at most `wait`. The pipe's end comes as a [`stream_lost`] error, once.
+    fn next(&self, wait: Duration) -> Result<io::Result<Frame>, crossbeam_channel::RecvTimeoutError> {
+        let Some(under) = self.under.as_ref().filter(|_| !self.under_ended.load(Ordering::SeqCst)) else {
+            return self.rx.recv_timeout(wait);
+        };
+        crossbeam_channel::select_biased! {
+            recv(self.rx) -> r => r.map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected),
+            recv(under.rx) -> r => {
+                let e = match r {
+                    // Nothing more is sent there once control has moved, but a server whose
+                    // move failed says so there.
+                    Ok(Ok(f)) => return Ok(Ok(f)),
+                    Ok(Err(e)) => e,
+                    Err(_) => io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed by peer"),
+                };
+                self.under_ended.store(true, Ordering::SeqCst);
+                Ok(Err(stream_lost(e)))
+            },
+            default(wait) => Err(crossbeam_channel::RecvTimeoutError::Timeout),
+        }
+    }
+
     /// Receive the next frame; a closed stream is an error (callers expect a reply).
     pub fn recv(&self) -> io::Result<Frame> {
         match self.rx.recv() {
@@ -1023,7 +1073,8 @@ impl Conn {
     /// session closes, and QUIC resends lost packets only while this process lives. So
     /// this waits (bounded) until the peer has ended too: the peer ends only once it has
     /// read all it needs. It ends its control stream or closes the session, or, when its
-    /// QUIC close is lost or it exits first, the idle ssh pipe reaches its end.
+    /// QUIC close is lost or it exits first, the idle ssh pipe reaches its end. A run that
+    /// stopped also gives up on a peer that has gone silent (see [`Conn::wait_for_peer`]).
     pub fn finish(self) -> io::Result<()> {
         self.close(false)
     }
@@ -1045,7 +1096,10 @@ impl Conn {
             mark("finish: session closed");
         }
         let stopped = self.out.stopped();
-        let deadline = Instant::now() + if stopped { STOPPED_CLOSE_WAIT } else { CLOSE_WAIT };
+        let start = Instant::now();
+        // A stopped run waits for the peer only while it answers (see `wait_for_peer`).
+        let heard = self.session.as_deref().filter(|_| stopped).map(|s| (s.received(), start));
+        let deadline = start + if stopped { STOPPED_CLOSE_WAIT } else { CLOSE_WAIT };
         // Closing: a writer failing from now on (a peer that already left) is no news.
         self.out.cancel();
         // A run that stopped has told the peer why on the control stream (`Interrupted`,
@@ -1063,7 +1117,7 @@ impl Conn {
         let r = if quic && confirmed { Ok(()) } else { r };
         if self.session.is_some() {
             mark("finish: streams ended");
-            let how = self.wait_for_peer(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            let how = self.wait_for_peer(Instant::now() + PEER_WAIT, heard);
             mark(format_args!("finish: peer ended ({how})"));
         }
         drop(self.session.take());
@@ -1082,15 +1136,41 @@ impl Conn {
 
     /// Wait until the peer has ended: its streams on this connection, or the ssh pipe
     /// underneath. Frames still arriving are dropped; the caller is done reading.
-    fn wait_for_peer(&self, deadline: std::time::Instant) -> &'static str {
+    ///
+    /// `heard`, for a run that stopped: the datagrams received from the peer when closing
+    /// began, and when. The wait still lets QUIC resend why this side stopped
+    /// (`Interrupted`, `Fatal`) until the peer has it, but nothing at all arriving from the
+    /// peer for [`SILENT`] means there is nothing left to resend: a running peer
+    /// acknowledges what is outstanding within a round trip, so it either has everything
+    /// or it no longer runs (stopped, or gone without closing). The wait ends there
+    /// instead of at the deadline.
+    fn wait_for_peer(&self, deadline: Instant, mut heard: Option<(u64, Instant)>) -> &'static str {
         let under = self.under.as_ref().map(|u| &u.rx);
+        let session = self.session.as_deref();
         loop {
+            let mut until = deadline;
+            if let (Some((count, since)), Some(s)) = (heard.as_mut(), session) {
+                let now = Instant::now();
+                let received = s.received();
+                if received != *count {
+                    (*count, *since) = (received, now);
+                }
+                if now >= *since + SILENT.max(3 * s.rtt()) {
+                    return "silent";
+                }
+                until = until.min(now + Duration::from_millis(50));
+            }
             let mut sel = crossbeam_channel::Select::new();
             let main = sel.recv(&self.rx);
             if let Some(u) = under {
                 sel.recv(u);
             }
-            let Ok(op) = sel.select_deadline(deadline) else { return "timed out" };
+            let Ok(op) = sel.select_deadline(until) else {
+                if Instant::now() >= deadline {
+                    return "timed out";
+                }
+                continue;
+            };
             if op.index() == main {
                 if op.recv(&self.rx).is_err() {
                     return "quic";

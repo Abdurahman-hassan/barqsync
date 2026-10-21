@@ -14,7 +14,8 @@
 //!
 //! Then control messages, metadata batches included, move to the control stream, and
 //! file data travels on unidirectional streams (one per `--streams`), routed by file id
-//! as over TCP. The ssh connection stays open, idle, until the end. QUIC runs on a small
+//! as over TCP. The ssh connection stays open, idle, until the end; if it ends first, so
+//! does the transfer, as rsync's would with its ssh. QUIC runs on a small
 //! tokio runtime; the protocol's reader and writer threads talk to it through blocking
 //! bridges.
 
@@ -57,7 +58,8 @@ fn transport(initial_rtt: Option<Duration>) -> Arc<TransportConfig> {
     t.stream_receive_window((8u32 << 20).into());
     t.receive_window((24u32 << 20).into());
     t.send_window(24 << 20);
-    // A peer that vanished is noticed within 15 s (ssh would see EOF at once).
+    // A peer that no longer answers is noticed within 15 s. One that dies is noticed
+    // sooner, by its ssh pipe's end (see `Conn::recv_timeout`).
     t.max_idle_timeout(Some(Duration::from_secs(15).try_into().expect("idle timeout")));
     t.keep_alive_interval(Some(Duration::from_secs(3)));
     Arc::new(t)
@@ -290,6 +292,16 @@ impl Session {
     /// `n` streams to receive file data on (each is accepted when its first data arrives).
     pub fn accept_data(&self, n: usize) -> Vec<Box<dyn Read + Send>> {
         (0..n).map(|_| Box::new(AcceptRead { conn: self.conn.clone(), stream: None }) as Box<dyn Read + Send>).collect()
+    }
+}
+
+impl crate::proto::Carrier for Session {
+    fn received(&self) -> u64 {
+        self.conn.stats().udp_rx.datagrams
+    }
+
+    fn rtt(&self) -> Duration {
+        self.conn.rtt()
     }
 }
 
