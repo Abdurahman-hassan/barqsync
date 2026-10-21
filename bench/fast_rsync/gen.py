@@ -1,4 +1,4 @@
-# Datasets for the fast_rsync comparison (fast_rsync_comparison.md), each an old/ and a new/
+# Datasets for the fast_rsync comparison (docs/fast-rsync-comparison.md), each an old/ and a new/
 # directory: inplace, shift, append, mid, sqlite (the first comparison), and tar, csv,
 # scatter (added to choose barqsync's block and chunk sizes). Seeded, so reruns produce
 # identical files.

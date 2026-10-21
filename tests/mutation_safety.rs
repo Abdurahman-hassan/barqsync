@@ -1,4 +1,4 @@
-//! Regressions for the destructive-operation findings in IMPLEMENTATION_PLAN.md: a source
+//! Regressions for the destructive-operation findings in docs/audit/findings.md: a source
 //! that is also the destination, backups that fail or would replace the file itself or
 //! the source, and the `--remove-source-files` check of whether a source changed.
 //! All CLI cases have a deadline and use disposable files, including fake SSH.

@@ -6,7 +6,7 @@
 Writes bench-everyday.svg, bench-delta-wan.svg, how-it-works.svg and two-level-delta.svg
 next to this script. Each SVG carries light and dark colors (prefers-color-scheme) on its
 own background, so it reads on GitHub and crates.io in either theme. The numbers are the
-measurements in IMPLEMENTATION.md (M14, macOS) and fast_rsync_comparison.md (M16, Linux).
+measurements in docs/implementation.md (M14, macOS) and docs/fast-rsync-comparison.md (M16, Linux).
 """
 import os
 

@@ -1,12 +1,16 @@
 # barqsync: The Plan as Built
 
-This document is a companion to `rust_rsync_replacement_master_plan.md`, in the same order. It
+This document is a companion to [the original plan](original-plan.md), in the same order. It
 describes what was built, what changed from the original plan and why, how it performs, and
-what is still open. The code is about 12,000 lines of Rust plus about 2,800 lines of tests
-(148 tests), built in milestones M0–M14. M0–M6 built the design described here; M7–M14 added
-rsync's common flags, the verification harness, and every component of the original plan
-that M0–M6 had replaced, each benchmarked against the replacement: the faster one is the
-default and the other stays selectable (§9).
+what is still open. The code is now about 18,000 lines of Rust plus about 5,700 lines of
+tests (about 250 tests), built in milestones M0–M21 and released as 0.4.0.
+
+- M0–M6 built the design described here.
+- M7–M14 added rsync's common flags, the verification harness, and every component of the
+  original plan that M0–M6 had replaced. Each was benchmarked against the replacement: the
+  faster one is the default and the other stays selectable (§9).
+- M15–M21 refined the delta engine and QUIC, added `-X`/`-A` and streams through ssh, and
+  fixed the October 2026 audit's findings (§6).
 
 ---
 
@@ -258,7 +262,7 @@ one file use the same stream, so they stay in order.
 ### M8: verification harness (part of `m7-integrated`)
 
 - Linux container with sshd and `tc netem` profiles (lan, wan, lossy), `strace -c` counts,
-  perf flamegraphs, `cp` baselines; see `IMPLEMENTATION.md`, Benchmarks.
+  perf flamegraphs, `cp` baselines; see [the implementation notes](implementation.md#benchmarks).
 
 ### M9: the plan's delta design as `--delta=cdc` (branch `m9-delta-cdc`)
 
@@ -308,7 +312,7 @@ one file use the same stream, so they stay in order.
 ### M15: block and chunk sizes, merged deltas (branch `ccr-2f85cd18-jxdmlm`)
 
 - Prompted by a comparison with fast_rsync and rsync on real transfers
-  (`fast_rsync_comparison.md`): fixed 64 KiB blocks and 32 KiB chunks sent 1.85–5.7× more
+  ([fast-rsync-comparison.md](fast-rsync-comparison.md)): fixed 64 KiB blocks and 32 KiB chunks sent 1.85–5.7× more
   than rsync on small or scattered edits.
 - `Params::for_size`: a quarter of √size as a power of two, 4 KiB to 64 KiB; chunks average
   the block size. Chosen from five rules on eight datasets by total bytes (signature plus
@@ -330,7 +334,7 @@ one file use the same stream, so they stay in order.
 - Over 100 Mbit / 20 ms, against 0.1.1: `append` 1.30 → 1.29 s, `inplace` 1.24 → 1.24 s,
   `shift` 1.00 → 0.75 s, `sqlite` 16.7 → 3.2 s, `scatter` 12.4 → 1.6 s; faster than rsync on
   7 of 8 datasets (all but 40 × 4 MiB files with 1 KiB edits: 0.73 against 0.69 s).
-  Signatures 0.06–0.9 MB (M15: 0.4–2.0 MB). Details in `fast_rsync_comparison.md` §10.
+  Signatures 0.06–0.9 MB (M15: 0.4–2.0 MB). Details in [fast-rsync-comparison.md](fast-rsync-comparison.md) §10.
 - Fixed a racy fixture: four differential tests created destination-only files once per
   tool and compared their mtimes, which differed when a second boundary fell between the two
   trees (`keep_dirlinks_matches_rsync` failed 1 in 400 runs). `Tree::same_mtimes` gives them
@@ -359,6 +363,17 @@ one file use the same stream, so they stay in order.
   on short ones, fast fallback that remembers the host). The suite (164 tests on macOS, 167
   on Linux) passes as is, with `BARQSYNC_TRANSPORT=auto`, and with auto forced onto QUIC
   (`BARQSYNC_AUTO_RTT_MS=0`).
+
+### M18: `-X`/`--xattrs` and `-A`/`--acls` (PR 10)
+
+- Extended attributes and ACLs with rsync's rules on each system: which namespaces are
+  copied, POSIX ACLs on Linux, extended ACLs on macOS. Locally and over every transport
+  (protocol 9).
+- Long attribute values travel as checksums, and the receiver asks for the full value only
+  when it differs.
+- A deferred value is written to the file's final path, and with `--remove-source-files` the
+  source waits until it is written.
+- Differential tests against rsync on both systems.
 
 ### M19: QUIC's fixed cost (branch `feat/confident-williams-07be06`)
 
@@ -393,12 +408,39 @@ one file use the same stream, so they stay in order.
   0). Such a pull now ends with the server's `RemovalsDone` (protocol 10); over QUIC that
   costs it a round trip. Differential test with and without a removal that fails.
 
+### M20: parallel streams through ssh (PR 11)
+
+- When a firewall refuses the direct stream connections (the macOS firewall for an app it
+  hasn't been told about, or any firewall, NAT or VPN that only lets ssh in), each stream
+  goes over its own extra ssh connection. `barqsync --stream-relay` passes bytes to the
+  stream listener on the server, which also listens on loopback. TLS with the pinned
+  certificate and the token still runs end to end.
+- Real Mac with its firewall on: push 18.0 → 12.7 s, pull 65.5 → 38.6 s (57 MB, slow
+  Wi-Fi link).
+- Found on the way: `io::copy` splicing between pipe and socket stalled the TLS handshake
+  through sshd's pipes, so the relay copies with plain reads and writes.
+- The full record is in [audit/04-ssh-relay.md](audit/04-ssh-relay.md).
+
+### M21: the October 2026 audit (PRs 15–19, released as 0.4.0)
+
+- An audit of v0.3.0 found 18 issues, 12 of them P1 (security and data loss). All 12 were
+  fixed before 0.4.0:
+  - what the sending side announces is checked before anything is written;
+  - source removal is limited to entries the sender listed, and only when asked for;
+  - same-file and backup guards;
+  - `--delete` across several sources, and none after a read error;
+  - `--threads=1` no longer hangs;
+  - Ctrl-C and lost peers end both sides in bounded time;
+  - large messages are chunked.
+- The findings, the fixes, where each landed and what's still open are in
+  [audit/](audit/README.md).
+
 ### Testing
 
 - **Coverage:** 145 tests on macOS (arm64, and x86_64 under Rosetta: BLAKE3/zstd x86 SIMD
   paths, `getattrlistbulk` on Intel builds) and 148 on Linux (aarch64 container, glibc rsync
   3.2.7) at M14; at M16, 157 on Linux (x86_64 VM, rsync 3.2.7) and 154 on macOS; at M17,
-  167 on Linux (aarch64 container) and 164 on macOS; at M19, 201 on Linux and 198 on macOS. The
+  167 on Linux (aarch64 container) and 164 on macOS; at M19, 201 on Linux and 198 on macOS; at 0.4.0, 253 on Linux and 249 on macOS. The
   whole suite also runs with each alternative design as the default
   (`BARQSYNC_DELTA`, `_SCANNER`, `_TRANSPORT` (`quic`, `auto`), `_WIRE`, `_STRATEGY`,
   `_NET_IO`, `_IO_URING`).
@@ -423,14 +465,18 @@ src/diff.rs           quick check (size + mtime, -u, --size-only, -I, --modify-w
 src/entry.rs          Meta / DirEnt (serializable)
 src/fsops/            platform I/O: getattrlistbulk, statx, clone, copy_file_range,
                       temp files, utimensat, Ctrl-C cleanup
-src/local/            planner + the engine (shared by local sync and the remote receiver)
+src/local/            planner + the engine (shared by local sync and the remote receiver);
+                      merge.rs: several sources into one destination as one tree
 src/delta/            signatures, diff, apply (clone + patch, ordered rebuild)
 src/proto/            frames, messages, connection threads, data-stream routing
-src/remote/           client (spawns ssh), server, sender, receiver, TLS streams
+src/remote/           client (spawns ssh), server, sender, receiver, TLS streams, QUIC,
+                      relay.rs (streams through ssh), check.rs (checks on what the
+                      sending side announces)
 src/output.rs         item lines, %i, escaping, forwarding, stats
 src/timing.rs         BARQSYNC_TIMING milestones (both sides of a remote transfer)
 src/progress.rs       overall progress line
-tests/                local, delta, remote, M6 features; fake ssh in tests/common
+tests/                local, delta, remote, M6 features, -X/-A, the audit's findings;
+                      fake ssh in tests/common
 bench/gen.py, run.sh  datasets A/B/C, hyperfine runner incl. remote (D) and --cold
 ```
 
@@ -492,21 +538,24 @@ Kept as built (not in the rework list): the per-directory engine's own clone/cop
 
 ## 10. Still open
 
-- **A fast real link.** The Intel MacBook Pro was tested over Tailscale across the internet
-  (real-host tests pass; 1.1–1.5× rsync on a ~4 Mbit/s link, see `IMPLEMENTATION.md`), but not on a
-  LAN. Behind its firewall, `--transport tcp` now carries the streams through extra ssh
-  connections; QUIC there still needs the firewall to allow the binary.
-- **Cold-cache runs** (`bench/run.sh DIR all --cold`) need `sudo purge` on macOS.
-- **NFS** isn't covered (no server).
+The full list, in order, is in [remaining.md](remaining.md). In short:
+
+- **0.4.0 follow-ups:**
+  - a GitHub security advisory for the two security findings fixed in 0.4.0;
+  - descriptor-based file operations against symlink-swap races;
+  - an end-to-end content hash;
+  - bounded stream admission;
+  - a memory budget;
+  - streams without any public listener;
+  - `--timeout`;
+  - signed macOS binaries.
+
+  [audit/README.md](audit/README.md) tracks each.
+- **Links:** QUIC behind a firewall still falls back to the single ssh pipe, and no fast real
+  LAN or long link has been measured yet.
 - **From rsync's feature set:** daemon mode (`rsync://`) and the single-argument listing mode.
-  (`-X`/`-A` are done: see `IMPLEMENTATION.md`, M18.)
-- **Worth trying next:** QUIC still costs ~2 round trips per transfer over the pipe (M19):
-  the handshake, and a push's close or a pull's late start. The pull's could go (start the
-  listing on the ssh pipe and switch mid-stream). Whether `--transport auto` becomes the
-  default is open: the numbers are close (at most +9% on clean long links at first contact,
-  1.3–4× faster on lossy ones), but it opens a UDP port on every server and hasn't met a
-  fast real long link. And a cheaper probe so `--strategy adaptive` stops costing 4–22% on
-  incompressible data.
-- **The refinement threshold is fixed** (64 KiB of basis data per file). With
-  `--strategy adaptive` the measured round trip could set it: a smaller gap is worth
-  refining on a LAN, not on a long link.
+- **Worth trying:**
+  - whether `--transport auto` becomes the default (close on clean long links, 1.3–4× faster
+    on lossy ones, but it opens a UDP port on every server);
+  - a cheaper adaptive probe;
+  - a refinement threshold set from the measured round trip.

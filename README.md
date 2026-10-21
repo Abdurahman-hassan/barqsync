@@ -125,8 +125,8 @@ Every result is checked byte for byte against the source. barqsync is faster on 
 40 files with a 1 KiB edit each are 6% slower, where per-file overhead dominates. On a fast
 LAN the picture is the same, and transfers that are limited by the link or by ssh's
 encryption are a tie. Method, raw data and more cases:
-[IMPLEMENTATION.md](IMPLEMENTATION.md#benchmarks) and
-[fast_rsync_comparison.md](fast_rsync_comparison.md).
+[the implementation notes](docs/implementation.md#benchmarks) and
+[the delta engine comparison](docs/fast-rsync-comparison.md).
 
 ## Options at a glance
 
@@ -142,11 +142,13 @@ encryption are a tie. Method, raw data and more cases:
 | **Output** | `-i`, `--out-format`, `--progress`, `--info=progress2` |
 
 Every option, and where barqsync differs from rsync:
-[IMPLEMENTATION.md](IMPLEMENTATION.md#supported-options).
+[the implementation notes](docs/implementation.md#supported-options).
 
 ## Good to know
 
 - **macOS and Linux only.**
+- **Upgrade from 0.3.x or earlier.** 0.4.0 fixes security and data-loss bugs found in an
+  audit (see the [changelog](CHANGELOG.md)). Its protocol changed, so upgrade both machines.
 - **Remote copies need barqsync on both machines,** like rsync, or `--remote-path` to point
   at it. Both ends must run the same release line.
 - **Remote paths:** use `host:path` or `'user@[::1]:path'` for IPv6 (quote brackets in
@@ -162,12 +164,17 @@ Every option, and where barqsync differs from rsync:
 
 ## Learn more
 
-- [IMPLEMENTATION.md](IMPLEMENTATION.md): milestones, every option, how each part works and
+All documentation is in [`docs/`](docs/README.md):
+
+- [Implementation notes](docs/implementation.md): every option, how each part works, and
   what the measurements showed.
-- [fast_rsync_comparison.md](fast_rsync_comparison.md): how the delta engine was measured and
-  improved against fast_rsync and rsync.
-- [barqsync_as_built_plan.md](barqsync_as_built_plan.md): the architecture, and the original
-  plan next to what was built.
+- [Delta engine comparison](docs/fast-rsync-comparison.md): how the delta engine was
+  measured and improved against fast_rsync and rsync.
+- [As-built plan](docs/as-built-plan.md): the architecture, and the original plan next to
+  what was built.
+- [The October 2026 audit](docs/audit/README.md): the security and data-loss findings fixed
+  in 0.4.0, and what remains.
+- [What's left](docs/remaining.md).
 
 ## License
 

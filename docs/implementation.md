@@ -2,7 +2,7 @@
 
 The detailed notes behind barqsync: milestone status, every supported option, how each part
 works, and the measurements that shaped it. Through 0.2.0 this was the README;
-[README.md](README.md) is now a short overview.
+[README.md](../README.md) is now a short overview.
 
 A parallel, rsync-compatible file synchronizer written in Rust.
 
@@ -36,11 +36,14 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M17 | `--transport auto`: an ssh ping picks QUIC on round trips of 30 ms and more, a short wait for it, hosts where it failed skipped for an hour (protocol 8). As fast as QUIC on the lossy link (2–3× the ssh pipe), 0.5 s lost at most where UDP is blocked, but a round trip more on short links and QUIC's ~3-round-trip setup and close on clean long ones (11–22% slower there on a delta or a no-op), so the ssh pipe stays the default; see [`--transport auto`, measured](#--transport-auto-measured) | done |
 | M18 | `-X/--xattrs` (`-XX`) and `-A/--acls` with rsync's semantics, locally and remote (protocol 9): rsync's namespace rules on each system, long values sent as checksums and fetched only when needed, POSIX ACLs on Linux and extended ACLs on macOS, `x`/`a` item columns, attribute-only updates; APFS clones no longer keep attributes without `-X`; see [Extended attributes and ACLs](#extended-attributes-and-acls--x--a) | done |
 | M19 | QUIC's fixed cost: `BARQSYNC_TIMING` milestones on both sides; the sender closes once it has `ReceiverDone`, nothing waits for acknowledgements, the client doesn't wait for the token's acknowledgement, auto connects alongside its ping, and hosts where QUIC found a clean link stay on the ssh pipe for an hour. On a clean 80 ms link QUIC's cost over the pipe fell from 3–5 round trips per transfer to 2 (auto: delta +9% → +3.5%, no-op +23% → +9%; once the host is known clean, the pipe's own times); the lossy win is unchanged. The ssh pipe stays the default; see [QUIC's fixed cost](#quics-fixed-cost-m19). Also: a pull with `--remove-source-files` prints the sender's removals and exits 23 when one fails, as rsync does (protocol 10) | done |
+| M20 | parallel streams through ssh when a firewall blocks them: `barqsync --stream-relay` on the server carries each stream over its own ssh connection to the stream listener, which also listens on loopback. TLS with the pinned certificate and token still runs end to end. Verified on a real Mac with its firewall on: push 18.0 → 12.7 s and pull 65.5 → 38.6 s on a slow link. Also `~` in remote paths, clearer errors, local copy progress and literal-data stats. See [audit/04-ssh-relay.md](audit/04-ssh-relay.md) | done |
+| M21 | the October 2026 audit's 12 P1 findings, fixed for 0.4.0 (PRs 15–19): what the sending side announces is checked before anything is written; source removal is limited to entries the sender listed; same-file and backup guards; `--delete` across several sources, and none after a read error; `--threads=1` no longer hangs; Ctrl-C and lost peers end both sides in bounded time; large messages are chunked. See [the audit](audit/README.md) | done |
 
-The test suite passes on macOS (APFS; 198 tests at M19, 164 at M17, 154 at M16, 145 at M14,
-when it was also built as x86_64 and run under Rosetta) and Linux (201 tests at M19 and 167 at
-M17 in an aarch64 container, 157 at M16 on an x86_64 VM, 148 at M14), compared against rsync
-3.2.7. Three tests are Linux-only.
+The test suite passes on macOS (APFS; 249 tests at 0.4.0, 198 at M19, 164 at M17, 154 at
+M16, 145 at M14, when it was also built as x86_64 and run under Rosetta) and Linux (253 tests
+at 0.4.0 and 201 at M19 in an aarch64 container, 167 at M17, 157 at M16 on an x86_64 VM, 148
+at M14), compared against rsync 3.5.1 on macOS and 3.2.7 on Linux. A few tests are
+Linux-only.
 
 ## Install
 
@@ -706,7 +709,7 @@ chunks. Files of 128 KiB or less are always sent whole.
 ### Two-level delta (M16)
 
 Comparing barqsync with [fast_rsync](https://crates.io/crates/fast_rsync) and rsync on real
-transfers ([`fast_rsync_comparison.md`](fast_rsync_comparison.md)) showed that fixed 64 KiB
+transfers ([`fast-rsync-comparison.md`](fast-rsync-comparison.md)) showed that fixed 64 KiB
 blocks and 32 KiB chunks made small or scattered edits expensive: a SQLite database that grew
 by 3 MB after 8,000 SQL changes sent 193 MB, where rsync sent 104 MB.
 
@@ -867,20 +870,29 @@ src/local/          planner (SRC... DEST → roots) and the parallel per-directo
                     flags.rs: link/compare-dest, backups, partial, sparse, -L/-k, removals
                     extra.rs: -X/-A in the engine (read, compare, write)
                     pipeline.rs: --scanner=jwalk feed, transfer queues A-D
+                    merge.rs: several sources into one destination as one tree
 src/scan.rs         --scanner=jwalk tree scan (jwalk hook) and the destination index
 src/delta/          block/CDC signatures, diff, parallel apply (clone+patch or rebuild);
                     cdc.rs: --delta=cdc (stitched parallel FastCDC, xxh3 + BLAKE3, mmap)
 src/proto/          wire frames (postcard or rkyv + raw data, optional zstd), reader/writer
                     threads; async_io.rs: the tokio runtime and the tokio connection layer
 src/remote/         client (spawns the server over ssh), server, sender and receiver roles;
-                    streams.rs: --transport tcp, quic.rs: --transport quic
+                    streams.rs: --transport tcp, quic.rs: --transport quic,
+                    relay.rs: streams through ssh (--stream-relay), auto.rs: --transport auto,
+                    check.rs: checks on what the sending side announces
 src/output.rs       rsync-style item lines and stats
 tests/local_sync.rs end-to-end tests, most of them differential against rsync 3.x
 tests/delta_sync.rs --no-whole-file end to end (clone+patch, --inplace, rebuild) vs rsync
 tests/remote_sync.rs push/pull through a fake ssh, differential against rsync over the same shim
 tests/rsync_flags.rs the options above, locally and over the fake ssh (and one that cuts it)
 tests/xattrs_acls.rs -X / -A vs rsync, locally and pushed/pulled on each transport
-bench/              dataset generator + hyperfine runner
+tests/mutation_safety.rs, source_ack_safety.rs, peer_input.rs, deletion.rs,
+tests/remote_lifecycle.rs, remote_shutdown.rs, remote_paths.rs
+                    the audit's findings (docs/audit): same file, backups, source removal,
+                    a hostile sending side, --delete, worker counts, Ctrl-C, locations
+bench/              dataset generator + hyperfine runner; net/: the Linux container harness
+                    (link profiles, syscalls, flamegraphs, firewall.sh, fixed-cost timing)
+docs/               these notes, the plans, the delta comparison and the audit
 .github/workflows/  ci.yml: build, test, clippy; release.yml: release builds (generated by dist)
 dist-workspace.toml release targets, archive format and installers for dist
 ```
@@ -1162,22 +1174,31 @@ contention or allocation shows up in the hot frames.
 
 ## Releasing
 
-Releases are built by [dist](https://github.com/axodotdev/cargo-dist) (cargo-dist). Bump
-`version` in `Cargo.toml`, commit, then push a matching tag:
+Releases are built by [dist](https://github.com/axodotdev/cargo-dist) (cargo-dist). Pushing a
+version tag starts `.github/workflows/release.yml`. It builds the four targets on native
+runners, packages them with checksums, a shell installer and a Homebrew formula
+(`barqsync.rb`), and creates the GitHub release. Publishing to crates.io stays a manual
+`cargo publish`. After changing `dist-workspace.toml`, run `dist generate` to update the
+workflow (`dist plan` shows what a release would contain).
 
-```bash
-git tag v0.2.4 && git push origin v0.2.4
-```
+The steps, so the tag and the crate both contain exactly the commit that was checked:
 
-`.github/workflows/release.yml` then builds the four targets on native runners, packages
-them with checksums, a shell installer and a Homebrew formula (`barqsync.rb`), and creates
-the GitHub release. Publishing to crates.io stays a manual `cargo publish`. After changing
-`dist-workspace.toml`, run `dist generate` to update the workflow (`dist plan` shows what a
-release would contain).
+1. Put everything the release changes in one pull request and merge it: the version in
+   `Cargo.toml` (and `Cargo.lock`), the CHANGELOG date, and README notes.
+2. Fetch and note the exact commit (`git fetch origin && git rev-parse origin/main`), and
+   check that CI passed on it.
+3. In a clean worktree of that commit, run the checks and `cargo publish --dry-run`:
+   `git worktree add /tmp/barqsync-release <commit>`.
+4. Tag that commit by its hash and push the tag:
+   `git tag -a vX.Y.Z -m "barqsync X.Y.Z" <commit> && git push origin vX.Y.Z`.
+5. Run `cargo publish` from the same worktree.
+
+0.4.0's release checks, and what went differently when it was published, are in
+[audit/p1-coordination.md](audit/p1-coordination.md).
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option. Unless you explicitly state otherwise, any
+Licensed under either of [Apache License, Version 2.0](../LICENSE-APACHE) or
+[MIT license](../LICENSE-MIT) at your option. Unless you explicitly state otherwise, any
 contribution intentionally submitted for inclusion in barqsync, as defined in the Apache-2.0
 license, shall be dual licensed as above, without any additional terms or conditions.

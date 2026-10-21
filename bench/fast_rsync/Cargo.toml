@@ -3,7 +3,7 @@ name = "frbench"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "fast_rsync vs barqsync comparison harness (see fast_rsync_comparison.md)"
+description = "fast_rsync vs barqsync comparison harness (see docs/fast-rsync-comparison.md)"
 
 # Standalone: not part of the barqsync package or a workspace.
 [workspace]

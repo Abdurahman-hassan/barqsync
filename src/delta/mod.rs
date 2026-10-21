@@ -68,7 +68,7 @@ impl Params {
     /// ([`refine`]) for a basis of `size` bytes: a quarter of √size rounded up to a power of
     /// two, between 4 KiB and 64 KiB (4 KiB up to 256 MiB, 8 KiB up to 1 GiB, 16 KiB up to
     /// 4 GiB, 32 KiB up to 16 GiB, 64 KiB beyond). Chunks average the block size (half to
-    /// twice it). Measured in `fast_rsync_comparison.md`.
+    /// twice it). Measured in `docs/fast-rsync-comparison.md`.
     pub fn for_size(size: u64) -> Params {
         let unit = ((size.isqrt() / 4) as usize).next_power_of_two().clamp(4 << 10, Params::DEFAULT.block_size);
         Params { block_size: unit, cdc_min: unit / 2, cdc_avg: unit, cdc_max: unit * 2, ..Params::DEFAULT }

@@ -1,6 +1,6 @@
 # Implementation milestones
 
-This tracker turns [the audit plan](../../IMPLEMENTATION_PLAN.md) into reviewable
+This tracker turns [the audit plan](findings.md) into reviewable
 parts. The original audit remains the record of the findings. A part is complete
 only when its implemented scope and verification are recorded below; completing
 a part does not close other acceptance criteria in the audit.

@@ -1,7 +1,7 @@
 # Diagnostic reproductions, not passing regression tests. All writes use new temporary directories.
 import os, pathlib, subprocess, tempfile, json, signal
 base=pathlib.Path(tempfile.mkdtemp(prefix='barqsync-cli-review-'))
-repo=pathlib.Path(__file__).resolve().parents[3]
+repo=pathlib.Path(__file__).resolve().parents[4]
 bin=str(repo/'target/debug/barqsync')
 import shutil
 ref=os.environ.get('RSYNC') or shutil.which('rsync')

@@ -8,7 +8,7 @@ Date: 20–21 October 2026.
 the version bump, the changelog date and the README protocol line. Before the tag was made,
 `git pull` in the main checkout stopped on uncommitted changes. Those changes turned out to
 be a Codex session's work in progress. It had written
-[the audit](../../IMPLEMENTATION_PLAN.md), with 18 findings against v0.3.0, 12 of them P1,
+[the audit](findings.md), with 18 findings against v0.3.0, 12 of them P1,
 and had begun fixing them on top of v0.3.0.
 
 Three of the audit's data-loss findings were reproduced on the 0.4.0 code before anything
@@ -138,7 +138,8 @@ merged:
 The published crate is the code checked above, but two things in it differ from PR 20:
 
 - Its `CHANGELOG.md` still dates 0.4.0 2026-10-20.
-- It includes `IMPLEMENTATION_PLAN.md` and `REMAINING.md`.
+- It includes `IMPLEMENTATION_PLAN.md` and `REMAINING.md`, the names these documents had at
+  the repository root then (now `docs/audit/findings.md` and `docs/remaining.md`).
 
 Neither affects the program. A published crate version can't be replaced, so they stay.
 PR 20 dates the changelog 2026-10-21, the day 0.4.0 was published, and its `Cargo.toml`
