@@ -63,30 +63,57 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Frame>
 }
 
 /// Writer task: drains queued frames into `w`. An empty buffer is the close request.
+/// `urgent`: a lane whose frames go before anything queued (see
+/// [`super::FrameSender::tell_interrupted`]).
 pub(crate) fn spawn_writer(
     w: impl AsyncWrite + Unpin + Send + 'static,
     depth: usize,
+    mut urgent: Option<mpsc::Receiver<Vec<u8>>>,
+    stop: std::sync::Arc<super::Stopper>,
 ) -> (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<io::Result<()>>) {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(depth);
     let task = rt().spawn(async move {
         let mut w = BufWriter::with_capacity(256 << 10, w);
-        while let Some(buf) = rx.recv().await {
-            if buf.is_empty() {
-                break;
+        let r = async {
+            loop {
+                let next = match urgent.as_mut() {
+                    Some(u) => match u.try_recv() {
+                        Ok(buf) => Some(buf),
+                        Err(_) => {
+                            std::future::poll_fn(|cx| {
+                                if let Poll::Ready(Some(buf)) = u.poll_recv(cx) {
+                                    return Poll::Ready(Some(buf));
+                                }
+                                rx.poll_recv(cx)
+                            })
+                            .await
+                        }
+                    },
+                    None => rx.recv().await,
+                };
+                let Some(buf) = next else { break };
+                if buf.is_empty() {
+                    break;
+                }
+                w.write_all(&buf).await?;
+                if rx.is_empty() && urgent.as_ref().is_none_or(|u| u.is_empty()) {
+                    w.flush().await?;
+                }
             }
-            w.write_all(&buf).await?;
-            if rx.is_empty() {
-                w.flush().await?;
-            }
+            w.flush().await?;
+            w.shutdown().await
         }
-        w.flush().await?;
-        w.shutdown().await
+        .await;
+        if let Err(e) = &r {
+            stop.fail(e);
+        }
+        r
     });
     (tx, task)
 }
 
-/// Reader task: decodes frames from `r` into `out`. `data_stream`: ends after `StreamEnd`
-/// and treats a plain end of stream as an error.
+/// Reader task: decodes frames from `r` into `out`, then says how the stream ended (a
+/// plain end of stream is an error too). `data_stream`: ends after `StreamEnd`.
 pub(crate) fn spawn_reader(
     r: impl AsyncRead + Unpin + Send + 'static,
     out: Sender<io::Result<Frame>>,
@@ -99,10 +126,10 @@ pub(crate) fn spawn_reader(
             let f = match read_frame(&mut r).await {
                 Ok(Some(f)) => f,
                 Ok(None) => {
-                    if data_stream {
-                        let e = io::Error::new(io::ErrorKind::UnexpectedEof, "data stream closed early");
-                        let _ = tokio::task::block_in_place(|| out.send(Err(e)));
-                    }
+                    // The control stream too: data streams may keep the channel open.
+                    let what = if data_stream { "data stream closed early" } else { "connection closed by peer" };
+                    let e = io::Error::new(io::ErrorKind::UnexpectedEof, what);
+                    let _ = tokio::task::block_in_place(|| out.send(Err(e)));
                     break;
                 }
                 Err(e) => {

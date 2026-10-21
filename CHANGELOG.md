@@ -90,6 +90,29 @@
   its size and modification second stayed the same: the sender compares the file type,
   device and inode, size and modification time to the nanosecond. It used to compare size
   and whole seconds, and only for regular files.
+- Remote transfers with `--threads=1` no longer hang: the protocol loop waited on the
+  only worker thread for messages that needed that thread's queued work.
+- `--delete` no longer deletes after an error reading the source side (a dangling symlink
+  under `-L`, an unreadable entry, attributes or ACLs that can't be read, a missing
+  source): such a listing lacks entries the source has. As rsync does, barqsync prints
+  "IO error encountered -- skipping file deletion", deletes nothing more and exits with
+  code 23, locally and in both directions of a remote transfer. `--scanner=jwalk` also
+  stopped dropping entries it could not stat without a word.
+- Several sources into one destination (`barqsync -a --delete a/ b/ dst/`) are now one
+  tree, as in rsync: `--delete` keeps whatever any source has, a name in several comes
+  from the first one, a directory wins over a file of the same name, and directories of
+  the same name merge their contents. Each source used to be synced on its own, so
+  `--delete` removed the other sources' files (only `b`'s survived), and remotely the
+  sources raced each other. This covers local transfers with both scanners, pushes and
+  pulls, named items (`a/ c dst/`) and `-R` paths from several bases.
+- Ctrl-C and a lost connection now end a remote transfer within a few seconds on both
+  sides, with rsync's exit codes, and leave no `barqsync --server` or `--stream-relay`
+  running. Ctrl-C with a server that stopped reading used to hang the client forever;
+  an interrupted client could exit 0, and a client whose server was interrupted exited 12
+  (both now 20, as rsync does). An interrupted side now tells the other one, which stops
+  as well. A connection whose writing side fails (a pipe cut between the two) is now
+  noticed instead of waiting forever for answers; closing a connection and waiting for
+  the remote shell and the stream relays are bounded.
 
 ## 0.3.0 - 2026-10-20
 

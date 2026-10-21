@@ -41,8 +41,8 @@ pub type Emit = Arc<dyn Fn(&Path, Vec<u8>, Vec<DirEnt>) + Send + Sync>;
 
 /// Walk the tree under `top` (whose path relative to the transfer root is `rel`),
 /// emitting every directory's listing, `top` included. Returns once the whole tree
-/// has been read. Directories that can't be read are skipped: the engine reads them
-/// itself and reports the error.
+/// has been read. Directories that can't be read completely (the directory, or one of
+/// its entries) are not emitted: the engine reads them itself and reports the error.
 pub fn walk(top: &Path, rel: &[u8], threads: usize, descend: Descend, emit: Emit) {
     let top_buf = top.to_path_buf();
     let prefix = rel.to_vec();
@@ -62,9 +62,19 @@ pub fn walk(top: &Path, rel: &[u8], threads: usize, descend: Descend, emit: Emit
                 Err(_) => return,
             };
             let Ok(handle) = DirHandle::open(dir) else { return };
+            let failed = AtomicBool::new(false);
             let stat = |c: &mut jwalk::Result<jwalk::DirEntry<((), ())>>| -> Option<DirEnt> {
-                let c = c.as_mut().ok()?;
-                let ent = stat_child(&handle, c.file_name.clone()).ok()??;
+                let Ok(c) = c.as_mut() else {
+                    failed.store(true, Relaxed);
+                    return None;
+                };
+                let ent = match stat_child(&handle, c.file_name.clone()) {
+                    Ok(e) => e?,
+                    Err(_) => {
+                        failed.store(true, Relaxed);
+                        return None;
+                    }
+                };
                 if ent.meta.kind != Kind::Dir || !descend(&join_rel(&rel, &ent.name), &ent.meta) {
                     c.read_children = None;
                 }
@@ -79,9 +89,20 @@ pub fn walk(top: &Path, rel: &[u8], threads: usize, descend: Descend, emit: Emit
                 std::thread::scope(|ts| {
                     let parts: Vec<_> =
                         children.chunks_mut(per).map(|part| ts.spawn(|| part.iter_mut().filter_map(stat).collect::<Vec<_>>())).collect();
-                    parts.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+                    parts
+                        .into_iter()
+                        .flat_map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                failed.store(true, Relaxed);
+                                Vec::new()
+                            })
+                        })
+                        .collect()
                 })
             };
+            if failed.load(Relaxed) {
+                return;
+            }
             ents.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
             emit(dir, rel, ents);
         });

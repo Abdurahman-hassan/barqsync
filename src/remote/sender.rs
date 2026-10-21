@@ -13,6 +13,7 @@ use crate::delta::{self, Delta, Op, Params, ReadAt, ReadOnce, cdc};
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::ids;
 use crate::local::extra;
+use crate::local::merge::{self, SrcDir, Sources};
 use crate::local::flags::{adjust_listing, adjust_mode, remove_source};
 use crate::xattrs::{Rules, Xattr};
 use crate::select::{self, Descend, Sel};
@@ -24,7 +25,7 @@ use crate::paths::{join_rel, split_source, wants_contents};
 use crate::proto::{self, Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
 use rayon::Scope;
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -37,8 +38,8 @@ struct Sender<'a> {
     opts: &'a Options,
     out: &'a Output,
     filter: Filter,
-    /// Listings sent and not yet answered: dir id -> (directory path, entries).
-    listings: Mutex<HashMap<u32, (PathBuf, Vec<DirEnt>)>>,
+    /// Listings sent and not yet answered, by dir id.
+    listings: Mutex<HashMap<u32, Listing>>,
     next_dir: AtomicU32,
     needs_done: AtomicU32,
     /// Large-file sends still running (each is its own task).
@@ -50,18 +51,39 @@ struct Sender<'a> {
     reported: AtomicU64,
     /// Ids already named to the receiver (no `--numeric-ids`).
     ids: Mutex<ids::Sent>,
-    /// Each root's base directory (`--remove-source-files` paths are relative to it).
-    bases: Vec<PathBuf>,
     /// `--remove-source-files`: the entries listed so far and not yet removed, by root and
-    /// path, as they were listed. The receiver names what it has; only these may go, and
-    /// whether they changed meanwhile is judged by this record.
-    removable: Mutex<HashMap<(u16, Vec<u8>), Meta>>,
+    /// path relative to it: where each is and what it was when listed. The receiver
+    /// names what it has; only these may go, and whether they changed meanwhile is
+    /// judged by this record.
+    removable: Mutex<Removable>,
     /// `-X`: which attribute names are sent.
     xrules: Rules,
     /// Deltas waiting for the receiver's answer to a `Refine`: file id -> where it goes.
     refining: Mutex<HashMap<u64, crossbeam_channel::Sender<Vec<GapSig>>>>,
+    /// `IoError` was sent. A lock, not a flag: a listing read after an error must not
+    /// overtake the `IoError` on the wire.
+    io_error: Mutex<bool>,
     /// A message too large to send stops the transfer.
     failed: SendFailure,
+}
+
+/// `--remove-source-files`: (root, path) -> where the entry is and what it was.
+type Removable = HashMap<(u16, Vec<u8>), (PathBuf, Meta)>;
+
+/// A top directory of the transfer root, with its listing when it is named items.
+type Top = (SrcDir, Option<Vec<DirEnt>>);
+
+/// A listing sent and not yet answered: its entries and the source directories they
+/// are in (several when SRC arguments merge into one destination directory).
+struct Listing {
+    entries: Vec<DirEnt>,
+    sources: Sources,
+}
+
+impl Listing {
+    fn path(&self, idx: usize) -> PathBuf {
+        self.sources.dir_of(idx as u32).path.join(&self.entries[idx].name)
+    }
 }
 
 /// A source argument resolved on disk.
@@ -77,6 +99,17 @@ impl Sender<'_> {
     fn err(&self, msg: impl AsRef<[u8]>) {
         self.errors.fetch_add(1, SeqCst);
         self.out.error(msg);
+    }
+
+    /// An error reading the source: the listings may now lack entries, which the
+    /// receiver must not delete (`IoError`, queued before any later listing).
+    fn scan_err(&self, msg: impl AsRef<[u8]>) {
+        self.err(msg);
+        let mut sent = self.io_error.lock().unwrap();
+        if !*sent {
+            self.send(Msg::IoError);
+            *sent = true;
+        }
     }
 
     fn send(&self, m: Msg) -> bool {
@@ -100,29 +133,29 @@ impl Sender<'_> {
     }
 
     /// Register a listing and send it. Registered first, so a quick `Need` finds it.
-    fn send_listing(&self, root: u16, rel: Vec<u8>, path: PathBuf, entries: Vec<DirEnt>) {
-        let sums = if self.opts.checksum { self.checksums(&path, &entries) } else { Vec::new() };
+    fn send_listing(&self, root: u16, rel: Vec<u8>, listing: Listing) {
+        let sums = if self.opts.checksum { self.checksums(&listing) } else { Vec::new() };
         let dir = self.next_dir.fetch_add(1, SeqCst);
         if self.removes() {
             let mut removable = self.removable.lock().unwrap();
-            for e in entries.iter().filter(|e| e.meta.kind != Kind::Dir) {
-                removable.insert((root, join_rel(&rel, &e.name)), e.meta);
+            for (i, e) in listing.entries.iter().enumerate().filter(|(_, e)| e.meta.kind != Kind::Dir) {
+                removable.insert((root, join_rel(&rel, &e.name)), (listing.path(i), e.meta));
             }
         }
-        self.listings.lock().unwrap().insert(dir, (path.clone(), entries.clone()));
+        let entries = listing.entries.clone();
+        // Errors name the listing by its (first) source directory.
+        let path = listing.sources.dirs.first().map(|d| d.path.clone()).unwrap_or_default();
+        self.listings.lock().unwrap().insert(dir, listing);
         self.name_ids(entries.iter().map(|e| (&e.meta, e.extra.as_deref())));
         self.send_for(Msg::DirBatch { root, dir, rel, entries, sums }, "the listing of \"", &path);
     }
 
     /// `-c`: checksums of the listing's regular files, hashed in parallel.
-    fn checksums(&self, dir: &Path, entries: &[DirEnt]) -> Vec<Option<Sum>> {
-        let files: Vec<PathBuf> =
-            entries.iter().filter(|e| e.meta.kind == Kind::File).map(|e| dir.join(&e.name)).collect();
+    fn checksums(&self, l: &Listing) -> Vec<Option<Sum>> {
+        let is_file = |i: &usize| l.entries[*i].meta.kind == Kind::File;
+        let files: Vec<PathBuf> = (0..l.entries.len()).filter(is_file).map(|i| l.path(i)).collect();
         let mut sums = checksum::sums(files).into_iter();
-        entries
-            .iter()
-            .map(|e| if e.meta.kind == Kind::File { sums.next().and_then(Result::ok) } else { None })
-            .collect()
+        (0..l.entries.len()).map(|i| if is_file(&i) { sums.next().and_then(Result::ok) } else { None }).collect()
     }
 
     /// Without `--numeric-ids`, name each uid/gid before the first listing that uses it
@@ -151,35 +184,59 @@ impl Sender<'_> {
 
     /// `-L`/`-k`/`--chmod`, then (`-X`/`-A`) the entries' attributes and ACLs.
     fn listing(&self, dir: &Path, ents: Vec<DirEnt>) -> Vec<DirEnt> {
-        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.err(m));
-        extra::collect(self.opts, &self.xrules, dir, ents, &mut |m| self.err(m))
+        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.scan_err(m));
+        extra::collect(self.opts, &self.xrules, dir, ents, &mut |m| self.scan_err(m))
     }
 
-    fn walk_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, path: PathBuf, root_dev: u64, sel: Option<&'static Sel>) {
+    /// The listing of source directory `dir` (only `sel`'s entries, if given), or `None`
+    /// after reporting that it could not be read.
+    fn read_dir(&self, dir: &Path, sel: Option<&Sel>) -> Option<Vec<DirEnt>> {
+        match sel {
+            Some(sel) if !sel.contents => Some(self.read_selected(dir, sel)),
+            _ => match fsops::read_dir_meta(dir) {
+                Ok(v) => Some(self.listing(dir, v)),
+                Err(e) => {
+                    self.scan_err(path_msg("opendir \"", dir, format!("\" failed: {e}")));
+                    None
+                }
+            },
+        }
+    }
+
+    /// Read and send the directory at `rel` of transfer root `root` (one source directory,
+    /// or several merging), then walk its subdirectories.
+    fn walk_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, dirs: Vec<SrcDir>) {
         if fsops::interrupted() {
             return;
         }
-        let ents = match sel {
-            Some(sel) if !sel.contents => self.read_selected(&path, sel),
-            _ => match fsops::read_dir_meta(&path) {
-                Ok(v) => self.listing(&path, v),
-                Err(e) => return self.err(path_msg("opendir \"", &path, format!("\" failed: {e}"))),
-            },
-        };
-        let ents: Vec<DirEnt> = ents
-            .into_iter()
-            .filter(|e| !self.filter.is_excluded(&join_rel(&rel, &e.name), e.meta.kind == Kind::Dir))
-            .collect();
-        let subdirs: Vec<(Vec<u8>, PathBuf, Option<&'static Sel>)> = ents
+        let lists: Vec<Option<Vec<DirEnt>>> = dirs.iter().map(|d| self.read_dir(&d.path, d.sel)).collect();
+        if lists.iter().all(Option::is_none) {
+            return;
+        }
+        self.send_dir(s, root, rel, dirs, lists.into_iter().map(Option::unwrap_or_default).collect());
+    }
+
+    /// Send the listing at `rel`, merged from `lists` (`dirs[i]`'s), and walk on.
+    fn send_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, dirs: Vec<SrcDir>, lists: Vec<Vec<DirEnt>>) {
+        let excluded = |e: &DirEnt| self.filter.is_excluded(&join_rel(&rel, &e.name), e.meta.kind == Kind::Dir);
+        let lists = lists.into_iter().map(|l| l.into_iter().filter(|e| !excluded(e)).collect()).collect();
+        let (entries, sources) = merge::merge(dirs, lists);
+        let (recursive, one_fs) = (self.opts.recursive, self.opts.one_file_system);
+        let subdirs: Vec<(Vec<u8>, Vec<SrcDir>)> = entries
             .iter()
-            .filter_map(|e| {
-                let sub = self.descend_into(sel, e, root_dev)?;
-                Some((join_rel(&rel, &e.name), path.join(&e.name), sub))
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let d = sources.dir_of(i as u32);
+                let dev = d.dev.unwrap_or(e.meta.dev);
+                let sub = self.descend_into(d.sel, e, dev)?;
+                let mut srcs = vec![SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev) }];
+                srcs.extend(sources.also_dirs(i as u32, &e.name, recursive, one_fs));
+                Some((join_rel(&rel, &e.name), srcs))
             })
             .collect();
-        self.send_listing(root, rel, path, ents);
-        for (crel, cpath, sub) in subdirs {
-            s.spawn(move |s| self.walk_dir(s, root, crel, cpath, root_dev, sub));
+        self.send_listing(root, rel, Listing { entries, sources });
+        for (crel, srcs) in subdirs {
+            s.spawn(move |s| self.walk_dir(s, root, crel, srcs));
         }
     }
 
@@ -187,7 +244,7 @@ impl Sender<'_> {
     fn read_selected(&self, dir: &Path, sel: &Sel) -> Vec<DirEnt> {
         let (ents, errs) = select::read_selected(dir, sel);
         for (p, e) in errs {
-            self.err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
+            self.scan_err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
         }
         self.listing(dir, ents)
     }
@@ -205,26 +262,23 @@ impl Sender<'_> {
         }
     }
 
-    fn walk_roots<'s>(&'s self, s: &Scope<'s>, roots: &'s [SrcRoot]) {
-        for (r, root) in roots.iter().enumerate() {
-            let r = r as u16;
-            if root.info.contents {
-                let dev = root.info.meta.map(|m| m.dev).unwrap_or(0);
-                let sel = root.sel.and_then(|sel| sel.at_root(self.opts.recursive));
-                s.spawn(move |s| self.walk_dir(s, r, Vec::new(), root.base.clone(), dev, sel));
-            } else {
-                // The named items form a virtual top-level listing.
-                for item in &root.info.items {
-                    if let Some(sub) = self.descend_into(root.sel, item, item.meta.dev) {
-                        let rel = item.name.as_bytes().to_vec();
-                        let path = root.base.join(&item.name);
-                        let dev = item.meta.dev;
-                        s.spawn(move |s| self.walk_dir(s, r, rel, path, dev, sub));
-                    }
-                }
-                self.send_listing(r, Vec::new(), root.base.clone(), root.info.items.clone());
-            }
+    /// Send the top of the (single) transfer root: the source arguments' top directories
+    /// merged, `src/` ones read now and named items as resolved.
+    fn walk_top<'s>(&'s self, s: &Scope<'s>, tops: Vec<Top>) {
+        if tops.is_empty() || fsops::interrupted() {
+            return;
         }
+        let (dirs, lists): (Vec<SrcDir>, Vec<Option<Vec<DirEnt>>>) = tops
+            .into_iter()
+            .map(|(d, items)| {
+                let l = items.or_else(|| self.read_dir(&d.path, d.sel));
+                (d, l)
+            })
+            .unzip();
+        if lists.iter().all(Option::is_none) {
+            return;
+        }
+        self.send_dir(s, 0, Vec::new(), dirs, lists.into_iter().map(Option::unwrap_or_default).collect());
     }
 
     /// Whether the receiver may report entries for removal (`Synced`).
@@ -239,11 +293,10 @@ impl Sender<'_> {
             let key = (root, rel);
             let listed = self.removable.lock().unwrap().remove(&key);
             let rel = key.1;
-            let (Some(listed), Some(base)) = (listed, self.bases.get(root as usize)) else {
+            let Some((path, listed)) = listed else {
                 self.err([&b"protocol error: removal of an entry not sent or already removed: "[..], &rel].concat());
                 continue;
             };
-            let path = base.join(OsStr::from_bytes(&rel));
             match remove_source(self.opts, &path, &listed, None) {
                 Ok(()) if self.out.verbose() >= 2 => self.out.info([&b"sender removed "[..], &rel].concat()),
                 Ok(()) => {}
@@ -261,7 +314,9 @@ impl Sender<'_> {
         {
             // Data streams first: the receiver finishes once it has seen every
             // stream's end as well as SenderDone (which travels on the ssh connection).
-            if let Err(e) = self.out_frames.end_data_streams() {
+            if let Err(e) = self.out_frames.end_data_streams()
+                && !self.out_frames.stopped()
+            {
                 self.err(format!("closing data streams failed: {e}"));
             }
             let errors = self.errors.load(SeqCst);
@@ -278,9 +333,9 @@ impl Sender<'_> {
     fn serve<'s>(&'s self, s: &Scope<'s>, dir: u32, reqs: Vec<NeedReq>, xattrs: Vec<u32>) {
         let listing = self.listings.lock().unwrap().remove(&dir);
         match listing {
-            Some((base, entries)) => {
-                self.send_xattrs(dir, &base, &entries, xattrs);
-                self.serve_listing(s, dir, &base, &entries, reqs)
+            Some(l) => {
+                self.send_xattrs(dir, &l, xattrs);
+                self.serve_listing(s, dir, &l, reqs)
             }
             None => self.err(format!("protocol error: request for unknown directory {dir}")),
         }
@@ -289,13 +344,13 @@ impl Sender<'_> {
     }
 
     /// `-X`: the attributes of these entries in full, for the receiver to update them.
-    fn send_xattrs(&self, dir: u32, base: &Path, entries: &[DirEnt], idxs: Vec<u32>) {
+    fn send_xattrs(&self, dir: u32, l: &Listing, idxs: Vec<u32>) {
         for idx in idxs {
-            let Some(e) = entries.get(idx as usize) else {
+            if idx as usize >= l.entries.len() {
                 self.err(format!("protocol error: request for unknown entry {dir}/{idx}"));
                 continue;
-            };
-            let path = base.join(&e.name);
+            }
+            let path = l.path(idx as usize);
             let xattrs = self.full_xattrs(&path);
             self.send_for(Msg::Xattrs { id: file_id(dir, idx), xattrs }, "the attributes of \"", &path);
         }
@@ -316,16 +371,16 @@ impl Sender<'_> {
     /// connection's backpressure, and a blocked parallel loop would let its thread
     /// steal more blocking tasks onto the same stack. Parallelism comes from many
     /// listings being served at once, and each large file being its own task.
-    fn serve_listing<'s>(&'s self, s: &Scope<'s>, dir: u32, base: &Path, entries: &[DirEnt], reqs: Vec<NeedReq>) {
+    fn serve_listing<'s>(&'s self, s: &Scope<'s>, dir: u32, l: &Listing, reqs: Vec<NeedReq>) {
         let mut small = Vec::new();
         let mut large = Vec::new();
         for req in reqs {
-            let Some(e) = entries.get(req.idx as usize) else {
+            let Some(e) = l.entries.get(req.idx as usize) else {
                 self.err(format!("protocol error: request for unknown file {dir}/{}", req.idx));
                 continue;
             };
             let id = file_id(dir, req.idx);
-            let path = base.join(&e.name);
+            let path = l.path(req.idx as usize);
             // Values the listing only had checksums of go along with the data.
             let full = extra::has_summed(e.extra.as_deref());
             crate::progress::planned(e.meta.size);
@@ -352,10 +407,10 @@ impl Sender<'_> {
                     match r {
                         // Sent bytes were counted as they went.
                         Ok(sent) => crate::progress::done(size.saturating_sub(sent)),
-                        // A failed file doesn't count as transferred; after Ctrl-C the
-                        // closed connection is expected, not worth a message.
+                        // A failed file doesn't count as transferred; once the run is
+                        // stopping (Ctrl-C, a failed peer) that is expected, not worth a message.
                         Err(e) => {
-                            if !fsops::interrupted() && self.failed.reason().is_none() {
+                            if !self.out_frames.stopped() && self.failed.reason().is_none() {
                                 self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
                             }
                             self.send(Msg::FileEnd { id, ok: false });
@@ -613,6 +668,49 @@ fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, out: &Ou
     roots
 }
 
+/// The transfer root the receiver sees, and its top directories with the named items
+/// already listed: several SRC arguments are one root, merged like rsync's file list
+/// (see [`merge`]). `None` when no source could be resolved.
+fn merge_roots(roots: &[SrcRoot], recursive: bool) -> (Option<RootInfo>, Vec<Top>) {
+    let tops: Vec<Top> = roots
+        .iter()
+        .map(|r| match r.info.meta {
+            Some(m) if r.info.contents => {
+                (SrcDir { path: r.base.clone(), sel: r.sel.and_then(|s| s.at_root(recursive)), dev: Some(m.dev) }, None)
+            }
+            _ => (SrcDir { path: r.base.clone(), sel: r.sel, dev: None }, Some(r.info.items.clone())),
+        })
+        .collect();
+    let info = match roots {
+        [] => None,
+        [r] => Some(r.info.clone()),
+        _ => {
+            // The destination itself gets the first `src/` directory's attributes.
+            let top = roots.iter().find(|r| r.info.contents);
+            let items = match top {
+                Some(_) => Vec::new(),
+                None => {
+                    let lists = tops.iter().map(|(_, items)| items.clone().unwrap_or_default()).collect();
+                    merge::merge(tops.iter().map(|(d, _)| d.clone()).collect(), lists).0
+                }
+            };
+            let sel = roots.iter().filter_map(|r| r.info.sel.as_ref()).fold(None, |all: Option<Sel>, s| {
+                let mut all = all.unwrap_or_default();
+                all.merge(s);
+                Some(all)
+            });
+            Some(RootInfo {
+                contents: top.is_some(),
+                meta: top.and_then(|r| r.info.meta),
+                items,
+                sel,
+                extra: top.and_then(|r| r.info.extra.clone()),
+            })
+        }
+    };
+    (info, tops)
+}
+
 /// A `src/` root directory's own attributes (values in full) and ACLs.
 fn root_extra(opts: &Options, r: &Rules, path: &Path, meta: &Meta, err: &mut dyn FnMut(Vec<u8>)) -> Option<Box<crate::entry::Extra>> {
     extra::read_wire(opts, r, path, Kind::Dir, meta.mode, true)
@@ -665,17 +763,24 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         errors,
         reported: AtomicU64::new(0),
         ids: Mutex::new(ids::Sent::default()),
-        bases: roots.iter().map(|r| r.base.clone()).collect(),
         removable: Mutex::new(HashMap::new()),
         xrules: extra::rules(opts),
         refining: Mutex::new(HashMap::new()),
+        io_error: Mutex::new(false),
         failed: SendFailure::default(),
     };
+    // Every error so far was about reading a source root.
+    if sender.errors.load(SeqCst) > 0 {
+        *sender.io_error.lock().unwrap() = true;
+        sender.send(Msg::IoError);
+    }
     sender.name_ids(roots.iter().flat_map(|r| {
         let root = r.info.meta.as_ref().map(|m| (m, r.info.extra.as_deref()));
         root.into_iter().chain(r.info.items.iter().map(|e| (&e.meta, e.extra.as_deref())))
     }));
-    sender.send_named(Msg::Roots(roots.iter().map(|r| r.info.clone()).collect()), || b"the list of sources".to_vec());
+    // Every root writes into the destination: several are sent as one merged root.
+    let (info, tops) = merge_roots(&roots, opts.recursive);
+    sender.send_named(Msg::Roots(info.into_iter().collect()), || b"the list of sources".to_vec());
 
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
@@ -690,12 +795,11 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         }
     };
     let sender = &sender;
-    let roots = &roots;
     // Keep blocking protocol coordination on the caller; every configured
     // worker remains available for finite scan, hash and write tasks.
     let result = pool.in_place_scope(|s| {
         s.spawn(move |_| {
-            rayon::scope(|ws| sender.walk_roots(ws, roots));
+            rayon::scope(|ws| sender.walk_top(ws, tops));
             sender.send(Msg::ScanDone { dirs: sender.next_dir.load(SeqCst) });
             sender.scan_done.store(true, SeqCst);
             sender.check_done();
@@ -744,8 +848,12 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
                 }
             }
         };
-        // Release deltas still waiting for an answer that won't come.
+        // Release deltas still waiting for an answer that won't come, and tasks waiting to
+        // send to a peer that may no longer read.
         sender.refining.lock().unwrap().clear();
+        if r.is_err() {
+            sender.out_frames.cancel();
+        }
         r
     });
     match result {

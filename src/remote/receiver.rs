@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 /// Rendezvous between a directory's listing and the receiver being ready for it.
 enum Slot {
     /// Ready (created by its parent), waiting for the listing.
-    Job(DirJob),
+    Job(Box<DirJob>),
     /// A `src` root (no trailing slash): named items synced into `dst_dir`.
     Items { dst_dir: PathBuf, rename: Option<OsString>, dst_is_new: bool, sel: Option<&'static Sel> },
     /// The listing arrived first.
@@ -420,7 +420,7 @@ impl RemoteState {
                 self.spawn_listing(s, eng, job, entries);
             }
             _ => {
-                slots.insert(key, Slot::Job(job));
+                slots.insert(key, Slot::Job(Box::new(job)));
             }
         }
     }
@@ -457,14 +457,14 @@ impl RemoteState {
             Some(Slot::Job(mut job)) => {
                 drop(slots);
                 job.wire_dir = dir;
-                self.spawn_listing(s, eng, job, entries);
+                self.spawn_listing(s, eng, *job, entries);
             }
             Some(Slot::Items { dst_dir, rename, dst_is_new, sel }) => {
                 drop(slots);
                 self.inflight.fetch_add(1, SeqCst);
                 s.spawn(move |s| {
                     let entries = entries.into_iter().enumerate().map(|(i, e)| (i as u32, e, rename.clone())).collect();
-                    eng.run_items(s, Path::new(""), &dst_dir, root, dir, entries, dst_is_new, sel);
+                    eng.run_items(s, Path::new(""), &dst_dir, root, dir, entries, dst_is_new, sel, None);
                     let r = eng.remote.as_ref().unwrap();
                     r.sums.lock().unwrap().remove(&dir);
                     r.task_done();
@@ -1093,7 +1093,7 @@ fn plan_dest(eng: &mut Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -
                 (true, Some(meta)) => {
                     let mut job = eng.root_job(PathBuf::new(), dest_path.clone(), meta, r, dest_exists && !fresh, root.extra.clone());
                     job.sel = sel.and_then(|s| s.at_root(eng.opts.recursive));
-                    Slot::Job(job)
+                    Slot::Job(Box::new(job))
                 }
                 _ => Slot::Items { dst_dir: dest_path.clone(), rename: None, dst_is_new: !dest_exists || fresh, sel },
             };
@@ -1116,6 +1116,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     let mut ids = IdMap::default();
     let mut probe = adapt::ProbeReceiver::default();
     let mut link = None;
+    let mut io_error = false;
     let mut roots = loop {
         let f = recv(conn);
         if let Ok(f) = &f {
@@ -1127,6 +1128,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         }
         match f {
             Ok(Frame::Msg(Msg::LinkInfo(l))) => link = Some(l),
+            Ok(Frame::Msg(Msg::IoError)) => io_error = true,
             Ok(Frame::Msg(Msg::Roots(r))) => break r,
             Ok(Frame::Msg(Msg::IdNames { users, groups })) => ids.add(&users, &groups),
             Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
@@ -1152,6 +1154,9 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         root.items.iter_mut().for_each(|e| ids.apply(&mut e.meta));
     }
     let mut engine = Engine::new(opts, filter, out);
+    if io_error {
+        engine.sender_io_error();
+    }
     for root in roots.iter_mut().filter(|_| engine.extras_on()) {
         let mode = root.meta.map_or(0, |m| m.mode);
         root.extra = local_extra(&ids, &engine.xrules, root.extra.take(), mode);
@@ -1206,7 +1211,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         }
         let mut streams_ended = 0;
         let mut sender_done: Option<u64> = None;
-        loop {
+        let r = loop {
             if let Some(errors) = sender_done
                 && streams_ended == streams
             {
@@ -1273,6 +1278,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                         remote.on_scan_done();
                         Ok(())
                     }
+                    Msg::IoError => {
+                        engine.sender_io_error();
+                        Ok(())
+                    }
                     Msg::SenderDone { errors } => {
                         crate::timing::mark("SenderDone received");
                         sender_done = Some(errors);
@@ -1299,7 +1308,12 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             if let Err(e) = r {
                 engine.err(format!("receiving file data failed: {e}"));
             }
+        };
+        // Stopping early: tasks waiting to send to a peer that may no longer read give up.
+        if r.1.is_some() {
+            conn.out.cancel();
         }
+        r
     });
 
     if let Some((index, scan)) = dst_scan {

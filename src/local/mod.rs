@@ -3,6 +3,7 @@
 pub mod exec;
 pub mod extra;
 pub mod flags;
+pub(crate) mod merge;
 pub mod pipeline;
 
 use crate::cli::Options;
@@ -183,13 +184,10 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
             p.run_workers(ts, engine, rx);
         }
         pool.install(|| {
-            for (i, root) in plan.roots.iter().enumerate() {
-                // Only the first root may assume a freshly created destination is empty.
-                let fresh = plan.dest_created && i == 0;
-                match &engine.pipeline {
-                    Some(p) => pipeline::run_root(engine, p, root, plan.dest_exists, fresh),
-                    None => rayon::scope(|s| engine.run_root(s, root, plan.dest_exists, fresh)),
-                }
+            // Several roots land in one destination: they are synced as one merged tree.
+            match &engine.pipeline {
+                Some(p) => pipeline::run_roots(engine, p, &plan.roots, plan.dest_exists, plan.dest_created),
+                None => rayon::scope(|s| engine.run_roots(s, &plan.roots, plan.dest_exists, plan.dest_created)),
             }
         });
         if let Some(p) = &engine.pipeline {

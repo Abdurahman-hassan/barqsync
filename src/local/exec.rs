@@ -13,6 +13,7 @@
 //! scan, destination entries from a pre-scanned index, and files go through queues.
 
 use super::Root;
+use super::merge::{self, SrcDir, Sources};
 use crate::cli::Options;
 use crate::delta::{self, DeltaMode, apply::apply, cdc};
 use super::extra::{DstExtra, Src, XSource};
@@ -33,6 +34,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 
 pub struct Engine<'a> {
@@ -60,6 +62,11 @@ pub struct Engine<'a> {
     pub(crate) dst_index: Option<Arc<crate::scan::DstIndex>>,
     /// `-X`: which attribute names take part.
     pub(crate) xrules: crate::xattrs::Rules,
+    /// The source side could not be read completely (rsync's `io_error`): its listings
+    /// may lack entries, so nothing is deleted from now on.
+    io_error: AtomicBool,
+    /// "IO error encountered -- skipping file deletion" was shown.
+    io_warned: AtomicBool,
 }
 
 pub(crate) struct DirJob {
@@ -78,6 +85,9 @@ pub(crate) struct DirJob {
     pre: Option<Meta>,
     /// `-R`/`--files-from`: only these entries are transferred (`None`: all of them).
     pub(crate) sel: Option<&'static Sel>,
+    /// Same-named directories of later sources merged into this one (several SRC
+    /// arguments land in one destination, see [`merge`]).
+    pub(crate) more: Vec<SrcDir>,
 }
 
 pub(crate) struct Ctx<'p> {
@@ -95,6 +105,8 @@ pub(crate) struct Ctx<'p> {
     sel: Option<&'static Sel>,
     /// Listing id on the wire (remote: finds the sender's `-c` checksums).
     wire_dir: u32,
+    /// A listing merged from several source directories: where each entry comes from.
+    sources: Option<&'p Sources>,
 }
 
 pub(crate) struct FileJob {
@@ -214,6 +226,8 @@ impl<'a> Engine<'a> {
             pipeline: None,
             dst_index: None,
             xrules: crate::xattrs::Rules { level: opts.xattrs, am_root },
+            io_error: AtomicBool::new(false),
+            io_warned: AtomicBool::new(false),
         }
     }
 
@@ -233,6 +247,30 @@ impl<'a> Engine<'a> {
     pub(crate) fn err(&self, msg: impl AsRef<[u8]>) {
         Stats::add(&self.stats.errors, 1);
         self.out.error(msg);
+    }
+
+    /// An error reading the source side (a listing, an entry's metadata or attributes):
+    /// listings may now lack entries the source has, so deletions stop.
+    pub(crate) fn src_err(&self, msg: impl AsRef<[u8]>) {
+        self.io_error.store(true, SeqCst);
+        self.err(msg);
+    }
+
+    /// The remote sender had a source-side error (see [`Engine::src_err`]).
+    pub(crate) fn sender_io_error(&self) {
+        self.io_error.store(true, SeqCst);
+    }
+
+    /// Whether `--delete` may delete now: not after a source-side error, as rsync
+    /// ("IO error encountered -- skipping file deletion", said once).
+    fn may_delete(&self) -> bool {
+        if !self.io_error.load(SeqCst) {
+            return true;
+        }
+        if !self.io_warned.swap(true, SeqCst) {
+            self.out.notice("IO error encountered -- skipping file deletion");
+        }
+        false
     }
 
     pub(crate) fn dry(&self) -> bool {
@@ -320,7 +358,7 @@ impl<'a> Engine<'a> {
                         super::flags::adjust_mode(self.opts, &mut m);
                         m
                     }
-                    Err(e) => return self.err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
+                    Err(e) => return self.src_err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
                 };
                 let extra = self.local_root_extra(src, &src_meta);
                 let job = self.root_job(src.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh, extra);
@@ -336,7 +374,7 @@ impl<'a> Engine<'a> {
                     let meta = match fsops::lstat(&sp) {
                         Ok(m) => m,
                         Err(e) => {
-                            self.err(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
+                            self.src_err(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
                             continue;
                         }
                     };
@@ -352,7 +390,7 @@ impl<'a> Engine<'a> {
                         (i as u32, e, dname)
                     })
                     .collect();
-                self.run_items(s, src_dir, dst_dir, 0, 0, entries, !dest_exists || dest_fresh, None);
+                self.run_items(s, src_dir, dst_dir, 0, 0, entries, !dest_exists || dest_fresh, None, None);
             }
             Root::Select { base, dst, sel, with_root } => {
                 if *with_root {
@@ -361,7 +399,7 @@ impl<'a> Engine<'a> {
                             super::flags::adjust_mode(self.opts, &mut m);
                             m
                         }
-                        Err(e) => return self.err(path_msg("link_stat \"", base, format!("\" failed: {e}"))),
+                        Err(e) => return self.src_err(path_msg("link_stat \"", base, format!("\" failed: {e}"))),
                     };
                     let extra = self.local_root_extra(base, &src_meta);
                     let mut job = self.root_job(base.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh, extra);
@@ -370,17 +408,77 @@ impl<'a> Engine<'a> {
                 } else {
                     let ents = self.read_selected(base, sel);
                     let entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
-                    self.run_items(s, base, dst, 0, 0, entries, !dest_exists || dest_fresh, Some(sel));
+                    self.run_items(s, base, dst, 0, 0, entries, !dest_exists || dest_fresh, Some(sel), None);
                 }
             }
         }
+    }
+
+    /// All of a run's roots. Several SRC arguments write into the same destination
+    /// directory, so they are synced as one merged tree (see [`merge`]): a name several
+    /// have is taken once, and `--delete` keeps whatever any of them has.
+    pub fn run_roots<'s>(&'s self, s: &Scope<'s>, roots: &[Root], dest_exists: bool, dest_fresh: bool) {
+        let [first, ..] = roots else { return };
+        if roots.len() == 1 {
+            return self.run_root(s, first, dest_exists, dest_fresh);
+        }
+        let dst = match first {
+            Root::Contents { dst, .. } | Root::Select { dst, .. } => dst.clone(),
+            Root::Items { dst_dir, .. } => dst_dir.clone(),
+        };
+        // Each root's top directory, and the first one transferred itself (`src/`), whose
+        // attributes the destination gets.
+        let mut dirs: Vec<SrcDir> = Vec::with_capacity(roots.len());
+        let mut top: Option<(PathBuf, Meta)> = None;
+        for root in roots {
+            let (path, sel, with_root) = match root {
+                Root::Contents { src, .. } => (src, None, true),
+                Root::Items { src_dir, items, .. } => {
+                    (src_dir, Some(select::leak(Sel::named(items.iter().map(|(n, _)| n.as_bytes())))), false)
+                }
+                Root::Select { base, sel, with_root, .. } => {
+                    (base, if *with_root { sel.at_root(self.opts.recursive) } else { Some(*sel) }, *with_root)
+                }
+            };
+            let mut dev = None;
+            if with_root {
+                match fsops::stat(path) {
+                    Ok(mut m) => {
+                        super::flags::adjust_mode(self.opts, &mut m);
+                        top.get_or_insert((path.clone(), m));
+                        dev = Some(m.dev);
+                    }
+                    Err(e) => {
+                        self.src_err(path_msg("link_stat \"", path, format!("\" failed: {e}")));
+                        continue;
+                    }
+                }
+            }
+            if dirs.iter().all(|d| d.path != *path || d.sel != sel) {
+                dirs.push(SrcDir { path: path.clone(), sel, dev });
+            }
+        }
+        let lists: Vec<Vec<DirEnt>> = dirs.iter().map(|d| self.read_source(&d.path, d.sel).unwrap_or_default()).collect();
+        let (ents, sources) = merge::merge(dirs, lists);
+        let entries: Entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
+        let Some((path, meta)) = top else {
+            // Only named items: the destination itself is neither pruned nor changed.
+            let base = sources.dirs.first().map(|d| d.path.clone()).unwrap_or_default();
+            return self.run_items(s, &base, &dst, 0, 0, entries, !dest_exists || dest_fresh, None, Some(&sources));
+        };
+        let extra = self.local_root_extra(&path, &meta);
+        let job = self.root_job(path, dst, meta, 0, dest_exists && !dest_fresh, extra);
+        s.spawn(move |s| {
+            let files = self.diff_listing(s, &job, entries, Some(&sources));
+            self.transfer(job.wire_dir, files);
+        });
     }
 
     /// The selected entries of `dir`, with missing names reported as errors.
     fn read_selected(&self, dir: &Path, sel: &Sel) -> Vec<DirEnt> {
         let (ents, errs) = select::read_selected(dir, sel);
         for (p, e) in errs {
-            self.err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
+            self.src_err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
         }
         self.adjust_listing(dir, ents)
     }
@@ -423,6 +521,7 @@ impl<'a> Engine<'a> {
             src_meta,
             pre,
             sel: None,
+            more: Vec::new(),
         }
     }
 
@@ -440,6 +539,7 @@ impl<'a> Engine<'a> {
         entries: Entries,
         dst_is_new: bool,
         sel: Option<&'static Sel>,
+        sources: Option<&Sources>,
     ) {
         let entries: Entries = entries
             .into_iter()
@@ -466,6 +566,7 @@ impl<'a> Engine<'a> {
             root_dev: None,
             sel,
             wire_dir,
+            sources,
         };
         let (_, files) = self.process_entries(s, &ctx, entries, &dst_map);
         self.transfer(wire_dir, files);
@@ -493,40 +594,68 @@ impl<'a> Engine<'a> {
 
     /// Read a directory and sync it.
     pub(crate) fn process_dir<'s>(&'s self, s: &Scope<'s>, job: DirJob) {
-        if fsops::interrupted() {
-            return;
-        }
-        let src_ents = match job.sel {
-            Some(sel) if !sel.contents => self.read_selected(&job.src, sel),
-            _ => match fsops::read_dir_meta(&job.src) {
-                Ok(v) => self.adjust_listing(&job.src, v),
-                Err(e) => {
-                    self.err(path_msg("opendir \"", &job.src, format!("\" failed: {e}")));
-                    return self.push_fixup(&job, false);
-                }
-            },
-        };
-        let entries = src_ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
-        self.process_listing(s, job, entries);
+        let scanned = vec![None; 1 + job.more.len()];
+        self.process_sources(s, job, scanned);
     }
 
-    /// `--scanner=jwalk`: sync a directory with its listing from the scan.
-    pub(crate) fn process_scanned<'s>(&'s self, s: &Scope<'s>, job: DirJob, ents: Vec<DirEnt>) {
+    /// Sync a directory: its listing from each of its sources (`job.src`, then
+    /// `job.more`) is `scanned[i]` (`--scanner=jwalk`) or is read now.
+    pub(crate) fn process_sources<'s>(&'s self, s: &Scope<'s>, mut job: DirJob, mut scanned: Vec<Option<Vec<DirEnt>>>) {
         if fsops::interrupted() {
             return;
         }
-        let ents = self.adjust_listing(&job.src, ents);
+        if job.more.is_empty() {
+            let ents = match scanned.pop().flatten() {
+                Some(ents) => self.adjust_listing(&job.src, ents),
+                None => match self.read_source(&job.src, job.sel) {
+                    Some(ents) => ents,
+                    None => return self.push_fixup(&job, false),
+                },
+            };
+            let entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
+            return self.process_listing(s, job, entries);
+        }
+        let own = SrcDir { path: job.src.clone(), sel: job.sel, dev: job.root_dev };
+        let dirs: Vec<SrcDir> = std::iter::once(own).chain(std::mem::take(&mut job.more)).collect();
+        let mut lists = Vec::with_capacity(dirs.len());
+        for (d, scanned) in dirs.iter().zip(scanned) {
+            let ents = match scanned {
+                Some(ents) => Some(self.adjust_listing(&d.path, ents)),
+                None => self.read_source(&d.path, d.sel),
+            };
+            lists.push(ents);
+        }
+        if lists.iter().all(Option::is_none) {
+            return self.push_fixup(&job, false);
+        }
+        let (ents, sources) = merge::merge(dirs, lists.into_iter().map(Option::unwrap_or_default).collect());
         let entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
-        self.process_listing(s, job, entries);
+        let files = self.diff_listing(s, &job, entries, Some(&sources));
+        self.transfer(job.wire_dir, files);
+    }
+
+    /// The listing of source directory `dir` (only `sel`'s entries, if given), or `None`
+    /// after reporting that it could not be read.
+    fn read_source(&self, dir: &Path, sel: Option<&Sel>) -> Option<Vec<DirEnt>> {
+        match sel {
+            Some(sel) if !sel.contents => Some(self.read_selected(dir, sel)),
+            _ => match fsops::read_dir_meta(dir) {
+                Ok(v) => Some(self.adjust_listing(dir, v)),
+                Err(e) => {
+                    self.src_err(path_msg("opendir \"", dir, format!("\" failed: {e}")));
+                    None
+                }
+            },
+        }
     }
 
     /// Sync one directory given its source listing.
     pub(crate) fn process_listing<'s>(&'s self, s: &Scope<'s>, job: DirJob, entries: Entries) {
-        let files = self.diff_listing(s, &job, entries);
+        let files = self.diff_listing(s, &job, entries, None);
         self.transfer(job.wire_dir, files);
     }
 
-    fn diff_listing<'s>(&'s self, s: &Scope<'s>, job: &DirJob, entries: Entries) -> Vec<FileJob> {
+    fn diff_listing<'s>(&'s self, s: &Scope<'s>, job: &DirJob, entries: Entries, sources: Option<&Sources>) -> Vec<FileJob> {
         let entries: Entries = if self.filter.is_empty() {
             entries
         } else {
@@ -553,7 +682,12 @@ impl<'a> Engine<'a> {
         };
 
         let mut changed = false;
-        if self.opts.delete && !job.dst_is_new && select::may_delete(job.sel) {
+        // A merged directory is pruned when any of its sources sends its full contents.
+        let full = match sources {
+            Some(src) => src.dirs.iter().any(|d| select::may_delete(d.sel)),
+            None => select::may_delete(job.sel),
+        };
+        if self.opts.delete && !job.dst_is_new && full && self.may_delete() {
             changed |= self.delete_extraneous(job, &entries, &dst_map);
         }
         let dst_handle = if job.dst_is_new || dst_metas.is_some() { None } else { fsops::DirHandle::open(&job.dst).ok() };
@@ -569,6 +703,7 @@ impl<'a> Engine<'a> {
             root_dev: job.root_dev,
             sel: job.sel,
             wire_dir: job.wire_dir,
+            sources,
         };
         let (c, files) = self.process_entries(s, &ctx, entries, &dst_map);
         self.push_fixup(job, changed || c);
@@ -845,7 +980,7 @@ impl<'a> Engine<'a> {
             }
             let dname: &OsStr = dname_override.as_deref().unwrap_or(&e.name);
             let rel = join_rel(ctx.rel, &e.name);
-            let src_path = ctx.src.join(&e.name);
+            let src_path = ctx.src_dir(idx).join(&e.name);
             let dst_path = ctx.dst.join(dname);
             let dst_kind = if ctx.dst_is_new { None } else { dst_map.get(dname).copied() };
             if self.opts.existing && dst_kind.is_none() && !(e.meta.kind == Kind::Dir && !self.opts.recursive && !self.opts.dirs) {
@@ -1019,7 +1154,7 @@ impl<'a> Engine<'a> {
             }
             let dst_path = ctx.dst.join(dname);
             if ctx.lstat_dst(dname, &dst_path).is_ok_and(|d| d.kind == Kind::File && d.size == e.meta.size) {
-                cands.push((*idx, ctx.src.join(&e.name), dst_path));
+                cands.push((*idx, ctx.src_dir(*idx).join(&e.name), dst_path));
             }
         }
         if cands.is_empty() {
@@ -1059,7 +1194,8 @@ impl<'a> Engine<'a> {
         dst_kind: Option<Kind>,
     ) -> bool {
         Stats::add(&self.stats.dirs, 1);
-        let descend = select::descend(ctx.sel, rel.rsplit(|&b| b == b'/').next().unwrap_or(&rel), self.opts.recursive);
+        let (sel, src_dev) = ctx.src_sel(idx);
+        let descend = select::descend(sel, rel.rsplit(|&b| b == b'/').next().unwrap_or(&rel), self.opts.recursive);
         if descend == Descend::No && !self.opts.dirs {
             self.out.info([b"skipping directory ", quoted(&rel)].concat());
             return false;
@@ -1131,7 +1267,13 @@ impl<'a> Engine<'a> {
                 self.err(path_msg("set_xattr/set_acl \"", &dst_path, format!("\" failed: {e}")));
             }
         }
-        let root_dev = ctx.root_dev.unwrap_or(meta.dev);
+        let root_dev = src_dev.unwrap_or(meta.dev);
+        let more = match ctx.sources {
+            Some(src) if descend != Descend::No => {
+                src.also_dirs(idx, src_path.file_name().unwrap_or_default(), self.opts.recursive, self.opts.one_file_system)
+            }
+            _ => Vec::new(),
+        };
         let job = DirJob {
             src: src_path,
             dst: dst_path,
@@ -1147,6 +1289,7 @@ impl<'a> Engine<'a> {
                 Descend::Some(sel) => Some(sel),
                 _ => None,
             },
+            more,
         };
         if descend == Descend::No {
             // -d: the directory itself, without its contents.
@@ -1655,6 +1798,19 @@ impl<'a> Engine<'a> {
 }
 
 impl Ctx<'_> {
+    /// The source directory entry `idx` of this listing is in.
+    fn src_dir(&self, idx: u32) -> &Path {
+        self.sources.map_or(self.src, |s| &s.dir_of(idx).path)
+    }
+
+    /// The selection and transfer-root device of the source entry `idx` comes from.
+    fn src_sel(&self, idx: u32) -> (Option<&'static Sel>, Option<u64>) {
+        match self.sources {
+            Some(s) => (s.dir_of(idx).sel, s.dir_of(idx).dev),
+            None => (self.sel, self.root_dev),
+        }
+    }
+
     fn lstat_dst(&self, name: &OsStr, path: &Path) -> io::Result<Meta> {
         if let Some(m) = self.dst_metas {
             return m.get(name).copied().ok_or_else(|| io::ErrorKind::NotFound.into());

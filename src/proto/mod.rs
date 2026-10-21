@@ -9,6 +9,7 @@
 //! sender                                   receiver
 //!   Roots ------------------------------------>   plan destination
 //!   DirBatch (one per directory, as scanned) ->   diff against local dirs
+//!   IoError (once, on a source read error) --->   delete nothing more
 //!   ...                                  <-----   Need (one per DirBatch: files + basis signatures)
 //!   SmallPack / FileBegin+Data+FileEnd /
 //!   DeltaBegin+Data+FileEnd -------------------->   write files in parallel
@@ -46,12 +47,14 @@ pub use wire::Wire;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 9: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
 /// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
-///     `Synced` names entries only.
+///     `Synced` names entries only; `IoError` (source read errors stop deletions).
 pub const VERSION: u32 = 10;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.
@@ -147,6 +150,9 @@ pub enum Msg {
     StreamEnd,
     /// The peer is giving up; the message says why.
     Fatal { msg: String },
+    /// The peer was interrupted (Ctrl-C) and is stopping: this side stops too, as if
+    /// interrupted itself (exit 20).
+    Interrupted,
     /// Output produced on the server, printed by the client. `escape`: the text may
     /// contain file names and is escaped with the client's charset before printing.
     Log { stderr: bool, escape: bool, text: Vec<u8> },
@@ -158,6 +164,10 @@ pub enum Msg {
     /// User and group names for ids in the listings that follow (no `--numeric-ids`).
     IdNames { users: Names, groups: Names },
     ScanDone { dirs: u32 },
+    /// The sender could not read part of its source (rsync's `io_error`): listings sent
+    /// from now on may lack entries, so the receiver deletes nothing more. Sent before
+    /// the listing the error concerns.
+    IoError,
     /// `xattrs`: `-X` attribute values in full, when the listing only had checksums of some.
     FileBegin { id: u64, size: u64, xattrs: Option<Vec<Xattr>> },
     /// Start a delta-encoded file: `copies` come from the receiver's basis, the
@@ -389,13 +399,104 @@ enum Tx {
     Task(tokio::sync::mpsc::Sender<Vec<u8>>),
 }
 
+fn closed() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")
+}
+
+fn stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, "the transfer was stopped")
+}
+
 impl Tx {
-    fn send(&self, buf: Vec<u8>) -> io::Result<()> {
-        let r = match self {
-            Tx::Thread(t) => t.send(buf).map_err(drop),
-            Tx::Task(t) => t.blocking_send(buf).map_err(drop),
-        };
-        r.map_err(|()| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+    /// Queue `buf`, waiting for room unless the connection is stopped meanwhile (see
+    /// [`FrameSender::stopped`]): a stopped run must not wait for a peer that no longer
+    /// reads.
+    fn send(&self, buf: Vec<u8>, stop: &Stopper) -> io::Result<()> {
+        if stop.is_set() {
+            return Err(stopped());
+        }
+        match self {
+            Tx::Thread(t) => crossbeam_channel::select! {
+                send(t, buf) -> r => r.map_err(|_| closed()),
+                recv(stop.wake) -> _ => Err(stopped()),
+                recv(crate::fsops::interrupt_wake()) -> _ => Err(stopped()),
+            },
+            Tx::Task(t) => match t.try_send(buf) {
+                Ok(()) => Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(closed()),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(buf)) => {
+                    use std::future::Future;
+                    use std::task::Poll;
+                    let mut send = std::pin::pin!(t.send(buf));
+                    let mut ours = std::pin::pin!(stop.token.cancelled());
+                    let mut all = std::pin::pin!(crate::fsops::interrupt_token().cancelled());
+                    async_io::rt().block_on(std::future::poll_fn(|cx| {
+                        if let Poll::Ready(r) = send.as_mut().poll(cx) {
+                            return Poll::Ready(r.map_err(|_| closed()));
+                        }
+                        if ours.as_mut().poll(cx).is_ready() || all.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(Err(stopped()));
+                        }
+                        Poll::Pending
+                    }))
+                }
+            },
+        }
+    }
+
+    /// Queue `buf` only if there is room now.
+    fn try_send(&self, buf: Vec<u8>) -> bool {
+        match self {
+            Tx::Thread(t) => t.try_send(buf).is_ok(),
+            Tx::Task(t) => t.try_send(buf).is_ok(),
+        }
+    }
+
+    /// Queue the close request (an empty buffer), waiting for room until `deadline`.
+    fn close(&self, deadline: Instant) {
+        match self {
+            Tx::Thread(t) => {
+                let _ = t.send_deadline(Vec::new(), deadline);
+            }
+            Tx::Task(t) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                // The timer must be made inside the runtime.
+                let _ = async_io::rt().block_on(async { tokio::time::timeout(left, t.send(Vec::new())).await });
+            }
+        }
+    }
+}
+
+/// Stops a connection's sends (see [`FrameSender::cancel`]), and keeps the first
+/// writer failure (see [`FrameSender::write_failure`]).
+pub(crate) struct Stopper {
+    token: tokio_util::sync::CancellationToken,
+    /// Disconnected when stopped, for `select!`.
+    wake_tx: std::sync::Mutex<Option<Sender<()>>>,
+    wake: Receiver<()>,
+    failed: std::sync::Mutex<Option<(io::ErrorKind, String)>>,
+}
+
+impl Stopper {
+    fn new() -> Arc<Stopper> {
+        let (tx, rx) = bounded(0);
+        Arc::new(Stopper { token: Default::default(), wake_tx: std::sync::Mutex::new(Some(tx)), wake: rx, failed: Default::default() })
+    }
+
+    /// A writer failed: the peer can't be reached any more. Not news once stopping.
+    fn fail(&self, e: &io::Error) {
+        if !self.is_set() {
+            self.failed.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert((e.kind(), format!("writing to the peer failed: {e}")));
+        }
+    }
+
+    fn stop(&self) {
+        self.token.cancel();
+        self.wake_tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    fn is_set(&self) -> bool {
+        self.token.is_cancelled() || crate::fsops::interrupted()
     }
 }
 
@@ -406,13 +507,41 @@ enum Joiner {
 }
 
 impl Joiner {
-    fn join(self) -> io::Result<()> {
+    /// Wait for the writer until `deadline`. One stuck in a write to a peer that no longer
+    /// reads is left behind (it ends with the process).
+    fn join_until(self, deadline: Instant) -> io::Result<()> {
+        let late = || io::Error::new(io::ErrorKind::TimedOut, "the peer stopped reading");
         match self {
-            Joiner::Thread(h) => h.join().unwrap_or_else(|_| Err(io::Error::other("writer thread panicked"))),
-            Joiner::Task(h) => async_io::rt().block_on(h).unwrap_or_else(|e| Err(io::Error::other(e))),
+            Joiner::Thread(h) => {
+                while !h.is_finished() {
+                    if Instant::now() >= deadline {
+                        return Err(late());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                h.join().unwrap_or_else(|_| Err(io::Error::other("writer thread panicked")))
+            }
+            Joiner::Task(mut h) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match async_io::rt().block_on(async { tokio::time::timeout(left, &mut h).await }) {
+                    Ok(r) => r.unwrap_or_else(|e| Err(io::Error::other(e))),
+                    Err(_) => {
+                        h.abort();
+                        Err(late())
+                    }
+                }
+            }
         }
     }
 }
+
+/// How long closing a connection waits for its writers to deliver what is queued.
+/// After a complete transfer only a few small frames are left; a peer that stops
+/// reading must not keep this side forever.
+const CLOSE_WAIT: Duration = Duration::from_secs(30);
+/// The same for a run that was stopped (interrupted, or failed): what is left is
+/// best-effort.
+const STOPPED_CLOSE_WAIT: Duration = Duration::from_secs(2);
 
 /// Cloneable handle for sending frames. Frames are encoded (and compressed) on the
 /// calling thread, so many tasks can compress in parallel; writer threads only write.
@@ -423,6 +552,12 @@ pub struct FrameSender {
     data: Option<Arc<Vec<Tx>>>,
     comp: Arc<Compression>,
     wire: Wire,
+    stop: Arc<Stopper>,
+    /// A one-frame lane to the control stream's writer, which takes it before anything
+    /// queued: `Interrupted` gets out even when `tx` is full.
+    urgent: Tx,
+    /// `Interrupted` was queued for the peer.
+    told: Arc<AtomicBool>,
 }
 
 /// Which data stream a frame belongs on (`None`: control, stays on the main stream).
@@ -439,7 +574,19 @@ fn data_key(f: &Frame) -> Option<u64> {
 }
 
 impl FrameSender {
-    /// Encode and queue a frame. Fails when the connection is gone.
+    fn new(tx: Tx, urgent: Tx, compress: bool, stop: Arc<Stopper>) -> FrameSender {
+        FrameSender {
+            tx,
+            data: None,
+            comp: Arc::new(Compression::new(compress, false, None)),
+            wire: Wire::Postcard,
+            stop,
+            urgent,
+            told: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Encode and queue a frame. Fails when the connection is gone or stopped.
     pub fn send(&self, frame: Frame) -> io::Result<()> {
         let level = self.comp.level(matches!(frame, Frame::Msg(Msg::SmallPack { .. })));
         let t = std::time::Instant::now();
@@ -453,20 +600,52 @@ impl FrameSender {
             (Some(streams), Some(key)) if !streams.is_empty() => &streams[(key % streams.len() as u64) as usize],
             _ => &self.tx,
         };
-        tx.send(buf)
+        tx.send(buf, &self.stop)
     }
 
     /// Close every data stream with `StreamEnd`, after all file data has been queued.
     pub fn end_data_streams(&self) -> io::Result<()> {
         for tx in self.data.iter().flat_map(|d| d.iter()) {
             let buf = encode(&Frame::Msg(Msg::StreamEnd), None, self.wire)?;
-            tx.send(buf)?;
+            tx.send(buf, &self.stop)?;
         }
         Ok(())
     }
 
     pub fn msg(&self, m: Msg) -> io::Result<()> {
         self.send(Frame::Msg(m))
+    }
+
+    /// The run is stopping early (see [`FrameSender::stopped`]): sends fail from now on,
+    /// and sends waiting for room give up, so no task waits for a peer that may no
+    /// longer read.
+    pub fn cancel(&self) {
+        self.stop.stop();
+    }
+
+    /// Sends fail at once: the connection was cancelled or the run interrupted. Their
+    /// errors are expected then, not worth reporting.
+    pub fn stopped(&self) -> bool {
+        self.stop.is_set()
+    }
+
+    /// Why a writer of this connection failed, if one did: the peer can't be reached, so
+    /// waiting for its answers would be forever.
+    pub fn write_failure(&self) -> Option<io::Error> {
+        let f = self.stop.failed.lock().unwrap_or_else(|e| e.into_inner());
+        f.as_ref().map(|(kind, msg)| io::Error::new(*kind, msg.clone()))
+    }
+
+    /// Tell the peer this side was interrupted (`Interrupted`), once: the peer then stops
+    /// too instead of waiting. It goes on its own lane, written right after the frame
+    /// being written however many are queued, so it never waits for room.
+    pub fn tell_interrupted(&self) {
+        if !self.told.load(Ordering::SeqCst)
+            && let Ok(buf) = encode(&Frame::Msg(Msg::Interrupted), None, self.wire)
+            && self.urgent.try_send(buf)
+        {
+            self.told.store(true, Ordering::SeqCst);
+        }
     }
 
     /// The link is measured: compression levels follow it from now on.
@@ -505,32 +684,62 @@ impl Drop for ClearOnDrop {
     }
 }
 
-fn spawn_writer(name: String, writer: impl Write + Send + 'static, wrx: Receiver<Vec<u8>>) -> JoinHandle<io::Result<()>> {
+/// The next frame to write: one on the urgent lane (see [`FrameSender::tell_interrupted`])
+/// before anything queued. `None`: every sender is gone.
+fn next_frame(wrx: &Receiver<Vec<u8>>, urgent: Option<&Receiver<Vec<u8>>>) -> Option<Vec<u8>> {
+    let Some(u) = urgent else { return wrx.recv().ok() };
+    if let Ok(buf) = u.try_recv() {
+        return Some(buf);
+    }
+    crossbeam_channel::select_biased! {
+        recv(u) -> buf => buf.ok().or_else(|| wrx.recv().ok()),
+        recv(wrx) -> buf => buf.ok(),
+    }
+}
+
+fn spawn_writer(
+    name: String,
+    writer: impl Write + Send + 'static,
+    wrx: Receiver<Vec<u8>>,
+    urgent: Option<Receiver<Vec<u8>>>,
+    stop: Arc<Stopper>,
+) -> JoinHandle<io::Result<()>> {
     std::thread::Builder::new()
         .name(name)
         .spawn(move || {
             let mut w = BufWriter::with_capacity(256 << 10, writer);
-            // An empty buffer is the close request from `Conn::finish`.
-            while let Ok(buf) = wrx.recv() {
-                if buf.is_empty() {
-                    break;
+            let r = (|| {
+                // An empty buffer is the close request from `Conn::finish`.
+                while let Some(buf) = next_frame(&wrx, urgent.as_ref()) {
+                    if buf.is_empty() {
+                        break;
+                    }
+                    w.write_all(&buf)?;
+                    if wrx.is_empty() && urgent.as_ref().is_none_or(Receiver::is_empty) {
+                        w.flush()?;
+                    }
                 }
-                w.write_all(&buf)?;
-                if wrx.is_empty() {
-                    w.flush()?;
-                }
+                w.flush()
+            })();
+            if let Err(e) = &r {
+                stop.fail(e);
             }
-            w.flush()
+            r
         })
         .expect("spawn writer thread")
 }
 
 impl Conn {
     pub fn start(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, compress: bool) -> Conn {
+        Conn::start_with(reader, writer, compress, Stopper::new())
+    }
+
+    fn start_with(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, compress: bool, stop: Arc<Stopper>) -> Conn {
         // Frames are up to ~4 MiB, so these bound memory to a few tens of MiB per side.
         let (tx, wrx) = bounded::<Vec<u8>>(16);
+        let (utx, urx) = bounded::<Vec<u8>>(1);
         let (rtx, rx) = bounded::<io::Result<Frame>>(16);
-        let writer = spawn_writer("barqsync-writer".into(), writer, wrx);
+        let writer = spawn_writer("barqsync-writer".into(), writer, wrx, Some(urx), stop.clone());
         let spare = Arc::new(std::sync::Mutex::new(Some(rtx.clone())));
         let spare2 = spare.clone();
         std::thread::Builder::new()
@@ -545,7 +754,12 @@ impl Conn {
                                 return;
                             }
                         }
-                        Ok(None) => return,
+                        // Said even while data streams keep the channel open: a closed
+                        // control stream means the peer is gone.
+                        Ok(None) => {
+                            let _ = rtx.send(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed by peer")));
+                            return;
+                        }
                         Err(e) => {
                             let _ = rtx.send(Err(e));
                             return;
@@ -555,7 +769,7 @@ impl Conn {
             })
             .expect("spawn reader thread");
         Conn {
-            out: FrameSender { tx: Tx::Thread(tx), data: None, comp: Arc::new(Compression::new(compress, false, None)), wire: Wire::Postcard },
+            out: FrameSender::new(Tx::Thread(tx), Tx::Thread(utx), compress, stop),
             rx,
             rtx: spare,
             writer: Some(Joiner::Thread(writer)),
@@ -572,13 +786,15 @@ impl Conn {
         writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
         compress: bool,
     ) -> Conn {
-        let (tx, task) = async_io::spawn_writer(writer, 16);
+        let stop = Stopper::new();
+        let (utx, urx) = tokio::sync::mpsc::channel(1);
+        let (tx, task) = async_io::spawn_writer(writer, 16, Some(urx), stop.clone());
         let (rtx, rx) = bounded::<io::Result<Frame>>(16);
         let spare = Arc::new(std::sync::Mutex::new(Some(rtx.clone())));
         let clear = ClearOnDrop(spare.clone());
         async_io::spawn_reader(reader, rtx, false, Some(Box::new(move || drop(clear))));
         Conn {
-            out: FrameSender { tx: Tx::Task(tx), data: None, comp: Arc::new(Compression::new(compress, false, None)), wire: Wire::Postcard },
+            out: FrameSender::new(Tx::Task(tx), Tx::Task(utx), compress, stop),
             rx,
             rtx: spare,
             writer: Some(Joiner::Task(task)),
@@ -593,7 +809,7 @@ impl Conn {
     pub fn attach_data_out_async(&mut self, streams: Vec<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>) {
         let mut senders = Vec::with_capacity(streams.len());
         for s in streams {
-            let (tx, task) = async_io::spawn_writer(s, 4);
+            let (tx, task) = async_io::spawn_writer(s, 4, None, self.out.stop.clone());
             self.data_writers.push(Joiner::Task(task));
             senders.push(Tx::Task(tx));
         }
@@ -613,9 +829,10 @@ impl Conn {
     /// current one stays open, idle, until [`Conn::finish`]; `session` is closed after
     /// everything sent on the new streams has been delivered.
     pub fn switch(&mut self, reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, session: Box<dyn std::any::Any + Send + Sync>) {
-        let mut new = Conn::start(reader, writer, false);
+        let mut new = Conn::start_with(reader, writer, false, self.out.stop.clone());
         new.out.wire = self.out.wire;
         new.out.comp = self.out.comp.clone();
+        new.out.told = self.out.told.clone();
         new.session = Some(session);
         let old = std::mem::replace(self, new);
         self.under = Some(Box::new(old));
@@ -627,7 +844,7 @@ impl Conn {
         for (i, s) in streams.into_iter().enumerate() {
             // Shallow queues: N streams × depth × ~4 MiB frames is the memory bound.
             let (tx, wrx) = bounded::<Vec<u8>>(4);
-            self.data_writers.push(Joiner::Thread(spawn_writer(format!("barqsync-data-{i}"), s, wrx)));
+            self.data_writers.push(Joiner::Thread(spawn_writer(format!("barqsync-data-{i}"), s, wrx, None, self.out.stop.clone())));
             senders.push(Tx::Thread(tx));
         }
         self.out.data = Some(Arc::new(senders));
@@ -736,14 +953,17 @@ impl Conn {
             drop(self.session.take());
             mark("finish: session closed");
         }
+        let deadline = Instant::now() + if self.out.stopped() { STOPPED_CLOSE_WAIT } else { CLOSE_WAIT };
+        // Closing: a writer failing from now on (a peer that already left) is no news.
+        self.out.cancel();
         for tx in self.out.data.iter().flat_map(|d| d.iter()) {
-            let _ = tx.send(Vec::new());
+            tx.close(deadline);
         }
         for h in self.data_writers.drain(..) {
-            let _ = h.join();
+            let _ = h.join_until(deadline);
         }
-        let _ = self.out.tx.send(Vec::new());
-        let r = self.writer.take().map_or(Ok(()), Joiner::join);
+        self.out.tx.close(deadline);
+        let r = self.writer.take().map_or(Ok(()), |w| w.join_until(deadline));
         // The writers of a closed session fail, as expected.
         let r = if quic && confirmed { Ok(()) } else { r };
         if self.session.is_some() {
@@ -863,6 +1083,8 @@ mod tests {
             Msg::FileBegin { id: 3, size: 9, xattrs: Some(xattrs.clone()) },
             Msg::Xattrs { id: file_id(2, 1), xattrs: Some(xattrs) },
             Msg::Xattrs { id: 5, xattrs: None },
+            Msg::IoError,
+            Msg::Interrupted,
         ]
     }
 
@@ -924,6 +1146,35 @@ mod tests {
             assert!(read_frame(&mut r).unwrap().is_none());
             // A stream that ends after a part is cut short, not cleanly closed.
             assert_eq!(read_frame(&mut &buf[..5 + first]).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    /// `Interrupted` reaches a peer that is behind even with the control queue full: it
+    /// goes out right after the frame being written, not after everything queued.
+    #[test]
+    fn the_interrupt_notice_overtakes_a_full_queue() {
+        use std::os::unix::net::UnixStream;
+        for tokio in [false, true] {
+            let (ours, peer) = UnixStream::pair().unwrap();
+            let conn = if tokio {
+                let r = async_io::FdIo::new(ours.try_clone().unwrap().into()).unwrap();
+                Conn::start_async(r, async_io::FdIo::new(ours.into()).unwrap(), false)
+            } else {
+                Conn::start(ours.try_clone().unwrap(), ours, false)
+            };
+            // The peer reads nothing yet: the writer blocks and the queue fills up.
+            let frame = encode(&Frame::Data { id: 1, off: 0, bytes: vec![7; 1 << 20] }, None, Wire::Postcard).unwrap();
+            while conn.out.tx.try_send(frame.clone()) {}
+            conn.out.tell_interrupted();
+            let mut r = io::BufReader::new(peer);
+            for read in 0.. {
+                assert!(read < 16, "tokio={tokio}: the notice waited behind the queue");
+                match read_frame(&mut r).unwrap() {
+                    Some(Frame::Msg(Msg::Interrupted)) => break,
+                    Some(Frame::Data { .. }) => {}
+                    other => panic!("tokio={tokio}: {other:?}"),
+                }
+            }
         }
     }
 

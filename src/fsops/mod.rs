@@ -177,8 +177,9 @@ fn bulk_disabled() -> bool {
 
 /// `readdir` + one `fstatat` per entry.
 pub fn read_dir_stat(dir: &Path) -> io::Result<Vec<DirEnt>> {
-    let names: Vec<OsString> =
-        fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
+    // An entry that can't be read fails the listing: a listing missing entries would
+    // have their destination copies deleted.
+    let names: Vec<OsString> = fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name())).collect::<io::Result<_>>()?;
     let handle = DirHandle::open(dir)?;
     let stat_one = |name: OsString| -> Option<io::Result<DirEnt>> {
         let meta = match handle.lstat(&name) {
@@ -237,12 +238,45 @@ pub fn unregister_temp(p: &Path) {
 
 static SIGNALS: AtomicU32 = AtomicU32::new(0);
 
+/// A channel nothing is sent on, disconnected by the first interrupt, so blocking waits
+/// (a send to a peer that no longer reads) can select on it and give up;
+/// [`interrupt_token`] is the same for tokio.
+struct Wake {
+    tx: Mutex<Option<crossbeam_channel::Sender<()>>>,
+    rx: crossbeam_channel::Receiver<()>,
+}
+
+static WAKE: LazyLock<Wake> = LazyLock::new(|| {
+    let (tx, rx) = crossbeam_channel::bounded(0);
+    Wake { tx: Mutex::new(Some(tx)), rx }
+});
+static WAKE_TOKEN: LazyLock<tokio_util::sync::CancellationToken> = LazyLock::new(Default::default);
+
+/// Stop the run: raise the flag the workers check and wake whatever waits on
+/// [`interrupt_wake`] or [`interrupt_token`]. Ctrl-C does this, and so does the other
+/// side of a remote transfer saying it was interrupted.
+pub fn raise_interrupt() {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+    WAKE.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+    WAKE_TOKEN.cancel();
+}
+
+/// Ready (disconnected) once the run is interrupted.
+pub fn interrupt_wake() -> &'static crossbeam_channel::Receiver<()> {
+    &WAKE.rx
+}
+
+/// Cancelled once the run is interrupted.
+pub fn interrupt_token() -> &'static tokio_util::sync::CancellationToken {
+    &WAKE_TOKEN
+}
+
 /// Ctrl-C handler. The first signal only raises a flag: workers notice it between
 /// write chunks and before every rename, delete their own unfinished file and stop,
 /// so nothing is left half-written. A second signal forces an immediate exit.
 pub fn on_interrupt(code: i32) {
     if SIGNALS.fetch_add(1, Ordering::SeqCst) == 0 {
-        INTERRUPTED.store(true, Ordering::SeqCst);
+        raise_interrupt();
         eprintln!("\nbarqsync: interrupted, finishing in-flight files (Ctrl-C again to force)");
     } else {
         cleanup_temps();

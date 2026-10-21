@@ -18,6 +18,7 @@ use crate::fsops;
 use crate::proto::{Conn, Frame, FrameSender, Msg};
 use crossbeam_channel::RecvTimeoutError;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::time::Duration;
 
 /// How file data travels in a remote transfer (`--transport`).
@@ -100,7 +101,8 @@ impl SendFailure {
     pub(crate) fn send(&self, out: &FrameSender, m: Msg, what: impl FnOnce() -> Vec<u8>) -> bool {
         match out.msg(m) {
             Ok(()) => true,
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => false,
+            // The connection is gone, or the run is stopping anyway.
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe || out.stopped() => false,
             Err(e) => {
                 let msg = [&b"sending "[..], &what(), format!(" failed: {e}").as_bytes()].concat();
                 if self.0.set(msg.clone()).is_ok() {
@@ -127,7 +129,11 @@ pub(crate) fn recv_unless(conn: &Conn, failed: &SendFailure) -> Result<Frame, St
     recv_checked(conn, None, Some(failed))
 }
 
-/// [`recv`], giving up at `deadline`.
+/// The other side said it was interrupted (so this side need not tell it).
+static PEER_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// [`recv`], giving up at `deadline`. Interrupted here, it tells the peer; told by the
+/// peer, it stops as if interrupted here.
 pub(crate) fn recv_until(conn: &Conn, deadline: Option<std::time::Instant>) -> Result<Frame, Stop> {
     recv_checked(conn, deadline, None)
 }
@@ -135,6 +141,9 @@ pub(crate) fn recv_until(conn: &Conn, deadline: Option<std::time::Instant>) -> R
 fn recv_checked(conn: &Conn, deadline: Option<std::time::Instant>, failed: Option<&SendFailure>) -> Result<Frame, Stop> {
     loop {
         if fsops::interrupted() {
+            if !PEER_INTERRUPTED.load(SeqCst) {
+                conn.out.tell_interrupted();
+            }
             return Err(Stop::Interrupted);
         }
         if deadline.is_some_and(|d| std::time::Instant::now() > d) {
@@ -144,9 +153,20 @@ fn recv_checked(conn: &Conn, deadline: Option<std::time::Instant>, failed: Optio
             return Err(Stop::Io(io::Error::other(String::from_utf8_lossy(why).into_owned())));
         }
         match conn.rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Ok(Frame::Msg(Msg::Interrupted))) => {
+                PEER_INTERRUPTED.store(true, SeqCst);
+                fsops::raise_interrupt();
+                eprintln!("barqsync: the remote side was interrupted");
+                return Err(Stop::Interrupted);
+            }
             Ok(Ok(f)) => return Ok(f),
             Ok(Err(e)) => return Err(Stop::Io(e)),
-            Err(RecvTimeoutError::Timeout) => continue,
+            // Nothing pending: a peer this side can no longer write to won't answer.
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(e) = conn.out.write_failure() {
+                    return Err(Stop::Io(e));
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(Stop::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed by peer")));
             }

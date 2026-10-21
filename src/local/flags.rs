@@ -162,7 +162,7 @@ impl Engine<'_> {
     /// `-L`/`-k`/`--chmod`, then (`-X`/`-A`) the entries' attributes and ACLs, for a
     /// listing read on this machine.
     pub(crate) fn adjust_listing(&self, dir: &Path, ents: Vec<DirEnt>) -> Vec<DirEnt> {
-        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.err(m));
+        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.src_err(m));
         self.local_listing(dir, ents)
     }
 

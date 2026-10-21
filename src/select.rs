@@ -63,6 +63,25 @@ impl Sel {
     pub fn at_root(&self, recursive: bool) -> Option<&Sel> {
         if recursive && self.named { None } else { Some(self) }
     }
+
+    /// The named entries of one directory (`src` arguments without a trailing slash),
+    /// each transferred whole.
+    pub fn named<'a>(names: impl IntoIterator<Item = &'a [u8]>) -> Sel {
+        let mut s = Sel::default();
+        for n in names {
+            s.children.insert(n.to_vec(), Sel { named: true, ..Sel::default() });
+        }
+        s
+    }
+
+    /// Add `other`'s paths to this selection (several `-R` roots land in one destination).
+    pub fn merge(&mut self, other: &Sel) {
+        self.named |= other.named;
+        self.contents |= other.contents;
+        for (name, c) in &other.children {
+            self.children.entry(name.clone()).or_default().merge(c);
+        }
+    }
 }
 
 pub fn leak(sel: Sel) -> &'static Sel {
