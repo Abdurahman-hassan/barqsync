@@ -1,3 +1,4 @@
 /target
 bench/results/*.svg
 target-prof/
+.DS_Store

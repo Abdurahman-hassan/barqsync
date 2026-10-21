@@ -2,16 +2,16 @@
 
 Status on 21 October 2026.
 
-- **Released: 0.4.0** on 21 October: crates.io, and a GitHub release built from the tag
-  `v0.4.0` (`2a8794a`). It contains the initial P1 remediations from [the audit](audit/findings.md)
-  (PRs 15–19) plus PRs 11–13; the changes are listed in `CHANGELOG.md` under 0.4.0. The
+- **Released: 0.4.1** on 21 October: crates.io, and a GitHub release built from the tag
+  `v0.4.1`. Incorporates the deletion barrier (pending deletions now wait for a successful
+  scan) and late interrupt preservation during remote connection cleanup. The
   protocol is 10, so 0.4.x can't talk to 0.3.x: upgrade both ends.
 
 How the P1 work was organized, and where each finding landed:
 [audit/p1-coordination.md](audit/p1-coordination.md). The
 milestone tracker is [audit/README.md](audit/README.md).
 
-The current tree also contains an unreleased [deletion barrier](audit/02a-deletion-barrier.md):
+The 0.4.1 release incorporates the [deletion barrier](audit/02a-deletion-barrier.md):
 0.4.0 stopped deletion after a reported source error, but could already have deleted
 entries before a later scan failure. Pending deletions now wait for a successful scan.
 
