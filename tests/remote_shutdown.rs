@@ -23,6 +23,8 @@ enum Act {
     CtrlC,
     /// SIGINT to the client alone.
     IntClient,
+    /// SIGINT after the connection closes, while the remote shell is being reaped.
+    IntClosing,
     /// SIGINT to the server alone.
     IntServer,
     /// The server stops reading (SIGSTOP), then Ctrl-C to the client alone.
@@ -97,7 +99,11 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
     std::os::unix::fs::symlink(BIN, &remote).unwrap();
     let remote = remote.to_str().unwrap().to_string();
     let cutter = t.join("cutter");
-    let shell = if act == Act::CutPipe {
+    let shell = if act == Act::IntClosing {
+        // Close the protocol pipes after the server exits but keep the remote shell
+        // alive, so the client is still cleaning up when it receives SIGINT.
+        "#!/bin/sh\nshift\n/bin/sh -c \"exec $*\"\nexec 0<&- 1>&-\nexec sleep 3\n".to_string()
+    } else if act == Act::CutPipe {
         // The data reaches the other side through a copier the test can kill.
         fs::write(&cutter, "#!/usr/bin/perl\nwhile (($n = sysread(STDIN, $b, 65536)) > 0) { syswrite(STDOUT, $b, $n) }\n").unwrap();
         match pull {
@@ -130,6 +136,9 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
     if transport == "relay" {
         cmd.env("BARQSYNC_TEST_DIRECT_BLOCKED", "1");
     }
+    if act == Act::IntClosing {
+        cmd.env("BARQSYNC_TIMING", "1");
+    }
     let mut client: Child = cmd.spawn().unwrap();
     let pid = client.id() as i32;
     let cleanup = |client: &mut Child| {
@@ -158,7 +167,7 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
     let server = server.unwrap();
     signal(server, libc::SIGSTOP);
     match act {
-        Act::KillServer => signal(server, libc::SIGKILL),
+        Act::KillServer | Act::IntClosing => signal(server, libc::SIGKILL),
         Act::CtrlC => signal(-pid, libc::SIGINT),
         Act::IntClient => signal(pid, libc::SIGINT),
         Act::IntServer => signal(server, libc::SIGINT),
@@ -176,6 +185,20 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
         signal(server, libc::SIGCONT);
     }
     let stopped = Instant::now();
+    if act == Act::IntClosing {
+        loop {
+            let log = read_back(&mut se);
+            if log.lines().any(|line| line.starts_with("barqsync timing: client ") && line.ends_with("connection closed")) {
+                signal(pid, libc::SIGINT);
+                break;
+            }
+            if client.try_wait().unwrap().is_some() || stopped.elapsed() > BOUND {
+                cleanup(&mut client);
+                panic!("{what}: did not reach connection cleanup\n{log}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     let status = loop {
         if let Some(s) = client.try_wait().unwrap() {
             break s;
@@ -232,6 +255,15 @@ fn ctrl_c_ends_both_sides() {
 #[test]
 fn an_interrupted_client_exits_20_and_ends_the_server() {
     each_transport(Act::IntClient, "threads");
+}
+
+#[test]
+fn an_interrupt_while_reaping_the_remote_shell_exits_20() {
+    for net_io in ["threads", "tokio"] {
+        for pull in [false, true] {
+            stop_midway(Act::IntClosing, "ssh", pull, net_io);
+        }
+    }
 }
 
 #[test]

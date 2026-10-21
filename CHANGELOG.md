@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- `--delete` now waits for the complete source scan. In 0.4.0, a destination entry
+  could be removed before a later directory produced a source-read error. Local,
+  push and pull transfers now preserve all pending deletion candidates on such an
+  error. Remote scan completion and listing counts are checked before deletion;
+  replaced destination entries and entries selected by another root are kept.
+- Ctrl-C during remote connection cleanup now returns exit 20 even if the transfer
+  had already selected another status before the interrupt arrived.
+
 ### Documentation
 
 - All documentation except the README and this changelog moved into `docs/`, with an index

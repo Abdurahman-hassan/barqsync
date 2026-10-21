@@ -3,13 +3,17 @@
 Status on 21 October 2026.
 
 - **Released: 0.4.0** on 21 October: crates.io, and a GitHub release built from the tag
-  `v0.4.0` (`2a8794a`). It contains every P1 fix from [the audit](audit/findings.md)
+  `v0.4.0` (`2a8794a`). It contains the initial P1 remediations from [the audit](audit/findings.md)
   (PRs 15–19) plus PRs 11–13; the changes are listed in `CHANGELOG.md` under 0.4.0. The
   protocol is 10, so 0.4.x can't talk to 0.3.x: upgrade both ends.
 
 How the P1 work was organized, and where each finding landed:
 [audit/p1-coordination.md](audit/p1-coordination.md). The
 milestone tracker is [audit/README.md](audit/README.md).
+
+The current tree also contains an unreleased [deletion barrier](audit/02a-deletion-barrier.md):
+0.4.0 stopped deletion after a reported source error, but could already have deleted
+entries before a later scan failure. Pending deletions now wait for a successful scan.
 
 ## Next steps, in order
 
@@ -20,15 +24,17 @@ milestone tracker is [audit/README.md](audit/README.md).
    `~/bin/barqsync-pr11` and `~/bin/barqsync-0.4.0-rc` (test builds), and `~/bin/barqsync`
    (0.1.0). Its firewall exceptions for those are no longer needed for `--streams`.
 3. **Tidy up:**
-   - The main checkout still holds Codex's original uncommitted edits on top of v0.3.0.
-     They're now on `main` (PRs 15–17) and kept on the local branch `audit/codex-wip`, so
-     the checkout can be reset to `main` once you've checked nothing else is in it.
+   - The initial audit edits are committed and merged (PRs 15–19). Their original
+     snapshot is retained locally as `audit/safety-wip`. The primary checkout was
+     refreshed from `main` at `567e570` on 21 October; preserve untracked local files
+     when changing branches.
    - Delete merged and superseded branches: the milestone branches, the PR branches,
      `p1-base`, and the worktrees under `.claude/worktrees/`.
    - Remove the release worktree `/tmp/barqsync-v0.4.0`
      (`git worktree remove /tmp/barqsync-v0.4.0`).
-   - PRs 11–19 went in without a Codex review (usage limit). Ask for one once it resets.
-4. **Next releases:** follow "Releasing next time" in `p1-coordination.md`. 0.4.0 was tagged
+   - Follow-up review of PRs 11–19 remains useful; release checks do not replace review
+     of the implementation and its remaining acceptance criteria.
+4. **Next releases:** follow [Releasing next time](audit/p1-coordination.md#releasing-next-time). 0.4.0 was tagged
    before its release PR merged, so the published crate's changelog says 2026-10-20 and the
    crate includes `IMPLEMENTATION_PLAN.md` and `REMAINING.md` (since moved into `docs/`).
 

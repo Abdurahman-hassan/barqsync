@@ -72,8 +72,12 @@ fn need(c: &Conn, dir: u32) -> Vec<NeedReq> {
 
 /// Finish as a sender does, and wait for the receiver to say it is done.
 fn finish(c: &Conn, dirs: u32) {
+    finish_with_errors(c, dirs, 0);
+}
+
+fn finish_with_errors(c: &Conn, dirs: u32, errors: u64) {
     c.msg(Msg::ScanDone { dirs }).unwrap();
-    c.msg(Msg::SenderDone { errors: 0 }).unwrap();
+    c.msg(Msg::SenderDone { errors }).unwrap();
     while let Some(f) = next(c) {
         if matches!(f, Frame::Msg(Msg::ReceiverDone { .. })) {
             return;
@@ -346,6 +350,130 @@ fn keep_dirlinks_does_not_follow_a_symlink_another_root_made() {
         assert!(files_in(&f.outside).is_empty(), "{mode:?}: wrote outside: {:?}", files_in(&f.outside));
         assert_eq!(fs::read(f.dest.join("a/pwn")).unwrap(), b"PWND", "{mode:?}");
         assert_eq!(code, 0, "{mode:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DATA-03: deletion waits for a complete, successful source scan
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deletion_waits_for_successful_scan_completion() {
+    for mode in MODES {
+        for outcome in ["success", "io-error", "sender-error", "fatal"] {
+            let f = fixture();
+            fs::write(f.dest.join("keep"), b"PRECIOUS").unwrap();
+            let code = receive(&f.dest, &["--delete"], mode, |p| {
+                p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
+                need(p, 0);
+                assert_eq!(fs::read(f.dest.join("keep")).unwrap(), b"PRECIOUS", "deleted while still scanning");
+                if outcome == "fatal" {
+                    p.msg(Msg::Fatal { msg: "source scan failed".into() }).unwrap();
+                    return;
+                }
+                if outcome == "io-error" {
+                    p.msg(Msg::IoError).unwrap();
+                }
+                finish_with_errors(p, 1, u64::from(outcome != "success"));
+            });
+            let expected = match outcome {
+                "success" => barqsync::exit::OK,
+                "fatal" => barqsync::exit::PROTOCOL,
+                _ => barqsync::exit::PARTIAL,
+            };
+            assert_eq!(code, expected, "{mode:?} {outcome}");
+            assert_eq!(f.dest.join("keep").exists(), outcome != "success", "{mode:?} {outcome}");
+        }
+    }
+}
+
+#[test]
+fn invalid_scan_completion_cannot_authorize_deletion() {
+    for mode in MODES {
+        for case in ["missing", "count", "repeated", "late-listing"] {
+            let f = fixture();
+            fs::write(f.dest.join("keep"), b"PRECIOUS").unwrap();
+            let code = receive(&f.dest, &["--delete"], mode, |p| {
+                p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
+                need(p, 0);
+                match case {
+                    "missing" => p.msg(Msg::SenderDone { errors: 0 }).unwrap(),
+                    "count" => p.msg(Msg::ScanDone { dirs: 2 }).unwrap(),
+                    "repeated" => {
+                        p.msg(Msg::ScanDone { dirs: 1 }).unwrap();
+                        p.msg(Msg::ScanDone { dirs: 1 }).unwrap();
+                    }
+                    _ => {
+                        p.msg(Msg::ScanDone { dirs: 1 }).unwrap();
+                        p.msg(Msg::DirBatch { root: 0, dir: 1, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
+                    }
+                }
+                assert!(refused(p).contains("protocol error"));
+            });
+            assert_eq!(code, barqsync::exit::PROTOCOL, "{mode:?} {case}");
+            assert_eq!(fs::read(f.dest.join("keep")).unwrap(), b"PRECIOUS");
+        }
+    }
+}
+
+#[test]
+fn missing_selected_directory_listing_preserves_deletion_candidates() {
+    for mode in MODES {
+        let f = fixture();
+        fs::write(f.dest.join("keep"), b"PRECIOUS").unwrap();
+        let code = receive(&f.dest, &["--delete"], mode, |p| {
+            p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
+            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", f.dir)], sums: vec![] }).unwrap();
+            need(p, 0);
+            // The count matches, but the selected subdirectory was never listed.
+            finish(p, 1);
+        });
+        assert_eq!(code, barqsync::exit::PARTIAL, "{mode:?}");
+        assert_eq!(fs::read(f.dest.join("keep")).unwrap(), b"PRECIOUS");
+    }
+}
+
+#[test]
+fn a_deletion_candidate_selected_by_another_root_survives() {
+    for mode in MODES {
+        for selected_first in [false, true] {
+            let f = fixture();
+            fs::write(f.dest.join("keep"), b"PRECIOUS").unwrap();
+            let meta = meta_of(&f.dest.join("keep"));
+            let code = receive(&f.dest, &["--delete"], mode, |p| {
+                p.msg(Msg::Roots(vec![root(&f.dest), root(&f.dest)])).unwrap();
+                for dir in 0..2 {
+                    let selected = (dir == 0) == selected_first;
+                    let entries = if selected { vec![ent("keep", meta)] } else { vec![] };
+                    p.msg(Msg::DirBatch { root: dir as u16, dir, rel: vec![], entries, sums: vec![] }).unwrap();
+                    assert!(need(p, dir).is_empty());
+                }
+                finish(p, 2);
+            });
+            assert_eq!(code, 0, "{mode:?}, selected_first={selected_first}");
+            assert_eq!(fs::read(f.dest.join("keep")).unwrap(), b"PRECIOUS");
+        }
+    }
+}
+
+#[test]
+fn a_replaced_deletion_candidate_is_kept() {
+    for mode in MODES {
+        let f = fixture();
+        fs::write(f.dest.join("keep"), b"OLD").unwrap();
+        let code = receive(&f.dest, &["--delete"], mode, |p| {
+            p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
+            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
+            need(p, 0);
+            let replacement = f.outside.join("replacement");
+            fs::write(&replacement, b"NEW").unwrap();
+            fs::rename(replacement, f.dest.join("keep")).unwrap();
+            finish(p, 1);
+        });
+        assert_eq!(code, barqsync::exit::PARTIAL, "{mode:?}");
+        assert_eq!(fs::read(f.dest.join("keep")).unwrap(), b"NEW");
     }
 }
 

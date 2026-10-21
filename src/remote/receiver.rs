@@ -196,9 +196,18 @@ pub(crate) struct Overlap(Mutex<Taken>);
 struct Taken {
     dirs: HashSet<PathBuf>,
     links: HashSet<PathBuf>,
+    selected: HashSet<PathBuf>,
 }
 
 impl Overlap {
+    pub(crate) fn select(&self, path: &Path) {
+        self.0.lock().unwrap().selected.insert(path.to_path_buf());
+    }
+
+    pub(crate) fn selected(&self, path: &Path) -> bool {
+        self.0.lock().unwrap().selected.contains(path)
+    }
+
     /// Take the directory at `path` (`kept`: with `-K`, a symlink to one).
     pub(crate) fn take_dir(&self, path: &Path, kept: bool) -> io::Result<()> {
         let mut t = self.0.lock().unwrap();
@@ -1274,7 +1283,13 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                         });
                         Ok(())
                     }
-                    Msg::ScanDone { .. } => {
+                    Msg::ScanDone { dirs } => {
+                        if let Err(e) = listings.finish(dirs) {
+                            let msg = format!("protocol error: {e}");
+                            out.error(&msg);
+                            let _ = conn.msg(Msg::Fatal { msg });
+                            break (0, Some(exit::PROTOCOL));
+                        }
                         remote.on_scan_done();
                         Ok(())
                     }
@@ -1283,6 +1298,12 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                         Ok(())
                     }
                     Msg::SenderDone { errors } => {
+                        if !listings.finished() {
+                            let msg = "protocol error: sender completed before its scan".to_string();
+                            out.error(&msg);
+                            let _ = conn.msg(Msg::Fatal { msg });
+                            break (0, Some(exit::PROTOCOL));
+                        }
                         crate::timing::mark("SenderDone received");
                         sender_done = Some(errors);
                         Ok(())
@@ -1325,6 +1346,15 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         fsops::cleanup_temps();
         return (code, engine.stats.snapshot(), false);
     }
+    if sender_errors > 0 {
+        engine.sender_io_error();
+    }
+    let unlisted = remote.slots.lock().unwrap().values()
+        .filter(|slot| matches!(slot, Slot::Job(_) | Slot::Items { .. })).count();
+    if unlisted > 0 {
+        engine.sender_io_error();
+        engine.err(format!("{unlisted} selected directories were never listed"));
+    }
     let unanswered = remote.needed.lock().unwrap().len() + remote.incoming.lock().unwrap().len();
     if unanswered > 0 {
         engine.err(format!("{unanswered} requested files were never received"));
@@ -1336,6 +1366,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     }
     pool.install(|| {
         engine.link_followers();
+        engine.finish_deletions();
         engine.apply_fixups();
     });
     remote.flush_synced();

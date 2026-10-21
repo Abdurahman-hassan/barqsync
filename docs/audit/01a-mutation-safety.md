@@ -34,7 +34,7 @@ close the gaps listed below it.
   `Synced` without `--remove-source-files`, or in a dry run, is a protocol error, and
   the removal helper refuses on its own too. `Synced` now carries entry names only:
   the receiver no longer sends size and time, so there is nothing to trust (protocol
-  10, which no release speaks yet).
+  10, finalized before v0.4.0 was released).
 - **DATA-06:** before unlinking, the helper compares type, device/inode, size and
   mtime to the nanosecond with the sender's record. Same-second edits, same-size inode
   replacement and symlink swaps prevent removal. The macOS bulk scanner now reports

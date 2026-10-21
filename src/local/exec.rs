@@ -1,9 +1,10 @@
 //! The sync engine (receiving side): one rayon task per directory.
 //!
 //! Each directory task takes the source directory's listing, compares it with the
-//! matching destination directory, deletes extraneous entries (`--delete`), creates
+//! matching destination directory, queues extraneous entries (`--delete`), creates
 //! subdirectories and descends into them, then has its changed files written.
-//! Directory attributes are applied after everything else, deepest first, so a
+//! Queued deletions run only after the source scan succeeds. Directory attributes
+//! are applied after everything else, deepest first, so a
 //! read-only source directory stays writable while it is being filled.
 //!
 //! Locally the listing comes from `readdir` and files are copied in parallel. As a
@@ -44,6 +45,8 @@ pub struct Engine<'a> {
     pub out: &'a Output,
     pub stats: Stats,
     fixups: Mutex<Vec<DirFixup>>,
+    /// Entries absent from a listing; removal waits for the complete source scan.
+    deletions: Mutex<HashMap<PathBuf, Deletion>>,
     /// `-H`: hard-link groups keyed by the source `(dev, ino)`.
     hardlinks: Mutex<HashMap<(u64, u64), HardGroup>>,
     pub(crate) umask: u32,
@@ -188,6 +191,11 @@ struct DirFixup {
     gid: Option<u32>,
 }
 
+struct Deletion {
+    rel: Vec<u8>,
+    meta: Meta,
+}
+
 /// A name for a message: the root shows as `.`.
 fn quoted(rel: &[u8]) -> &[u8] {
     if rel.is_empty() { b"." } else { rel }
@@ -217,6 +225,7 @@ impl<'a> Engine<'a> {
             out,
             stats: Stats::default(),
             fixups: Mutex::new(Vec::new()),
+            deletions: Mutex::new(HashMap::new()),
             hardlinks: Mutex::new(HashMap::new()),
             umask: fsops::current_umask(),
             remote: None,
@@ -688,7 +697,7 @@ impl<'a> Engine<'a> {
             None => select::may_delete(job.sel),
         };
         if self.opts.delete && !job.dst_is_new && full && self.may_delete() {
-            changed |= self.delete_extraneous(job, &entries, &dst_map);
+            changed |= self.defer_extraneous(job, &entries, &dst_map);
         }
         let dst_handle = if job.dst_is_new || dst_metas.is_some() { None } else { fsops::DirHandle::open(&job.dst).ok() };
         let ctx = Ctx {
@@ -710,7 +719,7 @@ impl<'a> Engine<'a> {
         files
     }
 
-    fn delete_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>) -> bool {
+    fn defer_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>) -> bool {
         let src_names: HashSet<&OsStr> = entries.iter().map(|(_, e, _)| e.name.as_os_str()).collect();
         let mut extra: Vec<(&OsString, Kind)> = dst_map
             .iter()
@@ -722,15 +731,56 @@ impl<'a> Engine<'a> {
             .map(|(n, k)| (n, *k))
             .collect();
         extra.sort_unstable_by(|a, b| b.0.as_bytes().cmp(a.0.as_bytes()));
-        for (name, kind) in &extra {
-            self.delete_tree(&job.dst.join(name), &join_rel(&job.rel, name), *kind, true);
+        let mut pending = self.deletions.lock().unwrap();
+        for (name, _) in &extra {
+            let path = job.dst.join(name);
+            match fsops::lstat(&path) {
+                Ok(meta) => {
+                    pending.entry(path).or_insert_with(|| Deletion { rel: join_rel(&job.rel, name), meta });
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => self.err(path_msg("stat before deletion \"", &path, format!("\" failed: {e}"))),
+            }
         }
         !extra.is_empty()
+    }
+
+    /// Called only after all scanning/transfer tasks have joined, and for a remote
+    /// transfer after the sender's completion was checked. A later source error
+    /// invalidates every earlier absence decision. Run before directory fixups.
+    pub(crate) fn finish_deletions(&self) {
+        let pending = std::mem::take(&mut *self.deletions.lock().unwrap());
+        if pending.is_empty() || fsops::interrupted() || !self.may_delete() {
+            return;
+        }
+        let mut pending: Vec<_> = pending.into_iter().collect();
+        pending.sort_unstable_by(|a, b| b.1.rel.cmp(&a.1.rel));
+        for (path, deletion) in pending {
+            if fsops::interrupted() {
+                break;
+            }
+            // An older/misbehaving peer can send separate overlapping roots. An
+            // entry selected by any of them must survive another root's absence.
+            if self.overlap().is_some_and(|o| o.selected(&path)) {
+                continue;
+            }
+            match fsops::lstat(&path) {
+                Ok(now) if now.kind == deletion.meta.kind && fsops::same_file(&now, &deletion.meta) => {
+                    self.delete_tree(&path, &deletion.rel, now.kind, true);
+                }
+                Ok(_) => self.err(path_msg("skipping deletion of changed entry \"", &path, "\"")),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => self.err(path_msg("stat before deletion \"", &path, format!("\" failed: {e}"))),
+            }
+        }
     }
 
     /// Remove `path` (recursively for directories). `report` prints rsync's
     /// "deleting" lines; replacements of one file type by another are silent.
     fn delete_tree(&self, path: &Path, rel: &[u8], kind: Kind, report: bool) {
+        if fsops::interrupted() {
+            return;
+        }
         if kind == Kind::Dir {
             match fsops::read_dir_kinds(path) {
                 Ok(m) => {
@@ -982,6 +1032,11 @@ impl<'a> Engine<'a> {
             let rel = join_rel(ctx.rel, &e.name);
             let src_path = ctx.src_dir(idx).join(&e.name);
             let dst_path = ctx.dst.join(dname);
+            if self.opts.delete
+                && let Some(overlap) = self.overlap()
+            {
+                overlap.select(&dst_path);
+            }
             let dst_kind = if ctx.dst_is_new { None } else { dst_map.get(dname).copied() };
             if self.opts.existing && dst_kind.is_none() && !(e.meta.kind == Kind::Dir && !self.opts.recursive && !self.opts.dirs) {
                 // --existing: nothing new is created, not even directories.

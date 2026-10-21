@@ -6,8 +6,8 @@
 //! 2. **Diff**: a listing is processed once its directory's job exists (the parent
 //!    creates the destination directory first, see [`Feed`]), against the destination
 //!    entries from the index, so no per-file `lstat`. Directories, symlinks and
-//!    specials are handled inline, in scan order; `--delete` runs per directory as in
-//!    the per-directory engine. Files are classified into queues: A metadata-only,
+//!    specials are handled inline, in scan order; `--delete` candidates wait until
+//!    scanning succeeds. Files are classified into queues: A metadata-only,
 //!    B small (≤ 128 KiB), C large and new, D large and changed.
 //! 3. **Transfer**: a pool of worker threads per queue.
 //! 4. **Commit**: each file is written to a temp file and renamed into place when

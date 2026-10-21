@@ -70,6 +70,7 @@ pub struct Listings {
     /// `(root, rel)` of the listings that may still arrive.
     expected: HashSet<(u16, Vec<u8>)>,
     ids: HashSet<u32>,
+    done: bool,
     /// Per root: its named items (`None` for a `src/` root), which its top listing repeats.
     items: Vec<Option<Names>>,
 }
@@ -91,11 +92,14 @@ impl Listings {
             }
             items.push(Some(root.items.iter().map(|e| (e.name.as_bytes().to_vec(), e.meta.kind)).collect()));
         }
-        Listings { expected, ids: HashSet::new(), items }
+        Listings { expected, ids: HashSet::new(), done: false, items }
     }
 
     /// Take listing `dir`, of directory `rel` in `root`, or say what is wrong with it.
     pub fn take(&mut self, root: u16, dir: u32, rel: &[u8], ents: &[DirEnt], sums: &[Option<Sum>]) -> Result<(), String> {
+        if self.done {
+            return Err("listing after scan completion".into());
+        }
         let Some(items) = self.items.get(usize::from(root)) else {
             return Err(format!("listing for unknown root {root}"));
         };
@@ -123,6 +127,19 @@ impl Listings {
             self.expected.insert((root, join_rel(rel, &e.name)));
         }
         Ok(())
+    }
+
+    /// Scan completion is a control-stream barrier, after every announced listing.
+    pub fn finish(&mut self, dirs: u32) -> Result<(), String> {
+        if self.done || self.ids.len() as u64 != u64::from(dirs) {
+            return Err(format!("invalid scan completion: {dirs} listings announced, {} received", self.ids.len()));
+        }
+        self.done = true;
+        Ok(())
+    }
+
+    pub fn finished(&self) -> bool {
+        self.done
     }
 }
 

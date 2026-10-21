@@ -5,8 +5,9 @@ Date: 21 October 2026.
 Status: implemented as described below; it covers part of 1B (SEC-01), part of 2B
 (DATA-05) and part of 3C (PROTO-01). Verification is recorded at the end.
 
-Findings: SEC-01, DATA-05, PROTO-01. The protocol stays at version 10, which no release
-speaks yet; its framing gains one frame kind.
+Findings: SEC-01, DATA-05, PROTO-01. These changes finalized protocol 10 before
+v0.4.0 was released, adding one frame kind. Protocol 10 is now released and any
+future incompatible wire change needs a new version.
 
 ## Changes
 
