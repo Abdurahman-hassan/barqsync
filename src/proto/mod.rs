@@ -266,6 +266,16 @@ fn piece_size() -> usize {
     *PIECE
 }
 
+/// How long the control stream's reader holds a peer's `Interrupted` before passing it
+/// on: `BARQSYNC_TEST_NOTICE_LAG_MS` (tests: a control path slower than the data streams,
+/// whose end then arrives first), else not at all.
+fn notice_lag(f: &Frame) -> Option<Duration> {
+    static LAG: std::sync::LazyLock<Option<Duration>> = std::sync::LazyLock::new(|| {
+        std::env::var("BARQSYNC_TEST_NOTICE_LAG_MS").ok().and_then(|v| v.parse().ok()).map(Duration::from_millis)
+    });
+    if matches!(f, Frame::Msg(Msg::Interrupted)) { *LAG } else { None }
+}
+
 /// Append one frame of at most [`MAX_FRAME`] bytes, compressed when that makes it smaller.
 fn push_frame(out: &mut Vec<u8>, kind: u8, body: &[u8], level: Option<i32>) -> io::Result<()> {
     let z = match level.filter(|_| body.len() >= 256) {
@@ -390,6 +400,36 @@ fn decode(kind: u8, mut body: Vec<u8>) -> io::Result<Frame> {
         }
         k => Err(invalid(format!("unknown frame kind {k}"))),
     }
+}
+
+/// A data stream's failure or early end, told apart from the control stream's end,
+/// which alone means the peer is gone (see [`Conn::recv_timeout`]).
+#[derive(Debug)]
+struct StreamLost(io::Error);
+
+impl std::fmt::Display for StreamLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for StreamLost {}
+
+/// `e`, from a data stream's reader.
+pub(crate) fn stream_lost(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), StreamLost(e))
+}
+
+/// Whether `e` is a data stream's failure or early end. A malformed frame is the peer's
+/// error, decided at once.
+fn is_stream_lost(e: &io::Error) -> bool {
+    e.kind() != io::ErrorKind::InvalidData && e.get_ref().is_some_and(|e| e.is::<StreamLost>())
+}
+
+/// Frames that travel on data streams when there are any: dropped once the transfer
+/// can't complete (see [`Conn::recv_timeout`]).
+fn carries_file_data(f: &Frame) -> bool {
+    data_key(f).is_some() || matches!(f, Frame::Msg(Msg::StreamEnd))
 }
 
 /// Where encoded frames are queued: a writer thread's channel, or a writer task's.
@@ -542,6 +582,9 @@ const CLOSE_WAIT: Duration = Duration::from_secs(30);
 /// The same for a run that was stopped (interrupted, or failed): what is left is
 /// best-effort.
 const STOPPED_CLOSE_WAIT: Duration = Duration::from_secs(2);
+/// How long a data stream's early end, or a failed write, waits for the control stream
+/// to say why (see [`Conn::recv_timeout`]).
+const SETTLE: Duration = Duration::from_secs(2);
 
 /// Cloneable handle for sending frames. Frames are encoded (and compressed) on the
 /// calling thread, so many tasks can compress in parallel; writer threads only write.
@@ -671,6 +714,9 @@ pub struct Conn {
     /// The connection this one replaced (the ssh pipe, once control moved to QUIC):
     /// idle, but kept open until this one finishes.
     under: Option<Box<Conn>>,
+    /// The first data stream failure or failed write, and until when the control stream
+    /// may still say why (see [`Conn::recv_timeout`]).
+    lost: std::sync::Mutex<Option<(io::Error, Instant)>>,
 }
 
 /// Clears the spare sender when the main reader thread exits, however it exits.
@@ -750,6 +796,9 @@ impl Conn {
                 loop {
                     match read_frame(&mut r) {
                         Ok(Some(f)) => {
+                            if let Some(lag) = notice_lag(&f) {
+                                std::thread::sleep(lag);
+                            }
                             if rtx.send(Ok(f)).is_err() {
                                 return;
                             }
@@ -777,6 +826,7 @@ impl Conn {
             data_in: 0,
             session: None,
             under: None,
+            lost: Default::default(),
         }
     }
 
@@ -802,6 +852,7 @@ impl Conn {
             data_in: 0,
             session: None,
             under: None,
+            lost: Default::default(),
         }
     }
 
@@ -865,11 +916,11 @@ impl Conn {
                             Ok(Some(f)) => f,
                             Ok(None) => {
                                 let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "data stream closed early");
-                                let _ = rtx.send(Err(eof));
+                                let _ = rtx.send(Err(stream_lost(eof)));
                                 return;
                             }
                             Err(e) => {
-                                let _ = rtx.send(Err(e));
+                                let _ = rtx.send(Err(stream_lost(e)));
                                 return;
                             }
                         };
@@ -917,6 +968,46 @@ impl Conn {
         self.out.msg(m)
     }
 
+    /// The next frame, waiting at most `wait` (`Ok(None)`: none yet), or why the
+    /// connection ended.
+    ///
+    /// A peer that stops ends its data streams too, and their end can arrive before the
+    /// reason it sends on the control stream (`Interrupted`, `Fatal`), which travels
+    /// another path. So a data stream that fails or ends early, or a write to the peer
+    /// that fails, ends the connection only once the control stream has had [`SETTLE`]
+    /// to deliver that reason or its own end. File data arriving meanwhile is dropped:
+    /// the transfer can't complete any more, and the frames behind it may be the reason.
+    pub fn recv_timeout(&self, wait: Duration) -> io::Result<Option<Frame>> {
+        let lost = || self.lost.lock().unwrap_or_else(|e| e.into_inner());
+        let settling = lost().as_ref().map(|&(_, until)| until);
+        let wait = match settling {
+            Some(until) if Instant::now() >= until => return Err(lost().take().expect("lost").0),
+            Some(until) => wait.min(until.saturating_duration_since(Instant::now())),
+            None => wait,
+        };
+        // The connection ended on the control stream: the first failure says how.
+        let ended = |e: io::Error| lost().take().map_or(e, |(first, _)| first);
+        match self.rx.recv_timeout(wait) {
+            Ok(Ok(f)) if settling.is_some() && carries_file_data(&f) => Ok(None),
+            Ok(Ok(f)) => Ok(Some(f)),
+            Ok(Err(e)) if is_stream_lost(&e) => {
+                lost().get_or_insert((e, Instant::now() + SETTLE));
+                Ok(None)
+            }
+            Ok(Err(e)) => Err(ended(e)),
+            // Nothing pending: a peer this side can no longer write to won't answer.
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if let Some(e) = self.out.write_failure() {
+                    lost().get_or_insert((e, Instant::now() + SETTLE));
+                }
+                Ok(None)
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(ended(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed by peer")))
+            }
+        }
+    }
+
     /// Receive the next frame; a closed stream is an error (callers expect a reply).
     pub fn recv(&self) -> io::Result<Frame> {
         match self.rx.recv() {
@@ -953,17 +1044,21 @@ impl Conn {
             drop(self.session.take());
             mark("finish: session closed");
         }
-        let deadline = Instant::now() + if self.out.stopped() { STOPPED_CLOSE_WAIT } else { CLOSE_WAIT };
+        let stopped = self.out.stopped();
+        let deadline = Instant::now() + if stopped { STOPPED_CLOSE_WAIT } else { CLOSE_WAIT };
         // Closing: a writer failing from now on (a peer that already left) is no news.
         self.out.cancel();
+        // A run that stopped has told the peer why on the control stream (`Interrupted`,
+        // `Fatal`): that goes out before the data streams end, which the peer would
+        // otherwise see first.
+        let control = stopped.then(|| self.close_control(deadline));
         for tx in self.out.data.iter().flat_map(|d| d.iter()) {
             tx.close(deadline);
         }
         for h in self.data_writers.drain(..) {
             let _ = h.join_until(deadline);
         }
-        self.out.tx.close(deadline);
-        let r = self.writer.take().map_or(Ok(()), |w| w.join_until(deadline));
+        let r = control.unwrap_or_else(|| self.close_control(deadline));
         // The writers of a closed session fail, as expected.
         let r = if quic && confirmed { Ok(()) } else { r };
         if self.session.is_some() {
@@ -977,6 +1072,12 @@ impl Conn {
             mark("finish: ssh pipe closed");
         }
         r
+    }
+
+    /// Deliver what is queued on the control stream and end it.
+    fn close_control(&mut self, deadline: Instant) -> io::Result<()> {
+        self.out.tx.close(deadline);
+        self.writer.take().map_or(Ok(()), |w| w.join_until(deadline))
     }
 
     /// Wait until the peer has ended: its streams on this connection, or the ssh pipe

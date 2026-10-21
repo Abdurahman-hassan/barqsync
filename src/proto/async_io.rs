@@ -127,16 +127,22 @@ pub(crate) fn spawn_reader(
                 Ok(Some(f)) => f,
                 Ok(None) => {
                     // The control stream too: data streams may keep the channel open.
-                    let what = if data_stream { "data stream closed early" } else { "connection closed by peer" };
-                    let e = io::Error::new(io::ErrorKind::UnexpectedEof, what);
+                    let e = match data_stream {
+                        true => super::stream_lost(io::Error::new(io::ErrorKind::UnexpectedEof, "data stream closed early")),
+                        false => io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed by peer"),
+                    };
                     let _ = tokio::task::block_in_place(|| out.send(Err(e)));
                     break;
                 }
                 Err(e) => {
+                    let e = if data_stream { super::stream_lost(e) } else { e };
                     let _ = tokio::task::block_in_place(|| out.send(Err(e)));
                     break;
                 }
             };
+            if let Some(lag) = super::notice_lag(&f).filter(|_| !data_stream) {
+                tokio::time::sleep(lag).await;
+            }
             let end = data_stream && matches!(f, Frame::Msg(super::Msg::StreamEnd));
             // The consumer applies backpressure through this bounded channel.
             if tokio::task::block_in_place(|| out.send(Ok(f))).is_err() || end {

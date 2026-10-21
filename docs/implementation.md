@@ -265,7 +265,12 @@ connections and control messages stay on ssh:
    without both checks.
 3. **Use.** Every frame of a file goes over the same stream, so it stays in order. Small-file
    packs spread across streams. Each stream ends with an end-of-stream marker, and the
-   receiver finishes only after all of them and the sender's final ssh message.
+   receiver finishes only after all of them and the sender's final ssh message. A stream
+   that ends without its marker, or a write that fails, ends the transfer, but first the
+   control connection gets up to 2 s to say why. A side that is interrupted closes its
+   streams too, and its notice travels on ssh, so it can arrive after their end. The
+   interrupt then decides the exit code (20, not 12). A side that stops sends its notice
+   before it closes its streams.
 4. **Through ssh when blocked.** If no direct connection opens within 5 s (a firewall on the
    server, NAT, a VPN that only lets ssh in), the client opens the same N streams over N
    extra ssh connections instead. Each runs `barqsync --stream-relay` on the server, which

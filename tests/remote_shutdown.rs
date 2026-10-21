@@ -27,6 +27,10 @@ enum Act {
     IntClosing,
     /// SIGINT to the server alone.
     IntServer,
+    /// SIGINT to the server alone, its notice held back on the client's control stream
+    /// (`BARQSYNC_TEST_NOTICE_LAG_MS`) until the data streams have ended: the interrupt,
+    /// not their end, decides how the client ends.
+    LateNotice,
     /// The server stops reading (SIGSTOP), then Ctrl-C to the client alone.
     StuckServer,
     /// The pipe the file data travels on is cut (into the server for a push, out of it
@@ -120,6 +124,7 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
     let mut args = vec!["-aS", "--strategy=fixed", "-e", "./fake-ssh", "--remote-path", &remote];
     match transport {
         "ssh" => args.push("--transport=ssh"),
+        "quic" => args.extend(["--transport=quic", "--streams=2"]),
         _ => args.extend(["--transport=tcp", "--streams=2"]),
     }
     args.extend(if pull { ["fake:src/", "dst/"] } else { ["src/", "fake:dst/"] });
@@ -138,6 +143,9 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
     }
     if act == Act::IntClosing {
         cmd.env("BARQSYNC_TIMING", "1");
+    }
+    if act == Act::LateNotice {
+        cmd.env("BARQSYNC_TEST_NOTICE_LAG_MS", "500");
     }
     let mut client: Child = cmd.spawn().unwrap();
     let pid = client.id() as i32;
@@ -170,7 +178,7 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
         Act::KillServer | Act::IntClosing => signal(server, libc::SIGKILL),
         Act::CtrlC => signal(-pid, libc::SIGINT),
         Act::IntClient => signal(pid, libc::SIGINT),
-        Act::IntServer => signal(server, libc::SIGINT),
+        Act::IntServer | Act::LateNotice => signal(server, libc::SIGINT),
         Act::StuckServer => {
             // Long enough for the client to fill the pipe and block on it.
             std::thread::sleep(Duration::from_millis(300));
@@ -234,7 +242,10 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
 }
 
 fn each_transport(act: Act, net_io: &str) {
-    for transport in ["ssh", "tcp", "relay"] {
+    // Over QUIC a dead server is noticed only by QUIC's idle timeout (15 s), and closing a
+    // stopped run waits up to 5 s for a peer that no longer answers: both take too long yet.
+    let quic = !matches!(act, Act::KillServer | Act::StuckServer);
+    for transport in ["ssh", "tcp", "relay", "quic"].into_iter().filter(|&t| quic || t != "quic") {
         for pull in [false, true] {
             stop_midway(act, transport, pull, net_io);
         }
@@ -269,6 +280,12 @@ fn an_interrupt_while_reaping_the_remote_shell_exits_20() {
 #[test]
 fn an_interrupted_server_ends_the_client_with_20() {
     each_transport(Act::IntServer, "threads");
+}
+
+#[test]
+fn a_server_interrupt_noticed_after_the_data_streams_end_exits_20() {
+    each_transport(Act::LateNotice, "threads");
+    each_transport(Act::LateNotice, "tokio");
 }
 
 #[test]
