@@ -30,17 +30,18 @@ pub(crate) struct SrcDir {
 pub(crate) struct Sources {
     /// The directories merged, in precedence order.
     pub(crate) dirs: Vec<SrcDir>,
-    /// For each entry, the index in `dirs` of the directory it comes from.
-    origin: Vec<u16>,
+    /// For each entry, the index in `dirs` of the directory it comes from (empty: there
+    /// is one directory). Full width: any number of sources can be given.
+    origin: Vec<usize>,
     /// Directory entries that later directories have as directories too: entry index ->
     /// those directories (index in `dirs`) and the device of each one's directory.
-    also: HashMap<u32, Vec<(u16, u64)>>,
+    also: HashMap<u32, Vec<(usize, u64)>>,
 }
 
 impl Sources {
     /// The source directory holding entry `idx`.
     pub(crate) fn dir_of(&self, idx: u32) -> &SrcDir {
-        &self.dirs[self.origin[idx as usize] as usize]
+        &self.dirs[self.origin.get(idx as usize).copied().unwrap_or(0)]
     }
 
     /// The later sources' directories that merge into directory entry `idx` (named
@@ -51,7 +52,7 @@ impl Sources {
         let own = self.dir_of(idx).path.join(name);
         let mut out: Vec<SrcDir> = Vec::new();
         for &(k, dev) in also {
-            let d = &self.dirs[k as usize];
+            let d = &self.dirs[k];
             let root_dev = d.dev.unwrap_or(dev);
             if one_fs && dev != root_dev {
                 continue;
@@ -72,9 +73,13 @@ impl Sources {
 
 /// Merge the listings of `dirs` (each sorted by name; `lists[i]` is `dirs[i]`'s) into one
 /// listing sorted by name, keeping rsync's precedence for names in several.
-pub(crate) fn merge(dirs: Vec<SrcDir>, lists: Vec<Vec<DirEnt>>) -> (Vec<DirEnt>, Sources) {
-    let mut all: Vec<(u16, DirEnt)> =
-        lists.into_iter().enumerate().flat_map(|(k, l)| l.into_iter().map(move |e| (k as u16, e))).collect();
+pub(crate) fn merge(dirs: Vec<SrcDir>, mut lists: Vec<Vec<DirEnt>>) -> (Vec<DirEnt>, Sources) {
+    if let ([_], [_]) = (dirs.as_slice(), lists.as_slice()) {
+        // One directory: nothing to merge.
+        return (lists.pop().unwrap_or_default(), Sources { dirs, ..Sources::default() });
+    }
+    let mut all: Vec<(usize, DirEnt)> =
+        lists.into_iter().enumerate().flat_map(|(k, l)| l.into_iter().map(move |e| (k, e))).collect();
     // Stable: entries of one name stay in source order.
     all.sort_by(|a, b| a.1.name.as_bytes().cmp(b.1.name.as_bytes()));
     let mut entries = Vec::with_capacity(all.len());
@@ -87,7 +92,7 @@ pub(crate) fn merge(dirs: Vec<SrcDir>, lists: Vec<Vec<DirEnt>>) -> (Vec<DirEnt>,
         }
         let win = group.iter().position(|(_, e)| e.meta.kind == Kind::Dir).unwrap_or(0);
         if group[win].1.meta.kind == Kind::Dir {
-            let also: Vec<(u16, u64)> = group[win + 1..]
+            let also: Vec<(usize, u64)> = group[win + 1..]
                 .iter()
                 .filter(|(_, e)| e.meta.kind == Kind::Dir)
                 .map(|(k, e)| (*k, e.meta.dev))
@@ -135,6 +140,20 @@ mod tests {
         assert_eq!(m.iter().map(|d| d.path.clone()).collect::<Vec<_>>(), [PathBuf::from("b/m")]);
         assert!(src.also_dirs(0, OsStr::new("d"), true, false).is_empty());
         assert!(src.also_dirs(4, OsStr::new("x"), true, false).is_empty());
+    }
+
+    #[test]
+    fn any_number_of_sources_keep_their_own_entries() {
+        // More sources than a u16 can count: each entry still comes from its own.
+        let n = 70_000;
+        let dirs: Vec<SrcDir> = (0..n).map(|i| dir(&format!("s{i}"))).collect();
+        let lists: Vec<Vec<DirEnt>> = (0..n).map(|i| vec![ent(&format!("e{i:06}"), Kind::File, i as u64)]).collect();
+        let (entries, src) = merge(dirs, lists);
+        assert_eq!(entries.len(), n);
+        for (i, e) in entries.iter().enumerate() {
+            let k = e.meta.size as usize;
+            assert_eq!(src.dir_of(i as u32).path, PathBuf::from(format!("s{k}")), "{:?}", e.name);
+        }
     }
 
     #[test]

@@ -553,6 +553,9 @@ pub struct FrameSender {
     comp: Arc<Compression>,
     wire: Wire,
     stop: Arc<Stopper>,
+    /// A one-frame lane to the control stream's writer, which takes it before anything
+    /// queued: `Interrupted` gets out even when `tx` is full.
+    urgent: Tx,
     /// `Interrupted` was queued for the peer.
     told: Arc<AtomicBool>,
 }
@@ -571,13 +574,14 @@ fn data_key(f: &Frame) -> Option<u64> {
 }
 
 impl FrameSender {
-    fn new(tx: Tx, compress: bool, stop: Arc<Stopper>) -> FrameSender {
+    fn new(tx: Tx, urgent: Tx, compress: bool, stop: Arc<Stopper>) -> FrameSender {
         FrameSender {
             tx,
             data: None,
             comp: Arc::new(Compression::new(compress, false, None)),
             wire: Wire::Postcard,
             stop,
+            urgent,
             told: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -632,13 +636,15 @@ impl FrameSender {
         f.as_ref().map(|(kind, msg)| io::Error::new(*kind, msg.clone()))
     }
 
-    /// Tell the peer this side was interrupted (`Interrupted`), once, if the control
-    /// stream has room right now: the peer then stops too instead of waiting.
+    /// Tell the peer this side was interrupted (`Interrupted`), once: the peer then stops
+    /// too instead of waiting. It goes on its own lane, written right after the frame
+    /// being written however many are queued, so it never waits for room.
     pub fn tell_interrupted(&self) {
-        if !self.told.swap(true, Ordering::SeqCst)
+        if !self.told.load(Ordering::SeqCst)
             && let Ok(buf) = encode(&Frame::Msg(Msg::Interrupted), None, self.wire)
+            && self.urgent.try_send(buf)
         {
-            self.tx.try_send(buf);
+            self.told.store(true, Ordering::SeqCst);
         }
     }
 
@@ -678,19 +684,38 @@ impl Drop for ClearOnDrop {
     }
 }
 
-fn spawn_writer(name: String, writer: impl Write + Send + 'static, wrx: Receiver<Vec<u8>>, stop: Arc<Stopper>) -> JoinHandle<io::Result<()>> {
+/// The next frame to write: one on the urgent lane (see [`FrameSender::tell_interrupted`])
+/// before anything queued. `None`: every sender is gone.
+fn next_frame(wrx: &Receiver<Vec<u8>>, urgent: Option<&Receiver<Vec<u8>>>) -> Option<Vec<u8>> {
+    let Some(u) = urgent else { return wrx.recv().ok() };
+    if let Ok(buf) = u.try_recv() {
+        return Some(buf);
+    }
+    crossbeam_channel::select_biased! {
+        recv(u) -> buf => buf.ok().or_else(|| wrx.recv().ok()),
+        recv(wrx) -> buf => buf.ok(),
+    }
+}
+
+fn spawn_writer(
+    name: String,
+    writer: impl Write + Send + 'static,
+    wrx: Receiver<Vec<u8>>,
+    urgent: Option<Receiver<Vec<u8>>>,
+    stop: Arc<Stopper>,
+) -> JoinHandle<io::Result<()>> {
     std::thread::Builder::new()
         .name(name)
         .spawn(move || {
             let mut w = BufWriter::with_capacity(256 << 10, writer);
             let r = (|| {
                 // An empty buffer is the close request from `Conn::finish`.
-                while let Ok(buf) = wrx.recv() {
+                while let Some(buf) = next_frame(&wrx, urgent.as_ref()) {
                     if buf.is_empty() {
                         break;
                     }
                     w.write_all(&buf)?;
-                    if wrx.is_empty() {
+                    if wrx.is_empty() && urgent.as_ref().is_none_or(Receiver::is_empty) {
                         w.flush()?;
                     }
                 }
@@ -712,8 +737,9 @@ impl Conn {
     fn start_with(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, compress: bool, stop: Arc<Stopper>) -> Conn {
         // Frames are up to ~4 MiB, so these bound memory to a few tens of MiB per side.
         let (tx, wrx) = bounded::<Vec<u8>>(16);
+        let (utx, urx) = bounded::<Vec<u8>>(1);
         let (rtx, rx) = bounded::<io::Result<Frame>>(16);
-        let writer = spawn_writer("barqsync-writer".into(), writer, wrx, stop.clone());
+        let writer = spawn_writer("barqsync-writer".into(), writer, wrx, Some(urx), stop.clone());
         let spare = Arc::new(std::sync::Mutex::new(Some(rtx.clone())));
         let spare2 = spare.clone();
         std::thread::Builder::new()
@@ -743,7 +769,7 @@ impl Conn {
             })
             .expect("spawn reader thread");
         Conn {
-            out: FrameSender::new(Tx::Thread(tx), compress, stop),
+            out: FrameSender::new(Tx::Thread(tx), Tx::Thread(utx), compress, stop),
             rx,
             rtx: spare,
             writer: Some(Joiner::Thread(writer)),
@@ -761,13 +787,14 @@ impl Conn {
         compress: bool,
     ) -> Conn {
         let stop = Stopper::new();
-        let (tx, task) = async_io::spawn_writer(writer, 16, stop.clone());
+        let (utx, urx) = tokio::sync::mpsc::channel(1);
+        let (tx, task) = async_io::spawn_writer(writer, 16, Some(urx), stop.clone());
         let (rtx, rx) = bounded::<io::Result<Frame>>(16);
         let spare = Arc::new(std::sync::Mutex::new(Some(rtx.clone())));
         let clear = ClearOnDrop(spare.clone());
         async_io::spawn_reader(reader, rtx, false, Some(Box::new(move || drop(clear))));
         Conn {
-            out: FrameSender::new(Tx::Task(tx), compress, stop),
+            out: FrameSender::new(Tx::Task(tx), Tx::Task(utx), compress, stop),
             rx,
             rtx: spare,
             writer: Some(Joiner::Task(task)),
@@ -782,7 +809,7 @@ impl Conn {
     pub fn attach_data_out_async(&mut self, streams: Vec<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>) {
         let mut senders = Vec::with_capacity(streams.len());
         for s in streams {
-            let (tx, task) = async_io::spawn_writer(s, 4, self.out.stop.clone());
+            let (tx, task) = async_io::spawn_writer(s, 4, None, self.out.stop.clone());
             self.data_writers.push(Joiner::Task(task));
             senders.push(Tx::Task(tx));
         }
@@ -817,7 +844,7 @@ impl Conn {
         for (i, s) in streams.into_iter().enumerate() {
             // Shallow queues: N streams × depth × ~4 MiB frames is the memory bound.
             let (tx, wrx) = bounded::<Vec<u8>>(4);
-            self.data_writers.push(Joiner::Thread(spawn_writer(format!("barqsync-data-{i}"), s, wrx, self.out.stop.clone())));
+            self.data_writers.push(Joiner::Thread(spawn_writer(format!("barqsync-data-{i}"), s, wrx, None, self.out.stop.clone())));
             senders.push(Tx::Thread(tx));
         }
         self.out.data = Some(Arc::new(senders));
@@ -1119,6 +1146,35 @@ mod tests {
             assert!(read_frame(&mut r).unwrap().is_none());
             // A stream that ends after a part is cut short, not cleanly closed.
             assert_eq!(read_frame(&mut &buf[..5 + first]).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    /// `Interrupted` reaches a peer that is behind even with the control queue full: it
+    /// goes out right after the frame being written, not after everything queued.
+    #[test]
+    fn the_interrupt_notice_overtakes_a_full_queue() {
+        use std::os::unix::net::UnixStream;
+        for tokio in [false, true] {
+            let (ours, peer) = UnixStream::pair().unwrap();
+            let conn = if tokio {
+                let r = async_io::FdIo::new(ours.try_clone().unwrap().into()).unwrap();
+                Conn::start_async(r, async_io::FdIo::new(ours.into()).unwrap(), false)
+            } else {
+                Conn::start(ours.try_clone().unwrap(), ours, false)
+            };
+            // The peer reads nothing yet: the writer blocks and the queue fills up.
+            let frame = encode(&Frame::Data { id: 1, off: 0, bytes: vec![7; 1 << 20] }, None, Wire::Postcard).unwrap();
+            while conn.out.tx.try_send(frame.clone()) {}
+            conn.out.tell_interrupted();
+            let mut r = io::BufReader::new(peer);
+            for read in 0.. {
+                assert!(read < 16, "tokio={tokio}: the notice waited behind the queue");
+                match read_frame(&mut r).unwrap() {
+                    Some(Frame::Msg(Msg::Interrupted)) => break,
+                    Some(Frame::Data { .. }) => {}
+                    other => panic!("tokio={tokio}: {other:?}"),
+                }
+            }
         }
     }
 
