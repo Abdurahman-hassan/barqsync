@@ -1,9 +1,11 @@
 # barqsync: audit findings and implementation plan
 
-> **Status, 21 October 2026:** all 12 P1 findings are fixed in 0.4.0 (PRs 15–19). Some parts
-> are partial, and the P2 and P3 items are still open. The [tracker](README.md) shows the
-> state of each part, and [p1-coordination.md](p1-coordination.md) shows where each finding
-> landed. The text below is the audit as written against v0.3.0.
+> **Status, 21 October 2026:** 0.4.0 contains the initial P1 remediations (PRs 15–19).
+> The complete-scan deletion barrier and late-interrupt fix followed in 0.4.1 (#22);
+> 0.4.2 adds interrupt-notice ordering and QUIC shutdown fixes (#23–24). Some acceptance
+> criteria remain partial, and P2/P3 work remains open. The [tracker](README.md) and
+> [P1 work record](p1-coordination.md) distinguish implemented scope from remaining work.
+> The text below is the original audit against v0.3.0.
 
 Reviewed **20 October 2026** against **v0.3.0**, commit
 `f9f8d8d87855c3ac8d24c8d852ca6c37a80ecc69`.

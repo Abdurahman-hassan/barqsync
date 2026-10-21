@@ -8,8 +8,8 @@ a part does not close other acceptance criteria in the audit.
 | Milestone | Parts | Status | Acceptance gate |
 | --- | --- | --- | --- |
 | 1. Mutation safety | 1A: same-file guards, mandatory atomic backups, source-removal authorization. 1B: descriptor confinement and sender-owned acknowledgement ledger. | 1A implemented; 1B partial (ledger, peer-input validation, multi-root guard; no descriptor confinement) | Preserve source, destination and prior backup on failure; reject unauthorized filesystem operations. |
-| 2. Transfer correctness | 2A: merged source namespace and scan-completion deletion barrier. 2B: file/pack state validation and end-to-end integrity. 2C: full source identity/change tracking. | 2A implemented in the current tree (#19: merged roots; unreleased follow-up: deletion after successful scanning); 2B partial (file, pack and delta range validation; no end-to-end hash); 2C partial (#17: type, device, inode, size and nanosecond mtime) | Delete only against a complete source view; commit and acknowledge only verified files. |
-| 3. Runtime and protocol | 3A: move coordination outside Rayon. 3B: cancellation and bounded shutdown. 3C: metadata chunking, error propagation and bounded stream admission. | 3A implemented; 3B implemented (#19: Ctrl-C and lost peers end both sides in bounded time; no `--timeout` yet); 3C partial (metadata chunking, send-failure propagation; no stream admission) | One-worker transfers finish; disconnects and oversized frames cannot hang a session. |
+| 2. Transfer correctness | 2A: merged source namespace and scan-completion deletion barrier. 2B: file/pack state validation and end-to-end integrity. 2C: full source identity/change tracking. | 2A implemented (#19: merged roots; #22, 0.4.1: deletion after successful scanning); 2B partial (file, pack and delta range validation; no end-to-end hash); 2C partial (#17: type, device, inode, size and nanosecond mtime) | Delete only against a complete source view; commit and acknowledge only verified files. |
+| 3. Runtime and protocol | 3A: move coordination outside Rayon. 3B: cancellation and bounded shutdown. 3C: metadata chunking, error propagation and bounded stream admission. | 3A implemented; 3B implemented (#19, #22–24: bounded shutdown and interrupt status across SSH, TCP, relays and QUIC; no `--timeout` yet); 3C partial (metadata chunking, send-failure propagation; no stream admission) | One-worker transfers finish; disconnects and oversized frames cannot hang a session. |
 | 4. SSH data streams | 4A: versioned session negotiation and private Unix socket helpers. 4B: SSH lifecycle, fallback and diagnostics. 4C: signed release integration and real Mac acceptance. | Relay fallback implemented (#11) and accepted on a real Mac with its firewall on; 4A (no public listener) and release signing pending | Push/pull on two Macs with firewalls enabled, no public data listener and no leaked helpers. |
 | 5. Resource safety and performance | 5A: byte-based memory budget. 5B: safe CDC reads of mutable files. 5C: measured large-file scheduling and live progress. | Pending | Bounded memory and clean source-change failures; publish measured performance tradeoffs. |
 | 6. Compatibility and maintenance | 6A: remote path/IPv6 parsing. 6B: CI, dependency audits and fault injection. 6C: diagnostics, durability documentation and release verification. | 6A implemented; 6B/6C pending | Compatibility matrix, CI and packaged artifact checks pass. |
@@ -28,6 +28,7 @@ with an explicit protocol version change and compatibility tests.
 - [Checkpoint verification](verification.md).
 - [Milestone 4: parallel streams through ssh](04-ssh-relay.md).
 - [P1 fixes before 0.4.0: organization and status](p1-coordination.md).
+- [0.4.2 release preparation and verification](../releases/0.4.2.md).
 
 ## Baseline reconciliation
 
@@ -42,8 +43,8 @@ The checkpoint was merged as [PR 15](https://github.com/Abdurahman-hassan/barqsy
 at `b1b257a`, after macOS and Linux CI passed (including Linux QUIC). Part 6A
 started from that merge. The three P1 worktrees stayed with their owners during
 that checkpoint; their completed work was later merged through PRs 17–19. The
-current baseline is `567e570`, including the release records and documentation
-move from PRs 20–21.
+0.4.2 release baseline is `c55abc6`, including the documentation move from PRs
+20–21, the 0.4.1 deletion barrier (#22), and shutdown follow-ups (#23–24).
 
 ## Verification outside this checkout
 
