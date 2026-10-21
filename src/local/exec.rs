@@ -231,6 +231,19 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// A remote receiver's roots that write into the same destination (see `Overlap`).
+    fn overlap(&self) -> Option<&crate::remote::receiver::Overlap> {
+        self.remote.as_ref()?.overlap.as_ref()
+    }
+
+    /// Put the new symlink `tmp` in place at `dst`.
+    pub(crate) fn place_link(&self, tmp: &Path, dst: &Path) -> io::Result<()> {
+        match self.overlap() {
+            Some(o) => o.place_link(dst, || fs::rename(tmp, dst)),
+            None => fs::rename(tmp, dst),
+        }
+    }
+
     pub(crate) fn err(&self, msg: impl AsRef<[u8]>) {
         Stats::add(&self.stats.errors, 1);
         self.out.error(msg);
@@ -753,6 +766,11 @@ impl<'a> Engine<'a> {
     /// A directory sits where a non-directory must go. rsync only removes it when
     /// deletions are enabled or it is empty.
     fn remove_conflicting_dir(&self, path: &Path, rel: &[u8]) -> bool {
+        // Several roots: another one's directory stays (rsync keeps the directory too).
+        if self.overlap().is_some_and(|o| o.taken(path)) {
+            self.err([b"cannot replace directory of another source: ", quoted(rel)].concat());
+            return false;
+        }
         if self.opts.delete {
             self.delete_tree(path, rel, Kind::Dir, false);
             return true;
@@ -1182,8 +1200,12 @@ impl<'a> Engine<'a> {
             self.out.info([b"skipping directory ", quoted(&rel)].concat());
             return false;
         }
-        // -K: a symlink to a directory on the receiver stands in for the directory.
-        let kept_link = if self.opts.keep_dirlinks && dst_kind == Some(Kind::Symlink) {
+        // -K: a symlink to a directory on the receiver stands in for the directory (not
+        // one this transfer made, see `Overlap`).
+        let kept_link = if self.opts.keep_dirlinks
+            && dst_kind == Some(Kind::Symlink)
+            && !self.overlap().is_some_and(|o| o.made_link(&dst_path))
+        {
             fsops::stat(&dst_path).ok().filter(|m| m.kind == Kind::Dir)
         } else {
             None
@@ -1229,6 +1251,13 @@ impl<'a> Engine<'a> {
                 }
                 changed = true;
             }
+        }
+        // Several roots: from here on this stays the directory its entries go into.
+        if let Some(o) = self.overlap()
+            && let Err(e) = o.take_dir(&dst_path, kept_link.is_some())
+        {
+            self.err(path_msg("mkdir \"", &dst_path, format!("\" failed: {e}")));
+            return changed;
         }
         // Like rsync, a directory gets its attributes and ACLs right away; the ACL keeps
         // the current (owner-writable) mode bits, the mode itself is fixed up last.
@@ -1360,7 +1389,7 @@ impl<'a> Engine<'a> {
                 if self.opts.times {
                     fsops::set_symlink_mtime(&tmp, meta.mtime, meta.mtime_ns)?;
                 }
-                fs::rename(&tmp, dst_path)
+                self.place_link(&tmp, dst_path)
             })();
             finish_temp(&tmp, r)
         });

@@ -5,6 +5,7 @@
 
 pub mod adapt;
 pub mod auto;
+pub mod check;
 pub mod client;
 pub mod receiver;
 pub mod sender;
@@ -14,7 +15,7 @@ pub mod relay;
 pub mod streams;
 
 use crate::fsops;
-use crate::proto::{Conn, Frame, Msg};
+use crate::proto::{Conn, Frame, FrameSender, Msg};
 use crossbeam_channel::RecvTimeoutError;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -88,9 +89,44 @@ pub(crate) enum Stop {
     Io(io::Error),
 }
 
+/// The first message this side could not send because it is too large to (see
+/// [`crate::proto::MAX_MESSAGE`]). The peer may be waiting for it, so the transfer stops:
+/// the peer is told why, and [`recv_unless`] gives up on this side. A closed connection
+/// is left to the receive loop, which sees it too.
+#[derive(Default)]
+pub(crate) struct SendFailure(std::sync::OnceLock<Vec<u8>>);
+
+impl SendFailure {
+    /// Send `m`; `what` names it if that fails. Returns whether it was sent.
+    pub(crate) fn send(&self, out: &FrameSender, m: Msg, what: impl FnOnce() -> Vec<u8>) -> bool {
+        match out.msg(m) {
+            Ok(()) => true,
+            // The connection is gone, or the run is stopping anyway.
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe || out.stopped() => false,
+            Err(e) => {
+                let msg = [&b"sending "[..], &what(), format!(" failed: {e}").as_bytes()].concat();
+                if self.0.set(msg.clone()).is_ok() {
+                    let _ = out.msg(Msg::Fatal { msg: String::from_utf8_lossy(&msg).into_owned() });
+                }
+                false
+            }
+        }
+    }
+
+    /// Why the transfer stopped, once it has.
+    pub(crate) fn reason(&self) -> Option<&[u8]> {
+        self.0.get().map(Vec::as_slice)
+    }
+}
+
 /// Next incoming frame, giving up early on Ctrl-C.
 pub(crate) fn recv(conn: &Conn) -> Result<Frame, Stop> {
     recv_until(conn, None)
+}
+
+/// [`recv`], also giving up once a message could not be sent (see [`SendFailure`]).
+pub(crate) fn recv_unless(conn: &Conn, failed: &SendFailure) -> Result<Frame, Stop> {
+    recv_checked(conn, None, Some(failed))
 }
 
 /// The other side said it was interrupted (so this side need not tell it).
@@ -99,6 +135,10 @@ static PEER_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// [`recv`], giving up at `deadline`. Interrupted here, it tells the peer; told by the
 /// peer, it stops as if interrupted here.
 pub(crate) fn recv_until(conn: &Conn, deadline: Option<std::time::Instant>) -> Result<Frame, Stop> {
+    recv_checked(conn, deadline, None)
+}
+
+fn recv_checked(conn: &Conn, deadline: Option<std::time::Instant>, failed: Option<&SendFailure>) -> Result<Frame, Stop> {
     loop {
         if fsops::interrupted() {
             if !PEER_INTERRUPTED.load(SeqCst) {
@@ -108,6 +148,9 @@ pub(crate) fn recv_until(conn: &Conn, deadline: Option<std::time::Instant>) -> R
         }
         if deadline.is_some_and(|d| std::time::Instant::now() > d) {
             return Err(Stop::Io(io::Error::new(io::ErrorKind::TimedOut, "no answer from the peer")));
+        }
+        if let Some(why) = failed.and_then(SendFailure::reason) {
+            return Err(Stop::Io(io::Error::other(String::from_utf8_lossy(why).into_owned())));
         }
         match conn.rx.recv_timeout(Duration::from_millis(200)) {
             Ok(Ok(Frame::Msg(Msg::Interrupted))) => {
