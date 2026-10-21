@@ -7,7 +7,7 @@ Date: 20–21 October 2026.
 0.4.0 was prepared for release in [PR 14](https://github.com/Abdurahman-hassan/barqsync/pull/14):
 the version bump, the changelog date and the README protocol line. Before the tag was made,
 `git pull` in the main checkout stopped on uncommitted changes. Those changes turned out to
-be a Codex session's work in progress. It had written
+be an audit session's work in progress. It had written
 [the audit](findings.md), with 18 findings against v0.3.0, 12 of them P1,
 and had begun fixing them on top of v0.3.0.
 
@@ -25,9 +25,9 @@ P1 findings were fixed.
 
 ## How the work was split
 
-1. **Codex's work was kept.** Its uncommitted diff and untracked files (tests, notes,
-   probes) were committed to the local branch `audit/codex-wip`, based on v0.3.0, through a
-   separate worktree. The main checkout was left as it was. The user stopped the Codex
+1. **The initial work was kept.** Its uncommitted diff and untracked files (tests, notes,
+   probes) were committed to a local snapshot branch, now named `audit/safety-wip`, based
+   on v0.3.0, through a separate worktree. The main checkout was left as it was. The user stopped the audit
    session, which then turned its work into PRs 15 and 16.
 2. **Three parallel lanes** each got its own worktree from `main` at `eeb6955`, its own Linux
    build volume, and a brief that named its findings, the files it owned and the other
@@ -41,8 +41,8 @@ P1 findings were fixed.
 
 | Lane | Findings | PR |
 | --- | --- | --- |
-| Codex checkpoint | DATA-01, DATA-04, SEC-02 (first part), NET-02 | [#15](https://github.com/Abdurahman-hassan/barqsync/pull/15) |
-| Codex 6A | CLI-01 (bracketed IPv6, host validation) | [#16](https://github.com/Abdurahman-hassan/barqsync/pull/16) |
+| Initial checkpoint | DATA-01, DATA-04, SEC-02 (first part), NET-02 | [#15](https://github.com/Abdurahman-hassan/barqsync/pull/15) |
+| Part 6A | CLI-01 (bracketed IPv6, host validation) | [#16](https://github.com/Abdurahman-hassan/barqsync/pull/16) |
 | A: safe changes to files | DATA-01, DATA-04, DATA-06, SEC-02 (sender-side record of removable entries) | [#17](https://github.com/Abdurahman-hassan/barqsync/pull/17) |
 | B: peer input | SEC-01, DATA-05, PROTO-01 | [#18](https://github.com/Abdurahman-hassan/barqsync/pull/18) |
 | C: deletion and lifecycle | DATA-02, DATA-03, NET-03 (its NET-02 duplicate of #15 was dropped) | [#19](https://github.com/Abdurahman-hassan/barqsync/pull/19) |
@@ -58,7 +58,7 @@ see [04-ssh-relay.md](04-ssh-relay.md).
 | SEC-02: unauthorized source removal | #15, #17 | – |
 | DATA-01: same-file copies | #15, #17 | A remote transfer to the same host (`localhost:`) isn't detected; rsync doesn't detect it either |
 | DATA-02: several roots with `--delete` | #19 | – |
-| DATA-03: deletion after scan errors | #19 | – |
+| DATA-03: deletion after scan errors | #19 stops deletion after reported errors; [unreleased follow-up](02a-deletion-barrier.md) defers it until scanning succeeds | Released 0.4.0 can still delete before a later source-read error |
 | DATA-04: backup failures | #15, #17 | – |
 | DATA-05: missing or malformed file data | #18 | An end-to-end content hash (2B) |
 | DATA-06: source-removal change detection | #17 | A change between the check and the unlink; ctime isn't compared |

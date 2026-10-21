@@ -819,7 +819,8 @@ directory:
 2. **Diff.** A listing is processed once its directory exists on the destination side (its
    parent creates it first), against the destination entries from the index, so there is no
    per-file `lstat`. Directories, symlinks and specials are handled inline in scan order;
-   `--delete` runs per directory. Files are classified into queues: A metadata-only, B small
+   `--delete` candidates are collected per directory and removed only after scanning
+   succeeds (the post-0.4.0 follow-up). Files are classified into queues: A metadata-only, B small
    (≤ 128 KiB), C large and new, D large and changed.
 3. **Transfer.** A pool of worker threads per queue (2 / threads / threads÷2 / threads÷4).
 4. **Commit.** Temp file + rename per file, as before; hard links and directory attributes

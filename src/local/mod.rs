@@ -197,6 +197,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     if !fsops::interrupted() {
         pool.install(|| {
             engine.link_followers();
+            engine.finish_deletions();
             engine.apply_fixups();
         });
     }

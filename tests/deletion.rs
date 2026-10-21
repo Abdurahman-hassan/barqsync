@@ -111,6 +111,30 @@ fn a_dangling_symlink_under_copy_links_stops_deletion() {
 }
 
 #[test]
+fn a_late_scan_error_preserves_earlier_deletion_candidates() {
+    for mode in MODES {
+        for backend in ["threads", "tokio"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let t = tmp.path();
+            fake_ssh(t);
+            files(t, &[("src/good", "copied"), ("dst/keep", "precious root entry"),
+                ("dst/deep/broken", "precious nested entry")]);
+            fs::create_dir(t.join("src/deep")).unwrap();
+            std::os::unix::fs::symlink("missing-target", t.join("src/deep/broken")).unwrap();
+            let net = format!("--net-io={backend}");
+            let args = ["-aL", "--delete", "--threads=1", "--transport=ssh", &net];
+            let r = run_mode(t, mode, &args, &["src/"], "dst/");
+            assert_eq!(r.code, 23, "{mode} {backend}: {}{}", r.stdout, r.stderr);
+            assert!(t.join("dst/keep").exists(), "{mode} {backend}: deleted before the later scan error");
+            assert_eq!(fs::read(t.join("dst/keep")).unwrap(), b"precious root entry");
+            assert_eq!(fs::read(t.join("dst/deep/broken")).unwrap(), b"precious nested entry");
+            assert_eq!(fs::read(t.join("dst/good")).unwrap(), b"copied");
+            assert!(r.stdout.contains(SKIPPING), "{mode} {backend}: {}", r.stdout);
+        }
+    }
+}
+
+#[test]
 fn entries_that_cannot_be_read_stop_deletion() {
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("SKIP: root reads every directory");
