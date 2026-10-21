@@ -34,8 +34,13 @@ enum Act {
     /// The server stops reading (SIGSTOP), then Ctrl-C to the client alone.
     StuckServer,
     /// The pipe the file data travels on is cut (into the server for a push, out of it
-    /// for a pull); both processes stay alive.
+    /// for a pull); both processes stay alive. Over ssh only: over QUIC that pipe is idle,
+    /// and an ssh that loses its connection closes it both ways (see `DropShell`).
     CutPipe,
+    /// The remote shell dies (as ssh does when its connection drops), closing the
+    /// connection both ways; the server stays alive. Over QUIC, whose session no longer
+    /// needs the shell, the transfer ends too, as rsync's would with its ssh.
+    DropShell,
 }
 
 /// Processes whose command line contains `pat` (with `start`: begins with it, so not a
@@ -103,6 +108,7 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
     std::os::unix::fs::symlink(BIN, &remote).unwrap();
     let remote = remote.to_str().unwrap().to_string();
     let cutter = t.join("cutter");
+    let dropper = t.join("dropper");
     let shell = if act == Act::IntClosing {
         // Close the protocol pipes after the server exits but keep the remote shell
         // alive, so the client is still cleaning up when it receives SIGINT.
@@ -114,11 +120,26 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
             true => format!("#!/bin/sh\nshift\n/bin/sh -c \"exec $*\" | {}\n", cutter.display()),
             false => format!("#!/bin/sh\nshift\n{} | /bin/sh -c \"exec $*\"\n", cutter.display()),
         }
+    } else if act == Act::DropShell {
+        // The command runs on pipes of its own, joined to the shell's stdin and stdout by
+        // two copiers (this process and a child) the test can kill.
+        let script = "#!/usr/bin/perl\n\
+            sub copy { my ($i, $o) = @_; while ((my $n = sysread($i, my $b, 65536)) > 0) { syswrite($o, $b, $n) or last } }\n\
+            shift;\n\
+            pipe(my $ir, my $iw); pipe(my $or, my $ow);\n\
+            my $cmd = fork() // die;\n\
+            if (!$cmd) { open(STDIN, '<&', $ir); open(STDOUT, '>&', $ow); exec '/bin/sh', '-c', \"exec @ARGV\" }\n\
+            close $ir; close $ow;\n\
+            if (!fork()) { close $iw; copy($or, \\*STDOUT); exit }\n\
+            close $or; copy(\\*STDIN, $iw); close $iw;\n\
+            waitpid($cmd, 0); exit($? >> 8);\n";
+        fs::write(&dropper, script).unwrap();
+        format!("#!/bin/sh\nexec {} \"$@\"\n", dropper.display())
     } else {
         "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n".to_string()
     };
     fs::write(t.join("fake-ssh"), shell).unwrap();
-    for f in ["fake-ssh", "cutter"].map(|f| t.join(f)).iter().filter(|p| p.exists()) {
+    for f in ["fake-ssh", "cutter", "dropper"].map(|f| t.join(f)).iter().filter(|p| p.exists()) {
         fs::set_permissions(f, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let mut args = vec!["-aS", "--strategy=fixed", "-e", "./fake-ssh", "--remote-path", &remote];
@@ -188,6 +209,11 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
             let copier = *pids(&cutter.display().to_string()).first().unwrap_or_else(|| panic!("{what}: no copier"));
             signal(copier, libc::SIGKILL);
         }
+        Act::DropShell => {
+            let copiers = pids(&dropper.display().to_string());
+            assert!(!copiers.is_empty(), "{what}: no remote shell");
+            copiers.into_iter().for_each(|p| signal(p, libc::SIGKILL));
+        }
     }
     if act != Act::StuckServer {
         signal(server, libc::SIGCONT);
@@ -234,7 +260,7 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
     let out = format!("{}{}", read_back(&mut so), read_back(&mut se));
     assert!(left.is_empty(), "{what}: still running: {left:?}\n{out}");
     let want = match act {
-        Act::KillServer | Act::CutPipe => 12,
+        Act::KillServer | Act::CutPipe | Act::DropShell => 12,
         _ => 20,
     };
     assert_eq!(status.code(), Some(want), "{what}\n{out}");
@@ -242,10 +268,7 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
 }
 
 fn each_transport(act: Act, net_io: &str) {
-    // Over QUIC a dead server is noticed only by QUIC's idle timeout (15 s), and closing a
-    // stopped run waits up to 5 s for a peer that no longer answers: both take too long yet.
-    let quic = !matches!(act, Act::KillServer | Act::StuckServer);
-    for transport in ["ssh", "tcp", "relay", "quic"].into_iter().filter(|&t| quic || t != "quic") {
+    for transport in ["ssh", "tcp", "relay", "quic"] {
         for pull in [false, true] {
             stop_midway(act, transport, pull, net_io);
         }
@@ -299,4 +322,9 @@ fn a_cut_pipe_ends_both_sides() {
     for pull in [false, true] {
         stop_midway(Act::CutPipe, "ssh", pull, "threads");
     }
+}
+
+#[test]
+fn a_dropped_remote_shell_ends_both_sides() {
+    each_transport(Act::DropShell, "threads");
 }

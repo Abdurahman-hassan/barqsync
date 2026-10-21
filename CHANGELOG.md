@@ -13,6 +13,18 @@
   early, or a failed write, waits up to 2 seconds for the control connection to say why
   (interrupted, a fatal error, or closed). A side that stops also sends its notice
   before it closes its data streams.
+- `--transport quic` now ends as quickly as the other transports when the other side
+  dies or stops responding:
+  - A dead server is noticed by its ssh connection's end, after about 2–4 seconds
+    (exit 12). Before, only QUIC's idle timeout noticed it, after 15–18 seconds.
+  - If the ssh connection drops while QUIC still works, the transfer now ends too
+    (exit 12), as rsync's does when its ssh dies. Before, it carried on over QUIC.
+  - Ctrl-C with a stopped server now ends the client within about 3–4 seconds, as
+    over ssh (7–9 seconds before). An interrupted or failed side still waits for a
+    peer that answers, so that the peer gets the notice, but not for one from which
+    nothing at all has arrived for a second.
+
+## 0.4.1 - 2026-10-21
 
 ### Fixed
 
