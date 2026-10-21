@@ -1,6 +1,7 @@
 //! Ctrl-C and a lost peer end every process of a remote transfer within seconds, with
 //! rsync's exit codes (20 interrupted, 12 connection lost), and leave no server or relay
-//! running. Each transfer is stopped while data is flowing.
+//! running. Each transfer is stopped while data is flowing: the server is frozen
+//! (SIGSTOP) as soon as data arrives, so a fast machine can't finish it first.
 
 use std::fs;
 use std::io::{Read, Seek};
@@ -26,19 +27,22 @@ enum Act {
     IntServer,
     /// The server stops reading (SIGSTOP), then Ctrl-C to the client alone.
     StuckServer,
-    /// The pipe from the server to the client is cut; both processes stay alive.
+    /// The pipe the file data travels on is cut (into the server for a push, out of it
+    /// for a pull); both processes stay alive.
     CutPipe,
 }
 
-/// Processes whose command line contains `pat`.
-fn pids(pat: &str) -> Vec<i32> {
+/// Processes whose command line contains `pat` (with `start`: begins with it, so not a
+/// shell running it, as dash's `sh -c` stays around).
+fn pids_where(pat: &str, start: bool) -> Vec<i32> {
+    let found = |cmd: &str| if start { cmd.starts_with(pat) } else { cmd.contains(pat) };
     let mut out = Vec::new();
     if cfg!(target_os = "linux") {
         for e in fs::read_dir("/proc").into_iter().flatten().flatten() {
             let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
             let Ok(cmd) = fs::read(e.path().join("cmdline")) else { continue };
             let cmd: Vec<u8> = cmd.iter().map(|&b| if b == 0 { b' ' } else { b }).collect();
-            if String::from_utf8_lossy(&cmd).contains(pat) {
+            if found(&String::from_utf8_lossy(&cmd)) {
                 out.push(pid);
             }
         }
@@ -47,7 +51,7 @@ fn pids(pat: &str) -> Vec<i32> {
         for line in String::from_utf8_lossy(&ps.stdout).lines() {
             let line = line.trim_start();
             if let Some((pid, cmd)) = line.split_once(' ')
-                && cmd.contains(pat)
+                && found(cmd.trim_start())
             {
                 out.push(pid.parse().unwrap());
             }
@@ -57,18 +61,17 @@ fn pids(pat: &str) -> Vec<i32> {
     out
 }
 
+fn pids(pat: &str) -> Vec<i32> {
+    pids_where(pat, false)
+}
+
 fn signal(pid: i32, sig: i32) {
     unsafe { libc::kill(pid, sig) };
 }
 
-/// The largest file below `dir`.
-fn largest(dir: &Path) -> u64 {
-    let mut max = 0;
-    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
-        max = max.max(if m.is_dir() { largest(&e.path()) } else { m.len() });
-    }
-    max
+/// Whether `dir` has an entry yet (the receiver's temp file: file data is arriving).
+fn receiving(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|mut d| d.next().is_some())
 }
 
 fn read_back(f: &mut fs::File) -> String {
@@ -86,17 +89,21 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
     let t = tmp.path();
     fs::create_dir(t.join("src")).unwrap();
     fs::create_dir(t.join("dst")).unwrap();
-    // Sparse: quick to make and to read, slow enough to send to be stopped midway.
-    fs::File::create(t.join("src/big")).unwrap().set_len(1 << 30).unwrap();
+    // Sparse, and written sparse (`-S`): quick to make and read, far too big to send
+    // before it is stopped, yet nothing lands on disk however much is sent.
+    fs::File::create(t.join("src/big")).unwrap().set_len(64 << 30).unwrap();
     // A unique name for the remote barqsync, to find the server and relays by.
     let remote = t.join("barq-remote");
     std::os::unix::fs::symlink(BIN, &remote).unwrap();
     let remote = remote.to_str().unwrap().to_string();
     let cutter = t.join("cutter");
     let shell = if act == Act::CutPipe {
-        // The server's output reaches the client through a copier the test can kill.
+        // The data reaches the other side through a copier the test can kill.
         fs::write(&cutter, "#!/usr/bin/perl\nwhile (($n = sysread(STDIN, $b, 65536)) > 0) { syswrite(STDOUT, $b, $n) }\n").unwrap();
-        format!("#!/bin/sh\nshift\n/bin/sh -c \"exec $*\" | {}\n", cutter.display())
+        match pull {
+            true => format!("#!/bin/sh\nshift\n/bin/sh -c \"exec $*\" | {}\n", cutter.display()),
+            false => format!("#!/bin/sh\nshift\n{} | /bin/sh -c \"exec $*\"\n", cutter.display()),
+        }
     } else {
         "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n".to_string()
     };
@@ -104,7 +111,7 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
     for f in ["fake-ssh", "cutter"].map(|f| t.join(f)).iter().filter(|p| p.exists()) {
         fs::set_permissions(f, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let mut args = vec!["-a", "--strategy=fixed", "-e", "./fake-ssh", "--remote-path", &remote];
+    let mut args = vec!["-aS", "--strategy=fixed", "-e", "./fake-ssh", "--remote-path", &remote];
     match transport {
         "ssh" => args.push("--transport=ssh"),
         _ => args.extend(["--transport=tcp", "--streams=2"]),
@@ -134,9 +141,11 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
         }
     };
 
-    // Wait for data to arrive.
+    // Wait for data to arrive, then freeze the server.
     let started = Instant::now();
-    while largest(&t.join("dst")) < 1 << 20 {
+    let mut server = None;
+    while server.is_none() || !receiving(&t.join("dst")) {
+        server = server.or_else(|| pids_where(&format!("{remote} --server"), true).first().copied());
         if let Some(status) = client.try_wait().unwrap() {
             panic!("{what}: ended before any data arrived: {status}\n{}", read_back(&mut se));
         }
@@ -146,14 +155,14 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let server = *pids(&format!("{remote} --server")).first().unwrap_or_else(|| panic!("{what}: no server"));
+    let server = server.unwrap();
+    signal(server, libc::SIGSTOP);
     match act {
         Act::KillServer => signal(server, libc::SIGKILL),
         Act::CtrlC => signal(-pid, libc::SIGINT),
         Act::IntClient => signal(pid, libc::SIGINT),
         Act::IntServer => signal(server, libc::SIGINT),
         Act::StuckServer => {
-            signal(server, libc::SIGSTOP);
             // Long enough for the client to fill the pipe and block on it.
             std::thread::sleep(Duration::from_millis(300));
             signal(pid, libc::SIGINT);
@@ -162,6 +171,9 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
             let copier = *pids(&cutter.display().to_string()).first().unwrap_or_else(|| panic!("{what}: no copier"));
             signal(copier, libc::SIGKILL);
         }
+    }
+    if act != Act::StuckServer {
+        signal(server, libc::SIGCONT);
     }
     let stopped = Instant::now();
     let status = loop {
@@ -175,6 +187,12 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
         std::thread::sleep(Duration::from_millis(10));
     };
     let took = stopped.elapsed();
+    if act == Act::StuckServer {
+        // A stopped process can't be ended from the other side of ssh (only the remote
+        // shell, which may be a `sh -c` above it, is). Once it runs again it must find
+        // its connection gone and exit.
+        signal(server, libc::SIGCONT);
+    }
     // No server and no relay outlives the client for long.
     let mut left = pids(&remote);
     while !left.is_empty() && stopped.elapsed() < took + Duration::from_secs(5) {
