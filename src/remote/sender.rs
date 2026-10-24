@@ -524,7 +524,10 @@ impl Sender<'_> {
         let (d, basis_size, unit) = match sig {
             Sig::Blocks(basis) => {
                 let bs = basis.block_size as usize;
-                if bs == 0 {
+                // The block size comes from the other side; the receiver only ever sends
+                // the coarse default. A zero or oversized one (which would size this
+                // side's hashing buffers) is refused by sending the file whole.
+                if !(1..=Params::DEFAULT.block_size).contains(&bs) {
                     return self.send_whole_file(id, &file, xattrs);
                 }
                 let p = Params { block_size: bs, segment: (Params::DEFAULT.segment / bs).max(1) * bs, ..Params::DEFAULT };

@@ -135,8 +135,24 @@ impl ReadAt for Window<'_> {
     }
 }
 
-/// The receiver's side: fine signatures of the basis stretches asked for.
+/// The most basis data a refinement is allowed to ask this side to sign, over and above
+/// its own size: a genuine refinement signs the basis stretches between matched ranges,
+/// so it never needs more than the basis a few times over. A peer that asks for far more
+/// (millions of gaps each spanning the whole basis) gets no refinement rather than this
+/// side signing unboundedly; the ranges then stay literal, which is correct, just larger.
+const REFINE_BUDGET: u64 = 4;
+
+/// The receiver's side: fine signatures of the basis stretches asked for. An implausibly
+/// large request (see [`REFINE_BUDGET`]) is declined with an empty answer.
 pub fn basis_sigs(basis: &dyn ReadAt, basis_size: u64, p: &Params, reqs: &[GapReq]) -> io::Result<Vec<GapSig>> {
+    let budget = basis_size.saturating_mul(REFINE_BUDGET).max(Params::DEFAULT.segment as u64);
+    let mut asked = 0u64;
+    for r in reqs {
+        asked = asked.saturating_add(r.len.min(basis_size));
+    }
+    if asked > budget {
+        return Ok(Vec::new());
+    }
     reqs.par_iter()
         .map(|r| {
             let off = r.off.min(basis_size);
