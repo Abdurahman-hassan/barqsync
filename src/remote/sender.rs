@@ -86,6 +86,16 @@ impl Listing {
     }
 }
 
+/// A file the receiver asked for: where it is and what it was when listed, which it
+/// must still be when its data is read (see [`fsops::open_listed`]).
+struct Source {
+    id: u64,
+    path: PathBuf,
+    meta: Meta,
+    /// Its attribute values go along in full (the listing only had checksums of some).
+    full: bool,
+}
+
 /// A source argument resolved on disk.
 struct SrcRoot {
     info: RootInfo,
@@ -384,25 +394,26 @@ impl Sender<'_> {
             // Values the listing only had checksums of go along with the data.
             let full = extra::has_summed(e.extra.as_deref());
             crate::progress::planned(e.meta.size);
+            let file = Source { id, path, meta: e.meta, full };
             if req.sig.is_none() && e.meta.size <= proto::SMALL_FILE {
-                small.push((id, path, full));
+                small.push(file);
             } else {
-                large.push((id, path, req.sig, full));
+                large.push((file, req.sig));
             }
         }
         if !small.is_empty() {
             // Files that grew past the small-file size since they were listed go whole.
-            large.extend(self.send_small(small).into_iter().map(|(id, path, full)| (id, path, None, full)));
+            large.extend(self.send_small(small).into_iter().map(|f| (f, None)));
         }
-        for (id, path, sig, full) in large {
+        for (file, sig) in large {
             self.pending_files.fetch_add(1, SeqCst);
             s.spawn(move |_| {
                 if !fsops::interrupted() {
-                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    let xattrs = if full { self.full_xattrs(&path) } else { None };
+                    let size = std::fs::metadata(&file.path).map(|m| m.len()).unwrap_or(0);
+                    let xattrs = if file.full { self.full_xattrs(&file.path) } else { None };
                     let r = match sig {
-                        Some(sig) => self.send_delta(id, &path, sig, xattrs),
-                        None => self.send_whole(id, &path, xattrs),
+                        Some(sig) => self.send_delta(&file, sig, xattrs),
+                        None => self.send_whole(&file, xattrs),
                     };
                     match r {
                         // Sent bytes were counted as they went.
@@ -411,9 +422,9 @@ impl Sender<'_> {
                         // stopping (Ctrl-C, a failed peer) that is expected, not worth a message.
                         Err(e) => {
                             if !self.out_frames.stopped() && self.failed.reason().is_none() {
-                                self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
+                                self.err(path_msg("send_files failed to read \"", &file.path, format!("\": {e}")));
                             }
-                            self.send(Msg::FileEnd { id, ok: false });
+                            self.send(Msg::FileEnd { id: file.id, ok: false });
                         }
                     }
                 }
@@ -423,18 +434,19 @@ impl Sender<'_> {
         }
     }
 
-    /// Read small files in parallel and send them packed into frames of ~4 MiB.
-    /// `full`: the file's attribute values go along in full. Returns the files that are
-    /// no longer small.
-    fn send_small(&self, files: Vec<(u64, PathBuf, bool)>) -> Vec<(u64, PathBuf, bool)> {
-        let read = files.into_iter().map(|(id, path, full)| (id, read_small(&path), path, full));
+    /// Read small files in parallel and send them packed into frames of ~4 MiB, with
+    /// their attribute values in full where `full`. Returns the files that are no longer
+    /// small.
+    fn send_small(&self, files: Vec<Source>) -> Vec<Source> {
+        let follow = self.opts.copy_links;
+        let read = files.into_iter().map(|f| (read_small(&f.path, &f.meta, follow), f));
         let mut pack: Vec<(u64, u32)> = Vec::new();
         let mut blob: Vec<u8> = Vec::new();
         let mut xattrs: Vec<(u64, Vec<Xattr>)> = Vec::new();
         let mut grown = Vec::new();
-        for (id, data, path, full) in read {
+        for (data, f) in read {
             match data {
-                Ok(None) => grown.push((id, path, full)),
+                Ok(None) => grown.push(f),
                 Ok(Some(d)) => {
                     crate::progress::done(d.len() as u64);
                     if !blob.is_empty() && blob.len() + d.len() > proto::PACK_BYTES {
@@ -444,15 +456,15 @@ impl Sender<'_> {
                             xattrs: std::mem::take(&mut xattrs),
                         });
                     }
-                    if full && let Some(x) = self.full_xattrs(&path) {
-                        xattrs.push((id, x));
+                    if f.full && let Some(x) = self.full_xattrs(&f.path) {
+                        xattrs.push((f.id, x));
                     }
-                    pack.push((id, d.len() as u32));
+                    pack.push((f.id, d.len() as u32));
                     blob.extend_from_slice(&d);
                 }
                 Err(e) => {
-                    self.err(path_msg("send_files failed to open \"", &path, format!("\": {e}")));
-                    self.send(Msg::FileEnd { id, ok: false });
+                    self.err(path_msg("send_files failed to open \"", &f.path, format!("\": {e}")));
+                    self.send(Msg::FileEnd { id: f.id, ok: false });
                 }
             }
         }
@@ -478,9 +490,9 @@ impl Sender<'_> {
 
     /// The sending functions return the size of the file as sent, all of it counted for
     /// progress by then. `xattrs`: attribute values to send in full with the data.
-    fn send_whole(&self, id: u64, path: &Path, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
-        let f = File::open(path)?;
-        self.send_whole_file(id, &f, xattrs)
+    fn send_whole(&self, src: &Source, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
+        let f = fsops::open_listed(&src.path, &src.meta, self.opts.copy_links)?;
+        self.send_whole_file(src.id, &f, xattrs)
     }
 
     fn send_whole_file(&self, id: u64, f: &File, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
@@ -495,8 +507,9 @@ impl Sender<'_> {
 
     /// Diff the source file against the receiver's basis signature and send only the
     /// ranges it doesn't have.
-    fn send_delta(&self, id: u64, path: &Path, sig: Sig, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
-        let file = File::open(path)?;
+    fn send_delta(&self, src: &Source, sig: Sig, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
+        let (id, path) = (src.id, src.path.as_path());
+        let file = fsops::open_listed(path, &src.meta, self.opts.copy_links)?;
         let size = file.metadata()?.len();
         if let Sig::Cdc(basis) = &sig {
             return match cdc::Mapped::new(&file, size) {
@@ -569,12 +582,12 @@ impl Sender<'_> {
     }
 }
 
-/// A file listed as small, read whole; `None` if it has grown past the small-file size
-/// since (it is then sent like a large file).
-fn read_small(path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// A file listed as small (as `listed`), read whole; `None` if it has grown past the
+/// small-file size since (it is then sent like a large file).
+fn read_small(path: &Path, listed: &Meta, follow: bool) -> io::Result<Option<Vec<u8>>> {
     use std::io::Read;
     let mut d = Vec::new();
-    File::open(path)?.take(proto::SMALL_FILE + 1).read_to_end(&mut d)?;
+    fsops::open_listed(path, listed, follow)?.take(proto::SMALL_FILE + 1).read_to_end(&mut d)?;
     Ok((d.len() as u64 <= proto::SMALL_FILE).then_some(d))
 }
 
