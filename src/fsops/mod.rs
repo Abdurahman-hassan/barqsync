@@ -298,13 +298,14 @@ pub fn interrupt_token() -> &'static tokio_util::sync::CancellationToken {
     &WAKE_TOKEN
 }
 
-/// Ctrl-C handler. The first signal only raises a flag: workers notice it between
-/// write chunks and before every rename, delete their own unfinished file and stop,
-/// so nothing is left half-written. A second signal forces an immediate exit.
+/// Handler for Ctrl-C and the termination signals (SIGINT, SIGTERM, SIGHUP; see
+/// `ctrlc`'s `termination` feature). The first signal only raises a flag: workers notice
+/// it between write chunks and before every rename, delete their own unfinished file and
+/// stop, so nothing is left half-written. A second signal forces an immediate exit.
 pub fn on_interrupt(code: i32) {
     if SIGNALS.fetch_add(1, Ordering::SeqCst) == 0 {
         raise_interrupt();
-        eprintln!("\nbarqsync: interrupted, finishing in-flight files (Ctrl-C again to force)");
+        eprintln!("\nbarqsync: interrupted, finishing in-flight files (signal again to force)");
     } else {
         cleanup_temps();
         std::process::exit(code);
