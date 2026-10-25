@@ -185,6 +185,21 @@ fn refinement_requests_are_checked_and_bad_answers_ignored() {
 }
 
 #[test]
+fn an_oversized_refinement_request_is_declined_not_signed() {
+    // The basis this side holds.
+    let basis = pseudo_random(300_000, 7);
+    let basis_size = basis.len() as u64;
+    let p = Params::for_size(basis_size);
+    // A plausible request (one gap spanning the basis) is answered.
+    let one = vec![refine::GapReq { off: 0, len: basis_size, chunks: true }];
+    assert_eq!(refine::basis_sigs(&basis, basis_size, &p, &one).unwrap().len(), 1);
+    // A flood of gaps, each asking for the whole basis: far more than any real refinement
+    // needs, so it is declined (empty answer) instead of signing the basis a million times.
+    let flood = vec![refine::GapReq { off: 0, len: basis_size, chunks: true }; 1_000_000];
+    assert!(refine::basis_sigs(&basis, basis_size, &p, &flood).unwrap().is_empty());
+}
+
+#[test]
 fn aligned_local_deltas_refine_below_the_block_size() {
     // Coarse blocks of 1 KiB, chunks averaging 256 B, fine blocks of 512 B (like a 4-16 GiB
     // file: 64 KiB blocks, 32 KiB chunks, 32 KiB fine blocks). The aligned pass is taken, so
