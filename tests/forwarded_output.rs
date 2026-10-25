@@ -41,13 +41,17 @@ rd(1<<30);                                                     # wait for the cl
 fn forwarded_server_output_cannot_write_escape_sequences_to_the_terminal() {
     let tmp = tempfile::tempdir().unwrap();
     let shim = hostile_server(tmp.path());
-    // A pull, so the client runs the receiver and prints what the "server" forwards.
+    // A pull, so the client runs the receiver and prints what the "server" forwards. The
+    // transport is pinned to ssh (and BARQSYNC_TRANSPORT cleared) so the forwarded Log
+    // reaches the receiver loop: under another transport the client would expect a stream
+    // offer right after the handshake and reject the hostile Log during setup instead.
     let out = Command::new(BIN)
         .current_dir(tmp.path())
-        .args(["-a", "-e"])
+        .args(["-a", "--transport=ssh", "-e"])
         .arg(&shim)
         .args(["--remote-path=barqsync", "fakehost:src/", "dst/"])
         .env("LC_ALL", "C.UTF-8")
+        .env_remove("BARQSYNC_TRANSPORT")
         .output()
         .unwrap();
     let mut bytes = out.stdout.clone();
