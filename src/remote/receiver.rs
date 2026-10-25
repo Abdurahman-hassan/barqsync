@@ -1170,7 +1170,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     if let Err(e) = check::roots(&roots) {
         return fail(exit::PROTOCOL, format!("protocol error: {e}"));
     }
-    let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded) {
+    let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
         Err(e) => return fail(exit::SYNTAX, format!("{e:#}")),
     };

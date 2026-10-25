@@ -7,6 +7,7 @@ use crate::cli::Options;
 use crate::entry::{DirEnt, Kind};
 use crate::filter::{DirRules, Filter, Side};
 use crate::fsops;
+use crate::output::path_msg;
 use crate::paths::join_rel;
 use crate::select::{self, Descend, Sel};
 use std::collections::HashMap;
@@ -16,7 +17,8 @@ use std::sync::Mutex;
 
 /// Whether entry `e` of source directory `dir` (at `rel` in the transfer, with its own
 /// filter state `rules`, `-R` selection `sel` and `-x` device `root_dev`) is sent: no rule
-/// excludes it, and with `-m` a directory has something to send below it.
+/// excludes it, and with `-m` a directory has something to send below it. `err` reports
+/// what a pruned directory was asked for and lacks (see [`Prune::keeps`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sends(
     opts: &Options,
@@ -28,6 +30,7 @@ pub(crate) fn sends(
     sel: Option<&'static Sel>,
     root_dev: Option<u64>,
     e: &DirEnt,
+    err: &dyn Fn(Vec<u8>),
 ) -> bool {
     if filter.is_empty() && !opts.prune_empty_dirs {
         return true;
@@ -38,6 +41,10 @@ pub(crate) fn sends(
         return false;
     }
     if !is_dir || !opts.prune_empty_dirs {
+        return true;
+    }
+    // A directory a receiver-side rule protects stays, as rsync keeps the ones "through" it.
+    if filter.excluded(rules, &erel, true, Side::Receiver) {
         return true;
     }
     let sub = match select::descend(sel, e.name.as_bytes(), opts.recursive) {
@@ -51,7 +58,7 @@ pub(crate) fn sends(
     }
     let child = dir.join(&e.name);
     match filter.enter(rules, &child, &erel) {
-        Ok(crules) => prune.keeps(opts, filter, &child, &erel, &crules, sub, root_dev.or(Some(e.meta.dev))),
+        Ok(crules) => prune.keeps(opts, filter, &child, &erel, &crules, sub, root_dev.or(Some(e.meta.dev)), err),
         // Reported when the directory itself is read.
         Err(_) => true,
     }
@@ -66,7 +73,9 @@ impl Prune {
     /// `rules`) has an entry other than a directory somewhere below it that the rules let
     /// through: one rsync would list. `sel`: the `-R`/`--files-from` selection inside it;
     /// `root_dev`: `-x`'s device. A directory that a receiver-side rule protects counts
-    /// too, as rsync keeps the directories leading to it.
+    /// too, as rsync keeps the directories leading to it. A directory found to have
+    /// nothing isn't read again, so `err` reports what the selection asked for in it and
+    /// isn't there, as rsync's sender does whether or not the directory is pruned.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn keeps(
         &self,
@@ -77,21 +86,32 @@ impl Prune {
         rules: &DirRules,
         sel: Option<&'static Sel>,
         root_dev: Option<u64>,
+        err: &dyn Fn(Vec<u8>),
     ) -> bool {
         if let Some(&keep) = self.0.lock().unwrap().get(dir) {
             return keep;
         }
-        let keep = self.look(opts, filter, dir, rel, rules, sel, root_dev);
+        let keep = self.look(opts, filter, dir, rel, rules, sel, root_dev, err);
         self.0.lock().unwrap().insert(dir.to_path_buf(), keep);
         keep
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn look(&self, opts: &Options, filter: &Filter, dir: &Path, rel: &[u8], rules: &DirRules, sel: Option<&'static Sel>, root_dev: Option<u64>) -> bool {
-        let ents = match sel {
-            Some(s) if !s.contents => select::read_selected(dir, s).0,
+    fn look(
+        &self,
+        opts: &Options,
+        filter: &Filter,
+        dir: &Path,
+        rel: &[u8],
+        rules: &DirRules,
+        sel: Option<&'static Sel>,
+        root_dev: Option<u64>,
+        err: &dyn Fn(Vec<u8>),
+    ) -> bool {
+        let (ents, missing) = match sel {
+            Some(s) if !s.contents => select::read_selected(dir, s),
             _ => match fsops::read_dir_meta(dir) {
-                Ok(v) => v,
+                Ok(v) => (v, Vec::new()),
                 // Left to the transfer, which reports it.
                 Err(_) => return true,
             },
@@ -118,9 +138,12 @@ impl Prune {
             }
             let child = dir.join(&e.name);
             let Ok(crules) = filter.enter(rules, &child, &erel) else { return true };
-            if self.keeps(opts, filter, &child, &erel, &crules, sub, root_dev.or(Some(e.meta.dev))) {
+            if self.keeps(opts, filter, &child, &erel, &crules, sub, root_dev.or(Some(e.meta.dev)), err) {
                 return true;
             }
+        }
+        for (p, e) in missing {
+            err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
         }
         false
     }

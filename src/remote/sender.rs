@@ -250,7 +250,8 @@ impl Sender<'_> {
 
     /// Send the listing at `rel`, merged from `lists` (`dirs[i]`'s), and walk on.
     fn send_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, dirs: Vec<SrcDir>, lists: Vec<Vec<DirEnt>>) {
-        let sends = |d: &SrcDir, e: &DirEnt| prune::sends(self.opts, &self.filter, &self.prune, &d.path, &rel, &d.rules, d.sel, d.dev, e);
+        let report = |m: Vec<u8>| self.scan_err(m);
+        let sends = |d: &SrcDir, e: &DirEnt| prune::sends(self.opts, &self.filter, &self.prune, &d.path, &rel, &d.rules, d.sel, d.dev, e, &report);
         let lists = dirs.iter().zip(lists).map(|(d, l)| l.into_iter().filter(|e| sends(d, e)).collect()).collect();
         let (entries, sources) = merge::merge(dirs, lists);
         let (recursive, one_fs) = (self.opts.recursive, self.opts.one_file_system);
@@ -660,7 +661,7 @@ fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, p
             }
             let items = adjust_listing(opts, &r.base, ents, &mut err)
                 .into_iter()
-                .filter(|e| prune::sends(opts, filter, prune, &r.base, b"", &rules, Some(sel), None, e))
+                .filter(|e| prune::sends(opts, filter, prune, &r.base, b"", &rules, Some(sel), None, e, &err))
                 .collect();
             let items = extra::collect(opts, &xrules, &r.base, items, &mut err);
             RootInfo { contents: false, meta: None, items, sel: Some(sel.clone()), extra: None }
@@ -698,7 +699,7 @@ fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, prune: &
                 // A named directory is the first directory read; its parent is the root.
                 let first = if items.iter().any(|e| e.meta.kind == Kind::Dir) { sp.clone() } else { parent.clone() };
                 let rules = filter.root(&parent, &first, Side::Sender);
-                let items: Vec<DirEnt> = items.into_iter().filter(|e| prune::sends(opts, filter, prune, &parent, b"", &rules, None, None, e)).collect();
+                let items: Vec<DirEnt> = items.into_iter().filter(|e| prune::sends(opts, filter, prune, &parent, b"", &rules, None, None, e, &err)).collect();
                 if items.is_empty() {
                     continue;
                 }
@@ -782,7 +783,7 @@ fn root_extra(opts: &Options, r: &Rules, path: &Path, meta: &Meta, err: &mut dyn
 /// and the receiver's counters (when it got that far). `report_removals`: end with
 /// `RemovalsDone` (see [`super::reports_removals`]).
 pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, report_removals: bool) -> (i32, Option<StatsSnapshot>) {
-    let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded) {
+    let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
         Err(e) => {
             out.error(format!("{e:#}"));

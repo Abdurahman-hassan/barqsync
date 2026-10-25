@@ -170,7 +170,7 @@ pub(crate) fn make_dest_path(dir: &Path, opts: &Options, out: &Output) -> Result
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // Process-lifetime output, shared with the progress thread.
     let out: &'static Output = Box::leak(Box::new(Output::new(opts)));
-    let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded) {
+    let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
         Err(e) => {
             out.error(format!("{e:#}"));

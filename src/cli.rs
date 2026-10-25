@@ -450,6 +450,8 @@ pub struct Options {
     /// `--max-delete`: at most this many deletions (`None`: no limit).
     pub max_delete: Option<u64>,
     pub filter_rules: Vec<RuleSpec>,
+    /// `--from0`: rules files, per-directory ones included, have NUL-separated rules.
+    pub from0: bool,
     /// `-m`: directories with nothing but directories below them are left out.
     pub prune_empty_dirs: bool,
     /// `--mkpath`: missing directories leading to the destination are created.
@@ -613,6 +615,7 @@ impl Options {
             // rsync: a negative limit means no deletions at all.
             max_delete: c.max_delete.map(|n| n.max(0) as u64),
             filter_rules,
+            from0: on(&["from0"], &["no_from0"]),
             prune_empty_dirs: on(&["prune_empty_dirs"], &["no_prune_empty_dirs"]),
             mkpath: on(&["mkpath"], &["no_mkpath"]),
             timeout: match toggle(m, &["timeout"], &["no_timeout"]) {

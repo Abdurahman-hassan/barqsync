@@ -873,6 +873,8 @@ pub struct Filter {
     /// What `-C` rules check: rsync's defaults, `~/.cvsignore` and `$CVSIGNORE`.
     cvs: Vec<Rule>,
     delete_excluded: bool,
+    /// `--from0`: per-directory files hold NUL-separated rules.
+    from0: bool,
     /// Some rule matches absolute paths.
     abs: bool,
     /// Per side (sender, receiver): the per-directory rules read above the first transfer
@@ -881,8 +883,9 @@ pub struct Filter {
 }
 
 impl Filter {
-    pub fn new(specs: &[RuleSpec], delete_excluded: bool) -> Result<Filter> {
-        let mut f = Filter { delete_excluded, ..Filter::default() };
+    /// `from0`: rules files have NUL-separated rules (`--from0`).
+    pub fn new(specs: &[RuleSpec], delete_excluded: bool, from0: bool) -> Result<Filter> {
+        let mut f = Filter { delete_excluded, from0, ..Filter::default() };
         for spec in specs {
             let item = match spec {
                 RuleSpec::Pattern { include, pattern, mods } => {
@@ -911,7 +914,7 @@ impl Filter {
                 }
                 RuleSpec::Cvs { mods } => {
                     if !f.items.iter().any(|i| matches!(i, Item::Cvs)) {
-                        f.cvs = cvs_rules(*mods, delete_excluded)?;
+                        f.cvs = cvs_rules(*mods, delete_excluded, from0)?;
                     }
                     Item::Cvs
                 }
@@ -1026,7 +1029,7 @@ impl Filter {
         };
         let mut rules = Vec::new();
         let mut cleared = false;
-        for line in split_rules(&data, m.tpl.words, false) {
+        for line in split_rules(&data, m.tpl.words, self.from0) {
             let mut s = line;
             loop {
                 match next_tok(&mut s, &m.tpl) {
@@ -1083,7 +1086,7 @@ impl Filter {
 
 /// The CVS excludes a `-C` rule checks, with its modifiers: rsync's defaults
 /// (perishable), then `~/.cvsignore` and `$CVSIGNORE`.
-fn cvs_rules(mods: Mods, delete_excluded: bool) -> Result<Vec<Rule>> {
+fn cvs_rules(mods: Mods, delete_excluded: bool, from0: bool) -> Result<Vec<Rule>> {
     let mods = match (mods.sender, mods.receiver) {
         (false, false) if delete_excluded => Mods { sender: true, ..mods },
         _ => mods,
@@ -1105,7 +1108,9 @@ fn cvs_rules(mods: Mods, delete_excluded: bool) -> Result<Vec<Rule>> {
     if let Some(home) = std::env::var_os("HOME")
         && let Ok(data) = std::fs::read(Path::new(&home).join(".cvsignore"))
     {
-        add(&data, &tpl)?;
+        for word in split_rules(&data, true, from0) {
+            add(word, &tpl)?;
+        }
     }
     if let Some(v) = std::env::var_os("CVSIGNORE") {
         add(v.as_bytes(), &tpl)?;
@@ -1151,7 +1156,7 @@ mod tests {
             .iter()
             .map(|(p, inc)| RuleSpec::Pattern { include: *inc, pattern: p.as_bytes().to_vec(), mods: Mods::default() })
             .collect();
-        Filter::new(&specs, false).unwrap()
+        Filter::new(&specs, false, false).unwrap()
     }
 
     fn excl(flt: &Filter, rel: &str, is_dir: bool) -> bool {
@@ -1331,18 +1336,18 @@ mod tests {
     #[test]
     fn sides_and_delete_excluded() {
         let specs = parse(&["- both", "H hide", "P prot"]);
-        let flt = Filter::new(&specs, false).unwrap();
+        let flt = Filter::new(&specs, false, false).unwrap();
         let x = |side, rel: &str| flt.excluded(&DirRules::default(), rel.as_bytes(), false, side);
         assert!(x(Side::Sender, "both") && x(Side::Receiver, "both"));
         assert!(x(Side::Sender, "hide") && !x(Side::Receiver, "hide"));
         assert!(!x(Side::Sender, "prot") && x(Side::Receiver, "prot"));
         // --delete-excluded: plain rules are for the sender only; `P` still protects.
-        let flt = Filter::new(&specs, true).unwrap();
+        let flt = Filter::new(&specs, true, false).unwrap();
         let x = |side, rel: &str| flt.excluded(&DirRules::default(), rel.as_bytes(), false, side);
         assert!(x(Side::Sender, "both") && !x(Side::Receiver, "both"));
         assert!(x(Side::Receiver, "prot"));
         // Perishable rules don't protect inside directories being deleted.
-        let flt = Filter::new(&parse(&["-p *.o", "- *.keep"]), false).unwrap();
+        let flt = Filter::new(&parse(&["-p *.o", "- *.keep"]), false, false).unwrap();
         let x = |side, rel: &str| flt.excluded(&DirRules::default(), rel.as_bytes(), false, side);
         assert!(x(Side::Receiver, "a.o") && !x(Side::Deleting, "a.o"));
         assert!(x(Side::Deleting, "a.keep"));
@@ -1350,17 +1355,17 @@ mod tests {
 
     #[test]
     fn negated_rules() {
-        let flt = Filter::new(&parse(&["-! */"]), false).unwrap();
+        let flt = Filter::new(&parse(&["-! */"]), false, false).unwrap();
         assert!(excl(&flt, "file", false), "`-! */` excludes non-directories");
         assert!(!excl(&flt, "dir", true));
-        let flt = Filter::new(&parse(&["+! *.c", "- *"]), false).unwrap();
+        let flt = Filter::new(&parse(&["+! *.c", "- *"]), false, false).unwrap();
         assert!(!excl(&flt, "x.o", false));
         assert!(excl(&flt, "x.c", false));
     }
 
     #[test]
     fn cvs_rules_exclude_the_defaults() {
-        let flt = Filter::new(&parse(&["-C"]), false).unwrap();
+        let flt = Filter::new(&parse(&["-C"]), false, false).unwrap();
         for rel in ["core", "a/b.o", "x~", "#tmp", "CVS"] {
             assert!(excl(&flt, rel, false), "{rel}");
         }
@@ -1377,7 +1382,7 @@ mod tests {
         std::fs::write(root.join(".f"), "- *.tmp\n- /top-only\n").unwrap();
         std::fs::write(root.join("sub/.f"), "+ keep.tmp\n- /anch\n").unwrap();
         std::fs::write(root.join("sub/deep/.f"), "!\n- other\n").unwrap();
-        let flt = Filter::new(&parse(&[": .f"]), false).unwrap();
+        let flt = Filter::new(&parse(&[": .f"]), false, false).unwrap();
         let base = flt.root(&root, &root, Side::Sender);
         let top = flt.enter(&base, &root, b"").unwrap();
         let sub = flt.enter(&top, &root.join("sub"), b"sub").unwrap();
@@ -1389,17 +1394,30 @@ mod tests {
         assert!(x(&sub, "sub/anch") && !x(&deep, "sub/deep/anch"));
         assert!(!x(&deep, "sub/deep/x.tmp") && x(&deep, "sub/deep/other"), "`!` clears the inherited rules");
         // `n`: not inherited.
-        let flt = Filter::new(&parse(&[":n .f"]), false).unwrap();
+        let flt = Filter::new(&parse(&[":n .f"]), false, false).unwrap();
         let top = flt.enter(&flt.root(&root, &root, Side::Sender), &root, b"").unwrap();
         let sub = flt.enter(&top, &root.join("sub"), b"sub").unwrap();
         assert!(flt.excluded(&top, b"a.tmp", false, Side::Sender));
         assert!(!flt.excluded(&sub, b"sub/a.tmp", false, Side::Sender));
         // A bad rule is an error naming the file.
         std::fs::write(root.join("sub/.f"), "bogus rule\n").unwrap();
-        let flt = Filter::new(&parse(&[": .f"]), false).unwrap();
+        let flt = Filter::new(&parse(&[": .f"]), false, false).unwrap();
         let top = flt.enter(&flt.root(&root, &root, Side::Sender), &root, b"").unwrap();
         let err = flt.enter(&top, &root.join("sub"), b"sub").unwrap_err();
         assert!(String::from_utf8_lossy(&err).contains("sub/.f"), "{}", String::from_utf8_lossy(&err));
+    }
+
+    #[test]
+    fn from0_per_directory_files_are_nul_separated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".f"), "- secret\0+ keep\0").unwrap();
+        for (from0, excluded) in [(true, true), (false, false)] {
+            let flt = Filter::new(&parse(&[": .f"]), false, from0).unwrap();
+            let st = flt.enter(&flt.root(&root, &root, Side::Sender), &root, b"").unwrap();
+            assert_eq!(flt.excluded(&st, b"secret", false, Side::Sender), excluded, "from0={from0}");
+        }
     }
 
     #[test]
@@ -1410,12 +1428,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(top.join(".f"), "- from-top\n- /a/src/anchored\n").unwrap();
         std::fs::write(top.join("a/.f"), "- from-a\n").unwrap();
-        let flt = Filter::new(&parse(&[": /.f"]), false).unwrap();
+        let flt = Filter::new(&parse(&[": /.f"]), false, false).unwrap();
         let st = flt.enter(&flt.root(&root, &root, Side::Sender), &root, b"").unwrap();
         let x = |rel: &str| flt.excluded(&st, rel.as_bytes(), false, Side::Sender);
         assert!(x("from-top") && x("x/from-a"));
         assert!(x("anchored") && !x("x/anchored"), "anchored at its own directory, above the transfer");
-        let flt = Filter::new(&parse(&[": .f"]), false).unwrap();
+        let flt = Filter::new(&parse(&[": .f"]), false, false).unwrap();
         let st = flt.enter(&flt.root(&root, &root, Side::Sender), &root, b"").unwrap();
         assert!(!flt.excluded(&st, b"from-top", false, Side::Sender));
     }

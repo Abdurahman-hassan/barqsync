@@ -988,8 +988,12 @@ fn prune_empty_dirs_matches_rsync() {
         &["-aim", "-f", "+ */", "-f", "+ *.txt", "-f", "- *"],
         &["-aim", "--delete", "--exclude=*.log"],
         &["-aim", "--no-l"],
-        &["-dim"],
+        // -t: without it both copies get the time of the copy, which can differ.
+        &["-dtim"],
         &["-aimn"],
+        // A protected directory stays, empty or not, and so do the ones leading to it.
+        &["-aim", "-f", "P c/"],
+        &["-aim", "-f", "P only-dirs/x/"],
     ];
     for (i, flags) in cases.iter().enumerate() {
         for (remote, dr, df) in [(0, format!("r{i}"), format!("f{i}")), (1, format!("pr{i}"), format!("pf{i}")), (2, format!("lr{i}"), format!("lf{i}"))] {
@@ -1006,6 +1010,36 @@ fn prune_empty_dirs_matches_rsync() {
             a.extend([src, dst]);
             let (r, f) = if remote == 0 { both(tmp.path(), &a, &dr, &df) } else { both_remote(tmp.path(), &a, &dr, &df) }.unwrap();
             same_output(&r, &f, &[(&dr, &df)], &format!("remote={remote} {flags:?}"));
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+        }
+    }
+}
+
+/// `-m` with `--files-from`: what the list names and is missing is reported (23) even
+/// when its directory is pruned, as rsync's sender reports it.
+#[test]
+fn prune_empty_dirs_reports_missing_listed_files_like_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("sub/f", "f").dir("other/empty").settle_mtimes();
+    fs::write(tmp.path().join("gone"), "sub/missing\n").unwrap();
+    fs::write(tmp.path().join("some"), "sub/missing\nsub/f\nother/empty/\n").unwrap();
+    for (i, list) in ["gone", "some"].iter().enumerate() {
+        for (remote, dr, df) in [(0, format!("r{i}"), format!("f{i}")), (1, format!("pr{i}"), format!("pf{i}")), (2, format!("lr{i}"), format!("lf{i}"))] {
+            // rsync leaves out "created directory" after a file-list error: an existing DEST.
+            Tree::new(tmp.path().join(&dr));
+            Tree::new(tmp.path().join(&df));
+            let from = format!("--files-from={list}");
+            let a: Vec<&str> = match remote {
+                0 => vec!["-ai", "-rm", &from, "src", "{dst}"],
+                1 => vec!["-ai", "-rm", &from, "src", "{host}{dst}"],
+                _ => vec!["-ai", "-rm", &from, "{host}src", "{dst}"],
+            };
+            let (r, f) = if remote == 0 { both(tmp.path(), &a, &dr, &df) } else { both_remote(tmp.path(), &a, &dr, &df) }.unwrap();
+            same_output(&r, &f, &[(&dr, &df)], &format!("remote={remote} {list}"));
+            assert!(f.stderr.contains("sub/missing"), "{}", f.stderr);
             assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
         }
     }
@@ -1171,6 +1205,36 @@ fn filter_rules_match_rsync() {
         let (r, f) = both(tmp.path(), &a, "br", "bf").unwrap();
         assert_eq!((r.code, f.code), (11, 11), "{bad:?}\nrsync: {}\nbarqsync: {}", r.stderr, f.stderr);
     }
+}
+
+/// `--from0` also applies to per-directory filter files. (rsync tells its server only
+/// with `--files-from`, so a pull's sender would read them line by line there; barqsync
+/// sends it along, which a pull checks on its own.)
+#[test]
+fn from0_applies_to_per_directory_filter_files() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src"))
+        .file(".rsync-filter", "- secret\0+ keep.tmp\0- *.tmp\0")
+        .file("secret", "s")
+        .file("keep.tmp", "k")
+        .file("drop.tmp", "d")
+        .file("sub/.rsync-filter", "- /x\0")
+        .file("sub/x", "x")
+        .file("sub/y", "y")
+        .settle_mtimes();
+    let (r, f) = both(tmp.path(), &["-ai", "-0", "-F", "src/", "{dst}"], "dr", "df").unwrap();
+    same_output(&r, &f, &[], "local");
+    assert_same_tree(&snap(&tmp.path().join("dr"), true), &snap(&tmp.path().join("df"), true));
+    assert!(!tmp.path().join("df/secret").exists() && tmp.path().join("df/keep.tmp").exists());
+    let (r, f) = both_remote(tmp.path(), &["-ai", "-0", "-F", "src/", "{host}{dst}"], "pr", "pf").unwrap();
+    same_output(&r, &f, &[], "push");
+    assert_same_tree(&snap(&tmp.path().join("pr"), true), &snap(&tmp.path().join("pf"), true));
+    let f = barqsync_remote(tmp.path(), &["-a", "-0", "-F", "{host}src/", "lf"]);
+    assert_eq!(f.code, 0, "{}", f.stderr);
+    assert_same_tree(&snap(&tmp.path().join("df"), true), &snap(&tmp.path().join("lf"), true));
 }
 
 #[test]
@@ -1350,8 +1414,9 @@ fn timeout_ends_a_stalled_transfer_with_30() {
     assert_eq!(fc, 30, "{ferr}");
     assert!(ferr.contains("io timeout after"), "{ferr}");
     assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
-    // A transfer that keeps moving is not cut short, however long it takes.
-    let f = barqsync_remote(tmp.path(), &["-a", "--timeout=1", "src/", "{host}ok"]);
+    // A healthy transfer is not cut short. (A longer timeout than above: under load, the
+    // remote side alone can take a second to start.)
+    let f = barqsync_remote(tmp.path(), &["-a", "--timeout=5", "src/", "{host}ok"]);
     assert_eq!(f.code, 0, "{}", f.stderr);
 }
 

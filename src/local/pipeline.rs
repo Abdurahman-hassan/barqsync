@@ -295,7 +295,7 @@ pub(crate) fn run_roots(eng: &Engine, p: &Pipeline, roots: &[Root], dest_exists:
     tops.retain(|(src, _, _)| seen.insert(src.clone()));
 
     let (tx, rx) = unbounded::<Option<(PathBuf, Vec<DirEnt>)>>();
-    let filter = Arc::new(Filter::new(&eng.opts.filter_rules, eng.opts.delete_excluded).unwrap_or_default());
+    let filter = Arc::new(Filter::new(&eng.opts.filter_rules, eng.opts.delete_excluded, eng.opts.from0).unwrap_or_default());
     let one_fs = eng.opts.one_file_system;
     let src_tops: Vec<(PathBuf, Vec<u8>)> = tops.iter().map(|(s, r, _)| (s.clone(), r.clone())).collect();
     let src_scan = std::thread::spawn(move || {

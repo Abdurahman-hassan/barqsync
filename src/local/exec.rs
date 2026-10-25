@@ -613,7 +613,7 @@ impl<'a> Engine<'a> {
             let erel = join_rel(rel, &e.name);
             return !self.filter.is_static() || !self.filter.excluded(&DirRules::default(), &erel, e.meta.kind == Kind::Dir, Side::Sender);
         }
-        super::prune::sends(self.opts, &self.filter, &self.prune, dir, rel, rules, sel, root_dev, e)
+        super::prune::sends(self.opts, &self.filter, &self.prune, dir, rel, rules, sel, root_dev, e, &|m| self.src_err(m))
     }
 
     /// The selected entries of `dir`, with missing names reported as errors.

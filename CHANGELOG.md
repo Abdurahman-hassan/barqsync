@@ -20,8 +20,9 @@
   - `--max-delete=N`: at most N deletions, in rsync's order; the rest are reported and the
     run ends with exit 25.
   - rsync's filter rules: `--filter`/`-f` with `-`, `+`, `H`, `S`, `P`, `R` and `!` rules,
-    their modifiers, `.` merge files and `:` per-directory merge files; `-F`, `-FF` and
-    `-C`/`--cvs-exclude`. `--include`/`--exclude` also take rsync's `+ `/`- ` prefixes.
+    their modifiers, `.` merge files and `:` per-directory merge files (NUL-separated with
+    `-0`); `-F`, `-FF` and `-C`/`--cvs-exclude`. `--include`/`--exclude` also take rsync's
+    `+ `/`- ` prefixes.
   - `-m`/`--prune-empty-dirs`, `--mkpath`, and `-s`/`--secluded-args`/`--protect-args`
     (accepted; barqsync never puts paths on the remote command line).
   - `--timeout=SECONDS`: a remote transfer whose connection delivers nothing for that
