@@ -18,8 +18,9 @@ use crate::local::flags::{adjust_listing, adjust_mode, remove_source};
 use crate::xattrs::{Rules, Xattr};
 use crate::select::{self, Descend, Sel};
 use crate::exit;
-use crate::filter::Filter;
+use crate::filter::{DirRules, Filter, Side};
 use crate::fsops;
+use crate::local::prune::{self, Prune};
 use crate::output::{Output, StatsSnapshot, path_msg};
 use crate::paths::{join_rel, split_source, wants_contents};
 use crate::proto::{self, Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
@@ -65,6 +66,10 @@ struct Sender<'a> {
     io_error: Mutex<bool>,
     /// A message too large to send stops the transfer.
     failed: SendFailure,
+    /// Files that were gone when they were to be sent (rsync's "file has vanished").
+    vanished: AtomicU64,
+    /// `-m`: which source directories have content.
+    prune: Prune,
 }
 
 /// `--remove-source-files`: (root, path) -> where the entry is and what it was.
@@ -93,12 +98,33 @@ struct SrcRoot {
     base: PathBuf,
     /// `-R`/`--files-from`: the selected paths below `base`.
     sel: Option<&'static Sel>,
+    /// Its transfer root's filter state (see [`DirRules`]).
+    rules: DirRules,
+}
+
+/// Whether `e` failed to open because its file is gone (rsync's "file has vanished").
+fn gone(e: &io::Error, path: &Path) -> bool {
+    e.kind() == io::ErrorKind::NotFound && fsops::lstat(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
 }
 
 impl Sender<'_> {
     fn err(&self, msg: impl AsRef<[u8]>) {
         self.errors.fetch_add(1, SeqCst);
         self.out.error(msg);
+    }
+
+    /// A file listed was gone when it was to be sent: a warning, not an error, and the
+    /// run ends with 24 (rsync's "file has vanished").
+    fn vanished(&self, path: &Path) {
+        self.vanished.fetch_add(1, SeqCst);
+        self.out.warning(path_msg("file has vanished: \"", &fsops::full_path(path), "\""));
+    }
+
+    /// The filter state of directory `dir` (at `rel`) from its parent's: its
+    /// per-directory filter files are read. `None` after reporting one that could not be
+    /// read: the directory is left out, since what it would exclude is unknown.
+    fn enter(&self, inherited: &DirRules, dir: &Path, rel: &[u8]) -> Option<DirRules> {
+        self.filter.enter(inherited, dir, rel).map_err(|m| self.scan_err(m)).ok()
     }
 
     /// An error reading the source: the listings may now lack entries, which the
@@ -205,11 +231,17 @@ impl Sender<'_> {
 
     /// Read and send the directory at `rel` of transfer root `root` (one source directory,
     /// or several merging), then walk its subdirectories.
-    fn walk_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, dirs: Vec<SrcDir>) {
+    fn walk_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, mut dirs: Vec<SrcDir>) {
         if fsops::interrupted() {
             return;
         }
-        let lists: Vec<Option<Vec<DirEnt>>> = dirs.iter().map(|d| self.read_dir(&d.path, d.sel)).collect();
+        let mut lists: Vec<Option<Vec<DirEnt>>> = Vec::with_capacity(dirs.len());
+        for d in &mut dirs {
+            lists.push(self.enter(&d.rules, &d.path, &rel).and_then(|r| {
+                d.rules = r;
+                self.read_dir(&d.path, d.sel)
+            }));
+        }
         if lists.iter().all(Option::is_none) {
             return;
         }
@@ -218,8 +250,8 @@ impl Sender<'_> {
 
     /// Send the listing at `rel`, merged from `lists` (`dirs[i]`'s), and walk on.
     fn send_dir<'s>(&'s self, s: &Scope<'s>, root: u16, rel: Vec<u8>, dirs: Vec<SrcDir>, lists: Vec<Vec<DirEnt>>) {
-        let excluded = |e: &DirEnt| self.filter.is_excluded(&join_rel(&rel, &e.name), e.meta.kind == Kind::Dir);
-        let lists = lists.into_iter().map(|l| l.into_iter().filter(|e| !excluded(e)).collect()).collect();
+        let sends = |d: &SrcDir, e: &DirEnt| prune::sends(self.opts, &self.filter, &self.prune, &d.path, &rel, &d.rules, d.sel, d.dev, e);
+        let lists = dirs.iter().zip(lists).map(|(d, l)| l.into_iter().filter(|e| sends(d, e)).collect()).collect();
         let (entries, sources) = merge::merge(dirs, lists);
         let (recursive, one_fs) = (self.opts.recursive, self.opts.one_file_system);
         let subdirs: Vec<(Vec<u8>, Vec<SrcDir>)> = entries
@@ -229,7 +261,7 @@ impl Sender<'_> {
                 let d = sources.dir_of(i as u32);
                 let dev = d.dev.unwrap_or(e.meta.dev);
                 let sub = self.descend_into(d.sel, e, dev)?;
-                let mut srcs = vec![SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev) }];
+                let mut srcs = vec![SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev), rules: d.rules.clone() }];
                 srcs.extend(sources.also_dirs(i as u32, &e.name, recursive, one_fs));
                 Some((join_rel(&rel, &e.name), srcs))
             })
@@ -270,8 +302,13 @@ impl Sender<'_> {
         }
         let (dirs, lists): (Vec<SrcDir>, Vec<Option<Vec<DirEnt>>>) = tops
             .into_iter()
-            .map(|(d, items)| {
-                let l = items.or_else(|| self.read_dir(&d.path, d.sel));
+            .map(|(mut d, items)| {
+                // A `src/` directory is read, so its own filter files count; named items' isn't.
+                let l = items.or_else(|| {
+                    let r = self.enter(&d.rules, &d.path, b"")?;
+                    d.rules = r;
+                    self.read_dir(&d.path, d.sel)
+                });
                 (d, l)
             })
             .unzip();
@@ -321,7 +358,7 @@ impl Sender<'_> {
             }
             let errors = self.errors.load(SeqCst);
             self.reported.store(errors, SeqCst);
-            self.send(Msg::SenderDone { errors });
+            self.send(Msg::SenderDone { errors, vanished: self.vanished.load(SeqCst) });
             crate::timing::mark("SenderDone sent");
         }
     }
@@ -398,6 +435,7 @@ impl Sender<'_> {
             self.pending_files.fetch_add(1, SeqCst);
             s.spawn(move |_| {
                 if !fsops::interrupted() {
+                    fsops::test_vanish(&path);
                     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     let xattrs = if full { self.full_xattrs(&path) } else { None };
                     let r = match sig {
@@ -410,7 +448,10 @@ impl Sender<'_> {
                         // A failed file doesn't count as transferred; once the run is
                         // stopping (Ctrl-C, a failed peer) that is expected, not worth a message.
                         Err(e) => {
-                            if !self.out_frames.stopped() && self.failed.reason().is_none() {
+                            if self.out_frames.stopped() || self.failed.reason().is_some() {
+                            } else if gone(&e, &path) {
+                                self.vanished(&path);
+                            } else {
                                 self.err(path_msg("send_files failed to read \"", &path, format!("\": {e}")));
                             }
                             self.send(Msg::FileEnd { id, ok: false });
@@ -427,7 +468,10 @@ impl Sender<'_> {
     /// `full`: the file's attribute values go along in full. Returns the files that are
     /// no longer small.
     fn send_small(&self, files: Vec<(u64, PathBuf, bool)>) -> Vec<(u64, PathBuf, bool)> {
-        let read = files.into_iter().map(|(id, path, full)| (id, read_small(&path), path, full));
+        let read = files.into_iter().map(|(id, path, full)| {
+            fsops::test_vanish(&path);
+            (id, read_small(&path), path, full)
+        });
         let mut pack: Vec<(u64, u32)> = Vec::new();
         let mut blob: Vec<u8> = Vec::new();
         let mut xattrs: Vec<(u64, Vec<Xattr>)> = Vec::new();
@@ -451,7 +495,11 @@ impl Sender<'_> {
                     blob.extend_from_slice(&d);
                 }
                 Err(e) => {
-                    self.err(path_msg("send_files failed to open \"", &path, format!("\": {e}")));
+                    if gone(&e, &path) {
+                        self.vanished(&path);
+                    } else {
+                        self.err(path_msg("send_files failed to open \"", &path, format!("\": {e}")));
+                    }
                     self.send(Msg::FileEnd { id, ok: false });
                 }
             }
@@ -579,7 +627,7 @@ fn read_small(path: &Path) -> io::Result<Option<Vec<u8>>> {
 }
 
 /// `-R`/`--files-from` roots: each base directory with its selected paths.
-fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, out: &Output, errors: &AtomicU64) -> Vec<SrcRoot> {
+fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, prune: &Prune, out: &Output, errors: &AtomicU64) -> Vec<SrcRoot> {
     let sel_roots = match &opts.files_from {
         Some(list) => select::from_list(&sources[0], list),
         None => select::from_relative_args(sources),
@@ -592,6 +640,7 @@ fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, o
     let mut roots = Vec::new();
     for r in sel_roots {
         let sel = select::leak(r.sel);
+        let rules = filter.root(&r.base, &r.base, Side::Sender);
         let info = if r.with_root {
             match fsops::stat(&r.base) {
                 Ok(mut m) => {
@@ -611,21 +660,21 @@ fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, o
             }
             let items = adjust_listing(opts, &r.base, ents, &mut err)
                 .into_iter()
-                .filter(|e| !filter.is_excluded(e.name.as_bytes(), e.meta.kind == Kind::Dir))
+                .filter(|e| prune::sends(opts, filter, prune, &r.base, b"", &rules, Some(sel), None, e))
                 .collect();
             let items = extra::collect(opts, &xrules, &r.base, items, &mut err);
             RootInfo { contents: false, meta: None, items, sel: Some(sel.clone()), extra: None }
         };
-        roots.push(SrcRoot { info, base: r.base, sel: Some(sel) });
+        roots.push(SrcRoot { info, base: r.base, sel: Some(sel), rules });
     }
     roots
 }
 
 /// Resolve SRC arguments the way rsync does: `src/` sends the directory's contents,
 /// `src` sends the directory (or file) itself under its name.
-fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, out: &Output, errors: &AtomicU64) -> Vec<SrcRoot> {
+fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, prune: &Prune, out: &Output, errors: &AtomicU64) -> Vec<SrcRoot> {
     if opts.relative {
-        return resolve_select_roots(opts, sources, filter, out, errors);
+        return resolve_select_roots(opts, sources, filter, prune, out, errors);
     }
     let xrules = extra::rules(opts);
     let mut err = |m: Vec<u8>| {
@@ -644,21 +693,30 @@ fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, out: &Ou
                         continue;
                     }
                 };
-                if filter.is_excluded(name.as_bytes(), meta.kind == Kind::Dir) {
-                    continue;
-                }
                 let link = if meta.kind == Kind::Symlink { fsops::read_link_bytes(&sp).ok() } else { None };
                 let items = adjust_listing(opts, &parent, vec![DirEnt::new(name, meta, link)], &mut err);
+                // A named directory is the first directory read; its parent is the root.
+                let first = if items.iter().any(|e| e.meta.kind == Kind::Dir) { sp.clone() } else { parent.clone() };
+                let rules = filter.root(&parent, &first, Side::Sender);
+                let items: Vec<DirEnt> = items.into_iter().filter(|e| prune::sends(opts, filter, prune, &parent, b"", &rules, None, None, e)).collect();
+                if items.is_empty() {
+                    continue;
+                }
                 let items = extra::collect(opts, &xrules, &parent, items, &mut err);
                 let info = RootInfo { contents: false, meta: None, items, sel: None, extra: None };
-                roots.push(SrcRoot { info, base: parent, sel: None });
+                roots.push(SrcRoot { info, base: parent, sel: None, rules });
+            }
+            // Without -r or -d, rsync transfers no directory, not even what a `src/` holds.
+            _ if !opts.recursive && !opts.dirs && fsops::stat(&sp).is_ok_and(|m| m.kind == Kind::Dir) => {
+                out.note("skipping directory .");
             }
             _ => match fsops::stat(&sp) {
                 Ok(mut m) if m.kind == Kind::Dir => {
                     adjust_mode(opts, &mut m);
                     let extra = root_extra(opts, &xrules, &sp, &m, &mut err);
                     let info = RootInfo { contents: true, meta: Some(m), items: Vec::new(), sel: None, extra };
-                    roots.push(SrcRoot { info, base: sp, sel: None })
+                    let rules = filter.root(&sp, &sp, Side::Sender);
+                    roots.push(SrcRoot { info, base: sp, sel: None, rules })
                 }
                 Ok(_) => err(path_msg("change_dir \"", &sp, "\" failed: Not a directory")),
                 Err(e) => err(path_msg("link_stat \"", &sp, format!("\" failed: {e}"))),
@@ -675,10 +733,11 @@ fn merge_roots(roots: &[SrcRoot], recursive: bool) -> (Option<RootInfo>, Vec<Top
     let tops: Vec<Top> = roots
         .iter()
         .map(|r| match r.info.meta {
-            Some(m) if r.info.contents => {
-                (SrcDir { path: r.base.clone(), sel: r.sel.and_then(|s| s.at_root(recursive)), dev: Some(m.dev) }, None)
-            }
-            _ => (SrcDir { path: r.base.clone(), sel: r.sel, dev: None }, Some(r.info.items.clone())),
+            Some(m) if r.info.contents => (
+                SrcDir { path: r.base.clone(), sel: r.sel.and_then(|s| s.at_root(recursive)), dev: Some(m.dev), rules: r.rules.clone() },
+                None,
+            ),
+            _ => (SrcDir { path: r.base.clone(), sel: r.sel, dev: None, rules: r.rules.clone() }, Some(r.info.items.clone())),
         })
         .collect();
     let info = match roots {
@@ -723,7 +782,7 @@ fn root_extra(opts: &Options, r: &Rules, path: &Path, meta: &Meta, err: &mut dyn
 /// and the receiver's counters (when it got that far). `report_removals`: end with
 /// `RemovalsDone` (see [`super::reports_removals`]).
 pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, report_removals: bool) -> (i32, Option<StatsSnapshot>) {
-    let filter = match Filter::new(&opts.filter_rules) {
+    let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded) {
         Ok(f) => f,
         Err(e) => {
             out.error(format!("{e:#}"));
@@ -748,7 +807,8 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
             }
         }
     }
-    let roots = resolve_roots(opts, sources, &filter, out, &errors);
+    let prune = Prune::default();
+    let roots = resolve_roots(opts, sources, &filter, &prune, out, &errors);
     let sender = Sender {
         out_frames: conn.out.clone(),
         opts,
@@ -768,6 +828,8 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         refining: Mutex::new(HashMap::new()),
         io_error: Mutex::new(false),
         failed: SendFailure::default(),
+        vanished: AtomicU64::new(0),
+        prune,
     };
     // Every error so far was about reading a source root.
     if sender.errors.load(SeqCst) > 0 {
@@ -864,8 +926,9 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
                 sender.send(Msg::RemovalsDone { errors });
                 crate::timing::mark("RemovalsDone sent");
             }
-            let failed = stats.errors() > 0 || sender.errors.load(SeqCst) > 0;
-            (if failed { exit::PARTIAL } else { exit::OK }, Some(stats))
+            // The receiver's counters include what this side said in `SenderDone`.
+            let code = if sender.errors.load(SeqCst) > 0 { exit::PARTIAL } else { stats.exit_code() };
+            (code, Some(stats))
         }
         Err(code) => (code, None),
     }

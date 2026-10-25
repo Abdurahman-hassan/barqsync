@@ -17,7 +17,7 @@ use super::Root;
 use super::exec::{DirJob, Engine, FileJob};
 use crate::diff::AttrDiff;
 use crate::entry::{DirEnt, Kind, Meta};
-use crate::filter::Filter;
+use crate::filter::{DirRules, Filter, Side};
 use crate::fsops;
 use crate::proto::SMALL_FILE;
 use crate::scan::{self, Descend, DstIndex, Emit};
@@ -295,7 +295,7 @@ pub(crate) fn run_roots(eng: &Engine, p: &Pipeline, roots: &[Root], dest_exists:
     tops.retain(|(src, _, _)| seen.insert(src.clone()));
 
     let (tx, rx) = unbounded::<Option<(PathBuf, Vec<DirEnt>)>>();
-    let filter = Arc::new(Filter::new(&eng.opts.filter_rules).unwrap_or_default());
+    let filter = Arc::new(Filter::new(&eng.opts.filter_rules, eng.opts.delete_excluded).unwrap_or_default());
     let one_fs = eng.opts.one_file_system;
     let src_tops: Vec<(PathBuf, Vec<u8>)> = tops.iter().map(|(s, r, _)| (s.clone(), r.clone())).collect();
     let src_scan = std::thread::spawn(move || {
@@ -304,7 +304,10 @@ pub(crate) fn run_roots(eng: &Engine, p: &Pipeline, roots: &[Root], dest_exists:
             let root_dev = fsops::stat(&top).map(|m| m.dev).ok();
             let filter = Arc::clone(&filter);
             let descend: Descend = Arc::new(move |rel, meta| {
-                !(fsops::interrupted() || filter.is_excluded(rel, true) || (one_fs && Some(meta.dev) != root_dev))
+                // Only rules needing no per-directory state can skip a subtree up front; the
+                // engine checks each listing itself.
+                let excluded = filter.is_static() && filter.excluded(&DirRules::default(), rel, true, Side::Sender);
+                !(fsops::interrupted() || excluded || (one_fs && Some(meta.dev) != root_dev))
             });
             let tx = tx.clone();
             let emit: Emit = Arc::new(move |dir, _, ents| {

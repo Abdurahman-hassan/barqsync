@@ -17,8 +17,9 @@ pub mod streams;
 use crate::fsops;
 use crate::proto::{Conn, Frame, FrameSender, Msg};
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use std::time::{Duration, Instant};
 
 /// How file data travels in a remote transfer (`--transport`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
@@ -131,6 +132,76 @@ pub(crate) fn recv_unless(conn: &Conn, failed: &SendFailure) -> Result<Frame, St
 /// The other side said it was interrupted (so this side need not tell it).
 static PEER_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+/// `--timeout` in seconds (0: none), once the options are agreed.
+static TIMEOUT: AtomicU64 = AtomicU64::new(0);
+/// When the last frame arrived, in milliseconds since [`clock`]'s start.
+static LAST_IN: AtomicU64 = AtomicU64::new(0);
+/// The transfer ended because nothing arrived for `--timeout` seconds.
+static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+
+fn clock() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// `--timeout`: from now on, a connection that delivers nothing for `secs` seconds ends
+/// the transfer (exit 30). Each side sends [`KeepAlive`]s meanwhile, so only a
+/// connection that stopped moving data trips it.
+pub(crate) fn set_timeout(secs: u64) {
+    LAST_IN.store(clock(), SeqCst);
+    TIMEOUT.store(secs, SeqCst);
+}
+
+/// Whether `--timeout` ended the transfer.
+pub fn timed_out() -> bool {
+    TIMED_OUT.load(SeqCst)
+}
+
+/// The error ending a connection that has been silent for longer than `--timeout`.
+fn check_timeout() -> Option<io::Error> {
+    let secs = TIMEOUT.load(SeqCst);
+    let idle = clock().saturating_sub(LAST_IN.load(SeqCst));
+    if secs == 0 || idle < secs * 1000 {
+        return None;
+    }
+    TIMED_OUT.store(true, SeqCst);
+    Some(io::Error::new(io::ErrorKind::TimedOut, format!("io timeout after {} seconds -- exiting", idle / 1000)))
+}
+
+/// `--timeout`: sends `KeepAlive` every third of the timeout while it lives, when there
+/// is room (a full queue means data is moving), so that a side busy scanning, hashing
+/// or deleting never looks dead to the other.
+pub(crate) struct KeepAlive(Option<(crossbeam_channel::Sender<()>, std::thread::JoinHandle<()>)>);
+
+impl KeepAlive {
+    pub(crate) fn start(out: &FrameSender, secs: u64) -> KeepAlive {
+        if secs == 0 {
+            return KeepAlive(None);
+        }
+        let (stop, wait) = crossbeam_channel::bounded::<()>(0);
+        let out = out.clone();
+        let every = Duration::from_millis((secs * 1000 / 3).max(200));
+        let thread = std::thread::Builder::new()
+            .name("barqsync-keepalive".into())
+            .spawn(move || {
+                while let Err(crossbeam_channel::RecvTimeoutError::Timeout) = wait.recv_timeout(every) {
+                    out.try_msg(Msg::KeepAlive);
+                }
+            })
+            .expect("spawn keepalive thread");
+        KeepAlive(Some((stop, thread)))
+    }
+}
+
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        if let Some((stop, thread)) = self.0.take() {
+            drop(stop);
+            let _ = thread.join();
+        }
+    }
+}
+
 /// [`recv`], giving up at `deadline`. Interrupted here, it tells the peer; told by the
 /// peer, it stops as if interrupted here.
 pub(crate) fn recv_until(conn: &Conn, deadline: Option<std::time::Instant>) -> Result<Frame, Stop> {
@@ -158,8 +229,16 @@ fn recv_checked(conn: &Conn, deadline: Option<std::time::Instant>, failed: Optio
                 eprintln!("barqsync: the remote side was interrupted");
                 return Err(Stop::Interrupted);
             }
-            Ok(Some(f)) => return Ok(f),
-            Ok(None) => {}
+            Ok(Some(Frame::Msg(Msg::KeepAlive))) => LAST_IN.store(clock(), SeqCst),
+            Ok(Some(f)) => {
+                LAST_IN.store(clock(), SeqCst);
+                return Ok(f);
+            }
+            Ok(None) => {
+                if let Some(e) = check_timeout() {
+                    return Err(Stop::Io(e));
+                }
+            }
             Err(e) => return Err(Stop::Io(e)),
         }
     }

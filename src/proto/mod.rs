@@ -55,7 +55,9 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 9: `-X`/`-A` (attributes and ACLs in listings, roots and file data; `Xattrs`).
 /// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
 ///     `Synced` names entries only; `IoError` (source read errors stop deletions).
-pub const VERSION: u32 = 10;
+/// 11: `--filter`/`-F`/`-C` rules, `--max-delete`, `-m`, `--mkpath` and `--timeout` in the
+///     options; `KeepAlive`; vanished files and stopped deletions in the counters.
+pub const VERSION: u32 = 11;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.
 pub const MAX_FRAME: usize = 64 << 20;
@@ -68,6 +70,15 @@ pub const DATA_CHUNK: usize = 1 << 20;
 pub const SMALL_FILE: u64 = 128 << 10;
 /// Target size of a small-file pack.
 pub const PACK_BYTES: usize = 4 << 20;
+
+/// Bytes this process wrote to and read from its connections (rsync's "sent N bytes
+/// received M bytes").
+pub static BYTES_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BYTES_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn count(counter: &std::sync::atomic::AtomicU64, n: usize) {
+    counter.fetch_add(n as u64, Ordering::Relaxed);
+}
 
 /// File id on the wire: directory id in the high half, index in its listing in the low half.
 pub fn file_id(dir: u32, idx: u32) -> u64 {
@@ -186,7 +197,8 @@ pub enum Msg {
     /// The answer to a `Need`'s `xattrs`: one entry's attributes with their values in
     /// full (`None`: the sender couldn't read them, and said why).
     Xattrs { id: u64, xattrs: Option<Vec<Xattr>> },
-    SenderDone { errors: u64 },
+    /// `vanished`: files that were gone when they were to be sent (rsync's exit 24).
+    SenderDone { errors: u64, vanished: u64 },
     /// A pull with `--remove-source-files` (see `remote::reports_removals`): the sender's
     /// last frame, after `ReceiverDone`, once every `Synced` entry is dealt with and its
     /// output sent. `errors`: failures since `SenderDone`.
@@ -200,6 +212,11 @@ pub enum Msg {
     /// only entries it listed itself, unchanged since by its own record of them.
     Synced { root: u16, files: SyncedFiles },
     ReceiverDone { stats: StatsSnapshot },
+
+    // either way
+    /// `--timeout`: sent by a side with nothing else to send for a while, so the other
+    /// side can tell an idle connection from a dead one.
+    KeepAlive,
 }
 
 #[derive(Debug)]
@@ -315,6 +332,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
         }
         let mut body = vec![0u8; body_len(&hdr)?];
         r.read_exact(&mut body)?;
+        count(&BYTES_RECEIVED, hdr.len() + body.len());
         if let Some(f) = pieces.add(hdr[4], body)? {
             return Ok(Some(f));
         }
@@ -675,6 +693,12 @@ impl FrameSender {
         self.send(Frame::Msg(m))
     }
 
+    /// Queue a control message only if there is room right now (a keepalive: a full
+    /// queue means data is moving anyway).
+    pub fn try_msg(&self, m: Msg) -> bool {
+        !self.stop.is_set() && encode(&Frame::Msg(m), None, self.wire).is_ok_and(|buf| self.tx.try_send(buf))
+    }
+
     /// The run is stopping early (see [`FrameSender::stopped`]): sends fail from now on,
     /// and sends waiting for room give up, so no task waits for a peer that may no
     /// longer read.
@@ -780,6 +804,7 @@ fn spawn_writer(
                         break;
                     }
                     w.write_all(&buf)?;
+                    count(&BYTES_SENT, buf.len());
                     if wrx.is_empty() && urgent.as_ref().is_none_or(Receiver::is_empty) {
                         w.flush()?;
                     }

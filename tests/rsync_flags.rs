@@ -828,3 +828,580 @@ fn remove_source_files_pull_reports_removals_like_rsync() {
     assert!(f.stderr.contains("sub/f2"), "{}", f.stderr);
     assert!(tmp.path().join("lf2-src/sub/f2").exists());
 }
+
+// ---------------------------------------------------------------------------
+// --no-OPTION
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_options_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    t.file("a", "a").file("sub/b", "b").symlink("lnk", "a").fifo("fifo").chmod("a", 0o640).chmod("sub", 0o750).settle_mtimes();
+    let cases: &[&[&str]] = &[
+        &["-ai", "--no-perms"],
+        &["-ai", "--no-p", "--no-t"],
+        &["-ai", "--no-o", "--no-g"],
+        &["-ai", "--no-D"],
+        &["-ai", "--no-l"],
+        &["-ai", "--no-specials"],
+        &["-ai", "--no-r"],
+        &["-ai", "--no-recursive", "-d"],
+        // What comes last wins: -a turns -t back on, -t after --no-times too.
+        &["--no-t", "-ai"],
+        &["-ai", "--no-times", "-t"],
+        &["-a", "-ii", "--no-i", "-i", "-a"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        let (dr, df) = (format!("r{i}"), format!("f{i}"));
+        let mut a = flags.to_vec();
+        a.extend(["src/", "{dst}"]);
+        let (r, f) = both(tmp.path(), &a, &dr, &df).unwrap();
+        same_output(&r, &f, &[(&dr, &df)], &format!("{flags:?}"));
+        let (pr, pf) = (tmp.path().join(&dr), tmp.path().join(&df));
+        assert_eq!(pr.exists(), pf.exists(), "{flags:?}");
+        if pr.exists() {
+            // Without -t, files get the time they were written.
+            assert_same_tree(&without_mtimes(snap(&pr, false)), &without_mtimes(snap(&pf, false)));
+        }
+    }
+    // An update: changed modes and times are left alone without -p and -t.
+    seed(tmp.path(), "src/", &["ur", "uf", "pr", "pf"]);
+    t.chmod("a", 0o600).chmod("sub/b", 0o604).mtime("sub/b", BASE_TIME + 500);
+    let (r, f) = both(tmp.path(), &["-ai", "--no-p", "--no-t", "src/", "{dst}"], "ur", "uf").unwrap();
+    same_output(&r, &f, &[], "update --no-p --no-t");
+    assert_same_tree(&snap(&tmp.path().join("ur"), true), &snap(&tmp.path().join("uf"), true));
+    let (r, f) = both_remote(tmp.path(), &["-ai", "--no-p", "--no-o", "--no-g", "src/", "{host}{dst}"], "pr", "pf").unwrap();
+    same_output(&r, &f, &[], "push --no-p --no-o --no-g");
+    assert_same_tree(&snap(&tmp.path().join("pr"), true), &snap(&tmp.path().join("pf"), true));
+}
+
+// ---------------------------------------------------------------------------
+// --delete-before/-during/-delay/-after, --max-delete
+// ---------------------------------------------------------------------------
+
+/// Extraneous entries in each destination: files and directories, nested, at the root
+/// and below, named so that rsync's deletion order matters.
+fn deletion_fixture(root: &Path, dsts: &[&str]) {
+    Tree::new(root.join("src")).file("a", "a").file("keep/k", "k").file("keep/sub/s", "s").settle_mtimes();
+    seed(root, "src/", dsts);
+    for d in dsts {
+        Tree::new(root.join(d))
+            .file("z", "z")
+            .file("y", "y")
+            .file("old/a", "1")
+            .file("old/s/b", "2")
+            .file("old/s/c", "3")
+            .dir("x")
+            .file("old-x/q", "4")
+            .file("keep/gone", "5")
+            .file("keep/sub/gone2", "6")
+            .file("keep/sub/deep/gone3", "7")
+            .same_mtimes(BASE_TIME + 700_000);
+    }
+}
+
+#[test]
+fn delete_timing_options_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let flags = ["--delete-before", "--delete-during", "--del", "--delete-delay", "--delete-after"];
+    let dsts: Vec<String> = (0..flags.len()).flat_map(|i| [format!("r{i}"), format!("f{i}"), format!("pr{i}"), format!("pf{i}")]).collect();
+    deletion_fixture(tmp.path(), &dsts.iter().map(String::as_str).collect::<Vec<_>>());
+    for (i, flag) in flags.iter().enumerate() {
+        let (r, f) = both(tmp.path(), &["-ai", flag, "src/", "{dst}"], &format!("r{i}"), &format!("f{i}")).unwrap();
+        same_output(&r, &f, &[], flag);
+        assert_same_tree(&snap_no_dir_times(&tmp.path().join(format!("r{i}"))), &snap_no_dir_times(&tmp.path().join(format!("f{i}"))));
+        let (r, f) = both_remote(tmp.path(), &["-ai", flag, "src/", "{host}{dst}"], &format!("pr{i}"), &format!("pf{i}")).unwrap();
+        same_output(&r, &f, &[], &format!("push {flag}"));
+        assert_same_tree(&snap_no_dir_times(&tmp.path().join(format!("pr{i}"))), &snap_no_dir_times(&tmp.path().join(format!("pf{i}"))));
+    }
+    // Two different times, and --delete without -r or -d, are refused.
+    for bad in [&["-a", "--delete-before", "--delete-after"][..], &["-a", "--del", "--delete-after"], &["--delete"], &["-a", "--no-r", "--delete"]] {
+        let mut a = bad.to_vec();
+        a.extend(["src/", "{dst}"]);
+        let (r, f) = both(tmp.path(), &a, "br", "bf").unwrap();
+        assert_eq!((r.code, f.code), (1, 1), "{bad:?}\nrsync: {}\nbarqsync: {}", r.stderr, f.stderr);
+    }
+}
+
+#[test]
+fn max_delete_matches_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let limits = ["0", "1", "2", "4", "-3", "100"];
+    let dsts: Vec<String> = (0..limits.len()).flat_map(|i| [format!("r{i}"), format!("f{i}"), format!("pr{i}"), format!("pf{i}"), format!("lr{i}"), format!("lf{i}")]).collect();
+    deletion_fixture(tmp.path(), &dsts.iter().map(String::as_str).collect::<Vec<_>>());
+    for (i, n) in limits.iter().enumerate() {
+        let max = format!("--max-delete={n}");
+        let (r, f) = both(tmp.path(), &["-ai", "--delete", &max, "src/", "{dst}"], &format!("r{i}"), &format!("f{i}")).unwrap();
+        same_output(&r, &f, &[], &max);
+        assert_same_tree(&snap_no_dir_times(&tmp.path().join(format!("r{i}"))), &snap_no_dir_times(&tmp.path().join(format!("f{i}"))));
+        if f.code == 25 {
+            assert!(f.stderr.contains("Deletions stopped due to --max-delete limit"), "{}", f.stderr);
+        }
+        let (r, f) = both_remote(tmp.path(), &["-ai", "--delete", &max, "src/", "{host}{dst}"], &format!("pr{i}"), &format!("pf{i}")).unwrap();
+        same_output(&r, &f, &[], &format!("push {max}"));
+        assert_same_tree(&snap_no_dir_times(&tmp.path().join(format!("pr{i}"))), &snap_no_dir_times(&tmp.path().join(format!("pf{i}"))));
+        let (r, f) = both_remote(tmp.path(), &["-ai", "--delete", &max, "{host}src/", "{dst}"], &format!("lr{i}"), &format!("lf{i}")).unwrap();
+        same_output(&r, &f, &[], &format!("pull {max}"));
+        assert_same_tree(&snap_no_dir_times(&tmp.path().join(format!("lr{i}"))), &snap_no_dir_times(&tmp.path().join(format!("lf{i}"))));
+    }
+    // Without --delete it changes nothing.
+    let (r, f) = both(tmp.path(), &["-ai", "--max-delete=1", "src/", "{dst}"], "nr", "nf").unwrap();
+    same_output(&r, &f, &[], "no --delete");
+}
+
+// ---------------------------------------------------------------------------
+// -m / --prune-empty-dirs
+// ---------------------------------------------------------------------------
+
+fn prune_fixture(root: &Path) {
+    Tree::new(root.join("src"))
+        .dir("a/b/c")
+        .file("d/e/f.txt", "f")
+        .file("g/h.log", "h")
+        .dir("only-dirs/x/y")
+        .file("only-dirs/z/w.txt", "w")
+        .file("top.txt", "t")
+        .symlink("lnkdir/l", "../top.txt")
+        .settle_mtimes();
+}
+
+#[test]
+fn prune_empty_dirs_matches_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    prune_fixture(tmp.path());
+    let cases: &[&[&str]] = &[
+        &["-aim"],
+        &["-aim", "--exclude=*.log"],
+        &["-aim", "-f", "+ */", "-f", "+ *.txt", "-f", "- *"],
+        &["-aim", "--delete", "--exclude=*.log"],
+        &["-aim", "--no-l"],
+        &["-dim"],
+        &["-aimn"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (remote, dr, df) in [(0, format!("r{i}"), format!("f{i}")), (1, format!("pr{i}"), format!("pf{i}")), (2, format!("lr{i}"), format!("lf{i}"))] {
+            // Destinations already holding some of what is pruned.
+            for d in [&dr, &df] {
+                Tree::new(tmp.path().join(d)).dir("a/b").file("g/old", "o").dir("only-dirs/x").same_mtimes(BASE_TIME + 900_000);
+            }
+            let mut a = flags.to_vec();
+            let (src, dst) = match remote {
+                0 => ("src/", "{dst}"),
+                1 => ("src/", "{host}{dst}"),
+                _ => ("{host}src/", "{dst}"),
+            };
+            a.extend([src, dst]);
+            let (r, f) = if remote == 0 { both(tmp.path(), &a, &dr, &df) } else { both_remote(tmp.path(), &a, &dr, &df) }.unwrap();
+            same_output(&r, &f, &[(&dr, &df)], &format!("remote={remote} {flags:?}"));
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --mkpath, -s
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mkpath_matches_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("f", "f").file("sub/g", "g").settle_mtimes();
+    let cases: &[&[&str]] = &[
+        &["-ai", "--mkpath", "src/", "{dst}/b/c"],
+        &["-ai", "--mkpath", "src/", "{dst}/b/c/"],
+        &["-ai", "--mkpath", "src/f", "{dst}/y/z"],
+        &["-ai", "--mkpath", "src/f", "{dst}/y/"],
+        &["-ai", "--mkpath", "src/", "{dst}"],
+        &["-ain", "--mkpath", "src/", "{dst}/b/c"],
+        &["-ain", "--mkpath", "src/f", "{dst}/y/z"],
+        &["-a", "--mkpath", "src/", "{dst}/q"],
+        // Without --mkpath the missing parent is an error (11).
+        &["-ai", "src/", "{dst}/b/c"],
+    ];
+    for (i, args) in cases.iter().enumerate() {
+        let (dr, df) = (format!("r{i}"), format!("f{i}"));
+        let (r, f) = both(tmp.path(), args, &dr, &df).unwrap();
+        same_output(&r, &f, &[(&dr, &df)], &format!("{args:?}"));
+        let (pr, pf) = (tmp.path().join(&dr), tmp.path().join(&df));
+        assert_eq!(pr.exists(), pf.exists(), "{args:?}");
+        if pr.exists() {
+            assert_same_tree(&snap_no_dir_times(&pr), &snap_no_dir_times(&pf));
+        }
+    }
+    for (i, args) in [&["-ai", "--mkpath", "src/", "{host}{dst}/b/c"][..], &["-ai", "--mkpath", "src/f", "{host}{dst}/y/z"], &["-ai", "--mkpath", "{host}src/", "{dst}/b/c"]].iter().enumerate() {
+        let (dr, df) = (format!("pr{i}"), format!("pf{i}"));
+        let (r, f) = both_remote(tmp.path(), args, &dr, &df).unwrap();
+        same_output(&r, &f, &[(&dr, &df)], &format!("{args:?}"));
+        assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+    }
+}
+
+#[test]
+fn secluded_args_are_accepted() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src dir")).file("a b", "x").file("c", "y").settle_mtimes();
+    for flag in ["-s", "--protect-args", "--secluded-args"] {
+        let (dr, df) = (format!("r{flag}"), format!("f{flag}"));
+        let (r, f) = both_remote(tmp.path(), &["-ai", flag, "{host}src dir/", "{dst} x"], &dr, &df).unwrap();
+        same_output(&r, &f, &[], flag);
+        assert_same_tree(&snap(&tmp.path().join(format!("{dr} x")), true), &snap(&tmp.path().join(format!("{df} x")), true));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --filter / -f, -F, -C
+// ---------------------------------------------------------------------------
+
+fn filter_fixture(root: &Path) {
+    Tree::new(root.join("src"))
+        .file("a.txt", "a")
+        .file("b.tmp", "b")
+        .file("keep.tmp", "k")
+        .file("x.o", "o")
+        .file("core", "c")
+        .file("notes~", "n")
+        .file("anch", "1")
+        .file(".rsync-filter", "- *.tmp\n+ keep.tmp\n")
+        .file("sub/anch", "2")
+        .file("sub/c.tmp", "c")
+        .file("sub/d.txt", "d")
+        .file("sub/e.log", "e")
+        .file("sub/.rsync-filter", "- /anch\n- *.log\n")
+        .file("deep/x/.cvsignore", "ignored *.dat\n")
+        .file("deep/x/ignored", "i")
+        .file("deep/x/y.dat", "y")
+        .file("deep/x/kept", "k")
+        .file("deep/.git/config", "g")
+        .settle_mtimes();
+    // Order matters: the first match wins, and `+ keep.tmp` comes after `- *.tmp`.
+    fs::write(root.join("rules"), "# merged\n- *.o\n+ sub/\n+ sub/d.txt\n- sub/*\n").unwrap();
+}
+
+#[test]
+fn filter_rules_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    filter_fixture(tmp.path());
+    let cases: &[&[&str]] = &[
+        &["-f", "- *.tmp"],
+        &["-f", "-_*.tmp", "-f", "exclude *.o"],
+        &["--filter=+ keep.tmp", "--filter=- *.tmp"],
+        &["-f", "- *.tmp", "-f", "!", "-f", "- *.o"],
+        &["-f", ". rules"],
+        &["-f", "merge,- rules-ex"],
+        &["-f", ": .rsync-filter"],
+        &["-f", "dir-merge,n .rsync-filter"],
+        &["-f", ":e .rsync-filter"],
+        &["-F"],
+        &["-FF"],
+        &["-C"],
+        &["-f", ":C"],
+        &["-f", "-C"],
+        &["-f", "-! */"],
+        &["-f", "+ */", "-f", "+ *.txt", "-f", "- *"],
+        &["-f", "H *.o", "-f", "S *"],
+        &["--exclude=+ a.txt", "--exclude=*.txt"],
+        &["--include=- *.o", "--exclude=*.tmp"],
+    ];
+    fs::write(tmp.path().join("rules-ex"), "*.o\ncore\n").unwrap();
+    for (i, flags) in cases.iter().enumerate() {
+        let (dr, df) = (format!("r{i}"), format!("f{i}"));
+        let mut a = vec!["-ai"];
+        a.extend_from_slice(flags);
+        a.extend(["src/", "{dst}"]);
+        let (r, f) = both(tmp.path(), &a, &dr, &df).unwrap();
+        same_output(&r, &f, &[(&dr, &df)], &format!("{flags:?}"));
+        assert_same_tree(&snap(&tmp.path().join(&dr), true), &snap(&tmp.path().join(&df), true));
+    }
+    // Over the wire, where the sender applies them (and the receiver protects).
+    for (i, flags) in [&["-F"][..], &["-FF", "-C"], &["-f", ". rules"], &["-f", "- *.tmp", "-f", "P *.keep"]].iter().enumerate() {
+        for (pull, dr, df) in [(false, format!("pr{i}"), format!("pf{i}")), (true, format!("lr{i}"), format!("lf{i}"))] {
+            let mut a = vec!["-ai"];
+            a.extend_from_slice(flags);
+            a.extend(if pull { ["{host}src/", "{dst}"] } else { ["src/", "{host}{dst}"] });
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            same_output(&r, &f, &[(&dr, &df)], &format!("pull={pull} {flags:?}"));
+            assert_same_tree(&snap(&tmp.path().join(&dr), true), &snap(&tmp.path().join(&df), true));
+        }
+    }
+    // Rules that can't be parsed are refused before anything is done (1), rules files
+    // that can't be read too, as file I/O errors (11).
+    for bad in ["bogus", "- ", ": ", "+,q x"] {
+        let (r, f) = both(tmp.path(), &["-a", "-f", bad, "src/", "{dst}"], "br", "bf").unwrap();
+        assert_eq!((r.code, f.code), (1, 1), "{bad:?}\nrsync: {}\nbarqsync: {}", r.stderr, f.stderr);
+    }
+    for bad in [&["-f", "merge nonexistent"][..], &["--exclude-from=nonexistent"], &["--include-from", "nonexistent"]] {
+        let mut a = vec!["-a"];
+        a.extend_from_slice(bad);
+        a.extend(["src/", "{dst}"]);
+        let (r, f) = both(tmp.path(), &a, "br", "bf").unwrap();
+        assert_eq!((r.code, f.code), (11, 11), "{bad:?}\nrsync: {}\nbarqsync: {}", r.stderr, f.stderr);
+    }
+}
+
+#[test]
+fn filter_rules_protect_from_delete_like_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    filter_fixture(tmp.path());
+    let cases: &[&[&str]] = &[
+        &["--delete", "-f", "- *.tmp"],
+        &["--delete", "-f", "P *.keep", "-f", "- *.tmp"],
+        &["--delete", "--delete-excluded", "-f", "P *.keep", "-f", "- *.tmp"],
+        &["--delete", "-f", "-p *.tmp"],
+        &["--delete", "-f", "R stale.keep", "-f", "P *.keep"],
+        &["--delete", "-F"],
+        &["--delete-after", "-FF"],
+        &["--delete", "-C"],
+        &["--delete", "--exclude=*.tmp", "--max-delete=2"],
+        // Backups (`*~`) are protected, also inside a directory being deleted.
+        &["--delete", "-b"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (remote, dr, df) in [(0, format!("r{i}"), format!("f{i}")), (1, format!("pr{i}"), format!("pf{i}")), (2, format!("lr{i}"), format!("lf{i}"))] {
+            for d in [&dr, &df] {
+                Tree::new(tmp.path().join(d))
+                    .file("stale.keep", "k")
+                    .file("stale.tmp", "t")
+                    .file("old/k.keep", "k")
+                    .file("old/t.tmp", "t")
+                    .file("old/x", "x")
+                    .file("old/core", "c")
+                    .file("old/in/deeper.tmp", "d")
+                    .file("old/in/bak~", "b")
+                    .file("old2/only.tmp", "t")
+                    .file("sub/stale.log", "l")
+                    .file("sub/.rsync-filter", "- *.keep\n")
+                    .same_mtimes(BASE_TIME + 900_000);
+            }
+            let mut a = vec!["-ai"];
+            a.extend_from_slice(flags);
+            a.extend(match remote {
+                0 => ["src/", "{dst}"],
+                1 => ["src/", "{host}{dst}"],
+                _ => ["{host}src/", "{dst}"],
+            });
+            let (r, f) = if remote == 0 { both(tmp.path(), &a, &dr, &df) } else { both_remote(tmp.path(), &a, &dr, &df) }.unwrap();
+            same_output(&r, &f, &[(&dr, &df)], &format!("remote={remote} {flags:?}"));
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vanished files, --timeout, --stats
+// ---------------------------------------------------------------------------
+
+/// barqsync with extra environment; `{host}` is the fake ssh's host, as in
+/// [`barqsync_remote`].
+fn barqsync_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> RunOut {
+    let shim = fake_ssh(cwd);
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_barqsync"));
+    cmd.env("LC_ALL", TEST_LOCALE).arg("-e").arg(&shim).arg(format!("--remote-path={}", env!("CARGO_BIN_EXE_barqsync")));
+    cmd.args(args.iter().map(|a| a.replace("{host}", "fakehost:")));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    run(&mut cmd, cwd)
+}
+
+/// A file that disappears between the scan and its transfer is a warning and exit 24,
+/// as rsync's "file has vanished"; an error still makes it 23. (rsync can't be raced
+/// reliably, so a test hook removes the file just before it is opened.)
+#[test]
+fn vanished_files_exit_24() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (i, (src, dst)) in [("src/", "d0"), ("src/", "{host}d1"), ("{host}src/", "d2")].iter().enumerate() {
+        Tree::new(tmp.path().join("src")).file("a", "a").file("gone", "g").file("big", vec![1u8; 300_000]).settle_mtimes();
+        Tree::new(tmp.path().join(format!("d{i}"))).file("extra", "e");
+        let f = barqsync_env(tmp.path(), &["-a", "--delete", src, dst], &[("BARQSYNC_TEST_VANISH", "gone")]);
+        assert_eq!(f.code, 24, "{src} {dst}\n{}", f.stderr);
+        assert!(f.stderr.contains("file has vanished: \"") && f.stderr.contains("src/gone\""), "{}", f.stderr);
+        let d = tmp.path().join(format!("d{i}"));
+        assert!(d.join("a").exists() && d.join("big").exists() && !d.join("gone").exists());
+        assert!(!d.join("extra").exists(), "a vanished file doesn't stop deletions");
+        // A large file is sent another way (on its own, not packed with small ones).
+        Tree::new(tmp.path().join("src")).file("gone", "g").file("big", vec![2u8; 300_000]);
+        let f = barqsync_env(tmp.path(), &["-a", src, dst], &[("BARQSYNC_TEST_VANISH", "big")]);
+        assert_eq!(f.code, 24, "{src} {dst}\n{}", f.stderr);
+        assert!(d.join("gone").exists() && fs::read(d.join("big")).unwrap()[0] == 1);
+    }
+    // A real error on top: 23.
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("a", "a").file("gone", "g").settle_mtimes();
+    let f = barqsync_env(tmp.path(), &["-a", "src/", "src/nonexistent", "d"], &[("BARQSYNC_TEST_VANISH", "gone")]);
+    assert_eq!(f.code, 23, "{}", f.stderr);
+}
+
+/// A remote shell that forwards `CUT_BYTES` bytes of the server's output, then nothing,
+/// keeping the connection open: a stalled link.
+fn stall_ssh(dir: &Path) -> std::path::PathBuf {
+    let p = dir.join("stall-ssh");
+    fs::write(
+        &p,
+        r#"#!/bin/sh
+shift
+fifo=$(mktemp -u "${TMPDIR:-/tmp}/stall.XXXXXX")
+mkfifo "$fifo"
+exec 3<&0
+/bin/sh -c "exec $*" <&3 >"$fifo" &
+pid=$!
+exec 3<&-
+perl -e '
+  $n = shift;
+  while ($n > 0 && ($r = sysread(STDIN, $buf, $n < 65536 ? $n : 65536)) > 0) { $n -= $r; syswrite(STDOUT, $buf, $r) }
+  sleep 15' "${CUT_BYTES:-4000}" <"$fifo"
+kill -9 $pid 2>/dev/null
+rm -f "$fifo"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// Run `cmd`, killing it after `limit`; returns its exit code, stderr and how long it
+/// took. Stderr goes to a file: what the remote shell left running may hold it open.
+fn run_limited(cmd: &mut std::process::Command, limit: std::time::Duration) -> (i32, String, std::time::Duration) {
+    let errs = tempfile::NamedTempFile::new().unwrap();
+    let start = std::time::Instant::now();
+    let mut child = cmd.stdout(std::process::Stdio::null()).stderr(errs.reopen().unwrap()).spawn().unwrap();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let took = start.elapsed();
+            return (status.code().unwrap_or(-1), fs::read_to_string(errs.path()).unwrap(), took);
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return (-1, "killed".into(), start.elapsed());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn timeout_ends_a_stalled_transfer_with_30() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("big", noise(4 << 20, 3)).file("small", "s").settle_mtimes();
+    let deaf = tmp.path().join("deaf-ssh");
+    // Keeps its stdout open and says nothing.
+    fs::write(&deaf, "#!/bin/sh\ncat >/dev/null\n").unwrap();
+    fs::set_permissions(&deaf, fs::Permissions::from_mode(0o755)).unwrap();
+    let stall = stall_ssh(tmp.path());
+    let limit = std::time::Duration::from_secs(20);
+    let rsync_bin = reference_rsync().unwrap();
+    let barq = |shim: &Path, src: &str, dst: &str| {
+        let mut f = std::process::Command::new(env!("CARGO_BIN_EXE_barqsync"));
+        f.current_dir(tmp.path()).env("BARQSYNC_TRANSPORT", "ssh").args(["-a", "--timeout=2", "-e"]).arg(shim);
+        f.arg(format!("--remote-path={}", env!("CARGO_BIN_EXE_barqsync"))).args([src, dst]);
+        run_limited(&mut f, limit)
+    };
+    // A remote side that never answers.
+    let mut r = std::process::Command::new(&rsync_bin);
+    r.current_dir(tmp.path()).args(["-a", "--timeout=2", "-e"]).arg(&deaf).arg(format!("--rsync-path={}", rsync_bin.display()));
+    let (rc, rerr, _) = run_limited(r.args(["src/", "fakehost:xr"]), limit);
+    let (fc, ferr, took) = barq(&deaf, "src/", "fakehost:xf");
+    assert_eq!((rc, fc), (30, 30), "rsync: {rerr}\nbarqsync: {ferr}");
+    assert!(ferr.contains("io timeout after 2 seconds"), "{ferr}");
+    assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    // A pull whose data stops arriving midway. (rsync 3.5.1 doesn't notice this one: its
+    // receiving process leaves timeouts to the generator, which still hears from it.)
+    let (fc, ferr, took) = barq(&stall, "fakehost:src/", "y");
+    assert_eq!(fc, 30, "{ferr}");
+    assert!(ferr.contains("io timeout after"), "{ferr}");
+    assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    // A transfer that keeps moving is not cut short, however long it takes.
+    let f = barqsync_remote(tmp.path(), &["-a", "--timeout=1", "src/", "{host}ok"]);
+    assert_eq!(f.code, 0, "{}", f.stderr);
+}
+
+#[test]
+fn stats_print_rsync_byte_counts() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("a", vec![5u8; 200_000]).file("b", "bb").settle_mtimes();
+    let pats = [
+        r"^Total bytes sent: [0-9,]+$",
+        r"^Total bytes received: [0-9,]+$",
+        r"^sent [0-9,]+ bytes  received [0-9,]+ bytes  [0-9,]+\.[0-9]{2} bytes/sec$",
+        r"^total size is [0-9,]+  speedup is [0-9,]+\.[0-9]{2}$",
+    ];
+    let lines = |out: &str, pat: &str| -> Vec<String> {
+        let re = regex_lite(pat);
+        out.lines().filter(|l| re(l)).map(str::to_string).collect()
+    };
+    let num = |line: &str, after: &str| -> u64 {
+        let rest = &line[line.find(after).unwrap() + after.len()..];
+        rest.chars().take_while(|c| c.is_ascii_digit() || *c == ',').filter(char::is_ascii_digit).collect::<String>().parse().unwrap()
+    };
+    let (r, f) = both(tmp.path(), &["-a", "--stats", "src/", "{dst}"], "dr", "df").unwrap();
+    let (pr, pf) = both_remote(tmp.path(), &["-a", "--stats", "src/", "{host}{dst}"], "pr", "pf").unwrap();
+    for (out, what) in [(&r, "rsync"), (&f, "local"), (&pr, "rsync push"), (&pf, "push")] {
+        for pat in pats {
+            assert_eq!(lines(&out.stdout, pat).len(), 1, "{what}: {pat}\n{}", out.stdout);
+        }
+    }
+    // A push sends the data, and some protocol around it.
+    let sent = num(&lines(&pf.stdout, pats[0])[0], "sent: ");
+    let received = num(&lines(&pf.stdout, pats[1])[0], "received: ");
+    assert!(sent > 200_000 && received > 0, "{}", pf.stdout);
+    // -v alone prints the two summary lines, a dry run says so.
+    let (r, f) = both(tmp.path(), &["-avn", "src/", "{dst}"], "vr", "vf").unwrap();
+    for out in [&r, &f] {
+        assert_eq!(lines(&out.stdout, pats[2]).len(), 1, "{}", out.stdout);
+        assert!(out.stdout.lines().any(|l| l.starts_with("total size is ") && l.ends_with(" (DRY RUN)")), "{}", out.stdout);
+        assert!(lines(&out.stdout, pats[0]).is_empty());
+    }
+}
+
+/// A tiny matcher for the patterns above: `^...$` with `[0-9,]+`, `[0-9]{2}`, `\.`.
+fn regex_lite(pat: &str) -> impl Fn(&str) -> bool + '_ {
+    move |s: &str| {
+        fn m(p: &[u8], t: &[u8]) -> bool {
+            if p.is_empty() || p == b"$" {
+                return t.is_empty();
+            }
+            if let Some(rest) = p.strip_prefix(b"[0-9,]+") {
+                let n = t.iter().take_while(|c| c.is_ascii_digit() || **c == b',').count();
+                return (1..=n).rev().any(|k| m(rest, &t[k..]));
+            }
+            if let Some(rest) = p.strip_prefix(b"[0-9]{2}") {
+                return t.len() >= 2 && t[..2].iter().all(u8::is_ascii_digit) && m(rest, &t[2..]);
+            }
+            if let Some(rest) = p.strip_prefix(b"\\.") {
+                return t.first() == Some(&b'.') && m(rest, &t[1..]);
+            }
+            t.first() == p.first() && m(&p[1..], &t[1..])
+        }
+        m(pat.strip_prefix('^').unwrap_or(pat).as_bytes(), s.as_bytes())
+    }
+}

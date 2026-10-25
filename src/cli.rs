@@ -5,9 +5,10 @@ use crate::delta::DeltaMode;
 use crate::proto::Wire;
 use crate::remote::{Strategy, Transport};
 use crate::scan::Scanner;
-use crate::filter::{RuleSpec, read_rules_file};
+use crate::filter::{RuleParser, RuleSpec};
 use anyhow::{Context, Result, bail};
 use std::os::unix::ffi::OsStrExt;
+use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -18,7 +19,13 @@ use std::path::PathBuf;
     name = "barqsync",
     version,
     about = "A fast, parallel, rsync-compatible file synchronizer",
-    disable_help_flag = true
+    disable_help_flag = true,
+    after_help = "Options implied by others (-a, -D, ...) or given earlier can be turned off with \
+                  --no-OPTION: --no-r, --no-l, --no-p, --no-t, --no-g, --no-o, --no-D, --no-devices, \
+                  --no-specials, --no-H, --no-A, --no-X, --no-O, --no-d, --no-x, --no-S, --no-c, --no-z, \
+                  --no-W, --no-v, --no-i, --no-h, --no-8, --no-m, --no-s, --no-inplace, --no-partial, \
+                  --no-progress, --no-numeric-ids, --no-backup, --no-mkpath, --no-timeout, --no-from0 \
+                  (and their long forms, e.g. --no-owner)."
 )]
 pub struct Cli {
     /// Print help
@@ -56,8 +63,8 @@ pub struct Cli {
     #[arg(short = 'A', long)]
     acls: bool,
     /// Preserve extended attributes (twice: also rsync's internal rsync.% ones)
-    #[arg(short = 'X', long, action = ArgAction::Count)]
-    xattrs: u8,
+    #[arg(short = 'X', long, action = ArgAction::Append, num_args = 0, default_missing_value = "1")]
+    xattrs: Vec<u8>,
     /// Transform symlinks into the files/directories they point to
     #[arg(short = 'L', long = "copy-links")]
     copy_links: bool,
@@ -95,12 +102,14 @@ pub struct Cli {
     #[arg(long)]
     specials: bool,
 
+    // Counted flags are lists, so that each occurrence keeps its place on the command
+    // line (a later --no-v resets the count, as in rsync; see `count_since`).
     /// Increase verbosity
-    #[arg(short = 'v', long, action = ArgAction::Count)]
-    verbose: u8,
+    #[arg(short = 'v', long, action = ArgAction::Append, num_args = 0, default_missing_value = "1")]
+    verbose: Vec<u8>,
     /// Output a change-summary for all updates (twice: also unchanged items)
-    #[arg(short = 'i', long = "itemize-changes", action = ArgAction::Count)]
-    itemize: u8,
+    #[arg(short = 'i', long = "itemize-changes", action = ArgAction::Append, num_args = 0, default_missing_value = "1")]
+    itemize: Vec<u8>,
     /// Suppress non-error messages
     #[arg(short = 'q', long)]
     quiet: bool,
@@ -142,7 +151,7 @@ pub struct Cli {
     #[arg(short = 'W', long = "whole-file")]
     whole_file: bool,
     /// Always use the delta-transfer algorithm
-    #[arg(long = "no-whole-file", overrides_with = "whole_file")]
+    #[arg(long = "no-whole-file", alias = "no-W", overrides_with = "whole_file")]
     no_whole_file: bool,
     /// Directory scanner: one task per directory, or a jwalk tree scan feeding queues
     #[arg(long, value_enum, value_name = "MODE", default_value_t, env = "BARQSYNC_SCANNER", hide_env = true)]
@@ -169,24 +178,60 @@ pub struct Cli {
     #[arg(long = "no-drop-cache", overrides_with = "drop_cache")]
     no_drop_cache: bool,
 
-    /// Delete extraneous files from destination dirs
+    /// Delete extraneous files from destination dirs, once the transfer is done
     #[arg(long)]
     delete: bool,
+    /// Same as --delete (rsync deletes before the transfer; see docs/implementation.md)
+    #[arg(long = "delete-before")]
+    delete_before: bool,
+    /// Same as --delete (rsync deletes during the transfer; see docs/implementation.md)
+    #[arg(long = "delete-during", alias = "del")]
+    delete_during: bool,
+    /// Find deletions during the transfer, delete after it (what --delete does)
+    #[arg(long = "delete-delay")]
+    delete_delay: bool,
+    /// Delete after the transfer (what --delete does)
+    #[arg(long = "delete-after")]
+    delete_after: bool,
     /// Also delete excluded files from destination dirs
     #[arg(long = "delete-excluded")]
     delete_excluded: bool,
+    /// Don't delete more than NUM files (more due: warn and exit 25)
+    #[arg(long = "max-delete", value_name = "NUM", allow_negative_numbers = true)]
+    max_delete: Option<i64>,
+    /// Add a file-filtering RULE (`- PATTERN`, `+ PATTERN`, `. FILE`, `: FILE`, `P`, `H`, ...)
+    #[arg(short = 'f', long, value_name = "RULE", value_parser = clap::value_parser!(OsString), allow_hyphen_values = true)]
+    filter: Vec<OsString>,
+    /// Same as --filter='dir-merge /.rsync-filter'; repeated: --filter='- .rsync-filter'
+    #[arg(short = 'F', action = ArgAction::Append, num_args = 0, default_missing_value = "1")]
+    rsync_filter: Vec<u8>,
+    /// Auto-ignore files in the same way CVS does
+    #[arg(short = 'C', long = "cvs-exclude")]
+    cvs_exclude: bool,
     /// Exclude files matching PATTERN
-    #[arg(long, value_name = "PATTERN")]
-    exclude: Vec<String>,
+    #[arg(long, value_name = "PATTERN", value_parser = clap::value_parser!(OsString), allow_hyphen_values = true)]
+    exclude: Vec<OsString>,
     /// Don't exclude files matching PATTERN
-    #[arg(long, value_name = "PATTERN")]
-    include: Vec<String>,
+    #[arg(long, value_name = "PATTERN", value_parser = clap::value_parser!(OsString), allow_hyphen_values = true)]
+    include: Vec<OsString>,
     /// Read exclude patterns from FILE
     #[arg(long = "exclude-from", value_name = "FILE")]
     exclude_from: Vec<PathBuf>,
     /// Read include patterns from FILE
     #[arg(long = "include-from", value_name = "FILE")]
     include_from: Vec<PathBuf>,
+    /// Prune empty directory chains from the file list
+    #[arg(short = 'm', long = "prune-empty-dirs")]
+    prune_empty_dirs: bool,
+    /// Create the destination's missing path components
+    #[arg(long)]
+    mkpath: bool,
+    /// Accepted for rsync compatibility: paths always travel in the protocol, never on the remote command line
+    #[arg(short = 's', long = "secluded-args", alias = "protect-args")]
+    secluded_args: bool,
+    /// Exit (code 30) when no data moves over a remote connection for SECONDS
+    #[arg(long, value_name = "SECONDS")]
+    timeout: Option<u64>,
 
     /// Skip files that are newer on the receiver
     #[arg(short = 'u', long)]
@@ -269,6 +314,72 @@ pub struct Cli {
     #[arg(long, value_enum, value_name = "FORMAT", default_value_t, env = "BARQSYNC_WIRE", hide_env = true)]
     wire: Wire,
 
+    // --no-OPTION: turns off what an earlier option (or -a, -D) turned on; see `toggle`.
+    #[arg(long = "no-recursive", alias = "no-r", hide = true)]
+    no_recursive: bool,
+    #[arg(long = "no-links", alias = "no-l", hide = true)]
+    no_links: bool,
+    #[arg(long = "no-perms", alias = "no-p", hide = true)]
+    no_perms: bool,
+    #[arg(long = "no-times", alias = "no-t", hide = true)]
+    no_times: bool,
+    #[arg(long = "no-group", alias = "no-g", hide = true)]
+    no_group: bool,
+    #[arg(long = "no-owner", alias = "no-o", hide = true)]
+    no_owner: bool,
+    #[arg(long = "no-D", hide = true)]
+    no_devices_specials: bool,
+    #[arg(long = "no-devices", hide = true)]
+    no_devices: bool,
+    #[arg(long = "no-specials", hide = true)]
+    no_specials: bool,
+    #[arg(long = "no-hard-links", alias = "no-H", hide = true)]
+    no_hard_links: bool,
+    #[arg(long = "no-acls", alias = "no-A", hide = true)]
+    no_acls: bool,
+    #[arg(long = "no-xattrs", alias = "no-X", hide = true)]
+    no_xattrs: bool,
+    #[arg(long = "no-omit-dir-times", alias = "no-O", hide = true)]
+    no_omit_dir_times: bool,
+    #[arg(long = "no-dirs", alias = "no-d", hide = true)]
+    no_dirs: bool,
+    #[arg(long = "no-one-file-system", alias = "no-x", hide = true)]
+    no_one_file_system: bool,
+    #[arg(long = "no-sparse", alias = "no-S", hide = true)]
+    no_sparse: bool,
+    #[arg(long = "no-checksum", alias = "no-c", hide = true)]
+    no_checksum: bool,
+    #[arg(long = "no-compress", alias = "no-z", hide = true)]
+    no_compress: bool,
+    #[arg(long = "no-verbose", alias = "no-v", hide = true)]
+    no_verbose: bool,
+    #[arg(long = "no-itemize-changes", alias = "no-i", hide = true)]
+    no_itemize: bool,
+    #[arg(long = "no-human-readable", alias = "no-h", hide = true)]
+    no_human: bool,
+    #[arg(long = "no-8-bit-output", alias = "no-8", hide = true)]
+    no_eight_bit_output: bool,
+    #[arg(long = "no-prune-empty-dirs", alias = "no-m", hide = true)]
+    no_prune_empty_dirs: bool,
+    #[arg(long = "no-secluded-args", aliases = ["no-protect-args", "no-s"], hide = true)]
+    no_secluded_args: bool,
+    #[arg(long = "no-inplace", hide = true)]
+    no_inplace: bool,
+    #[arg(long = "no-partial", hide = true)]
+    no_partial: bool,
+    #[arg(long = "no-progress", hide = true)]
+    no_progress: bool,
+    #[arg(long = "no-numeric-ids", hide = true)]
+    no_numeric_ids: bool,
+    #[arg(long = "no-backup", hide = true)]
+    no_backup: bool,
+    #[arg(long = "no-mkpath", hide = true)]
+    no_mkpath: bool,
+    #[arg(long = "no-timeout", hide = true)]
+    no_timeout: bool,
+    #[arg(long = "no-from0", hide = true)]
+    no_from0: bool,
+
     #[arg(long, hide = true)]
     server: bool,
     #[arg(long, hide = true)]
@@ -336,7 +447,15 @@ pub struct Options {
 
     pub delete: bool,
     pub delete_excluded: bool,
+    /// `--max-delete`: at most this many deletions (`None`: no limit).
+    pub max_delete: Option<u64>,
     pub filter_rules: Vec<RuleSpec>,
+    /// `-m`: directories with nothing but directories below them are left out.
+    pub prune_empty_dirs: bool,
+    /// `--mkpath`: missing directories leading to the destination are created.
+    pub mkpath: bool,
+    /// `--timeout`: seconds a remote connection may go without data (0: no limit).
+    pub timeout: u64,
 
     pub update: bool,
     pub size_only: bool,
@@ -385,17 +504,20 @@ impl Options {
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        let matches = Cli::command().try_get_matches_from(args)?;
+        // Like rsync, a flag or option given again is no error: the last one counts.
+        // (Counted flags such as -v and lists such as --exclude keep every occurrence.)
+        let cmd = Cli::command().mut_args(|a| match a.get_action() {
+            ArgAction::SetTrue | ArgAction::Set => {
+                let id = a.get_id().clone();
+                a.overrides_with(id)
+            }
+            _ => a,
+        });
+        let matches = cmd.try_get_matches_from(args)?;
         let cli = Cli::from_arg_matches(&matches)?;
-        let mut filter_rules = ordered_filter_rules(&cli, &matches)?;
-        // rsync protects a relative partial dir (and hides one on the sender) with a
-        // trailing exclude rule.
-        if let Some(d) = &cli.partial_dir
-            && !d.as_bytes().starts_with(b"/")
-        {
-            let d = String::from_utf8_lossy(d.as_bytes()).trim_end_matches('/').to_string();
-            filter_rules.push(RuleSpec { include: false, pattern: format!("{d}/") });
-        }
+        let m = &matches;
+        let from0 = toggle(m, &["from0"], &["no_from0"]).unwrap_or(false);
+        let filter_rules = ordered_filter_rules(&cli, m, from0)?;
         let chmod = parse_chmod_args(&cli.chmod)?;
         let max_size = cli.max_size.as_deref().map(|s| parse_size(s, "--max-size")).transpose()?;
         let min_size = cli.min_size.as_deref().map(|s| parse_size(s, "--min-size")).transpose()?;
@@ -406,11 +528,16 @@ impl Options {
         if cli.backup && cli.backup_dir.is_none() && cli.suffix.as_deref() == Some("") {
             bail!("--suffix cannot be empty without a --backup-dir");
         }
+        // --del, --delete-during and --delete-delay set one choice, as in rsync.
+        let when = [cli.delete_before, cli.delete_during || cli.delete_delay, cli.delete_after];
+        if when.iter().filter(|&&w| w).count() > 1 {
+            bail!("You may not combine multiple --delete-WHEN options.");
+        }
         let files_from = match &cli.files_from {
-            Some(f) => Some(read_files_from(f, cli.from0)?),
+            Some(f) => Some(read_files_from(f, from0)?),
             None => None,
         };
-        let mut o = Options::from_cli(cli, filter_rules);
+        let mut o = Options::from_cli(cli, m, filter_rules);
         o.chmod = chmod;
         o.max_size = max_size;
         o.min_size = min_size;
@@ -418,49 +545,53 @@ impl Options {
             // rsync: --files-from implies -R and -d, and -a no longer implies -r.
             o.relative = true;
             o.dirs = true;
-            o.recursive = matches.get_flag("recursive");
+            o.recursive = toggle(m, &["recursive"], &["no_recursive"]).unwrap_or(false);
         }
         o.files_from = files_from;
+        if o.delete && !o.recursive && !o.dirs {
+            bail!("--delete does not work without --recursive (-r) or --dirs (-d).");
+        }
         Ok(o)
     }
 
-    fn from_cli(c: Cli, filter_rules: Vec<RuleSpec>) -> Options {
-        let a = c.archive;
+    fn from_cli(c: Cli, m: &ArgMatches, filter_rules: Vec<RuleSpec>) -> Options {
+        let on = |on: &[&str], off: &[&str]| toggle(m, on, off).unwrap_or(false);
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let backup = on(&["backup"], &["no_backup"]) || c.backup_dir.is_some();
+        let quiet = c.quiet;
         Options {
-            recursive: c.recursive || a,
-            links: c.links || a,
-            hard_links: c.hard_links,
+            recursive: on(&["archive", "recursive"], &["no_recursive"]),
+            links: on(&["archive", "links"], &["no_links"]),
+            hard_links: on(&["hard_links"], &["no_hard_links"]),
             // rsync: -A implies -p.
-            perms: c.perms || a || c.acls,
-            times: c.times || a,
-            omit_dir_times: c.omit_dir_times || (c.backup && c.backup_dir.is_none()),
-            group: c.group || a,
-            owner: c.owner || a,
-            acls: c.acls,
-            xattrs: c.xattrs,
-            devices: c.devices || c.devices_specials || a,
-            specials: c.specials || c.devices_specials || a,
+            perms: on(&["archive", "perms", "acls"], &["no_perms"]),
+            times: on(&["archive", "times"], &["no_times"]),
+            omit_dir_times: on(&["omit_dir_times"], &["no_omit_dir_times"]) || (backup && c.backup_dir.is_none()),
+            group: on(&["archive", "group"], &["no_group"]),
+            owner: on(&["archive", "owner"], &["no_owner"]),
+            acls: on(&["acls"], &["no_acls"]),
+            xattrs: count_since(m, "xattrs", "no_xattrs"),
+            devices: on(&["archive", "devices_specials", "devices"], &["no_devices_specials", "no_devices"]),
+            specials: on(&["archive", "devices_specials", "specials"], &["no_devices_specials", "no_specials"]),
             copy_links: c.copy_links,
             copy_dirlinks: c.copy_dirlinks,
             keep_dirlinks: c.keep_dirlinks,
-            dirs: c.dirs,
+            dirs: on(&["dirs"], &["no_dirs"]),
             relative: c.relative,
             files_from: None,
             chmod: Vec::new(),
-            numeric_ids: c.numeric_ids,
-            verbose: if c.quiet { 0 } else { c.verbose },
-            itemize: if c.quiet { 0 } else { c.itemize },
-            quiet: c.quiet,
+            numeric_ids: on(&["numeric_ids"], &["no_numeric_ids"]),
+            verbose: if quiet { 0 } else { count_since(m, "verbose", "no_verbose") },
+            itemize: if quiet { 0 } else { count_since(m, "itemize", "no_itemize") },
+            quiet,
             dry_run: c.dry_run,
             out_format: c.out_format,
-            progress: c.progress
-                || c.partial_progress
+            progress: on(&["progress", "partial_progress"], &["no_progress"])
                 || c.info.iter().flat_map(|f| f.split(',')).any(|f| f.starts_with("progress") && f != "progress0"),
             stats: c.stats,
-            human: c.human,
-            eight_bit_output: c.eight_bit_output,
-            compress: c.compress,
+            human: on(&["human"], &["no_human"]),
+            eight_bit_output: on(&["eight_bit_output"], &["no_eight_bit_output"]),
+            compress: on(&["compress"], &["no_compress"]),
             whole_file: if c.whole_file {
                 Some(true)
             } else if c.no_whole_file {
@@ -470,27 +601,35 @@ impl Options {
             },
             delta: c.delta,
             scanner: c.scanner,
-            inplace: c.inplace,
+            inplace: on(&["inplace"], &["no_inplace"]),
             fsync: c.fsync,
             no_clone: c.no_clone,
             drop_cache: c.drop_cache || !c.no_drop_cache,
-            sparse: c.sparse,
-            partial: c.partial || c.partial_progress || c.partial_dir.is_some(),
+            sparse: on(&["sparse"], &["no_sparse"]),
+            partial: on(&["partial", "partial_progress"], &["no_partial"]) || c.partial_dir.is_some(),
             partial_dir: c.partial_dir,
-            delete: c.delete || c.delete_excluded,
+            delete: c.delete || c.delete_before || c.delete_during || c.delete_delay || c.delete_after || c.delete_excluded,
             delete_excluded: c.delete_excluded,
+            // rsync: a negative limit means no deletions at all.
+            max_delete: c.max_delete.map(|n| n.max(0) as u64),
             filter_rules,
+            prune_empty_dirs: on(&["prune_empty_dirs"], &["no_prune_empty_dirs"]),
+            mkpath: on(&["mkpath"], &["no_mkpath"]),
+            timeout: match toggle(m, &["timeout"], &["no_timeout"]) {
+                Some(true) => c.timeout.unwrap_or(0),
+                _ => 0,
+            },
             update: c.update,
             size_only: c.size_only,
             ignore_times: c.ignore_times,
             ignore_existing: c.ignore_existing,
-            one_file_system: c.one_file_system,
+            one_file_system: on(&["one_file_system"], &["no_one_file_system"]),
             modify_window: c.modify_window,
-            checksum: c.checksum,
+            checksum: on(&["checksum"], &["no_checksum"]),
             existing: c.existing,
             max_size: None,
             min_size: None,
-            backup: c.backup || c.backup_dir.is_some(),
+            backup,
             suffix: c.suffix.unwrap_or_else(|| if c.backup_dir.is_some() { String::new() } else { "~".to_string() }),
             backup_dir: c.backup_dir,
             alt_link: !c.link_dest.is_empty(),
@@ -521,6 +660,31 @@ impl Options {
             paths: c.paths,
         }
     }
+}
+
+/// Where the last of these arguments is on the command line, if any was given there.
+fn last_index(m: &ArgMatches, ids: &[&str]) -> Option<usize> {
+    ids.iter()
+        .filter(|id| m.value_source(id) == Some(ValueSource::CommandLine))
+        .filter_map(|id| m.indices_of(id).and_then(Iterator::max))
+        .max()
+}
+
+/// rsync processes options in order: the last of `on` (e.g. `-a`, `-o`) and `off`
+/// (`--no-o`) given decides. `None`: neither was given.
+fn toggle(m: &ArgMatches, on: &[&str], off: &[&str]) -> Option<bool> {
+    match (last_index(m, on), last_index(m, off)) {
+        (None, None) => None,
+        (a, b) => Some(a > b),
+    }
+}
+
+/// How many times a counted flag (`-v`) was given after its last `--no-` form.
+fn count_since(m: &ArgMatches, id: &str, off: &str) -> u8 {
+    let since = last_index(m, &[off]);
+    let given = m.value_source(id) == Some(ValueSource::CommandLine);
+    let n = m.indices_of(id).filter(|_| given).map_or(0, |i| i.filter(|&i| Some(i) > since).count());
+    n.min(u8::MAX as usize) as u8
 }
 
 fn parse_chmod_args(specs: &[String]) -> Result<Vec<ChmodRule>> {
@@ -599,31 +763,51 @@ fn read_files_from(file: &OsString, from0: bool) -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
-/// Include/exclude options are order-sensitive across flags, so rebuild the
-/// combined list using each value's position on the command line.
-fn ordered_filter_rules(cli: &Cli, m: &ArgMatches) -> Result<Vec<RuleSpec>> {
-    let mut indexed: Vec<(usize, Vec<RuleSpec>)> = Vec::new();
-    let mut push_patterns = |id: &str, values: &[String], include: bool| {
-        if let Some(idx) = m.indices_of(id) {
-            for (i, v) in idx.zip(values) {
-                indexed.push((i, vec![RuleSpec { include, pattern: v.clone() }]));
-            }
-        }
-    };
-    push_patterns("exclude", &cli.exclude, false);
-    push_patterns("include", &cli.include, true);
-    for (id, files, include) in [
-        ("exclude_from", &cli.exclude_from, false),
-        ("include_from", &cli.include_from, true),
-    ] {
-        if let Some(idx) = m.indices_of(id) {
-            for (i, f) in idx.zip(files) {
-                indexed.push((i, read_rules_file(f, include)?));
-            }
-        }
+/// The filter rules, in command-line order across `--filter`, `--include`, `--exclude`,
+/// their `-from` files and `-F`; `.` merge files are read now. Then, as in rsync, the
+/// rule hiding a relative `--partial-dir`, and `-C`'s rules last.
+fn ordered_filter_rules(cli: &Cli, m: &ArgMatches, from0: bool) -> Result<Vec<RuleSpec>> {
+    enum Opt<'a> {
+        Filter(&'a OsString),
+        Pattern(&'a OsString, bool),
+        File(&'a PathBuf, bool),
+        RsyncFilter(usize),
     }
-    indexed.sort_by_key(|(i, _)| *i);
-    Ok(indexed.into_iter().flat_map(|(_, r)| r).collect())
+    let mut opts: Vec<(usize, Opt)> = Vec::new();
+    let indices = |id: &str| m.indices_of(id).into_iter().flatten();
+    opts.extend(indices("filter").zip(&cli.filter).map(|(i, v)| (i, Opt::Filter(v))));
+    opts.extend(indices("exclude").zip(&cli.exclude).map(|(i, v)| (i, Opt::Pattern(v, false))));
+    opts.extend(indices("include").zip(&cli.include).map(|(i, v)| (i, Opt::Pattern(v, true))));
+    opts.extend(indices("exclude_from").zip(&cli.exclude_from).map(|(i, f)| (i, Opt::File(f, false))));
+    opts.extend(indices("include_from").zip(&cli.include_from).map(|(i, f)| (i, Opt::File(f, true))));
+    opts.extend(indices("rsync_filter").enumerate().map(|(n, i)| (i, Opt::RsyncFilter(n))));
+    opts.sort_by_key(|(i, _)| *i);
+    let mut p = RuleParser::new(from0);
+    for (_, opt) in opts {
+        match opt {
+            Opt::Filter(rule) => p.filter(rule.as_bytes()),
+            Opt::Pattern(pattern, include) => p.pattern(pattern.as_bytes(), include),
+            Opt::File(f, include) => p.file(f, include),
+            // -F: the first one reads `.rsync-filter` files, a second hides them.
+            Opt::RsyncFilter(0) => p.filter(b": /.rsync-filter"),
+            Opt::RsyncFilter(1) => p.filter(b"- .rsync-filter"),
+            Opt::RsyncFilter(_) => Ok(()),
+        }?;
+    }
+    // rsync protects a relative partial dir (and hides one on the sender) with a
+    // trailing exclude rule.
+    if let Some(d) = &cli.partial_dir
+        && !d.as_bytes().starts_with(b"/")
+    {
+        let d = d.as_bytes();
+        let end = d.iter().rposition(|&c| c != b'/').map_or(0, |e| e + 1);
+        p.rules.push(RuleSpec::exclude([&d[..end], b"/"].concat()));
+    }
+    if cli.cvs_exclude {
+        p.filter(b":C")?;
+        p.filter(b"-C")?;
+    }
+    Ok(p.rules)
 }
 
 #[cfg(test)]
@@ -660,8 +844,96 @@ mod tests {
             "barqsync", "--include", "keep.log", "--exclude", "*.log", "--include", "x", "s", "d",
         ])
         .unwrap();
-        let pats: Vec<_> = o.filter_rules.iter().map(|r| (r.include, r.pattern.as_str())).collect();
-        assert_eq!(pats, vec![(true, "keep.log"), (false, "*.log"), (true, "x")]);
+        let pats: Vec<_> = o
+            .filter_rules
+            .iter()
+            .map(|r| match r {
+                RuleSpec::Pattern { include, pattern, .. } => (*include, String::from_utf8_lossy(pattern).into_owned()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let want = [(true, "keep.log"), (false, "*.log"), (true, "x")];
+        assert_eq!(pats, want.map(|(i, p)| (i, p.to_string())));
+    }
+
+    #[test]
+    fn filter_options_keep_command_line_order() {
+        use crate::filter::{MergeMods, Mods};
+        let o = Options::parse_from([
+            "barqsync", "-C", "--exclude", "a", "-f", "+ b", "-F", "--include=- c", "-F", "-f", "P d", "-F", "s", "d",
+        ])
+        .unwrap();
+        let pat = |include: bool, p: &str, mods: Mods| RuleSpec::Pattern { include, pattern: p.as_bytes().to_vec(), mods };
+        let none = Mods::default();
+        let cvs = MergeMods { only: Some(false), words: true, no_inherit: true, cvs: true };
+        assert_eq!(
+            o.filter_rules,
+            vec![
+                pat(false, "a", none),
+                pat(true, "b", none),
+                RuleSpec::DirMerge { name: b"/.rsync-filter".to_vec(), merge: MergeMods::default(), mods: none },
+                // An old-style --include takes a `- ` prefix.
+                pat(false, "c", none),
+                pat(false, ".rsync-filter", none),
+                pat(false, "d", Mods { receiver: true, ..none }),
+                // -C's rules come last, wherever it was given.
+                RuleSpec::DirMerge { name: b".cvsignore".to_vec(), merge: cvs, mods: none },
+                RuleSpec::Cvs { mods: none },
+            ]
+        );
+        assert!(Options::parse_from(["barqsync", "-f", "bogus", "s", "d"]).is_err());
+        assert!(Options::parse_from(["barqsync", "--exclude-from=/nonexistent/x", "s", "d"]).is_err());
+    }
+
+    #[test]
+    fn no_option_negates_what_came_before() {
+        let o = Options::parse_from(["barqsync", "-a", "--no-o", "--no-g", "--no-perms", "--no-t", "--no-D", "s", "d"]).unwrap();
+        assert!(o.recursive && o.links);
+        assert!(!o.owner && !o.group && !o.perms && !o.times && !o.devices && !o.specials);
+        // The last of the two wins, as in rsync.
+        let o = Options::parse_from(["barqsync", "--no-o", "-a", "--no-l", "--no-r", "-d", "s", "d"]).unwrap();
+        assert!(o.owner && !o.links && !o.recursive && o.dirs);
+        let o = Options::parse_from(["barqsync", "-a", "--no-recursive", "-r", "--no-specials", "s", "d"]).unwrap();
+        assert!(o.recursive && o.devices && !o.specials);
+        let o = Options::parse_from(["barqsync", "-avv", "--no-v", "-v", "-X", "--no-X", "s", "d"]).unwrap();
+        assert_eq!((o.verbose, o.xattrs), (1, 0));
+        let o = Options::parse_from(["barqsync", "-aA", "--no-A", "--no-W", "-z", "--no-z", "s", "d"]).unwrap();
+        assert!(!o.acls && o.perms && o.whole_file == Some(false) && !o.compress);
+        // Options may be repeated, as with rsync.
+        let o = Options::parse_from(["barqsync", "-a", "-a", "-P", "--partial", "--stats", "--stats", "s", "d"]).unwrap();
+        assert!(o.recursive && o.partial && o.progress && o.stats);
+        let o = Options::parse_from(["barqsync", "--exclude=x", "--exclude=y", "s", "d"]).unwrap();
+        assert_eq!(o.filter_rules.len(), 2, "repeated values add up");
+    }
+
+    #[test]
+    fn delete_timing_and_limits() {
+        for flag in ["--delete-before", "--delete-during", "--del", "--delete-delay", "--delete-after"] {
+            let o = Options::parse_from(["barqsync", "-r", flag, "s", "d"]).unwrap();
+            assert!(o.delete, "{flag}");
+        }
+        assert!(Options::parse_from(["barqsync", "-r", "--delete-before", "--delete-after", "s", "d"]).is_err());
+        assert!(Options::parse_from(["barqsync", "-r", "--delete-delay", "--del", "s", "d"]).is_ok(), "one choice");
+        assert!(Options::parse_from(["barqsync", "--delete", "s", "d"]).is_err(), "needs -r or -d");
+        assert!(Options::parse_from(["barqsync", "-a", "--no-r", "--delete", "s", "d"]).is_err());
+        assert!(Options::parse_from(["barqsync", "-d", "--delete", "s", "d"]).is_ok());
+        let o = Options::parse_from(["barqsync", "-r", "--max-delete=3", "s", "d"]).unwrap();
+        assert_eq!((o.max_delete, o.delete), (Some(3), false));
+        let o = Options::parse_from(["barqsync", "-r", "--max-delete=-1", "s", "d"]).unwrap();
+        assert_eq!(o.max_delete, Some(0), "negative: no deletions");
+        let o = Options::parse_from(["barqsync", "-r", "s", "d"]).unwrap();
+        assert_eq!(o.max_delete, None);
+    }
+
+    #[test]
+    fn accepted_rsync_options() {
+        let o = Options::parse_from(["barqsync", "-asm", "--mkpath", "--protect-args", "--timeout=30", "s", "d"]).unwrap();
+        assert!(o.prune_empty_dirs && o.mkpath);
+        assert_eq!(o.timeout, 30);
+        let o = Options::parse_from(["barqsync", "-a", "--timeout=30", "--no-timeout", "--secluded-args", "--no-s", "s", "d"]).unwrap();
+        assert_eq!(o.timeout, 0);
+        let o = Options::parse_from(["barqsync", "-am", "--no-m", "--mkpath", "--no-mkpath", "s", "d"]).unwrap();
+        assert!(!o.prune_empty_dirs && !o.mkpath);
     }
 
     #[test]

@@ -77,7 +77,7 @@ fn finish(c: &Conn, dirs: u32) {
 
 fn finish_with_errors(c: &Conn, dirs: u32, errors: u64) {
     c.msg(Msg::ScanDone { dirs }).unwrap();
-    c.msg(Msg::SenderDone { errors }).unwrap();
+    c.msg(Msg::SenderDone { errors, vanished: 0 }).unwrap();
     while let Some(f) = next(c) {
         if matches!(f, Frame::Msg(Msg::ReceiverDone { .. })) {
             return;
@@ -399,7 +399,7 @@ fn invalid_scan_completion_cannot_authorize_deletion() {
                 p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
                 need(p, 0);
                 match case {
-                    "missing" => p.msg(Msg::SenderDone { errors: 0 }).unwrap(),
+                    "missing" => p.msg(Msg::SenderDone { errors: 0, vanished: 0 }).unwrap(),
                     "count" => p.msg(Msg::ScanDone { dirs: 2 }).unwrap(),
                     "repeated" => {
                         p.msg(Msg::ScanDone { dirs: 1 }).unwrap();

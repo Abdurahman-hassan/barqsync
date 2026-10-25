@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Compatibility
+
+- Remote transfers now use protocol 11: the new options travel to the other side, which
+  also reports vanished files and `--max-delete` stops. Upgrade barqsync on both machines
+  together; this release cannot communicate with 0.4.x.
+
+### Added
+
+- rsync command lines that failed with "unexpected argument" now run unchanged:
+  - `--no-OPTION` (`--no-o`, `--no-g`, `--no-p`, `--no-t`, `--no-D`, `--no-r`, `--no-l`, and
+    more; see `--help`), applied in command-line order as rsync does, so `-a --no-o --no-g`
+    works for NAS, exFAT and SMB targets. Options may also be repeated (`-a -a`, `-P --partial`).
+  - `--delete-before`, `--delete-during`/`--del`, `--delete-delay` and `--delete-after`. All
+    of them delete after the transfer, once the whole source was read, as `--delete`
+    always has; see the implementation notes.
+  - `--max-delete=N`: at most N deletions, in rsync's order; the rest are reported and the
+    run ends with exit 25.
+  - rsync's filter rules: `--filter`/`-f` with `-`, `+`, `H`, `S`, `P`, `R` and `!` rules,
+    their modifiers, `.` merge files and `:` per-directory merge files; `-F`, `-FF` and
+    `-C`/`--cvs-exclude`. `--include`/`--exclude` also take rsync's `+ `/`- ` prefixes.
+  - `-m`/`--prune-empty-dirs`, `--mkpath`, and `-s`/`--secluded-args`/`--protect-args`
+    (accepted; barqsync never puts paths on the remote command line).
+  - `--timeout=SECONDS`: a remote transfer whose connection delivers nothing for that
+    long ends with exit 30. Both sides send keepalives while busy.
+- A source file that disappears between the scan and its transfer is now a warning
+  ("file has vanished") and exit 24, as with rsync, instead of an error and exit 23.
+- `--stats` also prints rsync's "Total bytes sent/received" lines, and `-v` or `--stats`
+  rsync's "sent N bytes  received M bytes" and "total size is" summary lines.
+
+### Fixed
+
+- `--delete` no longer removes what the filter rules protect inside a directory it deletes:
+  with `--exclude='*.log'`, `old/keep.log` stays, and so does `old` ("cannot delete
+  non-empty directory"), as with rsync. Before, the whole directory was removed. The same
+  holds when a directory is replaced by a file, which is then reported as rsync does
+  ("could not make way for new regular file").
+- `--delete` without `-r` or `-d` is refused (exit 1), as rsync does, instead of deleting
+  from the destination's top directory.
+- Without `-r` or `-d`, a `src/` argument is skipped ("skipping directory .") instead of
+  copying the files in it, as rsync does; "skipping directory" no longer needs `-v`.
+- A source that resolves to nothing no longer creates the destination directory.
+- An `--exclude-from`/`--include-from` file that can't be read now ends with exit 11, as
+  with rsync, instead of 1.
+
 ## 0.4.2 - 2026-10-21
 
 ### Compatibility

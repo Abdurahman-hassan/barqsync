@@ -8,6 +8,7 @@
 //! remote receiver sees a single, already merged root.
 
 use crate::entry::{DirEnt, Kind};
+use crate::filter::DirRules;
 use crate::select::{self, Descend, Sel};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -23,6 +24,9 @@ pub(crate) struct SrcDir {
     /// `-x`: the device of the transfer root this directory is in (`None`: each entry
     /// is a root of its own, as named items are).
     pub(crate) dev: Option<u64>,
+    /// Filter state (see [`DirRules`]): its parent's until this directory is read, then
+    /// its own.
+    pub(crate) rules: DirRules,
 }
 
 /// Where the entries of a merged listing come from.
@@ -64,7 +68,7 @@ impl Sources {
             };
             let path = d.path.join(name);
             if path != own && out.iter().all(|o| o.path != path) {
-                out.push(SrcDir { path, sel, dev: Some(root_dev) });
+                out.push(SrcDir { path, sel, dev: Some(root_dev), rules: d.rules.clone() });
             }
         }
         out
@@ -120,7 +124,7 @@ mod tests {
     }
 
     fn dir(p: &str) -> SrcDir {
-        SrcDir { path: PathBuf::from(p), sel: None, dev: Some(1) }
+        SrcDir { path: PathBuf::from(p), sel: None, dev: Some(1), rules: DirRules::default() }
     }
 
     #[test]
