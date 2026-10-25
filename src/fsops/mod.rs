@@ -298,8 +298,26 @@ pub fn interrupt_token() -> &'static tokio_util::sync::CancellationToken {
     &WAKE_TOKEN
 }
 
+/// Run [`on_interrupt`] on SIGINT, SIGTERM and SIGHUP (`ctrlc`'s `termination` feature).
+/// A SIGTERM or SIGHUP ignored when barqsync started (under `nohup`, or by a parent that
+/// ignores it) stays ignored, as Unix tools leave it: whoever started us asked for the
+/// transfer to survive it.
+pub fn handle_interrupts(code: i32) {
+    let ignored: Vec<i32> = [libc::SIGTERM, libc::SIGHUP]
+        .into_iter()
+        .filter(|&sig| unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+        })
+        .collect();
+    let _ = ctrlc::set_handler(move || on_interrupt(code));
+    for sig in ignored {
+        unsafe { libc::signal(sig, libc::SIG_IGN) };
+    }
+}
+
 /// Handler for Ctrl-C and the termination signals (SIGINT, SIGTERM, SIGHUP; see
-/// `ctrlc`'s `termination` feature). The first signal only raises a flag: workers notice
+/// [`handle_interrupts`]). The first signal only raises a flag: workers notice
 /// it between write chunks and before every rename, delete their own unfinished file and
 /// stop, so nothing is left half-written. A second signal forces an immediate exit.
 pub fn on_interrupt(code: i32) {

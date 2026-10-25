@@ -23,7 +23,7 @@ fn main() {
             }
         },
     };
-    let _ = ctrlc::set_handler(|| fsops::on_interrupt(exit::SIGNAL));
+    fsops::handle_interrupts(exit::SIGNAL);
     let code = barqsync::run(opts);
     // An interrupt can arrive after the transfer chose its status, while closing
     // connections or reaping the remote shell. It still determines the process exit.
