@@ -709,6 +709,11 @@ mod tests {
         let d = tmp.path();
         fs::write(d.join("f"), b"the source file").unwrap();
         let listed = lstat(&d.join("f")).unwrap();
+        // Hold the original file open for the whole test. Its inode number then stays
+        // allocated after the name is removed, so no replacement below can be handed the
+        // same inode -- which on an inode-recycling filesystem (ext4) would otherwise make
+        // a swapped-in regular file look like the one that was listed and fail the test.
+        let _original = fs::File::open(d.join("f")).unwrap();
 
         // The listed file itself: read normally.
         let mut s = String::new();
