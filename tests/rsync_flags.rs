@@ -1015,6 +1015,14 @@ fn prune_empty_dirs_matches_rsync() {
 // --mkpath, -s
 // ---------------------------------------------------------------------------
 
+/// The reference rsync's version, as (3, 5, 1).
+fn rsync_version() -> (u32, u32, u32) {
+    let out = std::process::Command::new(reference_rsync().unwrap()).arg("--version").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut n = text.split_whitespace().nth(2).unwrap_or("").split('.').map(|p| p.parse().unwrap_or(0));
+    (n.next().unwrap_or(0), n.next().unwrap_or(0), n.next().unwrap_or(0))
+}
+
 #[test]
 fn mkpath_matches_rsync() {
     if skip_without_rsync() {
@@ -1034,7 +1042,12 @@ fn mkpath_matches_rsync() {
         // Without --mkpath the missing parent is an error (11).
         &["-ai", "src/", "{dst}/b/c"],
     ];
+    // rsync fixed --mkpath in dry runs in 3.4.4 (its #880); older ones are no reference.
+    let dry_ok = rsync_version() >= (3, 4, 4);
     for (i, args) in cases.iter().enumerate() {
+        if args.contains(&"-ain") && !dry_ok {
+            continue;
+        }
         let (dr, df) = (format!("r{i}"), format!("f{i}"));
         let (r, f) = both(tmp.path(), args, &dr, &df).unwrap();
         same_output(&r, &f, &[(&dr, &df)], &format!("{args:?}"));
