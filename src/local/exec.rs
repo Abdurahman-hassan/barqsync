@@ -1885,11 +1885,13 @@ impl<'a> Engine<'a> {
                 Err(_) => {}
             }
         }
+        // Opened once, before anything is created: what is read must be the listed file.
+        let src_file = fsops::open_listed(&job.src_path, src, self.opts.copy_links)?;
         // All of a file sent whole is literal data, as rsync counts it.
         Stats::add(&self.stats.literal_bytes, src.size);
 
         if self.opts.inplace && job.dst_meta.is_some_and(|d| d.kind == Kind::File) {
-            fsops::copy_into_existing(&job.src_path, &job.dst_path, src.size)?;
+            fsops::copy_into_existing(&src_file, &job.dst_path, src.size)?;
             fsops::lchown(&job.dst_path, uid, gid)?;
             self.written_extra(&job.dst_path, job, mode)?;
             fsops::chmod(&job.dst_path, mode)?;
@@ -1911,7 +1913,7 @@ impl<'a> Engine<'a> {
             // on Ctrl-C the partial file is removed like a temp file.
             fsops::register_temp(&job.dst_path);
             let r = self
-                .copy_new(&job.src_path, &job.dst_path, src.size, allow_fast, mode)
+                .copy_from(&src_file, &job.dst_path, src.size, allow_fast, mode)
                 .and_then(|copied| self.apply_new_file_attrs(&job.dst_path, copied, mode, uid, gid, mtime, Some(&job.src(false))))
                 .and_then(|()| fsops::check_interrupt());
             return self.finish_or_keep(&job.dst_path, job, r);
@@ -1919,7 +1921,7 @@ impl<'a> Engine<'a> {
         let (dir, name) = split_dst(&job.dst_path);
         let (tmp, copied) = fsops::with_temp(dir, name, |tmp| {
             // An interrupted copy is kept with --partial before the temp is discarded.
-            self.copy_new(&job.src_path, tmp, src.size, allow_fast, mode).inspect_err(|_| {
+            self.copy_from(&src_file, tmp, src.size, allow_fast, mode).inspect_err(|_| {
                 if fsops::interrupted() {
                     self.keep_partial(tmp, &job.dst_path);
                 }
@@ -1948,7 +1950,7 @@ impl<'a> Engine<'a> {
     /// rebuilt in parallel from both files. With `--inplace` and an in-place delta,
     /// the changed ranges are written straight into the destination.
     fn write_delta(&self, job: &FileJob, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<bool> {
-        let new = fs::File::open(&job.src_path)?;
+        let new = fsops::open_listed(&job.src_path, &job.meta, self.opts.copy_links)?;
         let basis = fs::File::open(job.basis_path())?;
         let basis_size = basis.metadata()?.len();
         let (maps, reads);

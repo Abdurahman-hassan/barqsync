@@ -140,14 +140,15 @@ impl Output {
         Output { forward: Some(forward), sender_view, ..Output::new(opts) }
     }
 
-    /// Print a line a server forwarded.
-    pub fn print_forwarded(&self, stderr: bool, escape_it: bool, text: &[u8]) {
+    /// Print a line a server forwarded. The text came from the other machine, so it is
+    /// always escaped for this terminal whatever the peer marked it: a malicious or
+    /// compromised server must not be able to put control characters or terminal escape
+    /// sequences on the user's screen through a `Log` frame. `_escape_it` (the peer's own
+    /// mark) is ignored for that reason; the server's forwarded lines are single lines of
+    /// item text, errors or notices, which escaping leaves intact.
+    pub fn print_forwarded(&self, stderr: bool, _escape_it: bool, text: &[u8]) {
         let mut line = Vec::with_capacity(text.len() + 1);
-        if escape_it {
-            escape(text, self.charset, &mut line);
-        } else {
-            line.extend_from_slice(text);
-        }
+        escape(text, self.charset, &mut line);
         line.push(b'\n');
         if stderr {
             self.flush();

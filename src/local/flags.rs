@@ -107,8 +107,7 @@ pub fn write_sparse_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn copy_sparse(src: &Path, tmp: &Path, mode: u32) -> io::Result<File> {
-    let mut s = File::open(src)?;
+fn copy_sparse(mut s: &File, tmp: &Path, mode: u32) -> io::Result<File> {
     let out = fsops::create_new(tmp, mode)?;
     let mut buf = vec![0u8; 1 << 20];
     let mut off = 0u64;
@@ -583,13 +582,14 @@ impl Engine<'_> {
     // --sparse
     // -----------------------------------------------------------------------
 
-    /// Copy a new file's data; with `-S` runs of zeros become holes (no clone or
-    /// kernel copy, which would keep them as data).
-    pub(crate) fn copy_new(&self, src: &Path, tmp: &Path, size: u64, allow_fast: bool, mode: u32) -> io::Result<Copied> {
+    /// Copy a new file's data from `src`, a source opened with [`fsops::open_listed`];
+    /// with `-S` runs of zeros become holes (no clone or kernel copy, which would keep
+    /// them as data).
+    pub(crate) fn copy_from(&self, src: &File, tmp: &Path, size: u64, allow_fast: bool, mode: u32) -> io::Result<Copied> {
         if self.opts.sparse {
             return copy_sparse(src, tmp, mode).map(Copied::Written);
         }
-        fsops::copy_new(src, tmp, size, allow_fast, mode)
+        fsops::copy_from(src, tmp, size, allow_fast, mode)
     }
 }
 

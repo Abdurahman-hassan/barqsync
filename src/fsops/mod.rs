@@ -203,6 +203,33 @@ pub fn full_path(path: &Path) -> PathBuf {
     }
 }
 
+/// What a source file that is no longer the one its listing described is refused with.
+pub const CHANGED_SINCE_LISTED: &str = "changed since it was listed";
+
+/// Open the source file at `path`, listed as `listed`, to read its data. It must still be
+/// that file: a regular file with the listed device and inode. Without `follow` it is
+/// opened without following a symlink. A source swapped for a symlink, a FIFO or another
+/// file between the scan and the read is refused, never read (rsync's CVE-2024-12747).
+/// `follow` (`-L`): the listing followed a symlink to `listed`, so `path` may be one, but
+/// it must still lead to that file.
+pub fn open_listed(path: &Path, listed: &Meta, follow: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK: a FIFO put in its place would otherwise block the open until it has a
+    // writer. It changes nothing for a regular file.
+    let flags = libc::O_NONBLOCK | if follow { 0 } else { libc::O_NOFOLLOW };
+    let changed = || io::Error::other(CHANGED_SINCE_LISTED);
+    let f = fs::OpenOptions::new().read(true).custom_flags(flags).open(path).map_err(|e| match e.raw_os_error() {
+        // O_NOFOLLOW met a symlink.
+        Some(libc::ELOOP) if !follow => changed(),
+        _ => e,
+    })?;
+    let now = Meta::from_metadata(&f.metadata()?);
+    if now.kind != Kind::File || !same_file(&now, listed) {
+        return Err(changed());
+    }
+    Ok(f)
+}
+
 /// Read a directory and `lstat` every child. Entries that vanish between `readdir`
 /// and `lstat` are skipped, matching rsync's behaviour for files deleted mid-scan.
 ///
@@ -323,13 +350,32 @@ pub fn interrupt_token() -> &'static tokio_util::sync::CancellationToken {
     &WAKE_TOKEN
 }
 
-/// Ctrl-C handler. The first signal only raises a flag: workers notice it between
-/// write chunks and before every rename, delete their own unfinished file and stop,
-/// so nothing is left half-written. A second signal forces an immediate exit.
+/// Run [`on_interrupt`] on SIGINT, SIGTERM and SIGHUP (`ctrlc`'s `termination` feature).
+/// A SIGTERM or SIGHUP ignored when barqsync started (under `nohup`, or by a parent that
+/// ignores it) stays ignored, as Unix tools leave it: whoever started us asked for the
+/// transfer to survive it.
+pub fn handle_interrupts(code: i32) {
+    let ignored: Vec<i32> = [libc::SIGTERM, libc::SIGHUP]
+        .into_iter()
+        .filter(|&sig| unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+        })
+        .collect();
+    let _ = ctrlc::set_handler(move || on_interrupt(code));
+    for sig in ignored {
+        unsafe { libc::signal(sig, libc::SIG_IGN) };
+    }
+}
+
+/// Handler for Ctrl-C and the termination signals (SIGINT, SIGTERM, SIGHUP; see
+/// [`handle_interrupts`]). The first signal only raises a flag: workers notice
+/// it between write chunks and before every rename, delete their own unfinished file and
+/// stop, so nothing is left half-written. A second signal forces an immediate exit.
 pub fn on_interrupt(code: i32) {
     if SIGNALS.fetch_add(1, Ordering::SeqCst) == 0 {
         raise_interrupt();
-        eprintln!("\nbarqsync: interrupted, finishing in-flight files (Ctrl-C again to force)");
+        eprintln!("\nbarqsync: interrupted, finishing in-flight files (signal again to force)");
     } else {
         cleanup_temps();
         std::process::exit(code);
@@ -460,13 +506,17 @@ pub enum Copied {
 /// not exist, created with permission bits `mode` (subject to the umask). With
 /// `allow_fast` false, data always goes through a userspace buffer.
 pub fn copy_new(src: &Path, tmp: &Path, size: u64, allow_fast: bool, mode: u32) -> io::Result<Copied> {
-    let src_file = File::open(src)?;
+    copy_from(&File::open(src)?, tmp, size, allow_fast, mode)
+}
+
+/// [`copy_new`] from a file already open (a source opened with [`open_listed`]).
+pub fn copy_from(src: &File, tmp: &Path, size: u64, allow_fast: bool, mode: u32) -> io::Result<Copied> {
     if !allow_fast {
         let dst = create_new(tmp, mode)?;
-        copy_buffered(&src_file, &dst, size)?;
+        copy_buffered(src, &dst, size)?;
         return Ok(Copied::Written(dst));
     }
-    platform::copy_new(&src_file, tmp, size, mode)
+    platform::copy_new(src, tmp, size, mode)
 }
 
 /// Create `tmp` as a copy-on-write clone of `basis` when the filesystem supports it
@@ -555,13 +605,12 @@ fn read_full(mut f: &File, buf: &mut [u8]) -> io::Result<usize> {
 /// `--inplace`), then cut it to the length copied. When both are the same file (`f f`,
 /// or hard links), nothing is written: it already holds the data, and writing into it
 /// would destroy the source.
-pub fn copy_into_existing(src: &Path, dst: &Path, size: u64) -> io::Result<()> {
-    let s = File::open(src)?;
+pub fn copy_into_existing(src: &File, dst: &Path, size: u64) -> io::Result<()> {
     let d = fs::OpenOptions::new().write(true).open(dst)?;
-    if same_open_file(&s, &d)? {
+    if same_open_file(src, &d)? {
         return Ok(());
     }
-    let n = copy_buffered(&s, &d, size)?;
+    let n = copy_buffered(src, &d, size)?;
     d.set_len(n)?;
     Ok(())
 }
@@ -722,6 +771,48 @@ mod tests {
         let t = temp_name(OsStr::new(&long));
         assert!(t.len() <= MAX_NAME);
         assert!(std::str::from_utf8(t.as_bytes()).is_ok(), "must cut on a char boundary");
+    }
+
+    #[test]
+    fn open_listed_refuses_a_swapped_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("f"), b"the source file").unwrap();
+        let listed = lstat(&d.join("f")).unwrap();
+        // Hold the original file open for the whole test. Its inode number then stays
+        // allocated after the name is removed, so no replacement below can be handed the
+        // same inode -- which on an inode-recycling filesystem (ext4) would otherwise make
+        // a swapped-in regular file look like the one that was listed and fail the test.
+        let _original = fs::File::open(d.join("f")).unwrap();
+
+        // The listed file itself: read normally.
+        let mut s = String::new();
+        open_listed(&d.join("f"), &listed, false).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "the source file");
+
+        // Swapped for a symlink to a secret: refused, and the secret is never opened.
+        fs::write(d.join("secret"), b"SECRET").unwrap();
+        let secret = lstat(&d.join("secret")).unwrap();
+        fs::remove_file(d.join("f")).unwrap();
+        std::os::unix::fs::symlink(d.join("secret"), d.join("f")).unwrap();
+        let e = open_listed(&d.join("f"), &listed, false).unwrap_err();
+        assert_eq!(e.to_string(), CHANGED_SINCE_LISTED);
+        // Even with -L (follow) it must still be the file that was listed, not the secret.
+        assert_eq!(open_listed(&d.join("f"), &listed, true).unwrap_err().to_string(), CHANGED_SINCE_LISTED);
+        // Following the symlink to the secret's own identity is fine (that is what -L listed).
+        let mut s = String::new();
+        open_listed(&d.join("f"), &secret, true).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "SECRET");
+
+        // Swapped for a different regular file (new inode): refused.
+        fs::remove_file(d.join("f")).unwrap();
+        fs::write(d.join("f"), b"the source file").unwrap();
+        assert_eq!(open_listed(&d.join("f"), &listed, false).unwrap_err().to_string(), CHANGED_SINCE_LISTED);
+
+        // Swapped for a FIFO: refused without blocking on a reader.
+        fs::remove_file(d.join("f")).unwrap();
+        mknod(&d.join("f"), Kind::Fifo, 0o644, 0).unwrap();
+        assert_eq!(open_listed(&d.join("f"), &listed, false).unwrap_err().to_string(), CHANGED_SINCE_LISTED);
     }
 
     #[test]

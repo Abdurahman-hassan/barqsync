@@ -104,15 +104,15 @@ fn copy_into_existing_never_truncates_its_source() {
     let alias = tmp.path().join("alias");
     fs::write(&src, b"valuable").unwrap();
     fs::hard_link(&src, &alias).unwrap();
-    fsops::copy_into_existing(&src, &alias, 8).unwrap();
+    fsops::copy_into_existing(&fs::File::open(&src).unwrap(), &alias, 8).unwrap();
     assert_eq!(fs::read(&src).unwrap(), b"valuable");
     fs::remove_file(&alias).unwrap();
     std::os::unix::fs::symlink(&src, &alias).unwrap();
-    fsops::copy_into_existing(&src, &alias, 8).unwrap();
+    fsops::copy_into_existing(&fs::File::open(&src).unwrap(), &alias, 8).unwrap();
     assert_eq!(fs::read(&src).unwrap(), b"valuable");
     fs::remove_file(&alias).unwrap();
     fs::write(&alias, b"old content that must be truncated").unwrap();
-    fsops::copy_into_existing(&src, &alias, 8).unwrap();
+    fsops::copy_into_existing(&fs::File::open(&src).unwrap(), &alias, 8).unwrap();
     assert_eq!(fs::read(&alias).unwrap(), b"valuable");
 }
 
