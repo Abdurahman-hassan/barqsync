@@ -164,8 +164,11 @@ Known differences:
   `--delete-after` or `-m`, or `-d`, `--files-from`): rsync shows the number of files
   before the transfer, barqsync once it is done. In a pull with `--delete-before` or
   `--delete-after`, rsync's receiving side also counts each destination directory it
-  scans for deletions; barqsync doesn't. `--info=stats3` shows what `stats2` does (rsync
-  adds memory statistics where its platform has them).
+  scans for deletions; barqsync doesn't. With `--existing`, the entries inside a
+  directory it doesn't create aren't counted (here or in `--stats`' "Number of files"),
+  since barqsync doesn't read that directory; rsync's file list has them.
+  `--info=stats3` shows what `stats2` does (rsync adds memory statistics where its
+  platform has them).
 - `-R` with an absolute path: rsync shows the names with a leading `/` (`/private/...`),
   barqsync without it. The files land in the same place.
 - rsync doesn't strip comment lines from a `--files-from` list it forwards to a remote

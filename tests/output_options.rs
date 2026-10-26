@@ -187,6 +187,9 @@ fn info_levels_match_rsync() {
         // --delete-after; that is left out of a pull here.
         &["-a", "--delete-after", "--info=flist2"],
         &["-d", "--info=flist2"],
+        // What --existing leaves out is still counted.
+        &["-d", "--existing", "--info=flist2"],
+        &["-a", "--existing", "--delete-after", "--info=flist2"],
         &["-rv", "-m"],
         &["-a", "--info=stats1"],
         &["-a", "--info=stats2"],

@@ -69,6 +69,8 @@ struct Incoming {
     prefix: Prefix,
     /// Bytes already counted for progress: copied ranges, and data as it arrives.
     counted: u64,
+    /// File data received for it (`%b`, reported once the file is done).
+    received: u64,
 }
 
 impl Incoming {
@@ -635,9 +637,9 @@ impl RemoteState {
     }
 
     fn file_begin(&self, eng: &Engine, id: u64, size: u64, job: FileJob) -> io::Result<()> {
-        eng.report_transfer(&job, job.item, size);
         // Without a backup the file stays as it is; its data is ignored.
         if !eng.backup_existing_file(&job) {
+            eng.report_transfer(&job, job.item, 0);
             return Ok(());
         }
         // A whole file is all literal data, as rsync counts it.
@@ -658,6 +660,7 @@ impl RemoteState {
             held: (0, Vec::new()),
             prefix: Prefix::default(),
             counted: 0,
+            received: 0,
         };
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
@@ -667,13 +670,13 @@ impl RemoteState {
         let basis = File::open(job.basis_path())?;
         let basis_size = basis.metadata()?.len();
         check::copies(&copies, size, basis_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid delta: {e}")))?;
-        let matched: u64 = copies.iter().map(Op::len).sum();
-        eng.report_transfer(&job, job.item, size.saturating_sub(matched));
         // Without a backup the file stays as it is; its data is ignored.
         if !eng.backup_existing_file(&job) {
+            eng.report_transfer(&job, job.item, 0);
             return Ok(());
         }
         let d = Delta { size, ops: copies };
+        let matched: u64 = d.ops.iter().map(Op::len).sum();
         Stats::add(&eng.stats.delta_files, 1);
         Stats::add(&eng.stats.matched_bytes, matched);
         Stats::add(&eng.stats.literal_bytes, size.saturating_sub(matched));
@@ -727,6 +730,7 @@ impl RemoteState {
             held: (0, Vec::new()),
             prefix: Prefix::with_copies(&d.ops),
             counted: matched,
+            received: 0,
         };
         crate::progress::bytes(matched);
         self.incoming.lock().unwrap().insert(id, inc);
@@ -766,6 +770,7 @@ impl RemoteState {
             return Ok(());
         }
         inc.counted += len;
+        inc.received += len;
         crate::progress::bytes(len);
         Ok(())
     }
@@ -786,6 +791,7 @@ impl RemoteState {
         // The sender failed to read it (and reported why), or its data is incomplete:
         // the file isn't put in place.
         if !ok || inc.prefix.done != inc.size {
+            eng.report_transfer(&inc.job, inc.job.item, inc.received);
             if ok {
                 let msg = format!("\" failed: only {} of {} bytes were sent", inc.prefix.done, inc.size);
                 eng.dst_err(path_msg("receiving \"", &inc.job.dst_path, msg));
@@ -797,8 +803,9 @@ impl RemoteState {
         }
         let dst = inc.job.dst_path.clone();
         crate::progress::done(inc.job.meta.size.saturating_sub(inc.counted));
-        let (path, registered) = (inc.path.clone(), inc.registered);
+        let (path, registered, received) = (inc.path.clone(), inc.registered, inc.received);
         let (job, r) = self.finish(eng, inc);
+        eng.report_transfer(&job, job.item, received);
         let r = if registered { finish_temp(&path, r) } else { r };
         match r {
             Ok(()) => eng.file_written(&job),

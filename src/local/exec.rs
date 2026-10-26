@@ -1295,8 +1295,22 @@ impl<'a> Engine<'a> {
                 overlap.select(&dst_path);
             }
             let dst_kind = if ctx.dst_is_new { None } else { dst_map.get(dname).copied() };
+            // Each entry listed counts ("Number of files", --info=flist2), whatever is done
+            // with it; a directory counts where it is handled.
+            match e.meta.kind {
+                Kind::Dir => {}
+                Kind::File => {
+                    Stats::add(&self.stats.files, 1);
+                    Stats::add(&self.stats.total_size, e.meta.size);
+                }
+                Kind::Symlink => Stats::add(&self.stats.links, 1),
+                _ => Stats::add(&self.stats.specials, 1),
+            }
             if self.opts.existing && dst_kind.is_none() && !(e.meta.kind == Kind::Dir && !self.opts.recursive && !self.opts.dirs) {
                 // --existing: nothing new is created, not even directories.
+                if e.meta.kind == Kind::Dir {
+                    Stats::add(&self.stats.dirs, 1);
+                }
                 if self.out.levels().skip > 0 {
                     let what: &[u8] = if e.meta.kind == Kind::Dir { b"directory" } else { b"file" };
                     self.out.note([b"not creating new ", what, b" \"", &rel, b"\""].concat());
@@ -1307,8 +1321,6 @@ impl<'a> Engine<'a> {
             match e.meta.kind {
                 Kind::Dir => changed |= self.handle_dir(s, ctx, e.meta, e.extra.as_deref(), idx, rel, src_path, dst_path, dst_kind),
                 Kind::File => {
-                    Stats::add(&self.stats.files, 1);
-                    Stats::add(&self.stats.total_size, e.meta.size);
                     if self.ignored_existing(ctx, &rel, &e, dname, &dst_path, dst_kind, same_sums.contains(&idx)) || self.size_filtered(&e.meta, &rel) {
                         continue;
                     }
@@ -1431,7 +1443,6 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Kind::Symlink => {
-                    Stats::add(&self.stats.links, 1);
                     if self.ignored_existing(ctx, &rel, &e, dname, &dst_path, dst_kind, false) {
                         continue;
                     }
@@ -1443,7 +1454,6 @@ impl<'a> Engine<'a> {
                     changed |= self.handle_symlink(ctx.root, at, &e, from, &rel, &src_path, &dst_path, dst_kind, &ctx.rules.dst);
                 }
                 kind => {
-                    Stats::add(&self.stats.specials, 1);
                     if self.ignored_existing(ctx, &rel, &e, dname, &dst_path, dst_kind, false) {
                         continue;
                     }
@@ -1499,7 +1509,9 @@ impl<'a> Engine<'a> {
             return if self.opts.checksum && src.kind == Kind::File { " (sum change)" } else { " (file change)" };
         }
         let a = self.rules.attrs_differ(src, d);
-        if a.mtime || a.owner || (a.mode && src.kind != Kind::Symlink) { " (attr change)" } else { " (uptodate)" }
+        let x = Src { kind: src.kind, meta: src, extra: e.extra.as_deref(), from: XSource::Full(&[]) };
+        let (xattr, acl) = self.extra_change(&x, dst_path, d).0;
+        if a.mtime || a.owner || (a.mode && src.kind != Kind::Symlink) || xattr || acl { " (attr change)" } else { " (uptodate)" }
     }
 
     /// A symlink without `-l`, or a device or special file without `-D`.
