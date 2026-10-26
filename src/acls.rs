@@ -129,7 +129,7 @@ impl Acls {
     }
 
     /// Map the named entries' ids (remote transfers map them by name, like owners).
-    pub fn map_ids(&mut self, f: impl Fn(bool, u32) -> u32) {
+    pub fn map_ids(&mut self, mut f: impl FnMut(bool, u32) -> u32) {
         for n in self.access.names.iter_mut().chain(self.default.names.iter_mut()) {
             n.id = f(n.user, n.id);
         }

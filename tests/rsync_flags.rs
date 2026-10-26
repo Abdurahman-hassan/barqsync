@@ -1499,3 +1499,244 @@ fn regex_lite(pat: &str) -> impl Fn(&str) -> bool + '_ {
         m(pat.strip_prefix('^').unwrap_or(pat).as_bytes(), s.as_bytes())
     }
 }
+
+// ---------------------------------------------------------------------------
+// --bwlimit
+// ---------------------------------------------------------------------------
+
+/// The first line of a tool's stderr without its `rsync: `/`barqsync: ` prefix (both say
+/// the same after it).
+fn message(stderr: &str) -> &str {
+    let line = stderr.lines().next().unwrap_or("");
+    line.strip_prefix("rsync: ").or_else(|| line.strip_prefix("barqsync: ")).unwrap_or(line)
+}
+
+/// rsync and barqsync with the same arguments, one after the other, each with how long
+/// it took. `{dst}` is the per-tool name, `{host}` the fake ssh's host.
+fn both_timed(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> ((RunOut, std::time::Duration), (RunOut, std::time::Duration)) {
+    let rsync_bin = reference_rsync().unwrap();
+    let shim = fake_ssh(cwd);
+    let sub = |d: &str| -> Vec<String> { args.iter().map(|a| a.replace("{dst}", d).replace("{host}", "fakehost:")).collect() };
+    let mut r = std::process::Command::new(&rsync_bin);
+    r.env("LC_ALL", TEST_LOCALE).arg("-e").arg(&shim).arg(format!("--rsync-path={}", rsync_bin.display())).args(sub(dst_r));
+    let mut f = std::process::Command::new(env!("CARGO_BIN_EXE_barqsync"));
+    f.env("LC_ALL", TEST_LOCALE).arg("-e").arg(&shim).arg(format!("--remote-path={}", env!("CARGO_BIN_EXE_barqsync")));
+    f.env("BARQSYNC_TRANSPORT", "ssh").args(sub(dst_f));
+    let start = std::time::Instant::now();
+    let ro = run(&mut r, cwd);
+    let rt = start.elapsed();
+    let start = std::time::Instant::now();
+    let fo = run(&mut f, cwd);
+    ((ro, rt), (fo, start.elapsed()))
+}
+
+#[test]
+fn bwlimit_paces_transfers_like_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // Incompressible data, so -z doesn't shrink what is paced.
+    Tree::new(tmp.path().join("src")).file("big", noise(512 << 10, 7)).file("small", "s").settle_mtimes();
+    // 512 KiB at 512 KiB/s is about a second, of which both let a tenth go unpaced.
+    let least = std::time::Duration::from_millis(700);
+    for (i, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+        let (dr, df) = (format!("r{i}"), format!("f{i}"));
+        let ((r, rt), (f, ft)) = both_timed(tmp.path(), &["-aiz", "--bwlimit=512", src, dst], &dr, &df);
+        same_output(&r, &f, &[], &format!("{src} {dst}"));
+        assert!(rt >= least && ft >= least, "{src} {dst}: rsync took {rt:?}, barqsync {ft:?}");
+        assert_same_tree(&snap(&tmp.path().join(&dr), true), &snap(&tmp.path().join(&df), true));
+    }
+    // rsync's size syntax, in KiB by default; 0 is no limit.
+    let (r, f) = both(tmp.path(), &["-ai", "--bwlimit=0", "src/", "{dst}"], "zr", "zf").unwrap();
+    same_output(&r, &f, &[], "--bwlimit=0");
+    for bad in ["--bwlimit=100b", "--bwlimit=511b", "--bwlimit=x", "--bwlimit=-5", "--bwlimit=1q"] {
+        let (r, f) = both(tmp.path(), &["-a", bad, "src/", "{dst}"], "er", "ef").unwrap();
+        assert_eq!((r.code, f.code), (1, 1), "{bad}: {}", f.stderr);
+        assert_eq!(message(&r.stderr), message(&f.stderr), "{bad}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --chown, --usermap, --groupmap
+// ---------------------------------------------------------------------------
+
+fn group_name(gid: u32) -> Option<String> {
+    let gr = unsafe { libc::getgrgid(gid) };
+    (!gr.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr((*gr).gr_name) }.to_string_lossy().into_owned())
+}
+
+/// A group other than `not` that this user may give files (one `chown` accepts), and its
+/// name.
+fn another_group(dir: &Path, not: u32) -> Option<(u32, String)> {
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0 as libc::gid_t; n.max(0) as usize];
+    let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    groups.truncate(n.max(0) as usize);
+    let probe = dir.join("group-probe");
+    fs::write(&probe, "").unwrap();
+    let found = groups.into_iter().filter(|&g| g != not).find_map(|g| {
+        let name = group_name(g)?;
+        std::os::unix::fs::lchown(&probe, None, Some(g)).ok().map(|()| (g, name))
+    });
+    fs::remove_file(probe).unwrap();
+    found
+}
+
+#[test]
+fn id_maps_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    t.file("a", "a").file("sub/b", "b").symlink("lnk", "a").settle_mtimes();
+    let src_gid = fs::metadata(t.path("a")).unwrap().gid();
+    let (Some(src_group), Some((gid, group))) = (group_name(src_gid), another_group(tmp.path(), src_gid)) else {
+        eprintln!("SKIP: this user is in no second group to map to");
+        return;
+    };
+    let me = unsafe { std::ffi::CStr::from_ptr((*libc::getpwuid(libc::getuid())).pw_name) }.to_string_lossy().into_owned();
+    let cases: Vec<Vec<String>> = vec![
+        vec!["-ai".into(), format!("--chown=:{group}")],
+        vec!["-ai".into(), format!("--chown={me}:{group}")],
+        vec!["-ai".into(), format!("--groupmap=*:{group}")],
+        vec!["-ai".into(), format!("--groupmap={src_group}:{group}")],
+        vec!["-ai".into(), format!("--groupmap={src_gid}:{gid}")],
+        vec!["-ai".into(), format!("--groupmap=0-{}:{group}", src_gid.max(1))],
+        vec!["-ai".into(), format!("--groupmap=no-such-group-x:{src_group},*:{group}")],
+        vec!["-ai".into(), format!("--groupmap=*:{group},{src_group}:{src_gid}")],
+        // No names travel with --numeric-ids: only numbers and an empty or wildcard name match.
+        vec!["-ai".into(), "--numeric-ids".into(), format!("--groupmap={src_group}:{group}")],
+        vec!["-ai".into(), "--numeric-ids".into(), format!("--groupmap=:{group}")],
+        // A name the receiver doesn't know is reported and its pair left out.
+        vec!["-ai".into(), "--groupmap=*:no-such-group-barqsync".into()],
+        // --chown implies -g where it is given (a later --no-g turns that off again: see below).
+        vec!["-ri".into(), format!("--chown=:{group}")],
+        vec!["-ai".into(), "--no-g".into(), format!("--chown=:{group}")],
+        // Without root, owners stay as they are.
+        vec!["-ai".into(), format!("--usermap=*:{me}")],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            let mut a: Vec<&str> = flags.iter().map(String::as_str).collect();
+            a.extend([src, dst]);
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            same_output(&r, &f, &[(&dr, &df)], &format!("{flags:?} {src} {dst}"));
+            assert_eq!(r.stderr, f.stderr, "{flags:?} {src} {dst}");
+            assert_eq!(gids(&tmp.path().join(&dr)), gids(&tmp.path().join(&df)), "{flags:?} {src} {dst}");
+        }
+    }
+    // A --no-g after --chown wins. (Only locally: rsync's server turns -g back on when it
+    // is given the map, while the client sends no groups, and it fails to chgrp.)
+    let no_g = format!("--chown=:{group}");
+    let (r, f) = both(tmp.path(), &["-ai", &no_g, "--no-g", "src/", "{dst}"], "nr", "nf").unwrap();
+    same_output(&r, &f, &[("nr", "nf")], "--chown --no-g");
+    assert_eq!(gids(&tmp.path().join("nr")), gids(&tmp.path().join("nf")));
+    assert_eq!(fs::metadata(tmp.path().join("nf/a")).unwrap().gid(), src_gid);
+    // An update changes the group of what is there (`.f.....g...`).
+    for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+        let (dr, df) = (format!("ur{j}"), format!("uf{j}"));
+        seed(tmp.path(), "src/", &[&dr, &df]);
+        let chown = format!("--chown=:{group}");
+        let (r, f) = both_remote(tmp.path(), &["-ai", &chown, src, dst], &dr, &df).unwrap();
+        same_output(&r, &f, &[], &format!("update {src} {dst}"));
+        assert!(f.stdout.contains(".f.....g... a"), "{}", f.stdout);
+        assert_eq!(gids(&tmp.path().join(&dr)), gids(&tmp.path().join(&df)));
+        assert_eq!(fs::metadata(tmp.path().join(&df).join("sub/b")).unwrap().gid(), gid);
+    }
+    // rsync's errors: each map once, --chown not mixed with them, and the maps' syntax.
+    let bad: &[&[&str]] = &[
+        &["--chown=a:b", "--usermap=x:y"],
+        &["--usermap=x:y", "--chown=a:b"],
+        &["--groupmap=x:y", "--chown=:b"],
+        &["--usermap=x:y", "--usermap=z:w"],
+        &["--chown=a:b", "--chown=c:d"],
+        &["--chown=:b", "--chown=:d"],
+        &["--usermap=x"],
+        &["--usermap=x:"],
+        &["--groupmap=1a:x"],
+        &["--groupmap=1-:x"],
+    ];
+    for flags in bad {
+        let mut a = vec!["-a"];
+        a.extend(*flags);
+        a.extend(["src/", "{dst}"]);
+        let (r, f) = both(tmp.path(), &a, "er", "ef").unwrap();
+        assert_eq!((r.code, f.code), (1, 1), "{flags:?}: {}", f.stderr);
+        assert_eq!(message(&r.stderr), message(&f.stderr), "{flags:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --append, --append-verify
+// ---------------------------------------------------------------------------
+
+/// Sources and destinations for `--append`: a file that grew, one unchanged, one that is
+/// shorter and one of the same size but newer at the source, a new one, one whose start
+/// differs (only `--append-verify` notices), and a big one that grew.
+fn append_fixture(root: &Path, dsts: &[&str]) {
+    let big = noise(300_000, 9);
+    let src = Tree::new(root.join("src"));
+    src.file("grown", "0123456789abcdef")
+        .file("same", "same")
+        .file("shrunk", "shrunk")
+        .file("samesize", "SAMESIZE")
+        .file("new", "new")
+        .file("mismatch", "XXXXmore")
+        .file("sub/big", &big)
+        .chmod("grown", 0o600)
+        .settle_mtimes();
+    let same = fs::metadata(src.path("same")).unwrap().mtime() as u64;
+    for d in dsts {
+        Tree::new(root.join(d))
+            .file("grown", "0123")
+            .file("same", "same")
+            .file("shrunk", "shrunk, and longer")
+            .file("samesize", "samesiz2")
+            .file("mismatch", "YYYY")
+            .file("sub/big", &big[..100_000])
+            .same_mtimes(BASE_TIME + 100_000)
+            .mtime("same", same);
+    }
+}
+
+#[test]
+fn append_matches_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    for (i, mode) in ["--append", "--append-verify"].into_iter().enumerate() {
+        for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            append_fixture(tmp.path(), &[&dr, &df]);
+            let (r, f) = both_remote(tmp.path(), &["-ai", mode, src, dst], &dr, &df).unwrap();
+            let what = format!("{mode} {src} {dst}");
+            same_output(&r, &f, &[], &what);
+            // --append-verify: "WARNING: mismatch failed verification -- update retained (will try again)."
+            let warnings = |o: &RunOut| o.stderr.lines().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(warnings(&r), warnings(&f), "{what}");
+            assert_same_tree(&snap(&tmp.path().join(&dr), true), &snap(&tmp.path().join(&df), true));
+            // What --append keeps: shorter files are left alone, attributes too.
+            let d = tmp.path().join(&df);
+            assert_eq!(fs::read(d.join("shrunk")).unwrap(), b"shrunk, and longer", "{what}");
+            assert_eq!(fs::metadata(d.join("samesize")).unwrap().mtime() as u64, BASE_TIME + 100_000, "{what}");
+            let mismatch: &[u8] = if mode == "--append" { b"YYYYmore" } else { b"XXXXmore" };
+            assert_eq!(fs::read(d.join("mismatch")).unwrap(), mismatch, "{what}");
+        }
+    }
+    // A second run has nothing left to append.
+    let (r, f) = both(tmp.path(), &["-ai", "--append", "src/", "{dst}"], "r0-0", "f0-0").unwrap();
+    same_output(&r, &f, &[], "again");
+    // rsync's conflicts: --append is in place and delta-based.
+    for flags in [&["--append", "-W"][..], &["--append-verify", "--partial-dir=pd"], &["--append", "--no-append", "-W"]] {
+        let mut a = vec!["-a"];
+        a.extend(flags);
+        a.extend(["src/", "{dst}"]);
+        let (r, f) = both(tmp.path(), &a, "er", "ef").unwrap();
+        assert_eq!(r.code, f.code, "{flags:?}: {}", f.stderr);
+        assert_eq!(message(&r.stderr), message(&f.stderr), "{flags:?}");
+    }
+}

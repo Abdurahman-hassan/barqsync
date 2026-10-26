@@ -56,7 +56,9 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
 ///     `Synced` names entries only; `IoError` (source read errors stop deletions).
 /// 11: `--filter`/`-F`/`-C` rules, `--max-delete`, `-m`, `--mkpath` and `--timeout` in the
-///     options; `KeepAlive`; vanished files and stopped deletions in the counters.
+///     options; `KeepAlive`; vanished files and stopped deletions in the counters. Also
+///     `--bwlimit`, `--usermap`/`--groupmap` (`--chown`) and `--append(-verify)` in the
+///     options, `Sig::Append`, and id 0's name in `IdNames`.
 pub const VERSION: u32 = 11;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.
@@ -115,6 +117,10 @@ pub enum Sig {
     Chunks(ChunkSig),
     /// `--delta=cdc`: FastCDC chunks with xxh3 and BLAKE3 hashes.
     Cdc(CdcSig),
+    /// `--append`: the receiver's file is the first `len` bytes of this one; only the
+    /// rest is wanted. `--append-verify` sends the checksum of those bytes: if the
+    /// sender's start differs, the file comes whole.
+    Append { len: u64, sum: Option<Sum> },
 }
 
 /// Server → client: where to open parallel data streams and how to authenticate.
@@ -803,7 +809,19 @@ fn spawn_writer(
                     if buf.is_empty() {
                         break;
                     }
-                    w.write_all(&buf)?;
+                    match crate::bwlimit::connections() {
+                        // --bwlimit: paced pieces, each sent before the next waits.
+                        Some(rate) => {
+                            for piece in buf.chunks(crate::bwlimit::piece(rate)) {
+                                if let Some(wait) = crate::bwlimit::reserve(rate, piece.len()) {
+                                    crate::bwlimit::pause(wait);
+                                }
+                                w.write_all(piece)?;
+                                w.flush()?;
+                            }
+                        }
+                        None => w.write_all(&buf)?,
+                    }
                     count(&BYTES_SENT, buf.len());
                     if wrx.is_empty() && urgent.as_ref().is_none_or(Receiver::is_empty) {
                         w.flush()?;

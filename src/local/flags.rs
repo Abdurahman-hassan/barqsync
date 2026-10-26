@@ -110,15 +110,17 @@ pub fn write_sparse_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
 fn copy_sparse(mut s: &File, tmp: &Path, mode: u32) -> io::Result<File> {
     let out = fsops::create_new(tmp, mode)?;
     let mut buf = vec![0u8; 1 << 20];
+    let want = crate::bwlimit::pacing().map_or(buf.len(), |rate| crate::bwlimit::piece(rate).min(buf.len()));
     let mut off = 0u64;
     loop {
         fsops::check_interrupt()?;
-        let n = match s.read(&mut buf) {
+        let n = match s.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
+        crate::bwlimit::copying(n as u64);
         write_sparse_at(&out, &buf[..n], off)?;
         off += n as u64;
     }
@@ -161,8 +163,28 @@ impl Engine<'_> {
     /// `-L`/`-k`/`--chmod`, then (`-X`/`-A`) the entries' attributes and ACLs, for a
     /// listing read on this machine.
     pub(crate) fn adjust_listing(&self, dir: &Path, ents: Vec<DirEnt>) -> Vec<DirEnt> {
-        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.src_err(m));
+        let mut ents = adjust_listing(self.opts, dir, ents, &mut |m| self.src_err(m));
+        if let Some(ids) = &self.local_ids {
+            let mut ids = ids.lock().unwrap();
+            ents.iter_mut().for_each(|e| self.map_local_ids(&mut ids, &mut e.meta));
+        }
         self.local_listing(dir, ents)
+    }
+
+    /// `--chmod` and the id maps for a local root directory's own metadata.
+    pub(crate) fn adjust_root(&self, meta: &mut Meta) {
+        adjust_mode(self.opts, meta);
+        if let Some(ids) = &self.local_ids {
+            self.map_local_ids(&mut ids.lock().unwrap(), meta);
+        }
+    }
+
+    /// Local transfers with `--usermap`/`--groupmap`: the owner and group the receiver
+    /// gives a source entry.
+    fn map_local_ids(&self, ids: &mut crate::ids::IdMap, meta: &mut Meta) {
+        let named = !self.opts.numeric_ids;
+        meta.uid = ids.map_local(true, meta.uid, named);
+        meta.gid = ids.map_local(false, meta.gid, named);
     }
 
     /// `--max-size` / `--min-size`: regular files outside the range are skipped.
@@ -419,6 +441,55 @@ impl Engine<'_> {
             }
         }
         self.source_done(job.root, &job.src_path, &job.dst_path, &job.rel, &job.meta);
+    }
+
+    // -----------------------------------------------------------------------
+    // --append / --append-verify
+    // -----------------------------------------------------------------------
+
+    /// `--append`: a destination file that isn't shorter than the source is left alone,
+    /// attributes included, when its data would otherwise be rewritten (rsync).
+    pub(crate) fn append_skips(&self, src: &Meta, dst: Option<&Meta>) -> bool {
+        self.opts.append > 0 && dst.is_some_and(|d| d.kind == Kind::File && d.size >= src.size)
+    }
+
+    /// `--append`: the destination file `job`'s data goes onto (shorter, not empty).
+    pub(crate) fn append_to(&self, job: &FileJob) -> Option<Meta> {
+        let d = job.dst_meta.filter(|d| d.kind == Kind::File && 0 < d.size && d.size < job.meta.size)?;
+        (self.opts.append > 0 && job.basis.is_none()).then_some(d)
+    }
+
+    /// `--append-verify` found that the data of the destination file (`d`) isn't the
+    /// start of the source's. rsync appends anyway, finds that the file fails its
+    /// checksum and sends it again: as it does, warn (with `-v` or `-i`) and itemize the
+    /// second try, which finds the source's size and mode but not its time.
+    pub(crate) fn append_failed(&self, job: &FileJob, d: &Meta) {
+        if self.out.verbose() > 0 || self.out.itemizes() {
+            self.out.warning([&b"WARNING: "[..], &job.rel, b" failed verification -- update retained (will try again)."].concat());
+        }
+        let change = Change { transfer: true, time: !self.rules.same_mtime(&job.meta, d), ..Change::default() };
+        self.out.item(&job.rel, Kind::File, Link::None, change, true);
+        Stats::add(&self.stats.transferred, 1);
+        Stats::add(&self.stats.transferred_bytes, job.meta.size);
+    }
+
+    /// `--append` locally: copy the source's data past the destination's end (`d.size`)
+    /// onto it. With `--append-verify` the data already there must be the source's
+    /// start, or the whole file is rewritten.
+    pub(crate) fn write_append(&self, job: &FileJob, d: &Meta, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+        let src = fsops::open_listed(&job.src_path, &job.meta, self.opts.copy_links)?;
+        let out = fs::OpenOptions::new().read(true).write(true).open(&job.dst_path)?;
+        let from = if self.opts.append > 1 && checksum::prefix_sum(&src, d.size)? != checksum::prefix_sum(&out, d.size)? {
+            self.append_failed(job, d);
+            0
+        } else {
+            d.size
+        };
+        let end = fsops::copy_tail(&src, &out, from)?;
+        Stats::add(&self.stats.literal_bytes, end - from);
+        Stats::add(&self.stats.matched_bytes, from);
+        out.set_len(end)?;
+        self.finish_delta_file(&out, &job.meta, mode, uid, gid, Some((&job.dst_path, &job.src(false))))
     }
 
     // -----------------------------------------------------------------------

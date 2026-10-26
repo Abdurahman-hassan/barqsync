@@ -92,6 +92,15 @@ pub struct Cli {
     /// Don't map uid/gid values by user/group name
     #[arg(long = "numeric-ids")]
     numeric_ids: bool,
+    /// Custom username mapping: FROM:TO pairs (names, ids, LOW-HIGH or wildcards), comma-separated
+    #[arg(long, value_name = "STRING")]
+    usermap: Vec<String>,
+    /// Custom groupname mapping: FROM:TO pairs, comma-separated
+    #[arg(long, value_name = "STRING")]
+    groupmap: Vec<String>,
+    /// Simple username/groupname mapping (same as --usermap=*:USER --groupmap=*:GROUP)
+    #[arg(long, value_name = "USER:GROUP")]
+    chown: Vec<String>,
     /// Same as --devices --specials
     #[arg(short = 'D')]
     devices_specials: bool,
@@ -162,6 +171,12 @@ pub struct Cli {
     /// Write files directly at their final name (no temp file + rename)
     #[arg(long)]
     inplace: bool,
+    /// Append data onto shorter files (implies --inplace)
+    #[arg(long)]
+    append: bool,
+    /// Like --append, but with the old data in the file checksum
+    #[arg(long = "append-verify")]
+    append_verify: bool,
     /// fsync every written file
     #[arg(long)]
     fsync: bool,
@@ -232,6 +247,9 @@ pub struct Cli {
     /// Exit (code 30) when no data moves over a remote connection for SECONDS
     #[arg(long, value_name = "SECONDS")]
     timeout: Option<u64>,
+    /// Limit the data rate (KiB per second unless RATE has a unit; 0: no limit)
+    #[arg(long, value_name = "RATE", allow_hyphen_values = true)]
+    bwlimit: Option<String>,
 
     /// Skip files that are newer on the receiver
     #[arg(short = 'u', long)]
@@ -365,6 +383,8 @@ pub struct Cli {
     no_secluded_args: bool,
     #[arg(long = "no-inplace", hide = true)]
     no_inplace: bool,
+    #[arg(long = "no-append", hide = true)]
+    no_append: bool,
     #[arg(long = "no-partial", hide = true)]
     no_partial: bool,
     #[arg(long = "no-progress", hide = true)]
@@ -417,6 +437,10 @@ pub struct Options {
     pub files_from: Option<Vec<Vec<u8>>>,
     pub chmod: Vec<ChmodRule>,
     pub numeric_ids: bool,
+    /// `--usermap` (or `--chown`'s user, as `*:USER`): applied by the receiver.
+    pub usermap: Option<String>,
+    /// `--groupmap` (or `--chown`'s group, as `*:GROUP`): applied by the receiver.
+    pub groupmap: Option<String>,
 
     pub verbose: u8,
     pub itemize: u8,
@@ -435,6 +459,9 @@ pub struct Options {
     pub delta: DeltaMode,
     pub scanner: Scanner,
     pub inplace: bool,
+    /// `--append` (1) or `--append-verify` (2): shorter destination files only get the
+    /// rest of the data, longer ones are left alone (implies `inplace`).
+    pub append: u8,
     pub fsync: bool,
     pub no_clone: bool,
     /// Page-cache hints for big files (see `fsops::cache`).
@@ -458,6 +485,8 @@ pub struct Options {
     pub mkpath: bool,
     /// `--timeout`: seconds a remote connection may go without data (0: no limit).
     pub timeout: u64,
+    /// `--bwlimit`: bytes per second, in whole KiB (0: no limit).
+    pub bwlimit: u64,
 
     pub update: bool,
     pub size_only: bool,
@@ -523,6 +552,8 @@ impl Options {
         let chmod = parse_chmod_args(&cli.chmod)?;
         let max_size = cli.max_size.as_deref().map(|s| parse_size(s, "--max-size")).transpose()?;
         let min_size = cli.min_size.as_deref().map(|s| parse_size(s, "--min-size")).transpose()?;
+        let bwlimit = cli.bwlimit.as_deref().map(parse_bwlimit).transpose()?.unwrap_or(0);
+        let [usermap, groupmap] = id_maps(&cli, m)?;
         if !cli.link_dest.is_empty() && !cli.compare_dest.is_empty() {
             bail!("--link-dest cannot be combined with --compare-dest");
         }
@@ -543,6 +574,21 @@ impl Options {
         o.chmod = chmod;
         o.max_size = max_size;
         o.min_size = min_size;
+        o.bwlimit = bwlimit;
+        // rsync: --usermap implies -o and --groupmap -g, where they are given.
+        let at = |map: &Option<(String, usize)>| map.as_ref().map(|&(_, i)| i);
+        o.owner = toggle_with(m, &["archive", "owner"], at(&usermap), &["no_owner"]).unwrap_or(false);
+        o.group = toggle_with(m, &["archive", "group"], at(&groupmap), &["no_group"]).unwrap_or(false);
+        o.usermap = usermap.map(|(map, _)| map);
+        o.groupmap = groupmap.map(|(map, _)| map);
+        if o.append > 0 {
+            if o.whole_file == Some(true) {
+                bail!("--append cannot be used with --whole-file");
+            }
+            if o.partial_dir.is_some() {
+                bail!("--append cannot be used with --partial-dir");
+            }
+        }
         if files_from.is_some() {
             // rsync: --files-from implies -R and -d, and -a no longer implies -r.
             o.relative = true;
@@ -561,6 +607,11 @@ impl Options {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let backup = on(&["backup"], &["no_backup"]) || c.backup_dir.is_some();
         let quiet = c.quiet;
+        // The last of --append, --append-verify and --no-append counts.
+        let append = match [&["append"], &["append_verify"], &["no_append"]].map(|id| last_index(m, id)) {
+            [a, v, off] if a.max(v) > off => 1 + u8::from(v > a),
+            _ => 0,
+        };
         Options {
             recursive: on(&["archive", "recursive"], &["no_recursive"]),
             links: on(&["archive", "links"], &["no_links"]),
@@ -583,6 +634,8 @@ impl Options {
             files_from: None,
             chmod: Vec::new(),
             numeric_ids: on(&["numeric_ids"], &["no_numeric_ids"]),
+            usermap: None,
+            groupmap: None,
             verbose: if quiet { 0 } else { count_since(m, "verbose", "no_verbose") },
             itemize: if quiet { 0 } else { count_since(m, "itemize", "no_itemize") },
             quiet,
@@ -603,7 +656,9 @@ impl Options {
             },
             delta: c.delta,
             scanner: c.scanner,
-            inplace: on(&["inplace"], &["no_inplace"]),
+            // rsync: --append implies --inplace.
+            inplace: on(&["inplace"], &["no_inplace"]) || append > 0,
+            append,
             fsync: c.fsync,
             no_clone: c.no_clone,
             drop_cache: c.drop_cache || !c.no_drop_cache,
@@ -622,6 +677,7 @@ impl Options {
                 Some(true) => c.timeout.unwrap_or(0),
                 _ => 0,
             },
+            bwlimit: 0,
             update: c.update,
             size_only: c.size_only,
             ignore_times: c.ignore_times,
@@ -682,6 +738,60 @@ fn toggle(m: &ArgMatches, on: &[&str], off: &[&str]) -> Option<bool> {
     }
 }
 
+/// [`toggle`], with one more `on` at command-line position `at` (an option implying it).
+fn toggle_with(m: &ArgMatches, on: &[&str], at: Option<usize>, off: &[&str]) -> Option<bool> {
+    match (last_index(m, on).max(at), last_index(m, off)) {
+        (None, None) => None,
+        (a, b) => Some(a > b),
+    }
+}
+
+/// `--usermap`, `--groupmap` and `--chown` (`*:USER`, `*:GROUP`) in command-line order,
+/// with rsync's errors: each map once, and `--chown` not mixed with the one it sets.
+/// Returns each map with its position on the command line (it implies `-o` or `-g`
+/// from there). The maps' syntax is checked here; their names are the receiver's to
+/// look up.
+fn id_maps(cli: &Cli, m: &ArgMatches) -> Result<[Option<(String, usize)>; 2]> {
+    let indices = |id: &str| m.indices_of(id).into_iter().flatten();
+    let mut opts: Vec<(usize, Option<usize>, &str)> = Vec::new();
+    opts.extend(indices("usermap").zip(&cli.usermap).map(|(i, s)| (i, Some(0), s.as_str())));
+    opts.extend(indices("groupmap").zip(&cli.groupmap).map(|(i, s)| (i, Some(1), s.as_str())));
+    opts.extend(indices("chown").zip(&cli.chown).map(|(i, s)| (i, None, s.as_str())));
+    opts.sort_by_key(|o| o.0);
+    const NAMES: [(&str, &str); 2] = [("usermap", "user"), ("groupmap", "group")];
+    // Each map, where it was given, and whether --chown set it.
+    let mut maps: [Option<(String, usize, bool)>; 2] = [None, None];
+    for (i, which, arg) in opts {
+        let Some(k) = which else {
+            let (user, group) = arg.split_once(':').unwrap_or((arg, ""));
+            for (k, part) in [user, group].into_iter().enumerate() {
+                if part.is_empty() {
+                    continue;
+                }
+                let (name, what) = NAMES[k];
+                match &maps[k] {
+                    Some((_, _, false)) => bail!("--chown conflicts with prior --{name}."),
+                    Some(_) => bail!("You can only specify a {what}-affecting --chown once."),
+                    None => maps[k] = Some((format!("*:{part}"), i, true)),
+                }
+            }
+            continue;
+        };
+        let name = NAMES[k].0;
+        match &maps[k] {
+            Some((_, _, true)) => bail!("--{name} conflicts with prior --chown."),
+            Some(_) => bail!("You can only specify --{name} once."),
+            None => maps[k] = Some((arg.to_string(), i, false)),
+        }
+    }
+    for (k, map) in maps.iter().enumerate() {
+        if let Some((map, ..)) = map {
+            crate::ids::NameMap::parse(map, k == 0, None, &mut |_| {}).map_err(|e| anyhow::anyhow!(e))?;
+        }
+    }
+    Ok(maps.map(|m| m.map(|(map, i, _)| (map, i))))
+}
+
 /// How many times a counted flag (`-v`) was given after its last `--no-` form.
 fn count_since(m: &ArgMatches, id: &str, off: &str) -> u8 {
     let since = last_index(m, &[off]);
@@ -698,27 +808,45 @@ fn parse_chmod_args(specs: &[String]) -> Result<Vec<ChmodRule>> {
 /// p`; `KB` = 1000, `K`/`KiB` = 1024), and an optional `+1`/`-1` adjustment.
 pub fn parse_size(arg: &str, opt: &str) -> Result<u64> {
     let invalid = || anyhow::anyhow!("{opt} value is invalid: {arg}");
+    // A number must come first (rsync would take `K`, or nothing, as 0).
+    let b = arg.as_bytes();
+    if !b.first().is_some_and(u8::is_ascii_digit) && !(b.first() == Some(&b'.') && b.get(1).is_some_and(u8::is_ascii_digit)) {
+        return Err(invalid());
+    }
+    size_arg(arg, b'b').map_err(|_| invalid())
+}
+
+/// rsync's `parse_size_arg`: [`parse_size`]'s syntax with `unit` when none is given.
+/// Fails with what is wrong, in rsync's words: `invalid`, or `too large` (a negative
+/// number counts as that, as in rsync).
+fn size_arg(arg: &str, unit: u8) -> Result<u64, &'static str> {
     let b = arg.as_bytes();
     let mut i = b.iter().take_while(|c| c.is_ascii_digit()).count();
     if b.get(i) == Some(&b'.') {
         i += 1 + b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
     }
-    let number: f64 = if i == 0 { return Err(invalid()) } else { arg[..i].parse().map_err(|_| invalid())? };
+    // The number as `strtod` reads it from the start, sign included.
+    let signed = usize::from(matches!(b.first(), Some(b'+' | b'-')) && i == 0);
+    let mut end = signed + b[signed..].iter().take_while(|c| c.is_ascii_digit()).count();
+    if b.get(end) == Some(&b'.') {
+        end += 1 + b[end + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+    }
     let mut rest = &b[i..];
-    let reps = match rest.first() {
-        None | Some(b'+') | Some(b'-') => 0,
-        Some(&c) => {
+    let suffix = match rest.first() {
+        Some(&c) if c != b'+' && c != b'-' => {
             rest = &rest[1..];
-            match c.to_ascii_lowercase() {
-                b'b' => 0,
-                b'k' => 1,
-                b'm' => 2,
-                b'g' => 3,
-                b't' => 4,
-                b'p' => 5,
-                _ => return Err(invalid()),
-            }
+            c
         }
+        _ => unit,
+    };
+    let reps = match suffix.to_ascii_lowercase() {
+        b'b' => 0,
+        b'k' => 1,
+        b'm' => 2,
+        b'g' => 3,
+        b't' => 4,
+        b'p' => 5,
+        _ => return Err("invalid"),
     };
     let mult: u64 = match rest.first() {
         Some(b'b') | Some(b'B') => {
@@ -730,17 +858,34 @@ pub fn parse_size(arg: &str, opt: &str) -> Result<u64> {
             rest = &rest[2..];
             1024
         }
-        _ => return Err(invalid()),
+        _ => return Err("invalid"),
     };
+    let number: f64 = arg[..end].parse().unwrap_or(0.0);
+    if number < 0.0 {
+        return Err("too large");
+    }
     let mut size = (mult.pow(reps) as f64 * number) as i128;
-    if let [sign @ (b'+' | b'-'), b'1', tail @ ..] = rest {
+    if let [sign @ (b'+' | b'-'), b'1', tail @ ..] = rest
+        && rest.len() < b.len()
+    {
         size += if *sign == b'+' { 1 } else { -1 };
         rest = tail;
     }
-    if !rest.is_empty() || size < 0 {
-        return Err(invalid());
+    if !rest.is_empty() {
+        return Err("invalid");
     }
-    Ok(size as u64)
+    u64::try_from(size).map_err(|_| "too large")
+}
+
+/// `--bwlimit=RATE`: rsync's size syntax, in KiB when no unit is given (`1.5m`,
+/// `100KB`), rounded to whole KiB per second as rsync does. 0 means no limit; anything
+/// else under 512 bytes is refused.
+fn parse_bwlimit(arg: &str) -> Result<u64> {
+    let size = size_arg(arg, b'k').map_err(|e| anyhow::anyhow!("--bwlimit={arg} is {e}"))?;
+    if size != 0 && size < 512 {
+        bail!("--bwlimit={arg} is too small (min: 512 or 0 for unlimited)");
+    }
+    Ok((size + 512) / 1024 * 1024)
 }
 
 /// Read a `--files-from` list: one path per line (or NUL-separated with `--from0`);
@@ -990,6 +1135,53 @@ mod tests {
         assert!(Options::parse_from(["barqsync", "--link-dest=a", "--compare-dest=b", "s", "d"]).is_err());
         assert!(Options::parse_from(["barqsync", "-b", "--suffix=", "s", "d"]).is_err());
         assert!(Options::parse_from(["barqsync", "-b", "--suffix=", "--backup-dir=bk", "s", "d"]).is_ok());
+    }
+
+    #[test]
+    fn bwlimit_parses_like_rsync() {
+        let rate = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).map(|o| o.bwlimit);
+        // KiB by default, rounded to whole KiB per second.
+        for (arg, want) in [("0", 0), ("100", 100 << 10), ("1.5", 2 << 10), ("1.5m", 1536 << 10), ("512b", 1 << 10), ("1000KB", 977 << 10), ("5-1", 5 << 10)] {
+            assert_eq!(rate(&[&format!("--bwlimit={arg}")]).unwrap(), want, "{arg}");
+        }
+        assert_eq!(rate(&[]).unwrap(), 0);
+        for (arg, why) in [("100b", "too small (min: 512 or 0 for unlimited)"), ("x", "invalid"), ("-5", "too large"), ("+5", "invalid"), ("1kq", "invalid")] {
+            let e = rate(&[&format!("--bwlimit={arg}")]).unwrap_err();
+            assert_eq!(e.to_string(), format!("--bwlimit={arg} is {why}"));
+        }
+    }
+
+    #[test]
+    fn id_maps_and_chown() {
+        let o = Options::parse_from(["barqsync", "-r", "--chown=me:staff", "s", "d"]).unwrap();
+        assert_eq!((o.usermap.as_deref(), o.groupmap.as_deref()), (Some("*:me"), Some("*:staff")));
+        assert!(o.owner && o.group, "--chown implies -o and -g");
+        let o = Options::parse_from(["barqsync", "-r", "--chown=:staff", "s", "d"]).unwrap();
+        assert!(o.usermap.is_none() && !o.owner && o.group);
+        let o = Options::parse_from(["barqsync", "-a", "--groupmap=0-9:wheel", "--no-g", "s", "d"]).unwrap();
+        assert!(!o.group && o.groupmap.is_some(), "a later --no-g wins");
+        let o = Options::parse_from(["barqsync", "--no-o", "--usermap=*:x", "--chown=:y", "s", "d"]).unwrap();
+        assert!(o.owner && o.group);
+        let err = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).unwrap_err().to_string();
+        assert_eq!(err(&["--chown=a:b", "--usermap=x:y"]), "--usermap conflicts with prior --chown.");
+        assert_eq!(err(&["--groupmap=x:y", "--chown=a:b"]), "--chown conflicts with prior --groupmap.");
+        assert_eq!(err(&["--usermap=x:y", "--usermap=x:y"]), "You can only specify --usermap once.");
+        assert_eq!(err(&["--chown=a", "--chown=b"]), "You can only specify a user-affecting --chown once.");
+        assert_eq!(err(&["--groupmap=7x:y"]), "Invalid number in --groupmap: 7x");
+        assert!(Options::parse_from(["barqsync", "--chown=a", "--chown=:b", "s", "d"]).is_ok());
+    }
+
+    #[test]
+    fn append_modes() {
+        let mode = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).map(|o| (o.append, o.inplace));
+        assert_eq!(mode(&["--append"]).unwrap(), (1, true));
+        assert_eq!(mode(&["--append", "--append-verify"]).unwrap(), (2, true));
+        assert_eq!(mode(&["--append-verify", "--append"]).unwrap(), (1, true));
+        assert_eq!(mode(&["--append", "--no-append"]).unwrap(), (0, false));
+        assert_eq!(mode(&["--append", "--no-append", "-W"]).unwrap(), (0, false));
+        assert_eq!(mode(&["--append", "-W"]).unwrap_err().to_string(), "--append cannot be used with --whole-file");
+        assert!(mode(&["--append", "-W", "--no-W"]).is_ok());
+        assert_eq!(mode(&["--append-verify", "--partial-dir=p"]).unwrap_err().to_string(), "--append cannot be used with --partial-dir");
     }
 
     #[test]

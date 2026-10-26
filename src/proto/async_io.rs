@@ -96,7 +96,19 @@ pub(crate) fn spawn_writer(
                 if buf.is_empty() {
                     break;
                 }
-                w.write_all(&buf).await?;
+                match crate::bwlimit::connections() {
+                    // --bwlimit: paced pieces, each sent before the next waits.
+                    Some(rate) => {
+                        for piece in buf.chunks(crate::bwlimit::piece(rate)) {
+                            if let Some(wait) = crate::bwlimit::reserve(rate, piece.len()) {
+                                tokio::time::sleep(wait).await;
+                            }
+                            w.write_all(piece).await?;
+                            w.flush().await?;
+                        }
+                    }
+                    None => w.write_all(&buf).await?,
+                }
                 super::count(&super::BYTES_SENT, buf.len());
                 if rx.is_empty() && urgent.as_ref().is_none_or(|u| u.is_empty()) {
                     w.flush().await?;

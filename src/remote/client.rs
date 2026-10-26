@@ -36,6 +36,7 @@ fn no_handshake_message(status: Option<i32>, remote: &str) -> String {
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     let out: &'static Output = Box::leak(Box::new(Output::new(opts)));
     let started = Instant::now();
+    crate::bwlimit::limit_connections(opts.bwlimit);
 
     // Push (local sources, remote destination) or pull (remote sources on one host,
     // local destination). An empty remote path means the remote home directory.

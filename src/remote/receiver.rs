@@ -546,8 +546,11 @@ impl RemoteState {
                 crate::progress::done(job.meta.size);
                 continue;
             }
-            let routed = self.link.is_none_or(|l| l.wants_delta(job.meta.size));
-            let sig = if self.delta && routed { basis_signature(&job, eng.opts.delta) } else { None };
+            let sig = match eng.append_to(&job) {
+                Some(d) => append_signature(&job, &d, eng.opts.append > 1),
+                None if self.delta && self.link.is_none_or(|l| l.wants_delta(job.meta.size)) => basis_signature(&job, eng.opts.delta),
+                None => None,
+            };
             reqs.push(NeedReq { idx: job.idx, sig });
             self.needed.lock().unwrap().insert(file_id(wire_dir, job.idx), job);
         }
@@ -638,6 +641,13 @@ impl RemoteState {
         // Without a backup the file stays as it is; its data is ignored.
         if !eng.backup_existing_file(&job) {
             return Ok(());
+        }
+        // --append-verify: the sender sends the file whole when the start it has isn't
+        // what this side holds.
+        if eng.opts.append > 1
+            && let Some(d) = eng.append_to(&job)
+        {
+            eng.append_failed(&job, &d);
         }
         // A whole file is all literal data, as rsync counts it.
         Stats::add(&eng.stats.literal_bytes, size);
@@ -1044,6 +1054,17 @@ fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<Sig> {
     }
 }
 
+/// `--append`: ask only for the data past the destination file (`d`), with
+/// `--append-verify` sending the checksum of what it holds. `None`, so the file comes
+/// whole, if it can't be read.
+fn append_signature(job: &FileJob, d: &crate::entry::Meta, verify: bool) -> Option<Sig> {
+    let sum = match verify {
+        true => Some(crate::checksum::prefix_sum(&File::open(&job.dst_path).ok()?, d.size).ok()?),
+        false => None,
+    };
+    Some(Sig::Append { len: d.size, sum })
+}
+
 /// Decide what each root maps to on this side: rsync's destination rules (a single
 /// file may be copied to a new name; otherwise DEST is a directory, created if needed).
 /// Also returns the directory the roots write into.
@@ -1138,7 +1159,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         let _ = conn.msg(Msg::Fatal { msg });
         (code, StatsSnapshot::default(), false)
     };
-    let mut ids = IdMap::default();
+    let mut ids = match IdMap::for_receiver(opts, &mut |m| out.warning(m)) {
+        Ok(ids) => ids,
+        Err(e) => return fail(exit::SYNTAX, e),
+    };
     let mut probe = adapt::ProbeReceiver::default();
     let mut link = None;
     let mut io_error = false;

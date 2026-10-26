@@ -532,8 +532,10 @@ pub(crate) fn create_new(path: &Path, mode: u32) -> io::Result<File> {
 
 /// Portable fallback: read/write through a reusable 1 MiB per-thread buffer.
 /// `size` is the expected length; big files go through [`copy_uncached`] instead.
+/// Under a local `--bwlimit` (see [`crate::bwlimit::paced`]) the copy goes in paced pieces.
 pub(crate) fn copy_buffered(mut src: &File, mut dst: &File, size: u64) -> io::Result<u64> {
-    if cache::wanted(size) {
+    let pace = crate::bwlimit::pacing();
+    if cache::wanted(size) && pace.is_none() {
         return copy_uncached(src, dst, size);
     }
     BUF.with(|b| {
@@ -541,15 +543,17 @@ pub(crate) fn copy_buffered(mut src: &File, mut dst: &File, size: u64) -> io::Re
         if buf.len() < (1 << 20) {
             buf.resize(1 << 20, 0);
         }
+        let want = pace.map_or(buf.len(), |rate| crate::bwlimit::piece(rate).min(buf.len()));
         let mut total = 0u64;
         loop {
             check_interrupt()?;
-            let n = match src.read(&mut buf) {
+            let n = match src.read(&mut buf[..want]) {
                 Ok(0) => return Ok(total),
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
+            crate::bwlimit::copying(n as u64);
             dst.write_all(&buf[..n])?;
             total += n as u64;
             crate::progress::copied(n as u64);
@@ -585,6 +589,34 @@ fn copy_uncached(src: &File, dst: &File, size: u64) -> io::Result<u64> {
         std::mem::swap(&mut cur, &mut next);
     }
     Ok(written)
+}
+
+/// `--append`: copy `src` from offset `from` to its end into `dst` at the same offsets,
+/// paced by a local `--bwlimit`. Returns where the data ends.
+pub fn copy_tail(src: &File, dst: &File, from: u64) -> io::Result<u64> {
+    use std::os::unix::fs::FileExt;
+    let pace = crate::bwlimit::pacing();
+    BUF.with(|b| {
+        let mut buf = b.borrow_mut();
+        if buf.len() < (1 << 20) {
+            buf.resize(1 << 20, 0);
+        }
+        let want = pace.map_or(buf.len(), |rate| crate::bwlimit::piece(rate).min(buf.len()));
+        let mut off = from;
+        loop {
+            check_interrupt()?;
+            let n = match src.read_at(&mut buf[..want], off) {
+                Ok(0) => return Ok(off),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            crate::bwlimit::copying(n as u64);
+            dst.write_all_at(&buf[..n], off)?;
+            off += n as u64;
+            crate::progress::copied(n as u64);
+        }
+    })
 }
 
 /// Fill `buf` from `f` unless the file ends first; returns the bytes read.
