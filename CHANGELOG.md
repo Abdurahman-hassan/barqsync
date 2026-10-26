@@ -51,6 +51,15 @@
 
 ### Fixed
 
+- `--delete` no longer deletes after a file could not be written to the destination (a
+  full disk, a quota, an I/O error, or data that never arrived complete). Before, a file
+  renamed in the source could lose its old name on the destination without getting the
+  new one: on a full disk the new name failed to write, the old one was deleted anyway,
+  and the destination had neither. Now the other files are still transferred, but nothing
+  is deleted ("IO error encountered -- skipping file deletion", exit 23). rsync's
+  `--delete-after` keeps the old file too: a write error ends rsync's run before it
+  deletes. A local copy that fails to read a source file now stops deletion as well, as
+  a remote sender's read error already did. All earlier releases are affected.
 - `--delete` no longer removes what the filter rules protect inside a directory it deletes:
   with `--exclude='*.log'`, `old/keep.log` stays, and so does `old` ("cannot delete
   non-empty directory"), as with rsync. Before, the whole directory was removed. The same

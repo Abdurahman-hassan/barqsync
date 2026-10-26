@@ -627,7 +627,7 @@ impl RemoteState {
             Err(e) => {
                 self.lost.lock().unwrap().insert(id);
                 if !fsops::interrupted() {
-                    eng.err(path_msg("receiving \"", &dst, format!("\" failed: {e}")));
+                    eng.dst_err(path_msg("receiving \"", &dst, format!("\" failed: {e}")));
                 }
             }
         }
@@ -759,7 +759,7 @@ impl RemoteState {
                 fsops::drop_temp(&inc.path);
             }
             if !fsops::interrupted() {
-                eng.err(path_msg("receiving \"", &inc.job.dst_path, format!("\" failed: {e}")));
+                eng.dst_err(path_msg("receiving \"", &inc.job.dst_path, format!("\" failed: {e}")));
             }
             return Ok(());
         }
@@ -776,7 +776,7 @@ impl RemoteState {
             match self.needed.lock().unwrap().remove(&id) {
                 // Never started: the sender couldn't read it (and reported why).
                 Some(_) if !ok => {}
-                Some(job) => eng.err(path_msg("receiving \"", &job.dst_path, "\" failed: no data was sent")),
+                Some(job) => eng.dst_err(path_msg("receiving \"", &job.dst_path, "\" failed: no data was sent")),
                 None => eng.err(format!("protocol error: end of unrequested file {id:#x}")),
             }
             return;
@@ -786,7 +786,7 @@ impl RemoteState {
         if !ok || inc.prefix.done != inc.size {
             if ok {
                 let msg = format!("\" failed: only {} of {} bytes were sent", inc.prefix.done, inc.size);
-                eng.err(path_msg("receiving \"", &inc.job.dst_path, msg));
+                eng.dst_err(path_msg("receiving \"", &inc.job.dst_path, msg));
             }
             if inc.registered {
                 fsops::drop_temp(&inc.path);
@@ -800,7 +800,7 @@ impl RemoteState {
         let r = if registered { finish_temp(&path, r) } else { r };
         match r {
             Ok(()) => eng.file_written(&job),
-            Err(e) if !fsops::interrupted() => eng.err(path_msg("receiving \"", &dst, format!("\" failed: {e}"))),
+            Err(e) if !fsops::interrupted() => eng.dst_err(path_msg("receiving \"", &dst, format!("\" failed: {e}"))),
             Err(_) => {}
         }
     }
@@ -854,7 +854,7 @@ impl RemoteState {
             // Nothing in it can be trusted to be complete: none of its files is written.
             for (id, _) in files {
                 match self.needed.lock().unwrap().remove(&id) {
-                    Some(job) => eng.err(path_msg("receiving \"", &job.dst_path, format!("\" failed: invalid small-file pack: {e}"))),
+                    Some(job) => eng.dst_err(path_msg("receiving \"", &job.dst_path, format!("\" failed: invalid small-file pack: {e}"))),
                     None => eng.err(format!("protocol error: data for unrequested file {id:#x}")),
                 }
             }
@@ -886,7 +886,7 @@ impl RemoteState {
             if let Err(e) = self.write_small(eng, job, bytes)
                 && !fsops::interrupted()
             {
-                eng.err(path_msg("receiving \"", &dst, format!("\" failed: {e}")));
+                eng.dst_err(path_msg("receiving \"", &dst, format!("\" failed: {e}")));
             }
         }
     }
@@ -900,7 +900,7 @@ impl RemoteState {
         use std::os::unix::ffi::OsStrExt;
         let report = |dst: &Path, e: io::Error| {
             if !fsops::interrupted() {
-                eng.err(path_msg("receiving \"", dst, format!("\" failed: {e}")));
+                eng.dst_err(path_msg("receiving \"", dst, format!("\" failed: {e}")));
             }
         };
         let mut jobs = Vec::with_capacity(files.len());
@@ -1373,7 +1373,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     }
     let unanswered = remote.needed.lock().unwrap().len() + remote.incoming.lock().unwrap().len();
     if unanswered > 0 {
-        engine.err(format!("{unanswered} requested files were never received"));
+        engine.dst_err(format!("{unanswered} requested files were never received"));
         remote.abandon(engine);
     }
     let waiting = remote.xattr_wait.lock().unwrap().len();
