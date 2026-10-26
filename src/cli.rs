@@ -23,7 +23,7 @@ use std::path::PathBuf;
     after_help = "Options implied by others (-a, -D, ...) or given earlier can be turned off with \
                   --no-OPTION: --no-r, --no-l, --no-p, --no-t, --no-g, --no-o, --no-D, --no-devices, \
                   --no-specials, --no-H, --no-A, --no-X, --no-O, --no-d, --no-x, --no-S, --no-c, --no-z, \
-                  --no-W, --no-v, --no-i, --no-h, --no-8, --no-m, --no-s, --no-inplace, --no-partial, \
+                  --no-W, --no-v, --no-i, --no-h, --no-8, --no-m, --no-s, --no-inplace, --no-append, --no-partial, \
                   --no-progress, --no-numeric-ids, --no-backup, --no-mkpath, --no-timeout, --no-from0 \
                   (and their long forms, e.g. --no-owner)."
 )]

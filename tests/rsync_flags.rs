@@ -1550,7 +1550,8 @@ fn bwlimit_paces_transfers_like_rsync() {
     // rsync's size syntax, in KiB by default; 0 is no limit.
     let (r, f) = both(tmp.path(), &["-ai", "--bwlimit=0", "src/", "{dst}"], "zr", "zf").unwrap();
     same_output(&r, &f, &[], "--bwlimit=0");
-    for bad in ["--bwlimit=100b", "--bwlimit=511b", "--bwlimit=x", "--bwlimit=-5", "--bwlimit=1q"] {
+    // (A negative rate is "too large" for rsync 3.5, "invalid" for 3.2: not compared.)
+    for bad in ["--bwlimit=100b", "--bwlimit=511b", "--bwlimit=x", "--bwlimit=1q"] {
         let (r, f) = both(tmp.path(), &["-a", bad, "src/", "{dst}"], "er", "ef").unwrap();
         assert_eq!((r.code, f.code), (1, 1), "{bad}: {}", f.stderr);
         assert_eq!(message(&r.stderr), message(&f.stderr), "{bad}");

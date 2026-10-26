@@ -26,6 +26,9 @@ enum From {
     Wild(Vec<u8>),
 }
 
+/// A user or group id by name, on the receiver.
+pub type Lookup<'a> = dyn FnMut(&str) -> Option<u32> + 'a;
+
 /// `--usermap`/`--groupmap`: the receiver's `FROM:TO` pairs, in order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NameMap(Vec<(From, u32)>);
@@ -36,7 +39,7 @@ impl NameMap {
     /// pair left out, as rsync does; `lookup` is `None` to check the syntax alone. Like
     /// rsync, the pairs are read from the last one back, so that is the order errors
     /// come in.
-    pub fn parse(map: &str, user: bool, lookup: Option<&mut dyn FnMut(&str) -> Option<u32>>, unknown: &mut dyn FnMut(String)) -> Result<NameMap, String> {
+    pub fn parse(map: &str, user: bool, lookup: Option<&mut Lookup<'_>>, unknown: &mut dyn FnMut(String)) -> Result<NameMap, String> {
         let what = if user { "user" } else { "group" };
         let mut lookup = lookup;
         let mut pairs = Vec::new();
