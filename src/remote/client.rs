@@ -136,6 +136,8 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
     let mut server_opts = opts.clone();
     server_opts.paths = server_paths;
+    // rsync: each side needs its own --munge-links; the server's is never this one.
+    server_opts.munge_links = false;
     server_opts.transport = if transport == Transport::Auto { Transport::Quic } else { transport };
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };
     // --timeout covers waiting for the remote side to start, as rsync's does.

@@ -196,6 +196,9 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
 
     let mut engine = Engine::new(opts, filter, out);
     engine.set_dest(&plan.dest_root);
+    if let Err(code) = engine.check_temp_dir() {
+        return code;
+    }
     if opts.usermap.is_some() || opts.groupmap.is_some() {
         match crate::ids::IdMap::for_receiver(opts, &mut |m| out.warning(m)) {
             Ok(ids) => engine.local_ids = Some(std::sync::Mutex::new(ids)),
@@ -245,6 +248,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     });
     if !fsops::interrupted() {
         pool.install(|| {
+            engine.finish_delayed();
             engine.link_followers();
             engine.finish_deletions();
             engine.apply_fixups();

@@ -58,7 +58,9 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 11: `--filter`/`-F`/`-C` rules, `--max-delete`, `-m`, `--mkpath` and `--timeout` in the
 ///     options; `KeepAlive`; vanished files and stopped deletions in the counters. Also
 ///     `--bwlimit`, `--usermap`/`--groupmap` (`--chown`) and `--append(-verify)` in the
-///     options, `Sig::Append`, and id 0's name in `IdNames`.
+///     options, `Sig::Append`, and id 0's name in `IdNames`; `-T`, `--delay-updates`,
+///     `--force`, `--ignore-errors`, the missing-args options and the symlink options in
+///     the options, and missing entries (`DirEnt::missing`) in listings.
 pub const VERSION: u32 = 11;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.

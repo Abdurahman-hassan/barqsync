@@ -45,12 +45,24 @@ pub fn roots(roots: &[RootInfo]) -> Result<(), String> {
     Ok(())
 }
 
+/// Entries asking for their destination's deletion (missing sources) come only with
+/// `--delete-missing-args`.
+pub fn missing<'e>(mut ents: impl Iterator<Item = &'e DirEnt>, opts: &crate::cli::Options) -> Result<(), String> {
+    match ents.find(|e| e.missing) {
+        Some(e) if opts.missing_args < 2 => Err(format!("deletion of {} asked for without --delete-missing-args", shown(e.name.as_bytes()))),
+        _ => Ok(()),
+    }
+}
+
 /// One listing's entries: valid names, each once.
 fn entries(ents: &[DirEnt]) -> Result<(), String> {
     let mut seen = HashSet::with_capacity(ents.len());
     for e in ents {
         let name = e.name.as_bytes();
-        if !name_ok(name) {
+        // A missing source below a directory missing at the source is named by its path
+        // from here (see `local::flags::missing_selected`).
+        let ok = if e.missing { !name.is_empty() && rel_ok(name) } else { name_ok(name) };
+        if !ok {
             return Err(format!("invalid file name {}", shown(name)));
         }
         if !seen.insert(name) {

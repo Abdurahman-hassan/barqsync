@@ -1741,3 +1741,248 @@ fn append_matches_rsync() {
         assert_eq!(message(&r.stderr), message(&f.stderr), "{flags:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// -T / --temp-dir, --delay-updates
+// ---------------------------------------------------------------------------
+
+/// Whether a tree holds any partial-dir or temp leftovers.
+fn leftovers(root: &Path) -> Vec<String> {
+    snapshot(root, false)
+        .keys()
+        .map(|k| String::from_utf8_lossy(k).into_owned())
+        .filter(|k| k.contains(".~tmp~") || k.split('/').next_back().is_some_and(|n| n.starts_with('.') && n.len() > 7 && n.as_bytes()[n.len() - 7] == b'.'))
+        .collect()
+}
+
+#[test]
+fn temp_dir_and_delay_updates_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    t.file("a", "alpha").file("same", "same").file("sub/b", noise(300_000, 4)).file("sub/c", "c").symlink("lnk", "a").settle_mtimes();
+    let cases: &[&[&str]] = &[
+        &["-ai", "-T", "scratch"],
+        &["-ai", "--temp-dir=scratch", "--partial"],
+        &["-ai", "--delay-updates"],
+        &["-ai", "--delay-updates", "-T", "scratch"],
+        &["-ai", "--delay-updates", "--partial-dir=.pd"],
+        &["-ai", "--delay-updates", "--no-delay-updates"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            // An update: a changed file, an unchanged one, a new one; and -T's directory,
+            // which is relative to the destination.
+            for d in [&dr, &df] {
+                Tree::new(tmp.path().join(d)).file("a", "old").file("same", "same").file("sub/b", noise(300_000, 5)).dir("scratch");
+                set_mtime(&tmp.path().join(d).join("same"), fs::metadata(t.path("same")).unwrap().mtime() as u64);
+            }
+            let mut a = flags.to_vec();
+            a.extend([src, dst]);
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            let what = format!("{flags:?} {src} {dst}");
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+            assert_eq!(leftovers(&tmp.path().join(&df)), Vec::<String>::new(), "{what}");
+            assert!(fs::read_dir(tmp.path().join(&df).join("scratch")).unwrap().next().is_none(), "{what}: the temp dir is left empty");
+        }
+    }
+    // rsync's checks: the temp dir must exist and be a directory, relative to the
+    // destination; in-place updates have no use for --delay-updates.
+    Tree::new(tmp.path().join("ed")).file("plainfile", "x");
+    for flags in [
+        &["-a", "-T", "nope"][..],
+        &["-a", "-T", "plainfile"],
+        &["-a", "--inplace", "--delay-updates"],
+        &["-a", "--append", "--delay-updates"],
+        &["-a", "--delay-updates", "--inplace"],
+    ] {
+        let mut a = flags.to_vec();
+        a.extend(["src/", "ed"]);
+        let r = rsync(tmp.path(), &a).unwrap();
+        let f = barqsync(tmp.path(), &a);
+        assert_eq!((r.code, f.code), (1, 1), "{flags:?}: {}", f.stderr);
+        assert_eq!(message(&r.stderr), message(&f.stderr), "{flags:?}");
+    }
+    // A pull checks it too, on the receiving (client) side.
+    let f = barqsync_remote(tmp.path(), &["-a", "-T", "nope", "{host}src/", "ed"]);
+    assert_eq!(f.code, 1, "{}", f.stderr);
+    assert!(f.stderr.contains("The temp-dir does not exist: nope"), "{}", f.stderr);
+}
+
+// ---------------------------------------------------------------------------
+// --force, --ignore-errors, --ignore-missing-args, --delete-missing-args
+// ---------------------------------------------------------------------------
+
+/// Each distinct stderr line, without the tool's name, the temp dir's path, or rsync's
+/// closing "rsync error/warning: ..." line (barqsync has none).
+fn messages(o: &RunOut, tmp: &Path) -> std::collections::BTreeSet<String> {
+    let t = tmp.to_str().unwrap();
+    o.stderr
+        .lines()
+        .filter(|l| !l.starts_with("rsync error") && !l.starts_with("rsync warning"))
+        .map(|l| l.strip_prefix("rsync: ").or_else(|| l.strip_prefix("barqsync: ")).unwrap_or(l))
+        .map(|l| l.replace("[sender] ", "").replace("[generator] ", "").replace("[receiver] ", "").replace(t, "").replace("/private", ""))
+        .collect()
+}
+
+#[test]
+fn force_and_missing_args_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("a", "a").file("x", "x").settle_mtimes();
+    // A directory deleted at the source whose files are still listed (rsync: they are
+    // deleted, the directory "vanished", exit 24).
+    fs::write(tmp.path().join("list"), "a\ngone\nsub/gone2\nsub/deep\nsub/deep/gone3\n").unwrap();
+    let cases: &[&[&str]] = &[
+        // A directory in the way of a file goes only with --delete or --force.
+        &["-ai", "src/", "{dst}"],
+        &["-ai", "--force", "src/", "{dst}"],
+        &["-ai", "--force", "--no-force", "src/", "{dst}"],
+        &["-ai", "--ignore-missing-args", "src/a", "src/gone", "src/x", "{dst}/"],
+        &["-ai", "--delete-missing-args", "src/a", "src/gone", "src/gonedir", "{dst}/"],
+        &["-ai", "--delete-missing-args", "--force", "src/a", "src/gonedir", "{dst}/"],
+        &["-ai", "--delete-missing-args", "--ignore-missing-args", "src/gone", "{dst}/"],
+        // A rule leaves a missing source's destination alone. (Only compared locally:
+        // over ssh rsync's sender sends the excluded name anyway, which its server then
+        // deletes in a push, and its client refuses in a pull, exit 4.)
+        &["-ai", "--delete-missing-args", "--exclude=gone", "src/a", "src/gone", "{dst}/"],
+        &["-ai", "--ignore-missing-args", "--files-from=list", "src/", "{dst}/"],
+        &["-ai", "--delete-missing-args", "--files-from=list", "src/", "{dst}/"],
+        // A single missing file copied to a new name deletes that name.
+        &["-ai", "--delete-missing-args", "src/gone", "{dst}/target"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, remote) in ["", "push", "pull"].into_iter().enumerate() {
+            if !remote.is_empty() && flags.contains(&"--exclude=gone") {
+                continue;
+            }
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            for d in [&dr, &df] {
+                Tree::new(tmp.path().join(d))
+                    .file("x/inner/f", "i")
+                    .file("gone", "g")
+                    .file("target", "t")
+                    .file("gonedir/k/q", "q")
+                    .file("sub/gone2", "g2")
+                    .file("sub/deep/gone3", "g3");
+            }
+            let a: Vec<String> = flags
+                .iter()
+                .map(|a| match (remote, a.starts_with("src/"), a.starts_with("{dst}")) {
+                    ("push", _, true) => format!("{{host}}{a}"),
+                    ("pull", true, _) => format!("{{host}}{a}"),
+                    _ => a.to_string(),
+                })
+                .collect();
+            let a: Vec<&str> = a.iter().map(String::as_str).collect();
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            let what = format!("{flags:?} {remote}");
+            same_output(&r, &f, &[(&dr, &df)], &what);
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+            let (rm, fm) = (messages(&r, tmp.path()), messages(&f, tmp.path()));
+            assert_eq!(rm.iter().map(|l| l.replace(&dr, "D")).collect::<Vec<_>>(), fm.iter().map(|l| l.replace(&df, "D")).collect::<Vec<_>>(), "{what}");
+        }
+    }
+}
+
+#[test]
+fn ignore_errors_deletes_after_errors_like_rsync() {
+    if skip_without_rsync() || unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // An unreadable source directory is an I/O error: --delete then deletes nothing,
+    // unless --ignore-errors. (--delete-after: rsync's default --delete-during deletes
+    // in the directories it reached before the error, barqsync only after a complete
+    // read; see the known differences.)
+    Tree::new(tmp.path().join("src")).file("a", "a").file("locked/f", "f").settle_mtimes();
+    fs::set_permissions(tmp.path().join("src/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let cases: [&[&str]; 4] = [
+        &["-ai", "--delete-after"],
+        &["-ai", "--delete-after", "--ignore-errors"],
+        &["-ai", "--delete", "--ignore-errors"],
+        &["-ai", "--delete-after", "--ignore-errors", "--no-ignore-errors"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            for d in [&dr, &df] {
+                Tree::new(tmp.path().join(d)).file("a", "a").file("extra", "e").dir("old/deep");
+            }
+            let mut a = flags.to_vec();
+            a.extend([src, dst]);
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            let what = format!("{flags:?} {src} {dst}");
+            same_output(&r, &f, &[], &what);
+            // The copy of the unreadable directory is unreadable too.
+            for d in [&dr, &df] {
+                let _ = fs::set_permissions(tmp.path().join(d).join("locked"), fs::Permissions::from_mode(0o755));
+            }
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+            assert_eq!(tmp.path().join(&df).join("extra").exists(), flags.len() != 3, "{what}");
+        }
+    }
+    fs::set_permissions(tmp.path().join("src/locked"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// --safe-links, --copy-unsafe-links, --munge-links
+// ---------------------------------------------------------------------------
+
+#[test]
+fn symlink_safety_options_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let top = tmp.path().join("top");
+    Tree::new(top.join("outside")).file("file", "outside");
+    // Links inside the transfer and out of it, as `src/` (where `../` leaves it at once)
+    // and `src` (one level more) see them. (No `a/../b` targets: rsync 3.4 and later call
+    // those unsafe, 3.2 doesn't.)
+    Tree::new(top.join("src"))
+        .file("a", "a")
+        .file("sub/b", "b")
+        .symlink("rel_ok", "a")
+        .symlink("sub/up_ok", "../a")
+        .symlink("rel_out", "../outside/file")
+        .symlink("sub/up_out", "../../outside/file")
+        .symlink("abs", "/etc/hosts")
+        .symlink("dir_out", "../outside")
+        .symlink("dangling_out", "../missing")
+        .symlink("munged", "/rsyncd-munged/a")
+        .settle_mtimes();
+    let cases: &[&[&str]] = &[
+        &["-ai", "--safe-links"],
+        &["-av", "--safe-links"],
+        &["-ai", "--copy-unsafe-links"],
+        &["-av", "--copy-unsafe-links"],
+        &["-ai", "--safe-links", "--copy-unsafe-links"],
+        // Each side munges on its own: a sending client unmunges, a receiving client
+        // munges, a local copy (whose client sends) unmunges.
+        &["-ai", "--munge-links"],
+        &["-ai", "--munge-links", "--safe-links"],
+        &["-ai", "--munge-links", "--no-munge-links"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, spec) in ["src/", "src"].into_iter().enumerate() {
+            for (k, (src, dst)) in [("", "{dst}/"), ("", "{host}{dst}/"), ("{host}", "{dst}/")].into_iter().enumerate() {
+                let (dr, df) = (format!("r{i}-{j}-{k}"), format!("f{i}-{j}-{k}"));
+                let source = format!("{src}{spec}");
+                let mut a = flags.to_vec();
+                a.extend([source.as_str(), dst]);
+                let (r, f) = both_remote(&top, &a, &dr, &df).unwrap();
+                let what = format!("{flags:?} {source} {dst}");
+                same_output(&r, &f, &[(&dr, &df)], &what);
+                // (Without the destination itself, which each tool created a moment apart.)
+                assert_same_tree(&snap(&top.join(&dr), false), &snap(&top.join(&df), false));
+            }
+        }
+    }
+}

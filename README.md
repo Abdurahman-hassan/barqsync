@@ -134,10 +134,10 @@ encryption are a tie. Method, raw data and more cases:
 | --- | --- |
 | **Basics** | `-a` (= `-rlptgoD`), `-r`, `-v`, `-q`, `-n` (dry run), `-z`, `-h`, `--stats`, `--no-OPTION` (`-a --no-o --no-g`) |
 | **What to copy** | `--exclude`, `--include`, `--exclude-from`, `--include-from`, `--filter`/`-f`, `-F`, `-C`, `-m`, `--files-from`, `-R`, `-d`, `-x`, `--max-size`, `--min-size`, `--existing`, `--ignore-existing`, `-u` |
-| **Deleting** | `--delete`, `--delete-before`/`-during`/`-delay`/`-after`, `--delete-excluded`, `--max-delete`, `--remove-source-files` |
+| **Deleting** | `--delete`, `--delete-before`/`-during`/`-delay`/`-after`, `--delete-excluded`, `--max-delete`, `--force`, `--ignore-errors`, `--ignore-missing-args`, `--delete-missing-args`, `--remove-source-files` |
 | **Comparing** | `-c`, `--size-only`, `-I`, `--modify-window` |
-| **Writing** | `--inplace`, `--append`, `--append-verify`, `--partial`, `--partial-dir`, `-P`, `-S`, `-W`, `--no-whole-file`, `--fsync`, `--mkpath`, `-b`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest` |
-| **Links and metadata** | `-l`, `-L`, `-k`, `-K`, `-H`, `-p`, `-t`, `-g`, `-o`, `-D`, `-O`, `-X` (extended attributes), `-A` (ACLs), `--numeric-ids`, `--chmod`, `--chown`, `--usermap`, `--groupmap` |
+| **Writing** | `--inplace`, `--append`, `--append-verify`, `-T`, `--delay-updates`, `--partial`, `--partial-dir`, `-P`, `-S`, `-W`, `--no-whole-file`, `--fsync`, `--mkpath`, `-b`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest` |
+| **Links and metadata** | `-l`, `-L`, `-k`, `-K`, `--safe-links`, `--copy-unsafe-links`, `--munge-links`, `-H`, `-p`, `-t`, `-g`, `-o`, `-D`, `-O`, `-X` (extended attributes), `-A` (ACLs), `--numeric-ids`, `--chmod`, `--chown`, `--usermap`, `--groupmap` |
 | **Remote** | `-e`, `--remote-path`, `--timeout`, `--bwlimit`, `-s`, `--transport` (ssh, tcp, quic, auto), `--streams N`, `--strategy adaptive`, `--compress-level N` |
 | **Output** | `-i`, `--out-format`, `--progress`, `--info=progress2` |
 

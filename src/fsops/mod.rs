@@ -433,6 +433,12 @@ const TEMP_SUFFIX_LEN: usize = 7; // ".XXXXXX"
 /// `.<name>.XXXXXX` in the same directory, truncated to fit NAME_MAX. Works on raw
 /// bytes so non-UTF-8 names never collapse onto a shared temp name.
 pub fn temp_name(final_name: &OsStr) -> OsString {
+    temp_name_with(final_name, true)
+}
+
+/// [`temp_name`], without the leading `.` when `dot` is false (a `-T` directory's temp
+/// files, as rsync names them there).
+pub fn temp_name_with(final_name: &OsStr, dot: bool) -> OsString {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut name = final_name.as_bytes();
     let budget = MAX_NAME - 1 - TEMP_SUFFIX_LEN;
@@ -446,7 +452,9 @@ pub fn temp_name(final_name: &OsStr) -> OsString {
         name = &name[..cut];
     }
     let mut out = Vec::with_capacity(1 + name.len() + TEMP_SUFFIX_LEN);
-    out.push(b'.');
+    if dot {
+        out.push(b'.');
+    }
     out.extend_from_slice(name);
     out.push(b'.');
     let mut r = next_rand();
@@ -464,10 +472,20 @@ use std::os::unix::ffi::OsStringExt;
 pub fn with_temp<T>(
     dir: &Path,
     final_name: &OsStr,
+    create: impl FnMut(&Path) -> io::Result<T>,
+) -> io::Result<(PathBuf, T)> {
+    with_temp_in(dir, final_name, true, create)
+}
+
+/// [`with_temp`], the names without their leading `.` when `dot` is false.
+pub fn with_temp_in<T>(
+    dir: &Path,
+    final_name: &OsStr,
+    dot: bool,
     mut create: impl FnMut(&Path) -> io::Result<T>,
 ) -> io::Result<(PathBuf, T)> {
     for _ in 0..64 {
-        let tmp = dir.join(temp_name(final_name));
+        let tmp = dir.join(temp_name_with(final_name, dot));
         register_temp(&tmp);
         match create(&tmp) {
             Ok(v) => return Ok((tmp, v)),
@@ -486,6 +504,25 @@ pub fn with_temp<T>(
 pub fn drop_temp(tmp: &Path) {
     let _ = fs::remove_file(tmp);
     unregister_temp(tmp);
+}
+
+/// Rename `from` to `to`. Across filesystems (a `-T` directory on another one) that
+/// can't work, so, as rsync does, the data is copied over `to` instead (truncated and
+/// rewritten in place, or created) and `from` removed. Returns whether it was copied:
+/// `to` then still needs its attributes.
+pub fn rename_or_copy(from: &Path, to: &Path) -> io::Result<bool> {
+    match fs::rename(from, to) {
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let src = File::open(from)?;
+            let md = src.metadata()?;
+            let out = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(md.permissions().mode() & 0o777).open(to)?;
+            copy_buffered(&src, &out, md.len())?;
+            fs::remove_file(from)?;
+            Ok(true)
+        }
+        r => r.map(|()| false),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -117,7 +117,7 @@ impl Prune {
             },
         };
         // Errors are reported when the transfer reads the directory.
-        let ents = adjust_listing(opts, dir, ents, &mut |_| {});
+        let ents = adjust_listing(opts, dir, rel, ents, &mut |_| {}, &mut |_| {});
         let passes = |e: &DirEnt| !filter.excluded(rules, &join_rel(rel, &e.name), e.meta.kind == Kind::Dir, Side::Sender);
         // Anything but a directory settles it without looking further down.
         if ents.iter().any(|e| e.meta.kind != Kind::Dir && passes(e)) {
