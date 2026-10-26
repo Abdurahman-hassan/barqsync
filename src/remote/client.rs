@@ -137,6 +137,8 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     server_opts.paths = server_paths;
     server_opts.transport = if transport == Transport::Auto { Transport::Quic } else { transport };
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };
+    // --timeout covers waiting for the remote side to start, as rsync's does.
+    super::set_timeout(opts.timeout);
     let handshake = conn.msg(hello).map_err(Stop::Io).and_then(|()| recv(&conn));
     match handshake {
         Ok(Frame::Msg(Msg::HelloAck { .. })) => mark("handshake done"),
@@ -159,6 +161,11 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         Err(Stop::Interrupted) => {
             let _ = child.kill();
             return exit::SIGNAL;
+        }
+        Err(Stop::Io(e)) if super::timed_out() => {
+            out.error(e.to_string());
+            let _ = child.kill();
+            return exit::TIMEOUT;
         }
         Err(Stop::Io(_)) => {
             drop(conn);
@@ -183,6 +190,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
 
     mark("setup done");
+    let keepalive = super::KeepAlive::start(&conn.out, opts.timeout);
     let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));
     // `confirmed`: this side has the peer's last frame, so the peer has everything this
     // side sent: the sender (of a push) once it has `ReceiverDone`, the receiver of a pull
@@ -196,14 +204,21 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         let confirmed = stats.is_some();
         (code, stats, confirmed)
     };
+    drop(keepalive);
     if let Some(r) = reporter {
         r.finish(out);
     }
     // Interrupted (here, or the server said so), the run ends with 20 even if the transfer
     // loop saw the peer finish first.
-    let code = if crate::fsops::interrupted() { exit::SIGNAL } else { code };
+    let code = if crate::fsops::interrupted() {
+        exit::SIGNAL
+    } else if super::timed_out() {
+        exit::TIMEOUT
+    } else {
+        code
+    };
     // A run that stopped early waits for nothing it doesn't have to.
-    let clean = code == exit::OK || code == exit::PARTIAL;
+    let clean = matches!(code, exit::OK | exit::PARTIAL | exit::VANISHED | exit::DEL_LIMIT);
     mark("transfer done");
     if chosen == Some(auto::Outcome::Quic)
         && code != exit::SIGNAL
@@ -223,7 +238,12 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     {
         let totals = Stats::default();
         totals.absorb(&s);
-        totals.print(out, started.elapsed(), opts.human, opts.stats);
+        let io = crate::output::Io {
+            sent: crate::proto::BYTES_SENT.load(std::sync::atomic::Ordering::Relaxed),
+            received: crate::proto::BYTES_RECEIVED.load(std::sync::atomic::Ordering::Relaxed),
+            dry_run: opts.dry_run,
+        };
+        totals.print(out, started.elapsed(), opts.human, opts.stats, io);
     }
     out.flush();
     code

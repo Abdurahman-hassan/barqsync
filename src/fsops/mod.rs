@@ -151,6 +151,58 @@ pub fn same_open_file(a: &File, b: &File) -> io::Result<bool> {
     Ok(same_file(&Meta::from_metadata(&a.metadata()?), &Meta::from_metadata(&b.metadata()?)))
 }
 
+/// Tests: with `BARQSYNC_TEST_VANISH=NAME`, a source file named NAME is removed just before
+/// it is opened to be sent, as if it was deleted after the scan.
+pub fn test_vanish(path: &Path) {
+    static NAME: std::sync::LazyLock<Option<std::ffi::OsString>> =
+        std::sync::LazyLock::new(|| std::env::var_os("BARQSYNC_TEST_VANISH"));
+    if let Some(name) = NAME.as_deref()
+        && path.file_name() == Some(name)
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// `--mkpath`: create the directories of `path` that don't exist yet, `path` included
+/// (rsync's `make_path`). A dry run only counts them. Returns how many there were.
+pub fn make_path(path: &Path, dry_run: bool) -> io::Result<usize> {
+    let mut missing = Vec::new();
+    let mut p = path;
+    loop {
+        match fs::metadata(p) {
+            Ok(m) if m.is_dir() => break,
+            Ok(_) => return Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing.push(p);
+                match p.parent() {
+                    Some(q) if !q.as_os_str().is_empty() => p = q,
+                    _ => break,
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if !dry_run {
+        for d in missing.iter().rev() {
+            match fs::create_dir(d) {
+                Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+                _ => {}
+            }
+        }
+    }
+    Ok(missing.len())
+}
+
+/// `path` as rsync names files in its messages: absolute, its directory resolved the way
+/// rsync's working directory is.
+pub fn full_path(path: &Path) -> PathBuf {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    match (std::fs::canonicalize(dir), path.file_name()) {
+        (Ok(d), Some(name)) => d.join(name),
+        _ => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+    }
+}
+
 /// What a source file that is no longer the one its listing described is refused with.
 pub const CHANGED_SINCE_LISTED: &str = "changed since it was listed";
 

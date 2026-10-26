@@ -52,6 +52,8 @@ pub fn run() -> i32 {
         return exit::PROTOCOL;
     }
     mark("setup done");
+    super::set_timeout(opts.timeout);
+    let keepalive = super::KeepAlive::start(&conn.out, opts.timeout);
     let fwd = conn.out.clone();
     // In a push the items come from this (receiving) side but describe what the
     // client sent, so they are shown as rsync's sender does (`<f...`).
@@ -77,8 +79,15 @@ pub fn run() -> i32 {
             }
         }
     };
+    drop(keepalive);
     // Interrupted (here, or the client said so): 20, whatever the transfer loop saw.
-    let code = if crate::fsops::interrupted() { exit::SIGNAL } else { code };
+    let code = if crate::fsops::interrupted() {
+        exit::SIGNAL
+    } else if super::timed_out() {
+        exit::TIMEOUT
+    } else {
+        code
+    };
     mark("transfer done");
     drop(out);
     let _ = if confirmed { conn.finish_confirmed() } else { conn.finish() };

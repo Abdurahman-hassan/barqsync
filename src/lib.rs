@@ -34,6 +34,12 @@ pub mod exit {
     pub const IPC: i32 = 14;
     pub const SIGNAL: i32 = 20;
     pub const PARTIAL: i32 = 23;
+    /// Source files vanished before they could be sent.
+    pub const VANISHED: i32 = 24;
+    /// `--max-delete` stopped deletions.
+    pub const DEL_LIMIT: i32 = 25;
+    /// `--timeout`: no data moved for that long.
+    pub const TIMEOUT: i32 = 30;
     /// The remote shell failed (e.g. ssh could not connect).
     pub const RSH: i32 = 255;
 }

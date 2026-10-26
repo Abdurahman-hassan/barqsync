@@ -132,13 +132,13 @@ encryption are a tie. Method, raw data and more cases:
 
 | Area | Options |
 | --- | --- |
-| **Basics** | `-a` (= `-rlptgoD`), `-r`, `-v`, `-q`, `-n` (dry run), `-z`, `-h`, `--stats` |
-| **What to copy** | `--exclude`, `--include`, `--exclude-from`, `--include-from`, `--files-from`, `-R`, `-d`, `-x`, `--max-size`, `--min-size`, `--existing`, `--ignore-existing`, `-u` |
-| **Deleting** | `--delete`, `--delete-excluded`, `--remove-source-files` |
+| **Basics** | `-a` (= `-rlptgoD`), `-r`, `-v`, `-q`, `-n` (dry run), `-z`, `-h`, `--stats`, `--no-OPTION` (`-a --no-o --no-g`) |
+| **What to copy** | `--exclude`, `--include`, `--exclude-from`, `--include-from`, `--filter`/`-f`, `-F`, `-C`, `-m`, `--files-from`, `-R`, `-d`, `-x`, `--max-size`, `--min-size`, `--existing`, `--ignore-existing`, `-u` |
+| **Deleting** | `--delete`, `--delete-before`/`-during`/`-delay`/`-after`, `--delete-excluded`, `--max-delete`, `--remove-source-files` |
 | **Comparing** | `-c`, `--size-only`, `-I`, `--modify-window` |
-| **Writing** | `--inplace`, `--partial`, `--partial-dir`, `-P`, `-S`, `-W`, `--no-whole-file`, `--fsync`, `-b`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest` |
+| **Writing** | `--inplace`, `--partial`, `--partial-dir`, `-P`, `-S`, `-W`, `--no-whole-file`, `--fsync`, `--mkpath`, `-b`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest` |
 | **Links and metadata** | `-l`, `-L`, `-k`, `-K`, `-H`, `-p`, `-t`, `-g`, `-o`, `-D`, `-O`, `-X` (extended attributes), `-A` (ACLs), `--numeric-ids`, `--chmod` |
-| **Remote** | `-e`, `--remote-path`, `--transport` (ssh, tcp, quic, auto), `--streams N`, `--strategy adaptive`, `--compress-level N` |
+| **Remote** | `-e`, `--remote-path`, `--timeout`, `-s`, `--transport` (ssh, tcp, quic, auto), `--streams N`, `--strategy adaptive`, `--compress-level N` |
 | **Output** | `-i`, `--out-format`, `--progress`, `--info=progress2` |
 
 Every option, and where barqsync differs from rsync:

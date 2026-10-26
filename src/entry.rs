@@ -36,6 +36,10 @@ impl Kind {
         }
     }
 
+    pub fn is_device(self) -> bool {
+        matches!(self, Kind::CharDev | Kind::BlockDev)
+    }
+
     pub fn is_special(self) -> bool {
         matches!(self, Kind::Fifo | Kind::CharDev | Kind::BlockDev | Kind::Socket)
     }

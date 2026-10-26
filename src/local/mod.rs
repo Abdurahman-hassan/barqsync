@@ -5,6 +5,7 @@ pub mod extra;
 pub mod flags;
 pub(crate) mod merge;
 pub mod pipeline;
+pub(crate) mod prune;
 
 use crate::cli::Options;
 use crate::entry::Kind;
@@ -50,6 +51,18 @@ pub struct Plan {
 /// (one level, like rsync) when it must be a directory and does not exist yet.
 pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output) -> Result<Plan, i32> {
     let dest_path = PathBuf::from(dest);
+    // Without -r or -d, rsync transfers no directory, not even what a `src/` holds.
+    let sources: Vec<OsString> = if !opts.recursive && !opts.dirs && !opts.relative {
+        let skipped = |s: &&OsString| wants_contents(s) && fs::metadata(s).is_ok_and(|m| m.is_dir());
+        sources.iter().filter(|s| skipped(s)).for_each(|_| out.note("skipping directory ."));
+        sources.iter().filter(|s| !skipped(s)).cloned().collect()
+    } else {
+        sources.to_vec()
+    };
+    if sources.is_empty() {
+        return Ok(Plan { roots: Vec::new(), dest_exists: false, dest_created: false, dest_root: dest_path });
+    }
+    let sources = &sources[..];
     let dest_meta = fs::metadata(&dest_path).ok();
     let dest_is_dir = dest_meta.as_ref().is_some_and(|m| m.is_dir());
 
@@ -68,6 +81,9 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
                 out.error(path_msg("invalid destination \"", &dest_path, "\""));
                 return Err(exit::SYNTAX);
             };
+            if opts.mkpath && dest.as_bytes().contains(&b'/') {
+                make_dest_path(&dst_dir, opts, out)?;
+            }
             return Ok(Plan {
                 roots: vec![Root::Items { src_dir: parent, dst_dir: dst_dir.clone(), items: vec![(name, dst_name)] }],
                 dest_exists: true,
@@ -79,11 +95,15 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
 
     let mut dest_exists = dest_is_dir;
     let mut dest_created = false;
-    if !dest_is_dir {
-        if dest_meta.is_some() {
-            out.error(path_msg("destination \"", &dest_path, "\" exists and is not a directory"));
-            return Err(exit::FILE_IO);
-        }
+    if !dest_is_dir && dest_meta.is_some() {
+        out.error(path_msg("destination \"", &dest_path, "\" exists and is not a directory"));
+        return Err(exit::FILE_IO);
+    }
+    // --mkpath: like rsync, the destination is then compared as an existing directory.
+    if !dest_is_dir && opts.mkpath {
+        dest_exists = make_dest_path(&dest_path, opts, out)? > 0 && !opts.dry_run;
+    }
+    if !dest_exists {
         let raw = dest.as_bytes();
         let shown = if raw.len() > 1 { &raw[..raw.iter().rposition(|&c| c != b'/').map_or(0, |p| p + 1)] } else { raw };
         let created = [b"created directory ", shown].concat();
@@ -128,10 +148,29 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
     Ok(Plan { roots, dest_exists, dest_created, dest_root: dest_path })
 }
 
+/// `--mkpath`: create the missing directories leading to and including `dir`, telling
+/// how many with `-v`/`-i` as rsync does (a dry run counts them and creates none).
+pub(crate) fn make_dest_path(dir: &Path, opts: &Options, out: &Output) -> Result<usize, i32> {
+    match fsops::make_path(dir, opts.dry_run) {
+        Ok(0) => Ok(0),
+        Ok(n) => {
+            let raw = dir.as_os_str().as_bytes();
+            let shown = &raw[..raw.iter().rposition(|&c| c != b'/').map_or(raw.len(), |p| p + 1)];
+            let what = if n == 1 { "directory" } else { "directories" };
+            out.info([format!("created {n} {what} for ").as_bytes(), shown].concat());
+            Ok(n)
+        }
+        Err(e) => {
+            out.error(path_msg("mkdir \"", dir, format!("\" failed: {e}")));
+            Err(exit::FILE_IO)
+        }
+    }
+}
+
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // Process-lifetime output, shared with the progress thread.
     let out: &'static Output = Box::leak(Box::new(Output::new(opts)));
-    let filter = match Filter::new(&opts.filter_rules) {
+    let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
         Err(e) => {
             out.error(format!("{e:#}"));
@@ -211,15 +250,11 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
 
     if opts.stats || opts.verbose > 0 {
-        engine.stats.print(out, started.elapsed(), opts.human, opts.stats);
+        // No connection: what is "sent" is the file data written.
+        let io = crate::output::Io { sent: Stats::get(&engine.stats.literal_bytes), received: 0, dry_run: opts.dry_run };
+        engine.stats.print(out, started.elapsed(), opts.human, opts.stats, io);
     }
     out.flush();
 
-    if fsops::interrupted() {
-        exit::SIGNAL
-    } else if Stats::get(&engine.stats.errors) > 0 {
-        exit::PARTIAL
-    } else {
-        exit::OK
-    }
+    if fsops::interrupted() { exit::SIGNAL } else { engine.stats.exit_code() }
 }

@@ -324,10 +324,31 @@ impl Output {
         }
     }
 
+    /// A message shown without `-v` but not with `-q` that may name entries (rsync's
+    /// `FINFO` lines, such as "cannot delete non-empty directory").
+    pub fn note(&self, msg: impl AsRef<[u8]>) {
+        if !self.quiet {
+            self.escaped_line(msg.as_ref());
+        }
+    }
+
     /// Always shown (unless redirected); used for summaries. Not escaped, so the
     /// message may contain newlines but must not contain names.
     pub fn always(&self, msg: impl AsRef<[u8]>) {
         self.line(msg.as_ref());
+    }
+
+    /// A warning to stderr, without the program name in front (rsync's `FWARNING`, such
+    /// as "file has vanished"); escaped like errors.
+    pub fn warning(&self, msg: impl AsRef<[u8]>) {
+        if let Some(f) = &self.forward {
+            return f(true, true, msg.as_ref());
+        }
+        self.flush();
+        let mut line = Vec::new();
+        escape(msg.as_ref(), self.charset, &mut line);
+        line.push(b'\n');
+        let _ = std::io::stderr().lock().write_all(&line);
     }
 
     /// Error to stderr, escaped like the other lines. Build names into the message with
@@ -505,23 +526,48 @@ pub struct Stats {
     pub delta_files: AtomicU64,
     pub literal_bytes: AtomicU64,
     pub matched_bytes: AtomicU64,
+    /// Entries `--delete` removed (not those replaced by another type of entry).
     pub deleted: AtomicU64,
     pub errors: AtomicU64,
+    /// Source files that were gone when they were to be sent (rsync's "file has vanished").
+    pub vanished: AtomicU64,
+    /// Deletions `--max-delete` stopped.
+    pub del_skipped: AtomicU64,
 }
 
 /// Plain copy of [`Stats`] for sending over the wire.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct StatsSnapshot(pub [u64; 14]);
+// Boxed: inline, it would make every protocol message as big as these counters.
+pub struct StatsSnapshot(pub Box<[u64; 16]>);
 
 impl StatsSnapshot {
     pub fn errors(&self) -> u64 {
         self.0[13]
     }
+
+    /// The exit code these counters call for (see [`exit_code`]).
+    pub fn exit_code(&self) -> i32 {
+        exit_code(self.0[13], self.0[14], self.0[15])
+    }
+}
+
+/// rsync's exit code after a transfer that ran to the end: 23 after errors, else 24 when
+/// source files vanished, else 25 when `--max-delete` stopped deletions, else 0.
+pub fn exit_code(errors: u64, vanished: u64, del_skipped: u64) -> i32 {
+    if errors > 0 {
+        crate::exit::PARTIAL
+    } else if vanished > 0 {
+        crate::exit::VANISHED
+    } else if del_skipped > 0 {
+        crate::exit::DEL_LIMIT
+    } else {
+        crate::exit::OK
+    }
 }
 
 impl Stats {
-    fn fields(&self) -> [&AtomicU64; 14] {
+    fn fields(&self) -> [&AtomicU64; 16] {
         [
             &self.files,
             &self.dirs,
@@ -537,16 +583,23 @@ impl Stats {
             &self.matched_bytes,
             &self.deleted,
             &self.errors,
+            &self.vanished,
+            &self.del_skipped,
         ]
     }
 
+    /// The exit code these counters call for (see [`exit_code`]).
+    pub fn exit_code(&self) -> i32 {
+        exit_code(Self::get(&self.errors), Self::get(&self.vanished), Self::get(&self.del_skipped))
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
-        StatsSnapshot(self.fields().map(Self::get))
+        StatsSnapshot(Box::new(self.fields().map(Self::get)))
     }
 
     /// Add another process's counters into these.
     pub fn absorb(&self, s: &StatsSnapshot) {
-        for (c, v) in self.fields().into_iter().zip(s.0) {
+        for (c, v) in self.fields().into_iter().zip(*s.0) {
             Self::add(c, v);
         }
     }
@@ -559,7 +612,9 @@ impl Stats {
         c.load(Relaxed)
     }
 
-    pub fn print(&self, out: &Output, elapsed: Duration, human: bool, full: bool) {
+    /// The summary of `-v` and `--stats` (`full`). `io`: the bytes this side sent and
+    /// received, which rsync's lines report.
+    pub fn print(&self, out: &Output, elapsed: Duration, human: bool, full: bool, io: Io) {
         let g = Self::get;
         let num = |n: u64| if human { human_num(n) } else { n.to_string() };
         let secs = elapsed.as_secs_f64().max(1e-9);
@@ -588,6 +643,8 @@ impl Stats {
             ));
             out.always(format!("Literal data: {} bytes", num(g(&self.literal_bytes))));
             out.always(format!("Matched data: {} bytes", num(g(&self.matched_bytes))));
+            out.always(format!("Total bytes sent: {}", rsync_num(io.sent, human)));
+            out.always(format!("Total bytes received: {}", rsync_num(io.received, human)));
             out.always(format!("Elapsed: {secs:.3}s"));
         }
         out.always(format!(
@@ -598,7 +655,74 @@ impl Stats {
             human_num((g(&self.transferred_bytes) as f64 / secs) as u64),
             num(g(&self.total_size)),
         ));
+        // rsync's own two lines, which scripts look for.
+        let moved = io.sent + io.received;
+        out.always(format!(
+            "\nsent {} bytes  received {} bytes  {} bytes/sec",
+            rsync_num(io.sent, human),
+            rsync_num(io.received, human),
+            rsync_dnum(moved as f64 / secs, human),
+        ));
+        out.always(format!(
+            "total size is {}  speedup is {}{}",
+            rsync_num(g(&self.total_size), human),
+            rsync_dnum(g(&self.total_size) as f64 / moved.max(1) as f64, false),
+            if io.dry_run { " (DRY RUN)" } else { "" },
+        ));
     }
+}
+
+/// What rsync's summary lines report besides the counters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Io {
+    /// Bytes this side wrote to the connection (a local copy: the file data written).
+    pub sent: u64,
+    /// Bytes it read from the connection.
+    pub received: u64,
+    pub dry_run: bool,
+}
+
+/// A number as rsync prints it: with thousands separators, or with `-h` in units of
+/// 1000 (`1.23K`).
+pub fn rsync_num(n: u64, human: bool) -> String {
+    if human && n >= 1000 {
+        let mut v = n as f64 / 1000.0;
+        let mut units = b"KMGTP".iter();
+        let mut unit = units.next().copied().unwrap_or(b'K');
+        while v >= 1000.0 {
+            match units.next() {
+                Some(&u) => {
+                    v /= 1000.0;
+                    unit = u;
+                }
+                None => break,
+            }
+        }
+        return format!("{v:.2}{}", unit as char);
+    }
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A fractional number as rsync prints it (two decimals; see [`rsync_num`]).
+pub fn rsync_dnum(v: f64, human: bool) -> String {
+    let v = if v.is_finite() && v >= 0.0 { v } else { 0.0 };
+    if v < 1000.0 {
+        return format!("{v:.2}");
+    }
+    if human {
+        return rsync_num(v as u64, true);
+    }
+    let fixed = format!("{v:.2}");
+    let (int, frac) = fixed.split_once('.').unwrap_or((&fixed, "00"));
+    format!("{}.{frac}", rsync_num(int.parse().unwrap_or(0), false))
 }
 
 pub fn human_num(n: u64) -> String {
@@ -669,6 +793,25 @@ mod tests {
         for s in [&b"\xe0\x80\x80"[..], b"\xf0\x80\x80\x80", b"\xf8\x80\x80\x80\x80", b"\xfc\x80\x80\x80\x80\x80", b"\x80", b"\xfe", b"\xff"] {
             assert_eq!(utf8_len(s), None, "{s:?}");
         }
+    }
+
+    #[test]
+    fn numbers_print_like_rsync() {
+        assert_eq!(rsync_num(0, false), "0");
+        assert_eq!(rsync_num(999, false), "999");
+        assert_eq!(rsync_num(1000, false), "1,000");
+        assert_eq!(rsync_num(1_234_567, false), "1,234,567");
+        assert_eq!(rsync_num(999, true), "999");
+        assert_eq!(rsync_num(1234, true), "1.23K");
+        assert_eq!(rsync_num(5_600_000, true), "5.60M");
+        assert_eq!(rsync_dnum(874.0, false), "874.00");
+        assert_eq!(rsync_dnum(12_345.678, false), "12,345.68");
+        assert_eq!(rsync_dnum(12_345.678, true), "12.35K");
+        assert_eq!(rsync_dnum(f64::NAN, false), "0.00");
+        assert_eq!(exit_code(1, 1, 1), 23);
+        assert_eq!(exit_code(0, 1, 1), 24);
+        assert_eq!(exit_code(0, 0, 1), 25);
+        assert_eq!(exit_code(0, 0, 0), 0);
     }
 
     #[test]

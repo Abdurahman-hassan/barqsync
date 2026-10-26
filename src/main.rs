@@ -19,7 +19,9 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("barqsync: {e:#}");
-                std::process::exit(exit::SYNTAX);
+                // A rules file that can't be read is a file I/O error for rsync.
+                let io = e.chain().any(|c| c.is::<barqsync::filter::RulesFileError>());
+                std::process::exit(if io { exit::FILE_IO } else { exit::SYNTAX });
             }
         },
     };

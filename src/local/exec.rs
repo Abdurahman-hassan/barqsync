@@ -20,7 +20,7 @@ use crate::delta::{self, DeltaMode, apply::apply, cdc};
 use super::extra::{DstExtra, Src, XSource};
 use crate::diff::{AttrDiff, DiffRules, FileAction, file_action_ext};
 use crate::entry::{DirEnt, Extra, Kind, Meta};
-use crate::filter::Filter;
+use crate::filter::{DirRules, Filter, Side};
 use crate::fsops::{self, Copied};
 use crate::output::{Change, Link, Output, Stats, path_msg};
 use crate::paths::join_rel;
@@ -28,6 +28,7 @@ use crate::checksum::{self, Sum};
 use crate::select::{self, Descend, Sel};
 use rayon::Scope;
 use rayon::prelude::*;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -70,6 +71,17 @@ pub struct Engine<'a> {
     io_error: AtomicBool,
     /// "IO error encountered -- skipping file deletion" was shown.
     io_warned: AtomicBool,
+    /// `-m`: which source directories have content (local transfers).
+    pub(crate) prune: super::prune::Prune,
+}
+
+/// Per-directory filter state (see [`DirRules`]): the source side's decides what is sent
+/// (local transfers: a remote sender checks its own), the destination side's what
+/// `--delete` leaves alone.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Rules {
+    pub(crate) src: DirRules,
+    pub(crate) dst: DirRules,
 }
 
 pub(crate) struct DirJob {
@@ -91,6 +103,8 @@ pub(crate) struct DirJob {
     /// Same-named directories of later sources merged into this one (several SRC
     /// arguments land in one destination, see [`merge`]).
     pub(crate) more: Vec<SrcDir>,
+    /// Filter state of the parent directory, which this one's own starts from.
+    pub(crate) rules: Rules,
 }
 
 pub(crate) struct Ctx<'p> {
@@ -110,6 +124,8 @@ pub(crate) struct Ctx<'p> {
     wire_dir: u32,
     /// A listing merged from several source directories: where each entry comes from.
     sources: Option<&'p Sources>,
+    /// This directory's own filter state (the source side's: when not merged).
+    rules: &'p Rules,
 }
 
 pub(crate) struct FileJob {
@@ -173,6 +189,8 @@ struct Follower {
     dst_path: PathBuf,
     rel: Vec<u8>,
     meta: Meta,
+    /// Destination-side filter state of its directory.
+    rules: DirRules,
     /// `-X`: the destination name's attributes differed when it was reached. rsync shows
     /// that on a name already linked to its leader too (its receiver writes attributes
     /// after the generator has looked at every name, unlike modes and ACLs).
@@ -194,11 +212,69 @@ struct DirFixup {
 struct Deletion {
     rel: Vec<u8>,
     meta: Meta,
+    /// Destination-side filter state of the directory it is in.
+    rules: DirRules,
+}
+
+/// How deleting an entry went (rsync's `enum delret`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Del {
+    Done,
+    /// Something in it stays: protected by a rule, or not deleted.
+    NotEmpty,
+    /// `--max-delete` was reached.
+    AtLimit,
+    Failed,
 }
 
 /// A name for a message: the root shows as `.`.
 fn quoted(rel: &[u8]) -> &[u8] {
     if rel.is_empty() { b"." } else { rel }
+}
+
+/// rsync's file-list order for two names in one directory (each with whether it is a
+/// directory), reversed, which is the order it deletes them in: subdirectories first,
+/// then the rest, each by descending name.
+fn in_dir_order(a: (&[u8], bool), b: (&[u8], bool)) -> Ordering {
+    match (a.1, b.1) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (true, true) => dir_name_cmp(b.0, a.0),
+        (false, false) => b.0.cmp(a.0),
+    }
+}
+
+/// Two directory names as rsync sorts them: as if each ended in `/`.
+fn dir_name_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    a.iter().chain(b"/").cmp(b.iter().chain(b"/"))
+}
+
+/// The order rsync deletes extraneous entries in (each a path relative to the transfer
+/// root, and whether it is a directory): directory by directory as its file list visits
+/// them (a directory before the ones in it, siblings by name), in each as
+/// [`in_dir_order`].
+fn deletion_order(a: (&[u8], bool), b: (&[u8], bool)) -> Ordering {
+    fn split(rel: &[u8]) -> (&[u8], &[u8]) {
+        match rel.iter().rposition(|&c| c == b'/') {
+            Some(i) => (&rel[..i], &rel[i + 1..]),
+            None => (b"", rel),
+        }
+    }
+    let ((pa, na), (pb, nb)) = (split(a.0), split(b.0));
+    if pa == pb {
+        return in_dir_order((na, a.1), (nb, b.1));
+    }
+    let mut ca = pa.split(|&c| c == b'/').filter(|c| !c.is_empty());
+    let mut cb = pb.split(|&c| c == b'/').filter(|c| !c.is_empty());
+    loop {
+        match (ca.next(), cb.next()) {
+            (Some(x), Some(y)) if x == y => {}
+            (Some(x), Some(y)) => return dir_name_cmp(x, y),
+            // One directory is above the other: its deletions come first.
+            (None, _) => return Ordering::Less,
+            (_, None) => return Ordering::Greater,
+        }
+    }
 }
 
 impl<'a> Engine<'a> {
@@ -237,6 +313,7 @@ impl<'a> Engine<'a> {
             xrules: crate::xattrs::Rules { level: opts.xattrs, am_root },
             io_error: AtomicBool::new(false),
             io_warned: AtomicBool::new(false),
+            prune: Default::default(),
         }
     }
 
@@ -370,7 +447,8 @@ impl<'a> Engine<'a> {
                     Err(e) => return self.src_err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
                 };
                 let extra = self.local_root_extra(src, &src_meta);
-                let job = self.root_job(src.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh, extra);
+                let mut job = self.root_job(src.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh, extra);
+                job.rules = self.root_rules(src, src, dst);
                 match &self.pipeline {
                     Some(p) => p.expect_dir(s, self, job),
                     None => s.spawn(move |s| self.process_dir(s, job)),
@@ -391,6 +469,9 @@ impl<'a> Engine<'a> {
                     ents.push(DirEnt::new(sname.clone(), meta, link));
                 }
                 let ents = self.adjust_listing(src_dir, ents);
+                // The first directory read is the first item that is one.
+                let first = ents.iter().find(|e| e.meta.kind == Kind::Dir).map_or_else(|| src_dir.clone(), |e| src_dir.join(&e.name));
+                let rules = self.root_rules(src_dir, &first, dst_dir);
                 let entries = ents
                     .into_iter()
                     .enumerate()
@@ -399,9 +480,10 @@ impl<'a> Engine<'a> {
                         (i as u32, e, dname)
                     })
                     .collect();
-                self.run_items(s, src_dir, dst_dir, 0, 0, entries, !dest_exists || dest_fresh, None, None);
+                self.run_items(s, src_dir, dst_dir, 0, 0, entries, !dest_exists || dest_fresh, None, None, &rules);
             }
             Root::Select { base, dst, sel, with_root } => {
+                let rules = self.root_rules(base, base, dst);
                 if *with_root {
                     let src_meta = match fsops::stat(base) {
                         Ok(mut m) => {
@@ -413,11 +495,12 @@ impl<'a> Engine<'a> {
                     let extra = self.local_root_extra(base, &src_meta);
                     let mut job = self.root_job(base.clone(), dst.clone(), src_meta, 0, dest_exists && !dest_fresh, extra);
                     job.sel = sel.at_root(self.opts.recursive);
+                    job.rules = rules;
                     s.spawn(move |s| self.process_dir(s, job));
                 } else {
                     let ents = self.read_selected(base, sel);
                     let entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
-                    self.run_items(s, base, dst, 0, 0, entries, !dest_exists || dest_fresh, Some(sel), None);
+                    self.run_items(s, base, dst, 0, 0, entries, !dest_exists || dest_fresh, Some(sel), None, &rules);
                 }
             }
         }
@@ -438,7 +521,9 @@ impl<'a> Engine<'a> {
         // Each root's top directory, and the first one transferred itself (`src/`), whose
         // attributes the destination gets.
         let mut dirs: Vec<SrcDir> = Vec::with_capacity(roots.len());
+        let mut tops: Vec<bool> = Vec::with_capacity(roots.len());
         let mut top: Option<(PathBuf, Meta)> = None;
+        let mut dst_rules = DirRules::default();
         for root in roots {
             let (path, sel, with_root) = match root {
                 Root::Contents { src, .. } => (src, None, true),
@@ -464,23 +549,71 @@ impl<'a> Engine<'a> {
                 }
             }
             if dirs.iter().all(|d| d.path != *path || d.sel != sel) {
-                dirs.push(SrcDir { path: path.clone(), sel, dev });
+                let rules = self.root_rules(path, path, &dst);
+                dst_rules = rules.dst;
+                dirs.push(SrcDir { path: path.clone(), sel, dev, rules: rules.src });
+                tops.push(with_root);
             }
         }
-        let lists: Vec<Vec<DirEnt>> = dirs.iter().map(|d| self.read_source(&d.path, d.sel).unwrap_or_default()).collect();
+        let mut lists: Vec<Vec<DirEnt>> = Vec::with_capacity(dirs.len());
+        for (d, with_root) in dirs.iter_mut().zip(&tops) {
+            // A `src/` directory is read, so its own filter files count; named items' isn't.
+            let ents = match if *with_root { self.src_rules(&d.rules, &d.path, b"") } else { Some(d.rules.clone()) } {
+                Some(rules) => {
+                    d.rules = rules;
+                    self.read_source(&d.path, d.sel).unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
+            lists.push(ents.into_iter().filter(|e| self.sends(&d.path, b"", &d.rules, d.sel, d.dev, e)).collect());
+        }
         let (ents, sources) = merge::merge(dirs, lists);
         let entries: Entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
+        let rules = Rules { src: DirRules::default(), dst: dst_rules };
         let Some((path, meta)) = top else {
             // Only named items: the destination itself is neither pruned nor changed.
             let base = sources.dirs.first().map(|d| d.path.clone()).unwrap_or_default();
-            return self.run_items(s, &base, &dst, 0, 0, entries, !dest_exists || dest_fresh, None, Some(&sources));
+            return self.run_items(s, &base, &dst, 0, 0, entries, !dest_exists || dest_fresh, None, Some(&sources), &rules);
         };
         let extra = self.local_root_extra(&path, &meta);
-        let job = self.root_job(path, dst, meta, 0, dest_exists && !dest_fresh, extra);
+        let mut job = self.root_job(path, dst, meta, 0, dest_exists && !dest_fresh, extra);
+        job.rules = rules;
         s.spawn(move |s| {
-            let files = self.diff_listing(s, &job, entries, Some(&sources));
+            let files = self.diff_listing(s, &job, entries, Some(&sources), &DirRules::default());
             self.transfer(job.wire_dir, files);
         });
+    }
+
+    /// The filter state of a transfer root: `transfer_root` is what its paths are
+    /// relative to, `first_dir` the first directory read in it, `dst` where it goes.
+    pub(crate) fn root_rules(&self, transfer_root: &Path, first_dir: &Path, dst: &Path) -> Rules {
+        Rules {
+            src: if self.remote.is_some() { DirRules::default() } else { self.filter.root(transfer_root, first_dir, Side::Sender) },
+            dst: if self.opts.delete { self.filter.root(dst, dst, Side::Receiver) } else { DirRules::default() },
+        }
+    }
+
+    /// The source-side filter state of directory `dir` (at `rel`), from its parent's: its
+    /// per-directory filter files are read. `None` after reporting one that could not be
+    /// read: the directory is left out, since what it would exclude is unknown.
+    fn src_rules(&self, inherited: &DirRules, dir: &Path, rel: &[u8]) -> Option<DirRules> {
+        if self.remote.is_some() {
+            return Some(DirRules::default());
+        }
+        self.filter.enter(inherited, dir, rel).map_err(|m| self.src_err(m)).ok()
+    }
+
+    /// Whether entry `e` of source directory `dir` (at `rel`, its own filter state `rules`,
+    /// `-R` selection `sel`, `-x` device `root_dev`) is transferred: no rule excludes it,
+    /// and with `-m` a directory has something to transfer below it. A remote sender
+    /// applied the rules already; the ones only it can check (per-directory files,
+    /// absolute paths) are trusted, as rsync trusts them.
+    fn sends(&self, dir: &Path, rel: &[u8], rules: &DirRules, sel: Option<&'static Sel>, root_dev: Option<u64>, e: &DirEnt) -> bool {
+        if self.remote.is_some() {
+            let erel = join_rel(rel, &e.name);
+            return !self.filter.is_static() || !self.filter.excluded(&DirRules::default(), &erel, e.meta.kind == Kind::Dir, Side::Sender);
+        }
+        super::prune::sends(self.opts, &self.filter, &self.prune, dir, rel, rules, sel, root_dev, e, &|m| self.src_err(m))
     }
 
     /// The selected entries of `dir`, with missing names reported as errors.
@@ -531,12 +664,13 @@ impl<'a> Engine<'a> {
             pre,
             sel: None,
             more: Vec::new(),
+            rules: Rules::default(),
         }
     }
 
     /// Named top-level entries (`src` without a trailing slash, or single files) synced
     /// into `dst_dir`. Unlike a directory, `dst_dir` itself is neither pruned nor
-    /// given the source's attributes.
+    /// given the source's attributes. `rules`: the transfer root's filter state.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_items<'s>(
         &'s self,
@@ -549,11 +683,13 @@ impl<'a> Engine<'a> {
         dst_is_new: bool,
         sel: Option<&'static Sel>,
         sources: Option<&Sources>,
+        rules: &Rules,
     ) {
-        let entries: Entries = entries
-            .into_iter()
-            .filter(|(_, e, _)| !self.filter.is_excluded(e.name.as_bytes(), e.meta.kind == Kind::Dir))
-            .collect();
+        // Merged roots were filtered source by source.
+        let entries: Entries = match sources {
+            Some(_) => entries,
+            None => entries.into_iter().filter(|(_, e, _)| self.sends(src_dir, b"", &rules.src, sel, None, e)).collect(),
+        };
         let mut dst_map = HashMap::new();
         if !dst_is_new {
             for (_, e, dname) in &entries {
@@ -576,6 +712,7 @@ impl<'a> Engine<'a> {
             sel,
             wire_dir,
             sources,
+            rules,
         };
         let (_, files) = self.process_entries(s, &ctx, entries, &dst_map);
         self.transfer(wire_dir, files);
@@ -624,22 +761,29 @@ impl<'a> Engine<'a> {
             let entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
             return self.process_listing(s, job, entries);
         }
-        let own = SrcDir { path: job.src.clone(), sel: job.sel, dev: job.root_dev };
-        let dirs: Vec<SrcDir> = std::iter::once(own).chain(std::mem::take(&mut job.more)).collect();
+        let own = SrcDir { path: job.src.clone(), sel: job.sel, dev: job.root_dev, rules: job.rules.src.clone() };
+        let mut dirs: Vec<SrcDir> = std::iter::once(own).chain(std::mem::take(&mut job.more)).collect();
         let mut lists = Vec::with_capacity(dirs.len());
-        for (d, scanned) in dirs.iter().zip(scanned) {
-            let ents = match scanned {
-                Some(ents) => Some(self.adjust_listing(&d.path, ents)),
-                None => self.read_source(&d.path, d.sel),
+        for (d, scanned) in dirs.iter_mut().zip(scanned) {
+            let ents = match self.src_rules(&d.rules, &d.path, &job.rel) {
+                Some(rules) => {
+                    d.rules = rules;
+                    match scanned {
+                        Some(ents) => Some(self.adjust_listing(&d.path, ents)),
+                        None => self.read_source(&d.path, d.sel),
+                    }
+                }
+                None => None,
             };
-            lists.push(ents);
+            // Each source's entries go by its own rules, before a name in several is chosen.
+            lists.push(ents.map(|l| l.into_iter().filter(|e| self.sends(&d.path, &job.rel, &d.rules, d.sel, d.dev, e)).collect::<Vec<_>>()));
         }
         if lists.iter().all(Option::is_none) {
             return self.push_fixup(&job, false);
         }
         let (ents, sources) = merge::merge(dirs, lists.into_iter().map(Option::unwrap_or_default).collect());
         let entries = ents.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
-        let files = self.diff_listing(s, &job, entries, Some(&sources));
+        let files = self.diff_listing(s, &job, entries, Some(&sources), &DirRules::default());
         self.transfer(job.wire_dir, files);
     }
 
@@ -660,18 +804,18 @@ impl<'a> Engine<'a> {
 
     /// Sync one directory given its source listing.
     pub(crate) fn process_listing<'s>(&'s self, s: &Scope<'s>, job: DirJob, entries: Entries) {
-        let files = self.diff_listing(s, &job, entries, None);
+        let Some(rules) = self.src_rules(&job.rules.src, &job.src, &job.rel) else { return self.push_fixup(&job, false) };
+        let files = self.diff_listing(s, &job, entries, None, &rules);
         self.transfer(job.wire_dir, files);
     }
 
-    fn diff_listing<'s>(&'s self, s: &Scope<'s>, job: &DirJob, entries: Entries, sources: Option<&Sources>) -> Vec<FileJob> {
-        let entries: Entries = if self.filter.is_empty() {
+    /// `src_rules`: the directory's own source-side filter state, which a listing from a
+    /// single source is filtered with here (merged ones were filtered source by source).
+    fn diff_listing<'s>(&'s self, s: &Scope<'s>, job: &DirJob, entries: Entries, sources: Option<&Sources>, src_rules: &DirRules) -> Vec<FileJob> {
+        let entries: Entries = if sources.is_some() || (self.filter.is_empty() && !self.opts.prune_empty_dirs) {
             entries
         } else {
-            entries
-                .into_iter()
-                .filter(|(_, e, _)| !self.filter.is_excluded(&join_rel(&job.rel, &e.name), e.meta.kind == Kind::Dir))
-                .collect()
+            entries.into_iter().filter(|(_, e, _)| self.sends(&job.src, &job.rel, src_rules, job.sel, job.root_dev, e)).collect()
         };
         let mut dst_metas = None;
         let dst_map = if job.dst_is_new {
@@ -689,6 +833,13 @@ impl<'a> Engine<'a> {
                 }
             }
         };
+        // The destination's own filter files decide what --delete leaves alone; one that
+        // can't be read leaves the whole directory alone.
+        let dst_rules = if self.opts.delete && !job.dst_is_new {
+            self.filter.enter(&job.rules.dst, &job.dst, &job.rel).map_err(|m| self.err(m)).ok()
+        } else {
+            Some(job.rules.dst.clone())
+        };
 
         let mut changed = false;
         // A merged directory is pruned when any of its sources sends its full contents.
@@ -696,10 +847,16 @@ impl<'a> Engine<'a> {
             Some(src) => src.dirs.iter().any(|d| select::may_delete(d.sel)),
             None => select::may_delete(job.sel),
         };
-        if self.opts.delete && !job.dst_is_new && full && self.may_delete() {
-            changed |= self.defer_extraneous(job, &entries, &dst_map);
+        if let Some(dst_rules) = &dst_rules
+            && self.opts.delete
+            && !job.dst_is_new
+            && full
+            && self.may_delete()
+        {
+            changed |= self.defer_extraneous(job, &entries, &dst_map, dst_rules);
         }
         let dst_handle = if job.dst_is_new || dst_metas.is_some() { None } else { fsops::DirHandle::open(&job.dst).ok() };
+        let rules = Rules { src: src_rules.clone(), dst: dst_rules.unwrap_or_else(|| job.rules.dst.clone()) };
         let ctx = Ctx {
             src: &job.src,
             dst: &job.dst,
@@ -713,30 +870,29 @@ impl<'a> Engine<'a> {
             sel: job.sel,
             wire_dir: job.wire_dir,
             sources,
+            rules: &rules,
         };
         let (c, files) = self.process_entries(s, &ctx, entries, &dst_map);
         self.push_fixup(job, changed || c);
         files
     }
 
-    fn defer_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>) -> bool {
+    /// Queue what `dst_map` has and the listing doesn't for deletion, unless a
+    /// destination-side rule (`dst_rules`) protects it.
+    fn defer_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>, dst_rules: &DirRules) -> bool {
         let src_names: HashSet<&OsStr> = entries.iter().map(|(_, e, _)| e.name.as_os_str()).collect();
-        let mut extra: Vec<(&OsString, Kind)> = dst_map
+        let extra: Vec<(&OsString, Kind)> = dst_map
             .iter()
             .filter(|(n, _)| !src_names.contains(n.as_os_str()))
-            .filter(|(n, k)| {
-                self.opts.delete_excluded
-                    || (!self.filter.is_excluded(&join_rel(&job.rel, n), **k == Kind::Dir) && !self.is_protected_backup(n))
-            })
+            .filter(|(n, k)| !self.protected(dst_rules, &join_rel(&job.rel, n), n, **k == Kind::Dir, Side::Receiver))
             .map(|(n, k)| (n, *k))
             .collect();
-        extra.sort_unstable_by(|a, b| b.0.as_bytes().cmp(a.0.as_bytes()));
         let mut pending = self.deletions.lock().unwrap();
         for (name, _) in &extra {
             let path = job.dst.join(name);
             match fsops::lstat(&path) {
                 Ok(meta) => {
-                    pending.entry(path).or_insert_with(|| Deletion { rel: join_rel(&job.rel, name), meta });
+                    pending.entry(path).or_insert_with(|| Deletion { rel: join_rel(&job.rel, name), meta, rules: dst_rules.clone() });
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => self.err(path_msg("stat before deletion \"", &path, format!("\" failed: {e}"))),
@@ -745,16 +901,24 @@ impl<'a> Engine<'a> {
         !extra.is_empty()
     }
 
+    /// Whether `--delete` leaves destination entry `name` (at `rel`, in a directory with
+    /// destination-side filter state `rules`) alone: a rule protects it, or it is a backup
+    /// (without `--backup-dir`, which rsync protects with a `P *~` rule).
+    fn protected(&self, rules: &DirRules, rel: &[u8], name: &OsStr, is_dir: bool, side: Side) -> bool {
+        self.filter.excluded(rules, rel, is_dir, side) || (!self.opts.delete_excluded && self.is_protected_backup(name))
+    }
+
     /// Called only after all scanning/transfer tasks have joined, and for a remote
     /// transfer after the sender's completion was checked. A later source error
     /// invalidates every earlier absence decision. Run before directory fixups.
+    /// Deletions go in rsync's order, which decides what `--max-delete` lets through.
     pub(crate) fn finish_deletions(&self) {
         let pending = std::mem::take(&mut *self.deletions.lock().unwrap());
         if pending.is_empty() || fsops::interrupted() || !self.may_delete() {
             return;
         }
         let mut pending: Vec<_> = pending.into_iter().collect();
-        pending.sort_unstable_by(|a, b| b.1.rel.cmp(&a.1.rel));
+        pending.sort_unstable_by(|a, b| deletion_order((&a.1.rel, a.1.meta.kind == Kind::Dir), (&b.1.rel, b.1.meta.kind == Kind::Dir)));
         for (path, deletion) in pending {
             if fsops::interrupted() {
                 break;
@@ -766,75 +930,141 @@ impl<'a> Engine<'a> {
             }
             match fsops::lstat(&path) {
                 Ok(now) if now.kind == deletion.meta.kind && fsops::same_file(&now, &deletion.meta) => {
-                    self.delete_tree(&path, &deletion.rel, now.kind, true);
+                    self.delete_item(&path, &deletion.rel, now.kind, &deletion.rules, false, false);
                 }
                 Ok(_) => self.err(path_msg("skipping deletion of changed entry \"", &path, "\"")),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => self.err(path_msg("stat before deletion \"", &path, format!("\" failed: {e}"))),
             }
         }
+        let skipped = Stats::get(&self.stats.del_skipped);
+        if skipped > 0 {
+            self.out.warning(format!("Deletions stopped due to --max-delete limit ({skipped} skipped)"));
+        }
     }
 
-    /// Remove `path` (recursively for directories). `report` prints rsync's
-    /// "deleting" lines; replacements of one file type by another are silent.
-    fn delete_tree(&self, path: &Path, rel: &[u8], kind: Kind, report: bool) {
+    /// rsync's `delete_item`: remove `path` (at `rel`), a directory's contents first
+    /// unless `emptied` says that was done. `rules`: the destination-side filter state of
+    /// the directory it is in. `room`: it makes way for another type of entry, which is
+    /// neither reported nor counted, nor stopped by `--max-delete` (its contents are).
+    fn delete_item(&self, path: &Path, rel: &[u8], kind: Kind, rules: &DirRules, emptied: bool, room: bool) -> Del {
         if fsops::interrupted() {
-            return;
+            return Del::Failed;
         }
-        if kind == Kind::Dir {
-            match fsops::read_dir_kinds(path) {
-                Ok(m) => {
-                    let mut kids: Vec<_> = m.into_iter().collect();
-                    kids.sort_unstable_by(|a, b| b.0.as_bytes().cmp(a.0.as_bytes()));
-                    for (n, k) in kids {
-                        self.delete_tree(&path.join(&n), &join_rel(rel, &n), k, report);
-                    }
-                }
-                Err(e) => return self.err(path_msg("opendir \"", path, format!("\" failed: {e}"))),
+        if kind == Kind::Dir && !emptied {
+            let r = self.delete_contents(path, rel, rules);
+            if r != Del::Done {
+                return r;
             }
-            if report {
-                self.out.deleting(rel, true);
-            }
-            if !self.dry()
-                && let Err(e) = fs::remove_dir(path)
-            {
-                return self.err(path_msg("delete_file: rmdir \"", path, format!("\" failed: {e}")));
-            }
+        }
+        if !room && self.opts.max_delete.is_some_and(|max| Stats::get(&self.stats.deleted) >= max) {
+            Stats::add(&self.stats.del_skipped, 1);
+            return Del::AtLimit;
+        }
+        let r = if kind == Kind::Dir {
+            if self.dry() { Ok(()) } else { fs::remove_dir(path) }
+        } else if self.dry() {
+            Ok(())
         } else {
-            if report {
-                self.out.deleting(rel, false);
+            self.remove_or_backup(path)
+        };
+        match r {
+            Ok(()) => {
+                if !room {
+                    self.out.deleting(rel, kind == Kind::Dir);
+                    Stats::add(&self.stats.deleted, 1);
+                }
+                Del::Done
             }
-            if !self.dry()
-                && let Err(e) = self.remove_or_backup(path)
-            {
-                return self.err(path_msg("delete_file: unlink \"", path, format!("\" failed: {e}")));
+            Err(e) if kind == Kind::Dir && matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) => {
+                self.out.note([b"cannot delete non-empty directory: ", quoted(rel)].concat());
+                Del::NotEmpty
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Del::Done,
+            Err(e) => {
+                let what = if kind == Kind::Dir { "rmdir" } else { "unlink" };
+                self.err(path_msg(&format!("delete_file: {what} \""), path, format!("\" failed: {e}")));
+                Del::Failed
             }
         }
-        Stats::add(&self.stats.deleted, 1);
     }
 
-    /// A directory sits where a non-directory must go. rsync only removes it when
-    /// deletions are enabled or it is empty.
-    fn remove_conflicting_dir(&self, path: &Path, rel: &[u8]) -> bool {
+    /// rsync's `delete_dir_contents`: delete what directory `path` (at `rel`, in a
+    /// directory with destination-side filter state `parent`) holds, as it is being
+    /// deleted. Its own filter files count; what a rule protects stays, perishable rules
+    /// aside, and so does the directory then.
+    fn delete_contents(&self, path: &Path, rel: &[u8], parent: &DirRules) -> Del {
+        let rules = match self.filter.enter(parent, path, rel) {
+            Ok(r) => r,
+            Err(m) => {
+                self.err(m);
+                return Del::Failed;
+            }
+        };
+        let kids = match fsops::read_dir_kinds(path) {
+            Ok(m) => m,
+            Err(e) => {
+                self.err(path_msg("opendir \"", path, format!("\" failed: {e}")));
+                return Del::Failed;
+            }
+        };
+        let mut ret = Del::Done;
+        let mut kids: Vec<(OsString, Kind)> = kids
+            .into_iter()
+            .filter(|(n, k)| {
+                let kept = self.protected(&rules, &join_rel(rel, n), n, *k == Kind::Dir, Side::Deleting);
+                if kept {
+                    ret = Del::NotEmpty;
+                }
+                !kept
+            })
+            .collect();
+        kids.sort_unstable_by(|a, b| in_dir_order((a.0.as_bytes(), a.1 == Kind::Dir), (b.0.as_bytes(), b.1 == Kind::Dir)));
+        for (name, kind) in kids {
+            if fsops::interrupted() {
+                return Del::Failed;
+            }
+            let (p, r) = (path.join(&name), join_rel(rel, &name));
+            if kind == Kind::Dir && self.delete_contents(&p, &r, &rules) != Del::Done {
+                ret = Del::NotEmpty;
+            }
+            if self.delete_item(&p, &r, kind, &rules, true, false) != Del::Done {
+                ret = Del::NotEmpty;
+            }
+        }
+        if ret == Del::NotEmpty {
+            self.out.note([b"cannot delete non-empty directory: ", quoted(rel)].concat());
+        }
+        ret
+    }
+
+    /// A directory sits where a non-directory (`what`, as in "regular file") must go.
+    /// rsync only removes it when deletions are enabled (what its contents' rules
+    /// protect staying, `rules` being those of the directory it is in) or it is empty.
+    fn remove_conflicting_dir(&self, path: &Path, rel: &[u8], rules: &DirRules, what: &str) -> bool {
         // Several roots: another one's directory stays (rsync keeps the directory too).
         if self.overlap().is_some_and(|o| o.taken(path)) {
             self.err([b"cannot replace directory of another source: ", quoted(rel)].concat());
             return false;
         }
-        if self.opts.delete {
-            self.delete_tree(path, rel, Kind::Dir, false);
+        let r = if self.opts.delete {
+            self.delete_item(path, rel, Kind::Dir, rules, false, true)
+        } else if self.dry() {
             return true;
-        }
-        if self.dry() {
-            return true;
-        }
-        match fs::remove_dir(path) {
-            Ok(()) => true,
-            Err(_) => {
-                self.err([b"cannot delete non-empty directory: ", quoted(rel)].concat());
-                false
+        } else {
+            match fs::remove_dir(path) {
+                Ok(()) => Del::Done,
+                Err(_) => {
+                    self.out.note([b"cannot delete non-empty directory: ", quoted(rel)].concat());
+                    Del::NotEmpty
+                }
             }
+        };
+        if r != Del::Done {
+            self.err([format!("could not make way for new {what}: ").as_bytes(), quoted(rel)].concat());
+            return false;
         }
+        true
     }
 
     fn push_fixup(&self, job: &DirJob, changed: bool) {
@@ -870,7 +1100,7 @@ impl<'a> Engine<'a> {
 
     /// `-H`: true if this name leads its hard-link group (and is transferred normally);
     /// otherwise it is queued to be linked to the leader at the end.
-    fn claim_leader(&self, root: u16, x: &Src, src_path: &Path, dst_path: &Path, rel: &[u8]) -> bool {
+    fn claim_leader(&self, root: u16, x: &Src, src_path: &Path, dst_path: &Path, rel: &[u8], rules: &DirRules) -> bool {
         let meta = x.meta;
         let mut groups = self.hardlinks.lock().unwrap();
         match groups.entry((meta.dev, meta.ino)) {
@@ -888,6 +1118,7 @@ impl<'a> Engine<'a> {
                     dst_path: dst_path.to_path_buf(),
                     rel: rel.to_vec(),
                     meta: *meta,
+                    rules: rules.clone(),
                     xattr,
                 });
                 false
@@ -966,7 +1197,7 @@ impl<'a> Engine<'a> {
                 if self.dry() {
                     continue;
                 }
-                if dst.is_some_and(|d| d.kind == Kind::Dir) && !self.remove_conflicting_dir(&f.dst_path, &f.rel) {
+                if dst.is_some_and(|d| d.kind == Kind::Dir) && !self.remove_conflicting_dir(&f.dst_path, &f.rel, &f.rules, "regular file") {
                     continue;
                 }
                 if !self.backup_existing(&f.src_path, &f.dst_path, false) {
@@ -1052,7 +1283,7 @@ impl<'a> Engine<'a> {
                     }
                     let leads = || {
                         let x = Src { kind: Kind::File, meta: &e.meta, extra: e.extra.as_deref(), from: XSource::Full(&[]) };
-                        self.claim_leader(ctx.root, &x, &src_path, &dst_path, &rel)
+                        self.claim_leader(ctx.root, &x, &src_path, &dst_path, &rel, &ctx.rules.dst)
                     };
                     if self.opts.hard_links && e.meta.nlink > 1 && !leads() {
                         // Linked at the end, which modifies this directory.
@@ -1062,7 +1293,7 @@ impl<'a> Engine<'a> {
                     let mut dst_meta = None;
                     match dst_kind {
                         Some(Kind::Dir) => {
-                            if !self.remove_conflicting_dir(&dst_path, &rel) {
+                            if !self.remove_conflicting_dir(&dst_path, &rel, &ctx.rules.dst, "regular file") {
                                 continue;
                             }
                             changed = true;
@@ -1166,7 +1397,8 @@ impl<'a> Engine<'a> {
                         self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
                         continue;
                     }
-                    changed |= self.handle_symlink(ctx.root, &e, self.xsource(ctx, idx, &src_path, &rel, &dst_path), &rel, &src_path, &dst_path, dst_kind);
+                    let from = self.xsource(ctx, idx, &src_path, &rel, &dst_path);
+                    changed |= self.handle_symlink(ctx.root, &e, from, &rel, &src_path, &dst_path, dst_kind, &ctx.rules.dst);
                 }
                 kind => {
                     Stats::add(&self.stats.specials, 1);
@@ -1180,7 +1412,7 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     let src = Src { kind, meta: &e.meta, extra: e.extra.as_deref(), from: self.xsource(ctx, idx, &src_path, &rel, &dst_path) };
-                    changed |= self.handle_special(ctx.root, &src, &rel, &src_path, &dst_path, dst_kind);
+                    changed |= self.handle_special(ctx.root, &src, &rel, &src_path, &dst_path, dst_kind, &ctx.rules.dst);
                 }
             }
         }
@@ -1252,7 +1484,7 @@ impl<'a> Engine<'a> {
         let (sel, src_dev) = ctx.src_sel(idx);
         let descend = select::descend(sel, rel.rsplit(|&b| b == b'/').next().unwrap_or(&rel), self.opts.recursive);
         if descend == Descend::No && !self.opts.dirs {
-            self.out.info([b"skipping directory ", quoted(&rel)].concat());
+            self.out.note([b"skipping directory ", quoted(&rel)].concat());
             return false;
         }
         // -K: a symlink to a directory on the receiver stands in for the directory (not
@@ -1345,6 +1577,7 @@ impl<'a> Engine<'a> {
                 _ => None,
             },
             more,
+            rules: Rules { src: ctx.src_rules(idx).clone(), dst: ctx.rules.dst.clone() },
         };
         if descend == Descend::No {
             // -d: the directory itself, without its contents.
@@ -1372,6 +1605,7 @@ impl<'a> Engine<'a> {
         src_path: &Path,
         dst_path: &Path,
         dst_kind: Option<Kind>,
+        rules: &DirRules,
     ) -> bool {
         let meta = &e.meta;
         let x = Src { kind: Kind::Symlink, meta, extra: e.extra.as_deref(), from };
@@ -1409,7 +1643,7 @@ impl<'a> Engine<'a> {
                     return false;
                 }
             }
-            Some(Kind::Dir) if !self.remove_conflicting_dir(dst_path, rel) => return false,
+            Some(Kind::Dir) if !self.remove_conflicting_dir(dst_path, rel, rules, "symlink") => return false,
             None if self.alt_symlink(rel, target.as_os_str().as_bytes(), dst_path) => {
                 self.source_done(root, src_path, dst_path, rel, meta);
                 return true;
@@ -1462,7 +1696,8 @@ impl<'a> Engine<'a> {
         true
     }
 
-    fn handle_special(&self, root: u16, x: &Src, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn handle_special(&self, root: u16, x: &Src, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>, rules: &DirRules) -> bool {
         let meta = x.meta;
         match dst_kind {
             Some(k) if k == meta.kind => {
@@ -1480,7 +1715,9 @@ impl<'a> Engine<'a> {
                     return false;
                 }
             }
-            Some(Kind::Dir) if !self.remove_conflicting_dir(dst_path, rel) => return false,
+            Some(Kind::Dir) if !self.remove_conflicting_dir(dst_path, rel, rules, if meta.kind.is_device() { "device file" } else { "special file" }) => {
+                return false;
+            }
             _ => {}
         }
         self.out.item(rel, meta.kind, Link::None, Change::new_local(), true);
@@ -1611,17 +1848,28 @@ impl<'a> Engine<'a> {
             crate::progress::done(job.meta.size);
             return;
         }
+        fsops::test_vanish(&job.src_path);
         // A big copy moves the progress line as it goes, not only once it is done.
         let (r, counted) = crate::progress::tracking(|| self.write_file(job));
         crate::progress::done(job.meta.size.saturating_sub(counted));
         match r {
             Ok(()) => self.file_written(job),
-            Err(e) if !fsops::interrupted() => {
+            Err(e) if fsops::interrupted() => drop(e),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && fsops::lstat(&job.src_path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) => {
+                self.vanished(&job.src_path)
+            }
+            Err(e) => {
                 let to = path_msg("\" -> \"", &job.dst_path, format!("\" failed: {e}"));
                 self.err(path_msg("copy \"", &job.src_path, to));
             }
-            Err(_) => {}
         }
+    }
+
+    /// A source file was gone when it was to be copied: a warning, not an error, and the
+    /// run ends with 24 (rsync's "file has vanished").
+    pub(crate) fn vanished(&self, path: &Path) {
+        Stats::add(&self.stats.vanished, 1);
+        self.out.warning(path_msg("file has vanished: \"", &fsops::full_path(path), "\""));
     }
 
     fn write_file(&self, job: &FileJob) -> io::Result<()> {
@@ -1855,6 +2103,11 @@ impl<'a> Engine<'a> {
 }
 
 impl Ctx<'_> {
+    /// The source-side filter state entry `idx` was checked with: its directory's own.
+    fn src_rules(&self, idx: u32) -> &DirRules {
+        self.sources.map_or(&self.rules.src, |s| &s.dir_of(idx).rules)
+    }
+
     /// The source directory entry `idx` of this listing is in.
     fn src_dir(&self, idx: u32) -> &Path {
         self.sources.map_or(self.src, |s| &s.dir_of(idx).path)
@@ -1895,5 +2148,38 @@ pub(crate) fn finish_temp(tmp: &Path, r: io::Result<()>) -> io::Result<()> {
             fsops::drop_temp(tmp);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletions_follow_rsyncs_order() {
+        let mut v: Vec<(&[u8], bool)> = vec![
+            (b"z", false),
+            (b"a-b", true),
+            (b"a/s/t", false),
+            (b"a", true),
+            (b"b/q", false),
+            (b"y", false),
+            (b"a/x", false),
+            (b"a/s", true),
+        ];
+        v.sort_by(|a, b| deletion_order(*a, *b));
+        let want: Vec<(&[u8], bool)> = vec![
+            // The top directory first: subdirectories (`a` sorts after `a-b` as `a/`), then
+            // files, each descending; then `a`, `a/s` and `b`, in the order rsync visits them.
+            (b"a", true),
+            (b"a-b", true),
+            (b"z", false),
+            (b"y", false),
+            (b"a/s", true),
+            (b"a/x", false),
+            (b"a/s/t", false),
+            (b"b/q", false),
+        ];
+        assert_eq!(v, want);
     }
 }

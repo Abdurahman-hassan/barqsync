@@ -56,6 +56,7 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Frame>
         };
         let mut body = vec![0u8; body_len(&hdr)?];
         r.read_exact(&mut body).await?;
+        super::count(&super::BYTES_RECEIVED, hdr.len() + body.len());
         if let Some(f) = pieces.add(hdr[4], body)? {
             return Ok(Some(f));
         }
@@ -96,6 +97,7 @@ pub(crate) fn spawn_writer(
                     break;
                 }
                 w.write_all(&buf).await?;
+                super::count(&super::BYTES_SENT, buf.len());
                 if rx.is_empty() && urgent.as_ref().is_none_or(|u| u.is_empty()) {
                     w.flush().await?;
                 }

@@ -38,6 +38,7 @@ uses copy-on-write clones (APFS `fclonefileat`) or in-kernel copies (Linux
 | M19 | QUIC's fixed cost: `BARQSYNC_TIMING` milestones on both sides; the sender closes once it has `ReceiverDone`, nothing waits for acknowledgements, the client doesn't wait for the token's acknowledgement, auto connects alongside its ping, and hosts where QUIC found a clean link stay on the ssh pipe for an hour. On a clean 80 ms link QUIC's cost over the pipe fell from 3–5 round trips per transfer to 2 (auto: delta +9% → +3.5%, no-op +23% → +9%; once the host is known clean, the pipe's own times); the lossy win is unchanged. The ssh pipe stays the default; see [QUIC's fixed cost](#quics-fixed-cost-m19). Also: a pull with `--remove-source-files` prints the sender's removals and exits 23 when one fails, as rsync does (protocol 10) | done |
 | M20 | parallel streams through ssh when a firewall blocks them: `barqsync --stream-relay` on the server carries each stream over its own ssh connection to the stream listener, which also listens on loopback. TLS with the pinned certificate and token still runs end to end. Verified on a real Mac with its firewall on: push 18.0 → 12.7 s and pull 65.5 → 38.6 s on a slow link. Also `~` in remote paths, clearer errors, local copy progress and literal-data stats. See [audit/04-ssh-relay.md](audit/04-ssh-relay.md) | done |
 | M21 | the October 2026 audit's 12 P1 findings, fixed for 0.4.0 (PRs 15–19): what the sending side announces is checked before anything is written; source removal is limited to entries the sender listed; same-file and backup guards; `--delete` across several sources, and none after a read error; `--threads=1` no longer hangs; Ctrl-C and lost peers end both sides in bounded time; large messages are chunked. See [the audit](audit/README.md) | done |
+| M22 | rsync command lines that failed with "unexpected argument" now run (protocol 11): `--no-OPTION`, repeated options, `--delete-before/-during/-delay/-after`, `--max-delete` (exit 25), rsync's filter rules (`--filter`/`-f` with merge and per-directory files, `-F`, `-C`), `-m`, `--mkpath`, `-s`, `--timeout` (exit 30), exit 24 for vanished files, and rsync's byte counts in `--stats`. Also: what the rules protect inside a directory `--delete` removes now stays, as with rsync | done |
 
 The test suite passes on macOS (APFS; 249 tests at 0.4.0, 198 at M19, 164 at M17, 154 at
 M16, 145 at M14, when it was also built as x86_64 and run under Rosetta) and Linux (253 tests
@@ -70,7 +71,8 @@ macOS and Linux only. For remote transfers, barqsync has to be installed on both
 (like rsync), or pointed to with `--remote-path`, in the same release line. Version 0.4
 uses wire protocol 10 (0.3 moved to 9 for extended attributes and ACLs; 0.4 adds the
 pull's `RemovalsDone`), so 0.4.x cannot communicate with 0.3.x or earlier releases
-("protocol version mismatch"). Upgrade both ends together.
+("protocol version mismatch"). The unreleased code moves to protocol 11 for the rsync
+options of M22, so it cannot communicate with 0.4.x. Upgrade both ends together.
 
 ## Build from source
 
@@ -89,7 +91,8 @@ With Homebrew's keg-only rustup, add `/opt/homebrew/opt/rustup/bin` to `PATH`.
 `-i`/`-ii` (`%i` in `--out-format`), `--progress`/`-P`/`--info=progress2`,
 `--out-format` (`%n`, `%L`), `--delete`, `--delete-excluded`,
 `--exclude/--include/--exclude-from/--include-from` (rsync wildcard rules, first match wins,
-`/` anchoring, trailing `/` for directories, `**`, `dir/***`), `-u`, `--size-only`, `-I`,
+`/` anchoring, trailing `/` for directories, `**`, `dir/***`, `+ `/`- ` prefixes, `!` to clear),
+`--filter`/`-f`, `-F`, `-C` (see the table), `-u`, `--size-only`, `-I`,
 `--ignore-existing`, `-x`, `--modify-window` (`-1` compares nanoseconds), `-W/--whole-file`,
 `--no-whole-file` (delta transfer; locally off by default, like rsync), `--inplace` (also
 writes new files directly, like rsync),
@@ -120,13 +123,25 @@ Also, with rsync's semantics locally and over ssh (each has a differential test 
 | `--chmod=CHMOD` | rsync's syntax (`D`/`F`, `ugoa`, `+-=`, `rwxXst`, octal), applied to the source modes as sent. |
 | `--remove-source-files` | Non-directories the receiver has (transferred or already up to date) are removed from the source, unless their size or mtime changed meanwhile. |
 | `-O/--omit-dir-times` | |
+| `--no-OPTION` | `--no-r`, `--no-l`, `--no-p`, `--no-t`, `--no-g`, `--no-o`, `--no-D`, `--no-devices`, `--no-specials`, `--no-H`, `--no-A`, `--no-X`, `--no-O`, `--no-d`, `--no-x`, `--no-S`, `--no-c`, `--no-z`, `--no-W`, `--no-v`, `--no-i`, `--no-h`, `--no-8`, `--no-m`, `--no-s`, `--no-inplace`, `--no-partial`, `--no-progress`, `--no-numeric-ids`, `--no-backup`, `--no-mkpath`, `--no-timeout`, `--no-from0`, and their long forms (`--no-owner`, ...). Options apply in order, as in rsync: `-a --no-o` drops `-o`, `--no-o -a` keeps it, and `--no-v` resets the `-v` count. Any option may be given more than once. |
+| `--delete-before`, `--delete-during`/`--del`, `--delete-delay`, `--delete-after` | Each implies `--delete`. Two different times are refused, and so is a `--delete` without `-r` or `-d` (also after `--no-r`). barqsync always deletes once the transfer is done and the whole source was read without errors, which is rsync's `--delete-delay`/`--delete-after`; see the differences below. |
+| `--max-delete=N` | At most N deletions (a negative N: none), in rsync's order (directory by directory as rsync's file list visits them; in each, subdirectories first, then files, by descending name). What the limit stops is counted: "Deletions stopped due to --max-delete limit (K skipped)", exit 25 unless an error (23) or a vanished file (24) says otherwise. A directory that keeps an entry stays ("cannot delete non-empty directory"). |
+| `--filter`/`-f`, `-F`, `-C` | rsync's filter rules: `-`/`+` (`exclude`/`include`), `H`/`S` (sender only), `P`/`R` (receiver only), `!` (`clear`), the modifiers `!`, `/`, `p`, `s`, `r` and `C`, a space or `_` before the pattern. `. FILE` merges FILE's rules (read on the client, `-` for stdin); `: FILE` reads FILE in each directory, its rules applying there and below, deeper ones first (`n`: not inherited; `-`/`+`: bare patterns; `w`: words; `e`: exclude FILE too; `C`: `.cvsignore` style). A name with a leading `/` or other path (`-F` is `: /.rsync-filter`) is also read in the directories above the first one transferred. A leading `/` in a per-directory file anchors at its directory. `-FF` adds `- .rsync-filter`; `-C` appends `:C` and `-C` (rsync's default CVS list, perishable, then `~/.cvsignore` and `$CVSIGNORE`). With `-0`/`--from0`, rules files, merge and per-directory ones included, have NUL-separated rules. With `--delete`, receiver-side rules protect destination entries, read from the destination's own per-directory files, also inside a directory being deleted (which then stays), perishable rules aside; `--delete-excluded` makes plain rules sender-only. A remote receiver re-checks what the sender lists unless the rules need the sender's files (per-directory or `/` rules), as rsync trusts the sender then. |
+| `-m/--prune-empty-dirs` | Directories with nothing but directories below them, once the rules apply, are left out (with `--delete`, the destination's copies are then extraneous). A directory a receiver-side rule (`P`) protects stays, with the ones leading to it, and a `--files-from` entry missing from a pruned directory is still reported (23). The sender decides, so a pull needs the server to know `-m` (protocol 11). |
+| `--mkpath` | The destination's missing directories are created ("created N directories for DIR" with `-v`/`-i`, also counted in a dry run); for a single file, its parent's. |
+| `-s/--secluded-args`, `--protect-args` | Accepted: barqsync's remote paths and options always travel in the protocol, never on the remote command line. |
+| `--timeout=SECONDS` | A remote transfer whose connection delivers nothing for that long ends with 30 ("io timeout after N seconds -- exiting"), the server too. Each side sends a keepalive when it has nothing else to send, so a side that is busy (scanning, hashing, deleting) doesn't trip it; only a connection that stopped moving data does. |
+| `--stats` | Also rsync's "Total bytes sent/received" lines, and with `-v` or `--stats` its "sent N bytes  received M bytes  R bytes/sec" and "total size is T  speedup is S" lines (thousands separators; `-h`: units of 1000). They count the bytes on the connection, all streams included; a local copy, which has none, counts the file data written as sent. |
 
-Trailing-slash semantics match rsync: `src/` syncs the contents, `src` syncs the directory itself.
-Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 20 interrupted, 23 partial transfer).
+Trailing-slash semantics match rsync: `src/` syncs the contents, `src` syncs the directory itself;
+without `-r` or `-d` neither is transferred ("skipping directory").
+Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 12 protocol, 20 interrupted, 23 partial
+transfer, 24 source files vanished, 25 `--max-delete` limit, 30 `--timeout`).
 
-Still missing: daemon mode (`rsync://`, `host::module`), as well as `--delete-before/-after/-delay`, `--no-OPTION`, `--copy-dest`, `--fuzzy`, `-T`,
-`--bwlimit`, `--timeout`, `--log-file`, `--usermap/--groupmap/--chown`, `--no-implied-dirs`,
-`--no-R`, and a remote (`host:`) `--files-from` list.
+Still missing: daemon mode (`rsync://`, `host::module`), as well as `--copy-dest`, `--fuzzy`, `-T`,
+`--bwlimit`, `--contimeout`, `--log-file`, `--usermap/--groupmap/--chown`, `--no-implied-dirs`,
+`--no-R`, `--delete-missing-args`, filter rules for xattr names (the `x` modifier), merge and
+`-C` rules inside per-directory filter files, and a remote (`host:`) `--files-from` list.
 
 Known differences:
 
@@ -146,6 +161,25 @@ Known differences:
   barqsync prints it.
 - With `-K`, rsync on macOS also tries to chmod the symlink and fails ("Too many levels of
   symbolic links"); barqsync leaves the mode alone.
+- `--delete-before` and `--delete-during` (`--del`, rsync's default) are accepted, but
+  barqsync deletes after the transfer, as with `--delete-after`: the source is read in
+  parallel, and nothing is deleted until all of it was read without errors. So
+  `--delete-before` doesn't make room before new files arrive on a nearly full destination.
+  Which entries go is the same, and with `--max-delete` also which ones are left.
+- The destination's per-directory filter files (`:` rules, `-F`) are read when their
+  directory is compared, before its files are updated, as rsync does with its default
+  `--delete-during`. With `--delete-after` rsync reads the updated ones; barqsync still
+  reads the old ones.
+- A per-directory filter file that can't be read or has an invalid rule is reported, and
+  what its directory holds is left out (exit 23, and nothing is deleted); rsync stops (exit 1).
+- `--from0` applies to per-directory filter files on both sides. rsync tells its server
+  about it only along with `--files-from`, so in a pull its sender reads them line by line.
+- `--timeout` applies to remote transfers, where both sides send keepalives while they are
+  busy; rsync's peers do so in fewer places, so it can also time out a busy peer. A local
+  copy has no connection, and the option has no effect there.
+- A source file that disappears after its directory was read gives rsync's "file has
+  vanished" warning and exit 24. One that disappears between reading its directory and
+  reading its metadata is skipped without a word (rsync warns about it too).
 
 ### Extended attributes and ACLs (`-X`, `-A`)
 

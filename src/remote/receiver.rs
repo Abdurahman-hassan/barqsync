@@ -20,7 +20,7 @@ use crate::select::{self, Sel};
 use crate::exit;
 use crate::filter::Filter;
 use crate::fsops::{self, Copied, cache};
-use crate::local::exec::{DirJob, Engine, FileJob, finish_temp, split_dst};
+use crate::local::exec::{DirJob, Engine, FileJob, Rules, finish_temp, split_dst};
 use crate::output::{Output, Stats, StatsSnapshot, path_msg};
 use crate::paths::{split_source, wants_contents};
 use crate::proto::{Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
@@ -41,7 +42,7 @@ enum Slot {
     /// Ready (created by its parent), waiting for the listing.
     Job(Box<DirJob>),
     /// A `src` root (no trailing slash): named items synced into `dst_dir`.
-    Items { dst_dir: PathBuf, rename: Option<OsString>, dst_is_new: bool, sel: Option<&'static Sel> },
+    Items { dst_dir: PathBuf, rename: Option<OsString>, dst_is_new: bool, sel: Option<&'static Sel>, rules: Rules },
     /// The listing arrived first.
     Batch { dir: u32, entries: Vec<DirEnt> },
 }
@@ -468,12 +469,12 @@ impl RemoteState {
                 job.wire_dir = dir;
                 self.spawn_listing(s, eng, *job, entries);
             }
-            Some(Slot::Items { dst_dir, rename, dst_is_new, sel }) => {
+            Some(Slot::Items { dst_dir, rename, dst_is_new, sel, rules }) => {
                 drop(slots);
                 self.inflight.fetch_add(1, SeqCst);
                 s.spawn(move |s| {
                     let entries = entries.into_iter().enumerate().map(|(i, e)| (i as u32, e, rename.clone())).collect();
-                    eng.run_items(s, Path::new(""), &dst_dir, root, dir, entries, dst_is_new, sel, None);
+                    eng.run_items(s, Path::new(""), &dst_dir, root, dir, entries, dst_is_new, sel, None, &rules);
                     let r = eng.remote.as_ref().unwrap();
                     r.sums.lock().unwrap().remove(&dir);
                     r.task_done();
@@ -1049,6 +1050,11 @@ fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<Sig> {
 /// Records the destination in `eng` (see [`Engine::set_dest`]).
 fn plan_dest(eng: &mut Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -> Result<Vec<(u16, Slot)>, i32> {
     let dest_path = PathBuf::from(dest);
+    // Nothing to transfer: like rsync, the destination isn't created either.
+    if roots.is_empty() {
+        eng.set_dest(&dest_path);
+        return Ok(Vec::new());
+    }
     let dest_meta = fs::metadata(&dest_path).ok();
     let dest_is_dir = dest_meta.as_ref().is_some_and(|m| m.is_dir());
 
@@ -1064,17 +1070,25 @@ fn plan_dest(eng: &mut Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -
             out.error(path_msg("invalid destination \"", &dest_path, "\""));
             return Err(exit::SYNTAX);
         };
+        if eng.opts.mkpath && dest.as_bytes().contains(&b'/') {
+            crate::local::make_dest_path(&dst_dir, eng.opts, out)?;
+        }
         eng.set_dest(&dst_dir);
-        return Ok(vec![(0, Slot::Items { dst_dir, rename: Some(dst_name), dst_is_new: false, sel: None })]);
+        let rules = eng.root_rules(&dst_dir, &dst_dir, &dst_dir);
+        return Ok(vec![(0, Slot::Items { dst_dir, rename: Some(dst_name), dst_is_new: false, sel: None, rules })]);
     }
 
     let mut dest_exists = dest_is_dir;
     let mut created = false;
-    if !dest_is_dir {
-        if dest_meta.is_some() {
-            out.error(path_msg("destination \"", &dest_path, "\" exists and is not a directory"));
-            return Err(exit::FILE_IO);
-        }
+    if !dest_is_dir && dest_meta.is_some() {
+        out.error(path_msg("destination \"", &dest_path, "\" exists and is not a directory"));
+        return Err(exit::FILE_IO);
+    }
+    // --mkpath: like rsync, the destination is then compared as an existing directory.
+    if !dest_is_dir && eng.opts.mkpath {
+        dest_exists = crate::local::make_dest_path(&dest_path, eng.opts, out)? > 0 && !eng.dry();
+    }
+    if !dest_exists {
         let shown = dest.to_string_lossy();
         let shown = if shown.len() > 1 { shown.trim_end_matches('/') } else { &shown };
         if eng.dry() {
@@ -1092,6 +1106,7 @@ fn plan_dest(eng: &mut Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -
     let fresh = created && roots.len() == 1;
     eng.set_dest(&dest_path);
     let eng = &*eng;
+    let rules = eng.root_rules(&dest_path, &dest_path, &dest_path);
     let slots = roots
         .iter()
         .enumerate()
@@ -1102,9 +1117,10 @@ fn plan_dest(eng: &mut Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -
                 (true, Some(meta)) => {
                     let mut job = eng.root_job(PathBuf::new(), dest_path.clone(), meta, r, dest_exists && !fresh, root.extra.clone());
                     job.sel = sel.and_then(|s| s.at_root(eng.opts.recursive));
+                    job.rules = rules.clone();
                     Slot::Job(Box::new(job))
                 }
-                _ => Slot::Items { dst_dir: dest_path.clone(), rename: None, dst_is_new: !dest_exists || fresh, sel },
+                _ => Slot::Items { dst_dir: dest_path.clone(), rename: None, dst_is_new: !dest_exists || fresh, sel, rules: rules.clone() },
             };
             (r, slot)
         })
@@ -1154,7 +1170,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     if let Err(e) = check::roots(&roots) {
         return fail(exit::PROTOCOL, format!("protocol error: {e}"));
     }
-    let filter = match Filter::new(&opts.filter_rules) {
+    let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
         Err(e) => return fail(exit::SYNTAX, format!("{e:#}")),
     };
@@ -1211,7 +1227,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     let streams = conn.data_streams_in();
     // Keep blocking protocol coordination on the caller; every configured
     // worker remains available for finite scan, hash and write tasks.
-    let (sender_errors, failure) = pool.in_place_scope(|s| {
+    let ((sender_errors, sender_vanished), failure) = pool.in_place_scope(|s| {
         {
             let mut map = remote.slots.lock().unwrap();
             for (r, slot) in slots {
@@ -1219,25 +1235,25 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             }
         }
         let mut streams_ended = 0;
-        let mut sender_done: Option<u64> = None;
+        let mut sender_done: Option<(u64, u64)> = None;
         let r = loop {
-            if let Some(errors) = sender_done
+            if let Some(counts) = sender_done
                 && streams_ended == streams
             {
-                break (errors, None);
+                break (counts, None);
             }
             let frame = match recv_unless(conn, &remote.failed) {
                 Ok(f) => f,
                 // After Ctrl-C, which also stops ssh, a closed connection is expected.
-                Err(Stop::Interrupted) => break (0, Some(exit::SIGNAL)),
-                Err(Stop::Io(_)) if fsops::interrupted() => break (0, Some(exit::SIGNAL)),
+                Err(Stop::Interrupted) => break ((0, 0), Some(exit::SIGNAL)),
+                Err(Stop::Io(_)) if fsops::interrupted() => break ((0, 0), Some(exit::SIGNAL)),
                 Err(Stop::Io(_)) if remote.failed.reason().is_some() => {
                     out.error(remote.failed.reason().unwrap_or_default());
-                    break (0, Some(exit::PROTOCOL));
+                    break ((0, 0), Some(exit::PROTOCOL));
                 }
                 Err(Stop::Io(e)) => {
                     out.error(format!("connection error: {e}"));
-                    break (0, Some(exit::PROTOCOL));
+                    break ((0, 0), Some(exit::PROTOCOL));
                 }
             };
             let r = match frame {
@@ -1252,7 +1268,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                             let msg = format!("protocol error: {e}");
                             out.error(&msg);
                             let _ = conn.msg(Msg::Fatal { msg });
-                            break (0, Some(exit::PROTOCOL));
+                            break ((0, 0), Some(exit::PROTOCOL));
                         }
                     },
                     Msg::IdNames { users, groups } => {
@@ -1288,7 +1304,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                             let msg = format!("protocol error: {e}");
                             out.error(&msg);
                             let _ = conn.msg(Msg::Fatal { msg });
-                            break (0, Some(exit::PROTOCOL));
+                            break ((0, 0), Some(exit::PROTOCOL));
                         }
                         remote.on_scan_done();
                         Ok(())
@@ -1297,15 +1313,15 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                         engine.sender_io_error();
                         Ok(())
                     }
-                    Msg::SenderDone { errors } => {
+                    Msg::SenderDone { errors, vanished } => {
                         if !listings.finished() {
                             let msg = "protocol error: sender completed before its scan".to_string();
                             out.error(&msg);
                             let _ = conn.msg(Msg::Fatal { msg });
-                            break (0, Some(exit::PROTOCOL));
+                            break ((0, 0), Some(exit::PROTOCOL));
                         }
                         crate::timing::mark("SenderDone received");
-                        sender_done = Some(errors);
+                        sender_done = Some((errors, vanished));
                         Ok(())
                     }
                     Msg::StreamEnd => {
@@ -1318,11 +1334,11 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
                     }
                     Msg::Fatal { msg } => {
                         out.error(format!("remote: {msg}"));
-                        break (0, Some(exit::PROTOCOL));
+                        break ((0, 0), Some(exit::PROTOCOL));
                     }
                     other => {
                         out.error(format!("protocol error: unexpected {other:?}"));
-                        break (0, Some(exit::PROTOCOL));
+                        break ((0, 0), Some(exit::PROTOCOL));
                     }
                 },
             };
@@ -1371,6 +1387,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     });
     remote.flush_synced();
     Stats::add(&engine.stats.errors, sender_errors);
+    Stats::add(&engine.stats.vanished, sender_vanished);
     let stats = engine.stats.snapshot();
     let _ = conn.msg(Msg::ReceiverDone { stats: stats.clone() });
     crate::timing::mark("ReceiverDone sent");
@@ -1380,8 +1397,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             Err(code) => return (code, stats, false),
         }
     }
-    let code = if Stats::get(&engine.stats.errors) > 0 { exit::PARTIAL } else { exit::OK };
-    (code, stats, await_removals)
+    (engine.stats.exit_code(), stats, await_removals)
 }
 
 /// The sender's output for the removals it does after `ReceiverDone`, up to its

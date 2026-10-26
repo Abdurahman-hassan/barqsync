@@ -122,13 +122,18 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
         }
     } else if act == Act::DropShell {
         // The command runs on pipes of its own, joined to the shell's stdin and stdout by
-        // two copiers (this process and a child) the test can kill.
+        // two copiers (this process and a child) the test can kill. It runs as on the
+        // other machine: in a session of its own, with no terminal to hang up (SIGHUP
+        // ignored), so dropping the shell only closes its pipes. Otherwise macOS may send
+        // SIGHUP to the server, frozen when its parent dies, and to this process group,
+        // and barqsync ends on SIGHUP as on Ctrl-C (exit 20).
         let script = "#!/usr/bin/perl\n\
+            use POSIX ();\n\
             sub copy { my ($i, $o) = @_; while ((my $n = sysread($i, my $b, 65536)) > 0) { syswrite($o, $b, $n) or last } }\n\
             shift;\n\
             pipe(my $ir, my $iw); pipe(my $or, my $ow);\n\
             my $cmd = fork() // die;\n\
-            if (!$cmd) { open(STDIN, '<&', $ir); open(STDOUT, '>&', $ow); exec '/bin/sh', '-c', \"exec @ARGV\" }\n\
+            if (!$cmd) { POSIX::setsid(); $SIG{HUP} = 'IGNORE'; open(STDIN, '<&', $ir); open(STDOUT, '>&', $ow); exec '/bin/sh', '-c', \"exec @ARGV\" }\n\
             close $ir; close $ow;\n\
             if (!fork()) { close $iw; copy($or, \\*STDOUT); exit }\n\
             close $or; copy(\\*STDIN, $iw); close $iw;\n\
