@@ -3,9 +3,10 @@
 //! Each directory task takes the source directory's listing, compares it with the
 //! matching destination directory, queues extraneous entries (`--delete`), creates
 //! subdirectories and descends into them, then has its changed files written.
-//! Queued deletions run only after the source scan succeeds. Directory attributes
-//! are applied after everything else, deepest first, so a
-//! read-only source directory stays writable while it is being filled.
+//! Queued deletions run only after the source scan succeeds and every entry that was
+//! to be written reached the destination. Directory attributes are applied after
+//! everything else, deepest first, so a read-only source directory stays writable
+//! while it is being filled.
 //!
 //! Locally the listing comes from `readdir` and files are copied in parallel. As a
 //! remote receiver (see `remote::receiver`), listings arrive as `DirBatch` frames,
@@ -67,7 +68,8 @@ pub struct Engine<'a> {
     /// `-X`: which attribute names take part.
     pub(crate) xrules: crate::xattrs::Rules,
     /// The source side could not be read completely (rsync's `io_error`): its listings
-    /// may lack entries, so nothing is deleted from now on.
+    /// may lack entries, so nothing is deleted from now on. Also set when an entry the
+    /// source has could not be written to the destination.
     io_error: AtomicBool,
     /// "IO error encountered -- skipping file deletion" was shown.
     io_warned: AtomicBool,
@@ -351,8 +353,19 @@ impl<'a> Engine<'a> {
         self.io_error.store(true, SeqCst);
     }
 
+    /// An entry the source has did not reach the destination: it could not be written
+    /// there (a full disk, say), or its data never arrived complete. Deletions stop too,
+    /// or a file renamed in the source could lose its old name on the destination without
+    /// getting the new one. rsync's `--delete-after` keeps it as well: a write error ends
+    /// rsync's run before it deletes.
+    pub(crate) fn dst_err(&self, msg: impl AsRef<[u8]>) {
+        self.io_error.store(true, SeqCst);
+        self.err(msg);
+    }
+
     /// Whether `--delete` may delete now: not after a source-side error, as rsync
-    /// ("IO error encountered -- skipping file deletion", said once).
+    /// ("IO error encountered -- skipping file deletion", said once), nor after an
+    /// entry failed to reach the destination.
     fn may_delete(&self) -> bool {
         if !self.io_error.load(SeqCst) {
             return true;
@@ -914,7 +927,8 @@ impl<'a> Engine<'a> {
 
     /// Called only after all scanning/transfer tasks have joined, and for a remote
     /// transfer after the sender's completion was checked. A later source error
-    /// invalidates every earlier absence decision. Run before directory fixups.
+    /// invalidates every earlier absence decision, and so does an entry that failed to
+    /// reach the destination. Run before directory fixups.
     /// Deletions go in rsync's order, which decides what `--max-delete` lets through.
     pub(crate) fn finish_deletions(&self) {
         let pending = std::mem::take(&mut *self.deletions.lock().unwrap());
@@ -1182,7 +1196,7 @@ impl<'a> Engine<'a> {
                         };
                         self.transfer_file(&job);
                     } else {
-                        self.err([&b"hard link target missing for "[..], &f.rel].concat());
+                        self.dst_err([&b"hard link target missing for "[..], &f.rel].concat());
                     }
                     continue;
                 }
@@ -1212,7 +1226,7 @@ impl<'a> Engine<'a> {
                     .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, &f.dst_path)));
                 match r {
                     Ok(()) => self.source_done(f.root, &f.src_path, &f.dst_path, &f.rel, &f.meta),
-                    Err(e) => self.err(path_msg("link \"", &f.dst_path, format!("\" failed: {e}"))),
+                    Err(e) => self.dst_err(path_msg("link \"", &f.dst_path, format!("\" failed: {e}"))),
                 }
             }
         }
@@ -1306,7 +1320,7 @@ impl<'a> Engine<'a> {
                             Ok(m) => dst_meta = Some(m),
                             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                             Err(e) => {
-                                self.err(path_msg("stat \"", &dst_path, format!("\" failed: {e}")));
+                                self.dst_err(path_msg("stat \"", &dst_path, format!("\" failed: {e}")));
                                 continue;
                             }
                         },
@@ -1513,7 +1527,7 @@ impl<'a> Engine<'a> {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    self.err(path_msg("stat \"", &dst_path, format!("\" failed: {e}")));
+                    self.dst_err(path_msg("stat \"", &dst_path, format!("\" failed: {e}")));
                     return false;
                 }
             },
@@ -1521,7 +1535,7 @@ impl<'a> Engine<'a> {
                 if !self.dry()
                     && let Err(e) = self.remove_or_backup(&dst_path)
                 {
-                    self.err(path_msg("unlink \"", &dst_path, format!("\" failed: {e}")));
+                    self.dst_err(path_msg("unlink \"", &dst_path, format!("\" failed: {e}")));
                     return false;
                 }
                 changed = true;
@@ -1540,7 +1554,7 @@ impl<'a> Engine<'a> {
             if !self.dry() {
                 let r = fs::DirBuilder::new().mode(0o700 | self.new_mode(&meta)).create(&dst_path);
                 if let Err(e) = r {
-                    self.err(path_msg("mkdir \"", &dst_path, format!("\" failed: {e}")));
+                    self.dst_err(path_msg("mkdir \"", &dst_path, format!("\" failed: {e}")));
                     return changed;
                 }
                 changed = true;
@@ -1690,7 +1704,7 @@ impl<'a> Engine<'a> {
             finish_temp(&tmp, r)
         });
         match res {
-            Err(e) => self.err(path_msg("symlink \"", dst_path, format!("\" failed: {e}"))),
+            Err(e) => self.dst_err(path_msg("symlink \"", dst_path, format!("\" failed: {e}"))),
             Ok(()) => {
                 if self.want_xattrs(Kind::Symlink)
                     && let Err(e) = self.apply_extra(dst_path, &x, None, 0o777)
@@ -1758,7 +1772,7 @@ impl<'a> Engine<'a> {
             self.source_done(root, src_path, dst_path, rel, meta);
         }
         if let Err(e) = res {
-            self.err(path_msg("mknod \"", dst_path, format!("\" failed: {e}")));
+            self.dst_err(path_msg("mknod \"", dst_path, format!("\" failed: {e}")));
         }
         true
     }
@@ -1867,7 +1881,7 @@ impl<'a> Engine<'a> {
             }
             Err(e) => {
                 let to = path_msg("\" -> \"", &job.dst_path, format!("\" failed: {e}"));
-                self.err(path_msg("copy \"", &job.src_path, to));
+                self.dst_err(path_msg("copy \"", &job.src_path, to));
             }
         }
     }

@@ -97,7 +97,12 @@ fn refused(c: &Conn) -> String {
 }
 
 /// Run a receiver into `dest` against the sender `script` plays; returns its exit code.
-fn receive(dest: &Path, args: &[&str], (wire, tokio): (Wire, bool), script: impl FnOnce(&Conn)) -> i32 {
+fn receive(dest: &Path, args: &[&str], mode: (Wire, bool), script: impl FnOnce(&Conn)) -> i32 {
+    receive_logged(dest, args, mode, script).0
+}
+
+/// [`receive`], also returning what the receiver printed (errors too), a line each.
+fn receive_logged(dest: &Path, args: &[&str], (wire, tokio): (Wire, bool), script: impl FnOnce(&Conn)) -> (i32, String) {
     let mut argv = vec!["barqsync", "-a", "--threads=2"];
     argv.extend_from_slice(args);
     argv.extend_from_slice(&["s/", "d/"]);
@@ -105,14 +110,21 @@ fn receive(dest: &Path, args: &[&str], (wire, tokio): (Wire, bool), script: impl
     let _one = one_at_a_time();
     let (actual, peer) = pair(wire, tokio);
     let dest = dest.as_os_str().to_owned();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = log.clone();
     let handle = std::thread::spawn(move || {
-        let out = Output::new(&opts);
+        let out = Output::forwarding(&opts, false, Box::new(move |_, _, text| {
+            let mut log = sink.lock().unwrap();
+            log.push_str(&String::from_utf8_lossy(text));
+            log.push('\n');
+        }));
         receiver::run(&actual, &opts, &dest, &out, false).0
     });
     script(&peer);
     let code = handle.join().unwrap();
     drop(peer);
-    code
+    let log = log.lock().unwrap().clone();
+    (code, log)
 }
 
 fn meta_of(p: &Path) -> Meta {
@@ -557,6 +569,39 @@ fn incomplete_file_data_is_never_committed() {
             p.msg(Msg::FileEnd { id, ok: true }).unwrap();
         });
         assert_eq!((code, &got[..]), (0, &b"NEW!"[..]), "{mode:?}");
+    }
+}
+
+/// The sender finishes without errors while a file it was asked for never arrived, or
+/// arrived only in part. That file didn't reach the destination, so `--delete` deletes
+/// nothing either: `stale` stays, as after a failed write on the receiving side.
+#[test]
+fn a_requested_file_that_never_arrives_stops_deletion() {
+    for mode in MODES {
+        for case in ["never started", "never finished"] {
+            let f = fixture();
+            fs::write(f.dest.join("f"), b"OLD!").unwrap();
+            fsops::set_mtime(&f.dest.join("f"), 1_000_000_000, 0).unwrap();
+            fs::write(f.dest.join("stale"), b"PRECIOUS").unwrap();
+            let (code, log) = receive_logged(&f.dest, &["--delete"], mode, |p| {
+                p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("f", f.file)], sums: vec![] }).unwrap();
+                assert_eq!(need(p, 0).len(), 1);
+                if case == "never finished" {
+                    let id = file_id(0, 0);
+                    p.msg(Msg::FileBegin { id, size: 4, xattrs: None }).unwrap();
+                    data(p, id, 0, b"NE");
+                }
+                finish(p, 1);
+            });
+            assert_eq!(code, barqsync::exit::PARTIAL, "{case} {mode:?}: {log}");
+            assert!(log.contains("1 requested files were never received"), "{case} {mode:?}: {log}");
+            assert!(log.contains("IO error encountered -- skipping file deletion"), "{case} {mode:?}: {log}");
+            assert_eq!(fs::read(f.dest.join("stale")).unwrap(), b"PRECIOUS", "{case} {mode:?}: {log}");
+            assert_eq!(fs::read(f.dest.join("f")).unwrap(), b"OLD!", "{case} {mode:?}");
+            let names = files_in(&f.dest);
+            assert_eq!(names, [OsString::from("f"), OsString::from("stale")], "{case} {mode:?}: no temp file is left");
+        }
     }
 }
 
