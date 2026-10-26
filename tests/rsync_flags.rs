@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type Snap = BTreeMap<Vec<u8>, Node>;
 
@@ -44,6 +45,18 @@ fn snap_no_dir_times(p: &Path) -> Snap {
     let mut m = snapshot(p, false);
     for n in m.values_mut() {
         if n.kind == 'd' {
+            n.mtime = None;
+        }
+    }
+    m
+}
+
+/// Snapshot without the mtimes from `since` on: without -t a written file gets the time
+/// of the copy, which two runs a moment apart needn't share. Older times must still match.
+fn snap_old_times(p: &Path, since: i64) -> Snap {
+    let mut m = snapshot(p, true);
+    for n in m.values_mut() {
+        if n.mtime.is_some_and(|t| t >= since) {
             n.mtime = None;
         }
     }
@@ -868,12 +881,15 @@ fn no_options_match_rsync() {
             assert_same_tree(&without_mtimes(snap(&pr, false)), &without_mtimes(snap(&pf, false)));
         }
     }
-    // An update: changed modes and times are left alone without -p and -t.
+    // An update: changed modes and times are left alone without -p and -t. sub/b's time
+    // differs, so both rewrite it, and it and sub get the time of the copy; those times
+    // are left out (from a second before the runs: file times can trail this clock).
     seed(tmp.path(), "src/", &["ur", "uf", "pr", "pf"]);
     t.chmod("a", 0o600).chmod("sub/b", 0o604).mtime("sub/b", BASE_TIME + 500);
+    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 1;
     let (r, f) = both(tmp.path(), &["-ai", "--no-p", "--no-t", "src/", "{dst}"], "ur", "uf").unwrap();
     same_output(&r, &f, &[], "update --no-p --no-t");
-    assert_same_tree(&snap(&tmp.path().join("ur"), true), &snap(&tmp.path().join("uf"), true));
+    assert_same_tree(&snap_old_times(&tmp.path().join("ur"), since), &snap_old_times(&tmp.path().join("uf"), since));
     let (r, f) = both_remote(tmp.path(), &["-ai", "--no-p", "--no-o", "--no-g", "src/", "{host}{dst}"], "pr", "pf").unwrap();
     same_output(&r, &f, &[], "push --no-p --no-o --no-g");
     assert_same_tree(&snap(&tmp.path().join("pr"), true), &snap(&tmp.path().join("pf"), true));

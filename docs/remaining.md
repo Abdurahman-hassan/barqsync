@@ -1,11 +1,15 @@
 # What's left in barqsync
 
-Status on 21 October 2026.
+Status on 26 October 2026.
 
 - **0.4.2** adds the interrupt-notice ordering and bounded QUIC shutdown fixes from
   PRs 23–24. The [release record](releases/0.4.2.md) describes its scope and checks.
   It retains 0.4.1's complete-scan deletion barrier and late-interrupt fix from PR 22.
   Protocol remains 10, so 0.4.x cannot talk to 0.3.x: upgrade both ends.
+- **Merged since 0.4.2, not released yet:** the hardening against hostile peers and
+  swapped source files (PR 27) and the everyday rsync flags (PR 28). PR 28 moves the
+  protocol to 11, so the next release can't talk to 0.4.x: upgrade both ends together.
+  The CHANGELOG's Unreleased section lists both.
 
 How the P1 work was organized, and where each finding landed:
 [audit/p1-coordination.md](audit/p1-coordination.md). The
@@ -17,21 +21,15 @@ entries before a later scan failure. Pending deletions now wait for a successful
 
 ## Next steps, in order
 
-1. **Security advisory** on GitHub for SEC-01 and SEC-02: versions up to 0.3.0 affected,
-   fixed in 0.4.0. Yanking 0.1 to 0.3 on crates.io because of the data-loss bugs is your
-   call.
+1. **Yanking 0.1 to 0.3** on crates.io because of the data-loss bugs is your call. The
+   GitHub advisories for SEC-01 and SEC-02 (versions up to 0.3.0 affected, fixed in 0.4.0)
+   are published: GHSA-44h8-452c-567g and GHSA-vw2w-g2g6-46ww.
 2. **Install 0.4.2 on both Macs.** Then delete the old copies on the second Mac:
    `~/bin/barqsync-pr11` and `~/bin/barqsync-0.4.0-rc` (test builds), and `~/bin/barqsync`
    (0.1.0). Its firewall exceptions for those are no longer needed for `--streams`.
 3. **Tidy up:**
-   - The initial audit edits are committed and merged (PRs 15–19). Their original
-     snapshot is retained locally as `audit/safety-wip`. The primary checkout was
-     refreshed from `main` for the 0.4.2 release; preserve untracked local files
-     when changing branches.
    - Delete merged and superseded branches: the milestone branches, the PR branches,
-     `p1-base`, and the worktrees under `.claude/worktrees/`.
-   - Remove the release worktree `/tmp/barqsync-v0.4.0`
-     (`git worktree remove /tmp/barqsync-v0.4.0`).
+     and the worktrees under `.claude/worktrees/`.
    - Follow-up review of PRs 11–19 remains useful; release checks do not replace review
      of the implementation and its remaining acceptance criteria.
 4. **Next releases:** follow [Releasing next time](audit/p1-coordination.md#releasing-next-time). 0.4.0 was tagged
@@ -43,7 +41,8 @@ entries before a later scan failure. Pending deletions now wait for a successful
 ### From the audit (P2, or what the P1 fixes left out)
 
 - **Descriptor confinement:** file operations relative to an open directory with no-follow
-  checks, against symlink-swap races (SEC-01 hardening, part 1B).
+  checks, against symlink-swap races in parent directories (SEC-01 hardening, part 1B).
+  PR 27 covers only a listed source file itself being swapped for a symlink.
 - **An end-to-end content hash** of each committed file (2B).
 - **Bounded stream admission (NET-04) and a byte-based memory budget (PERF-01)** (3C, 5A).
 - **Mutable files:** safe delta reads of files that shrink while mapped (PLAT-01, 5B), and
@@ -52,17 +51,15 @@ entries before a later scan failure. Pending deletions now wait for a successful
   The relays already make streams work behind a firewall.
 - **Signed and notarized macOS binaries;** CI fault injection and dependency audits (6B, 6C).
 - **Gaps the PRs called out:**
-  - No `--timeout` for a peer that stays connected but stops responding.
-  - SIGTERM and SIGHUP aren't handled like SIGINT.
+  - `-c` still reads source files for their checksums by path, following a symlink
+    swapped in after the scan; PR 27 made the data reads safe, not these.
+  - No restricted server mode (left for later by PR 27).
   - A remote transfer to the same host isn't detected as a same-file case (neither in
     rsync).
   - A source changed between the removal check and the unlink isn't caught.
 
 ### Rough edges found earlier
 
-- **Intermittent macOS shutdown test failure.** One release-PR run ended the SSH
-  push client by an unreported signal. The merged main's CI and local shutdown
-  checks passed; the cause remains unconfirmed. See the [release evidence](releases/0.4.2.md#intermittent-test-failure-to-investigate).
 - **QUIC behind a firewall.** UDP can't go through ssh, so `--transport quic` and `auto` fall
   back to the single ssh pipe. A better fallback would be relayed TCP streams, which needs
   the server to offer both (a protocol change).
