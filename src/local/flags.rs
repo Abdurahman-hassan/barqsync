@@ -277,7 +277,7 @@ impl Engine<'_> {
                     let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&p, tmp))
                         .and_then(|(tmp, ())| finish_temp(&tmp, fs::rename(&tmp, dst_path)));
                     if let Err(e) = r {
-                        self.err(path_msg("link \"", dst_path, format!("\" failed: {e}")));
+                        self.dst_err(path_msg("link \"", dst_path, format!("\" failed: {e}")));
                         return AltFile::Done;
                     }
                 }
@@ -310,7 +310,7 @@ impl Engine<'_> {
                 && let Err(e) = self.copy_alt(&p, dst_path, x)
             {
                 let to = path_msg("\" -> \"", dst_path, format!("\" failed: {e}"));
-                self.err(path_msg("copy \"", &p, to));
+                self.dst_err(path_msg("copy \"", &p, to));
                 self.not_written(x);
                 return AltFile::Done;
             }
@@ -358,7 +358,7 @@ impl Engine<'_> {
             let r = fsops::with_temp(dir, name, |tmp| fs::hard_link(&p, tmp))
                 .and_then(|(tmp, ())| finish_temp(&tmp, self.place_link(&tmp, dst_path)));
             if let Err(e) = r {
-                self.err(path_msg("link \"", dst_path, format!("\" failed: {e}")));
+                self.dst_err(path_msg("link \"", dst_path, format!("\" failed: {e}")));
             }
         }
         true

@@ -1,5 +1,6 @@
 //! `--delete` deletes only what the complete source lacks: nothing after a source read
-//! error (rsync's "IO error encountered -- skipping file deletion").
+//! error (rsync's "IO error encountered -- skipping file deletion"), and nothing after
+//! a file could not be written to the destination.
 
 use std::fs;
 use std::io::{Read, Seek};
@@ -19,17 +20,22 @@ struct Out {
 
 /// Run barqsync in `dir`, killing its process group if it takes over 30 seconds.
 fn sync(dir: &Path, args: &[&str]) -> Out {
+    sync_with(dir, args, |_| {})
+}
+
+/// [`sync`], with `setup` applied to the command before it starts.
+fn sync_with(dir: &Path, args: &[&str], setup: impl FnOnce(&mut Command)) -> Out {
     let (mut so, mut se) = (tempfile::tempfile().unwrap(), tempfile::tempfile().unwrap());
-    let mut child = Command::new(BIN)
-        .current_dir(dir)
+    let mut cmd = Command::new(BIN);
+    cmd.current_dir(dir)
         .env("LC_ALL", "C.UTF-8")
         .args(args)
         .stdin(Stdio::null())
         .stdout(so.try_clone().unwrap())
         .stderr(se.try_clone().unwrap())
-        .process_group(0)
-        .spawn()
-        .unwrap();
+        .process_group(0);
+    setup(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(s) = child.try_wait().unwrap() {
@@ -301,5 +307,103 @@ fn a_missing_source_among_several_stops_deletion() {
         assert_eq!(tree(&t.join("dst")), ["stale=kept: the other source is missing", "sub/", "sub/f=kept", "x=x"], "{mode}: {}{}", r.stdout, r.stderr);
         assert_eq!(r.code, 23, "{mode}: {}{}", r.stdout, r.stderr);
         assert!(r.stdout.contains(SKIPPING), "{mode}: {}", r.stdout);
+    }
+}
+
+/// Writes that would make a file longer than `limit` bytes fail with EFBIG ("File too
+/// large"), in barqsync and in the server it starts: a destination write error without
+/// a full disk. With SIGXFSZ ignored, such a write fails instead of killing the writer.
+fn limit_file_size(cmd: &mut Command, limit: u64) {
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let lim = libc::rlimit { rlim_cur: limit as libc::rlim_t, rlim_max: limit as libc::rlim_t };
+            match libc::setrlimit(libc::RLIMIT_FSIZE, &lim) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+}
+
+/// The source has `new.bin`, the destination still has `old.bin`, which the source no
+/// longer has, as after a rename. If `new.bin` can't be written, deleting `old.bin` leaves
+/// the destination with neither. rsync's `--delete-after` keeps it, since a write error
+/// ends rsync's run before it deletes; barqsync carries on with the other files, but
+/// deletes nothing.
+#[test]
+fn a_failed_write_stops_deletion() {
+    for mode in MODES {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        fake_ssh(t);
+        files(t, &[("src/ok.txt", "copied"), ("dst/old.bin", "the only copy left")]);
+        fs::write(t.join("src/new.bin"), vec![b'n'; 2 << 20]).unwrap();
+        // --no-clone: a clone would make the copy without writing it.
+        let args = mode_args(mode, &["-a", "--delete", "--no-clone"], &["src/"], "dst/");
+        let r = sync_with(t, &args.iter().map(String::as_str).collect::<Vec<_>>(), |cmd| limit_file_size(cmd, 1 << 20));
+        assert_eq!(r.code, 23, "{mode}: {}{}", r.stdout, r.stderr);
+        assert!(r.stderr.contains("File too large"), "{mode}: {}", r.stderr);
+        assert!(r.stdout.contains(SKIPPING), "{mode}: {}", r.stdout);
+        // The other file is still copied, and nothing is left of the one that failed.
+        assert_eq!(tree(&t.join("dst")), ["ok.txt=copied", "old.bin=the only copy left"], "{mode}: {}{}", r.stdout, r.stderr);
+    }
+}
+
+/// A small APFS volume of its own (a disk image), detached when dropped.
+#[cfg(target_os = "macos")]
+struct Volume {
+    mount: std::path::PathBuf,
+    _image: tempfile::TempDir,
+}
+
+#[cfg(target_os = "macos")]
+impl Volume {
+    fn new(mib: u32) -> Option<Volume> {
+        let image = tempfile::tempdir().unwrap();
+        let (dmg, mount) = (image.path().join("vol.dmg"), image.path().join("mnt"));
+        let ok = |c: &mut Command| c.stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        let size = format!("{mib}m");
+        let created = ok(Command::new("hdiutil").args(["create", "-size", &size, "-fs", "APFS", "-volname", "barqsync-test"]).arg(&dmg));
+        let attached = created && ok(Command::new("hdiutil").args(["attach", "-nobrowse", "-mountpoint"]).arg(&mount).arg(&dmg));
+        attached.then_some(Volume { mount, _image: image })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Volume {
+    fn drop(&mut self) {
+        let _ = Command::new("hdiutil").args(["detach", "-force"]).arg(&self.mount).stdout(Stdio::null()).status();
+    }
+}
+
+/// [`a_failed_write_stops_deletion`] on a disk that is really full: a 32 MiB volume that
+/// holds the 20 MiB `old.bin` has no room for the 20 MiB `new.bin`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_full_disk_stops_deletion() {
+    let Some(vol) = Volume::new(32) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    fake_ssh(t);
+    fs::create_dir(t.join("src")).unwrap();
+    fs::write(t.join("src/new.bin"), vec![b'n'; 20 << 20]).unwrap();
+    for mode in MODES {
+        let dst = vol.mount.join(mode);
+        fs::create_dir(&dst).unwrap();
+        fs::write(dst.join("old.bin"), vec![b'o'; 20 << 20]).unwrap();
+        let dst_arg = format!("{}/", dst.display());
+        let args = mode_args(mode, &["-a", "--delete"], &["src/"], &dst_arg);
+        let r = sync(t, &args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(r.code, 23, "{mode}: {}{}", r.stdout, r.stderr);
+        assert!(r.stderr.contains("No space left on device"), "{mode}: {}", r.stderr);
+        assert!(r.stdout.contains(SKIPPING), "{mode}: {}", r.stdout);
+        // `old.bin` is untouched, and no temp file is left behind.
+        assert_eq!(names(&dst), ["old.bin"], "{mode}: {}{}", r.stdout, r.stderr);
+        assert_eq!(fs::read(dst.join("old.bin")).unwrap(), vec![b'o'; 20 << 20], "{mode}");
+        fs::remove_dir_all(&dst).unwrap();
     }
 }
