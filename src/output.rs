@@ -1,11 +1,14 @@
-//! User-facing output: itemized names (rsync `%n%L` style), deletions, errors and stats.
+//! User-facing output: items (rsync's `--out-format`), deletions, messages, errors and
+//! stats, each shown when rsync's `--info` levels would show it.
 //!
 //! Every line that can carry a file name goes through [`escape`], which mirrors rsync's
 //! log.c (`rwrite` + `filtered_fwrite`), so a name cannot put control characters or
 //! terminal escape sequences on the user's terminal.
 
-use crate::cli::Options;
-use crate::entry::Kind;
+use crate::cli::{Info, Options};
+use crate::entry::{Kind, Meta};
+use crate::logformat::{Fields, Format};
+use crate::proto::Msg;
 use std::io::{BufWriter, Stdout, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -13,9 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Where a server sends its output instead of its own stdout/stderr:
-/// `(stderr, escape, text)`, printed by the client (see [`Output::print_forwarded`]).
-pub type Forward = Box<dyn Fn(bool, bool, &[u8]) + Send + Sync>;
+/// Where a server sends its output instead of its own stdout/stderr: `Log`, `Item` and
+/// `Deleted` messages, which the client shows (see [`Output::print_forwarded`]).
+pub type Forward = Box<dyn Fn(Msg) + Send + Sync>;
 
 struct Sink {
     w: BufWriter<Stdout>,
@@ -38,29 +41,53 @@ impl Sink {
     }
 }
 
+/// What the client is doing, which decides how items look: as rsync's client shows them,
+/// its sender in a local copy or a push, its receiver in a pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// `%o` is `send` and `%f` the source path, but transfers show `>f`.
+    Local,
+    /// To a remote receiver: `send`, the source path, and `<f`.
+    Push,
+    /// From a remote sender: `recv`, and `%f` is the name in the destination.
+    Pull,
+}
+
 pub struct Output {
     out: Mutex<Sink>,
     /// stdout is a terminal (progress is redrawn in place only then).
     tty: bool,
     verbose: u8,
-    /// `-q`: no notices either.
+    /// `-q`: nothing on stdout.
     quiet: bool,
-    /// Number of `-i`: at 2+, unchanged items are listed too.
+    /// Number of `-i`.
     itemize: u8,
-    format: Option<String>,
-    /// The format contains `%i`: attribute-only changes and deletions are shown.
-    has_i: bool,
+    info: Info,
+    /// rsync's `stdout_format`: `--out-format`, else `%i %n%L` with `-i`, else `%n%L` with
+    /// `--info=name` (`-v`). Items are only reported with one.
+    format: Option<Format>,
+    /// rsync's `stdout_format_has_i`: 0, or the format has `%i` (2+: so does `-ii`).
+    has_i: u8,
+    /// Deletions are shown in the format (it has `%o` or `%i`), else as `deleting NAME`.
+    del_format: bool,
+    /// `%b`: a transfer is reported once its data is known (see [`Output::after`]).
+    after: bool,
     /// `-t` is on: an mtime difference shows as `t`, otherwise as `T` (rsync).
     times: bool,
-    /// Items are reported from the sending side's point of view (`<f...`): a push,
-    /// whose items are produced by the remote receiver.
-    sender_view: bool,
+    /// `-o`, `-g`: `%U` and `%G` show the ids (rsync shows 0 and `DEFAULT` otherwise).
+    owner: bool,
+    group: bool,
+    side: Side,
+    /// [`Side::Pull`]: whether this process may give a file the group `%G` shows (root,
+    /// or the groups it is in); rsync shows `DEFAULT` for the others.
+    groups: OnceLock<(bool, Vec<u32>)>,
     charset: Charset,
     forward: Option<Forward>,
 }
 
 /// What changed about one item, rendered by `%i` as rsync's `YXcstpoguax`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Change {
     /// Didn't exist (or had another type): all attribute columns show `+`.
     pub new: bool,
@@ -92,8 +119,9 @@ impl Change {
         self.value || self.size || self.time || self.perms || self.owner || self.group || self.acl || self.xattr
     }
 
-    fn anything(&self) -> bool {
-        self.new || self.transfer || self.local || self.hardlink || self.any_attr()
+    /// rsync's `SIGNIFICANT_ITEM_FLAGS`: anything but a local change or a name.
+    fn significant(&self) -> bool {
+        self.new || self.transfer || self.any_attr()
     }
 }
 
@@ -107,37 +135,108 @@ pub enum Link<'a> {
     Hard(&'a [u8]),
 }
 
+/// An entry to report (rsync's `log_item`): created, changed, or (`-ii`,
+/// `--info=name2`) found up to date.
+#[derive(Clone, Copy)]
+pub struct Item<'a> {
+    /// Relative to the transfer root (empty: the root itself).
+    pub rel: &'a [u8],
+    /// The source entry as listed: what `%l`, `%M`, `%B`, `%U` and `%G` show.
+    pub meta: &'a Meta,
+    pub change: Change,
+    pub link: Link<'a>,
+    /// Where the source entry is on this machine (`%f` of a local copy).
+    pub src: &'a Path,
+    /// A remote receiver's: the listing the entry came in and its index there, by which
+    /// the sending client finds its `%f` (`None`: the transfer root).
+    pub at: Option<(u32, u32)>,
+    /// `%b`: the file data sent for it.
+    pub bytes: u64,
+}
+
+impl<'a> Item<'a> {
+    pub fn new(rel: &'a [u8], meta: &'a Meta, change: Change) -> Item<'a> {
+        Item { rel, meta, change, link: Link::None, src: Path::new(""), at: None, bytes: 0 }
+    }
+
+    pub fn link(self, link: Link<'a>) -> Item<'a> {
+        Item { link, ..self }
+    }
+
+    pub fn from(self, src: &'a Path, at: Option<(u32, u32)>) -> Item<'a> {
+        Item { src, at, ..self }
+    }
+
+    pub fn bytes(self, bytes: u64) -> Item<'a> {
+        Item { bytes, ..self }
+    }
+}
+
+/// An item a remote receiver reports for the client to show: in a push, what rsync's
+/// sending client logs about the files it sent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ItemRec {
+    pub rel: Vec<u8>,
+    pub at: Option<(u32, u32)>,
+    pub meta: Meta,
+    /// `%L`: a symlink's target, or (`true`) the name it is hard-linked to.
+    pub link: Option<(bool, Vec<u8>)>,
+    pub change: Change,
+    pub bytes: u64,
+}
+
+impl ItemRec {
+    fn of(it: &Item) -> ItemRec {
+        let link = match it.link {
+            Link::None => None,
+            Link::Sym(t) => Some((false, t.to_vec())),
+            Link::Hard(n) => Some((true, n.to_vec())),
+        };
+        ItemRec { rel: it.rel.to_vec(), at: it.at, meta: *it.meta, link, change: it.change, bytes: it.bytes }
+    }
+}
+
 impl Output {
-    /// Output configured from the command line: `-v` lists items as `%n%L`, `-i` as
-    /// `%i %n%L`, `--out-format` overrides both; `-8` skips the charset check when escaping.
-    pub fn new(opts: &Options) -> Output {
-        let format = opts.out_format.clone().or_else(|| {
-            if opts.itemize > 0 {
-                Some("%i %n%L".to_string())
-            } else {
-                (opts.verbose > 0).then(|| "%n%L".to_string())
-            }
-        });
+    /// Output for the client of a transfer, configured from the command line; `-8` skips
+    /// the charset check when escaping.
+    pub fn new(opts: &Options, side: Side) -> Output {
+        // Checked when the options were parsed (a server's arrive from the client).
+        let user = opts.out_format.as_deref().and_then(|f| Format::parse(f).ok());
+        let (format, has_i) = match user {
+            // rsync: `itemize_changes | 1`.
+            Some(f) if f.has(b'i') => (Some(f), if opts.itemize > 1 { 3 } else { 1 }),
+            Some(f) => (Some(f), 0),
+            None if opts.itemize > 0 => (Format::parse("%i %n%L").ok(), opts.itemize),
+            None if opts.info.name > 0 => (Format::parse("%n%L").ok(), 0),
+            None => (None, 0),
+        };
         Output {
             out: Mutex::new(Sink { w: BufWriter::with_capacity(64 * 1024, std::io::stdout()), progress: None }),
             tty: std::io::IsTerminal::is_terminal(&std::io::stdout()),
             verbose: opts.verbose,
             quiet: opts.quiet,
             itemize: opts.itemize,
-            has_i: format.as_deref().is_some_and(|f| f.contains("%i")),
+            info: opts.info,
+            del_format: has_i > 0 || format.as_ref().is_some_and(|f| f.has(b'o')),
+            after: format.as_ref().is_some_and(|f| f.has(b'b')),
             format,
+            has_i,
             times: opts.times,
-            sender_view: false,
+            owner: opts.owner,
+            group: opts.group,
+            side,
+            groups: OnceLock::new(),
             charset: Charset::for_output(opts.eight_bit_output),
             forward: None,
         }
     }
 
-    /// Output for a server process: nothing is written locally, every line goes to
-    /// `forward` unescaped, so the client escapes it for its own terminal and charset.
-    /// `sender_view`: items are shown as the (client) sender sees them.
-    pub fn forwarding(opts: &Options, sender_view: bool, forward: Forward) -> Output {
-        Output { forward: Some(forward), sender_view, ..Output::new(opts) }
+    /// Output for a server process: nothing is written locally. Lines go to `forward`
+    /// unescaped, so the client escapes them for its own terminal and charset; items and
+    /// deletions go as records, which the client formats as its side.
+    pub fn forwarding(opts: &Options, forward: Forward) -> Output {
+        Output { forward: Some(forward), ..Output::new(opts, Side::Local) }
     }
 
     /// Print a line a server forwarded. The text came from the other machine, so it is
@@ -147,6 +246,9 @@ impl Output {
     /// mark) is ignored for that reason; the server's forwarded lines are single lines of
     /// item text, errors or notices, which escaping leaves intact.
     pub fn print_forwarded(&self, stderr: bool, _escape_it: bool, text: &[u8]) {
+        if self.quiet && !stderr {
+            return;
+        }
         let mut line = Vec::with_capacity(text.len() + 1);
         escape(text, self.charset, &mut line);
         line.push(b'\n');
@@ -161,7 +263,7 @@ impl Output {
     /// Draw the progress status line. Redrawn in place on a terminal; elsewhere only
     /// the final status is printed. `last`: finish it with a newline.
     pub fn progress(&self, status: &[u8], last: bool) {
-        if self.forward.is_some() || (!self.tty && !last) {
+        if self.forward.is_some() || self.quiet || (!self.tty && !last) {
             return;
         }
         let mut sink = self.out.lock().unwrap();
@@ -183,14 +285,36 @@ impl Output {
         self.verbose
     }
 
+    /// The `--info` levels.
+    pub fn levels(&self) -> &Info {
+        &self.info
+    }
+
     /// Item lines show `%i` change summaries (so attribute differences are worth finding).
     pub fn itemizes(&self) -> bool {
-        self.format.is_some() && self.has_i
+        self.has_i > 0
+    }
+
+    /// Unchanged items are reported too: listed (`-ii`, `--info=name2` with `%i`), or
+    /// "X is uptodate" (`--info=name2`).
+    pub fn all_items(&self) -> bool {
+        self.format.is_some() && (self.has_i > 1 || self.info.name > 1)
+    }
+
+    /// The format has `%b`: a transfer is reported once the data sent for it is known,
+    /// not when it is decided on (rsync's `log_before_transfer` off).
+    pub fn after(&self) -> bool {
+        self.after
+    }
+
+    /// Item lines use the escape `letter`.
+    pub fn uses(&self, letter: u8) -> bool {
+        self.format.as_ref().is_some_and(|f| f.has(letter))
     }
 
     fn line(&self, bytes: &[u8]) {
         if let Some(f) = &self.forward {
-            return f(false, false, bytes);
+            return f(Msg::Log { stderr: false, escape: false, text: bytes.to_vec() });
         }
         let mut line = Vec::with_capacity(bytes.len() + 1);
         line.extend_from_slice(bytes);
@@ -202,7 +326,7 @@ impl Output {
     /// `--out-format` text included.
     fn escaped_line(&self, text: &[u8]) {
         if let Some(f) = &self.forward {
-            return f(false, true, text);
+            return f(Msg::Log { stderr: false, escape: true, text: text.to_vec() });
         }
         let mut line = Vec::with_capacity(text.len() + 1);
         escape(text, self.charset, &mut line);
@@ -218,7 +342,7 @@ impl Output {
         } else if c.local {
             b'c'
         } else if c.transfer {
-            if self.sender_view { b'<' } else { b'>' }
+            if self.side == Side::Push { b'<' } else { b'>' }
         } else {
             b'.'
         };
@@ -248,68 +372,191 @@ impl Output {
         f
     }
 
-    /// Report an item. `rel` is relative to the transfer root (empty for the root
-    /// itself, shown as `./`). `significant`: shown by plain `-v` (transfers, creations,
-    /// directory time changes); `-i` also shows attribute-only changes, `-ii` everything.
-    pub fn item(&self, rel: &[u8], kind: Kind, link: Link, change: Change, significant: bool) {
-        let Some(fmt) = &self.format else { return };
-        if !(significant || (self.has_i && change.anything()) || self.itemize >= 2) {
+    /// Report an item, as rsync's client does: a transfer always; with `%i`, any change
+    /// (`-ii`, `--info=name2`: any item); otherwise what was created or changed in place,
+    /// a hard link, or a directory that changed. With `--info=name2` and no `%i`, rsync
+    /// names the other entries that aren't directories: "X is uptodate", or just "X"
+    /// when only their attributes were updated.
+    pub fn item(&self, it: &Item) {
+        if self.quiet || self.format.is_none() {
             return;
         }
-        let mut name = if rel.is_empty() { b".".to_vec() } else { rel.to_vec() };
+        let c = it.change;
+        let significant = c.significant();
+        let named = matches!(it.link, Link::Hard(_));
+        let kind = it.meta.kind;
+        let shown = c.transfer
+            || (self.has_i > 0 && (significant || named || self.has_i > 1 || self.info.name > 1))
+            || ((c.local || c.hardlink) && significant)
+            || named
+            || (kind == Kind::Dir && significant);
+        if shown {
+            return match &self.forward {
+                Some(f) => f(Msg::Item(Box::new(ItemRec::of(it)))),
+                None => self.show(it, self.long_name(it.rel, it.src)),
+            };
+        }
+        if self.has_i == 0 && self.info.name > 1 && kind != Kind::Dir {
+            let state: &[u8] = if c.any_attr() { b"" } else { b" is uptodate" };
+            self.escaped_line(&[it.rel, state].concat());
+        }
+    }
+
+    /// An item a remote receiver reported (see [`ItemRec`]); `src` is where its source
+    /// is on this side.
+    pub fn peer_item(&self, rec: &ItemRec, src: &Path) {
+        if self.quiet || self.format.is_none() {
+            return;
+        }
+        let link = match &rec.link {
+            None => Link::None,
+            Some((false, t)) => Link::Sym(t),
+            Some((true, n)) => Link::Hard(n),
+        };
+        let it = Item { rel: &rec.rel, meta: &rec.meta, change: rec.change, link, src, at: rec.at, bytes: rec.bytes };
+        self.show(&it, self.long_name(&rec.rel, src));
+    }
+
+    /// `%f`: the source path for a sender (a transfer root's directory ends in `/.`, a
+    /// leading `/` is dropped), the name in the destination for a receiver.
+    fn long_name(&self, rel: &[u8], src: &Path) -> Vec<u8> {
+        if self.side == Side::Pull {
+            return clean_fname(rel);
+        }
+        let mut path = src.as_os_str().as_bytes().to_vec();
+        if rel.is_empty() {
+            path.extend_from_slice(b"/.");
+        }
+        let mut name = clean_fname(&path);
+        if name.len() > 1 && name[0] == b'/' {
+            name.remove(0);
+        }
+        name
+    }
+
+    fn show(&self, it: &Item, fname: Vec<u8>) {
+        let Some(format) = &self.format else { return };
+        let kind = it.meta.kind;
+        let mut name = if it.rel.is_empty() { b".".to_vec() } else { it.rel.to_vec() };
         if kind == Kind::Dir {
             name.push(b'/');
         }
-        let mut line = Vec::with_capacity(name.len() + 16);
-        let mut chars = fmt.as_bytes().iter().copied().peekable();
-        while let Some(c) = chars.next() {
-            if c != b'%' {
-                line.push(c);
-                continue;
-            }
-            match chars.next() {
-                Some(b'n') => line.extend_from_slice(&name),
-                Some(b'L') => match link {
-                    Link::Sym(t) => {
-                        line.extend_from_slice(b" -> ");
-                        line.extend_from_slice(t);
-                    }
-                    Link::Hard(t) => {
-                        line.extend_from_slice(b" => ");
-                        line.extend_from_slice(t);
-                    }
-                    Link::None => {}
-                },
-                Some(b'i') => line.extend_from_slice(&self.itemize_field(kind, &change)),
-                Some(b'%') => line.push(b'%'),
-                Some(other) => {
-                    line.push(b'%');
-                    line.push(other);
-                }
-                None => line.push(b'%'),
-            }
-        }
-        self.escaped_line(&line);
+        let changes = self.itemize_field(kind, &it.change);
+        let link = match it.link {
+            Link::None => None,
+            Link::Sym(t) => Some((&b" -> "[..], t)),
+            Link::Hard(n) => Some((&b" => "[..], n)),
+        };
+        let fields = Fields {
+            op: if self.side == Side::Pull { b"recv" } else { b"send" },
+            name: &name,
+            fname: &fname,
+            link,
+            changes: &changes,
+            size: it.meta.size,
+            bytes: it.bytes,
+            mtime: it.meta.mtime,
+            mode: it.meta.mode,
+            uid: if self.owner { it.meta.uid } else { 0 },
+            gid: self.shown_gid(it.meta.gid),
+        };
+        self.escaped_line(&format.render(&fields));
     }
 
-    /// A deletion: `deleting name` with `-v`, or `*deleting   name` when itemizing.
-    pub fn deleting(&self, rel: &[u8], is_dir: bool) {
-        if self.verbose == 0 && !self.has_i {
+    /// `%G`: rsync's receiver shows `DEFAULT` for a group it can't give a file.
+    fn shown_gid(&self, gid: u32) -> Option<u32> {
+        if !self.group {
+            return None;
+        }
+        if self.side != Side::Pull {
+            return Some(gid);
+        }
+        let (root, mine) = self.groups.get_or_init(|| (crate::fsops::am_root(), crate::fsops::my_groups()));
+        (*root || mine.contains(&gid)).then_some(gid)
+    }
+
+    /// A deletion: in the format when it has `%o` or `%i` (`del.`, `*deleting  `), else
+    /// `deleting NAME`; shown with `--info=del` (`-v`) or any item format. `mode`: the
+    /// deleted entry's permissions, which a receiving client's `%B` shows.
+    pub fn deleting(&self, rel: &[u8], is_dir: bool, mode: u32) {
+        if self.quiet || (self.info.del == 0 && self.format.is_none()) {
             return;
+        }
+        if let Some(f) = &self.forward {
+            return f(Msg::Deleted { rel: rel.to_vec(), dir: is_dir });
         }
         let mut name = rel.to_vec();
         if is_dir {
             name.push(b'/');
         }
-        let line = if self.has_i {
-            [&b"*deleting   "[..], &name].concat()
-        } else {
-            [&b"deleting "[..], &name].concat()
+        let line = match &self.format {
+            Some(format) if self.del_format => {
+                let fields = Fields {
+                    op: b"del.",
+                    name: &name,
+                    fname: &clean_fname(rel),
+                    changes: b"*deleting  ",
+                    // rsync's sending client is told only names; its receiver knows more.
+                    mode: if self.side == Side::Pull { mode } else { 0 },
+                    gid: self.group.then_some(0),
+                    ..Fields::default()
+                };
+                format.render(&fields)
+            }
+            _ => [&b"deleting "[..], &name].concat(),
         };
         self.escaped_line(&line);
     }
 
-    /// Informational message shown with `-v` or `-i` (as rsync does); may contain raw name bytes.
+    /// Deletions show their permissions (`%B` in a receiving client's deletion format).
+    pub fn deletion_modes(&self) -> bool {
+        self.side == Side::Pull && self.del_format && self.format.as_ref().is_some_and(|f| f.has(b'B'))
+    }
+
+    /// "created directory DEST" and `--mkpath`'s "created N directories for DEST": with
+    /// `--info=name` (`-v`) or `%i`, as in rsync.
+    pub fn created(&self, msg: impl AsRef<[u8]>) {
+        if !self.quiet && (self.info.name > 0 || self.has_i > 0) {
+            self.escaped_line(msg.as_ref());
+        }
+    }
+
+    /// rsync's file-list message as the transfer starts (`--info=flist`, which `-v`
+    /// implies): incremental recursion's, or (without it, `-r` or `-d`) the one for a
+    /// file list built first. `receiving`: this side receives the list.
+    pub fn flist_start(&self, opts: &Options, receiving: bool) {
+        if self.quiet || self.info.flist == 0 {
+            return;
+        }
+        let msg = match (opts.inc_recurse, receiving) {
+            (true, false) => "sending incremental file list",
+            (true, true) => "receiving incremental file list",
+            _ if !(opts.recursive || opts.dirs) || self.info.flist > 1 => return,
+            (false, false) => "building file list ... done",
+            (false, true) => "receiving file list ... done",
+        };
+        self.line(msg.as_bytes());
+    }
+
+    /// `--info=flist2` without incremental recursion: how many entries the file list had,
+    /// with rsync's running count while building it (rsync shows this before the
+    /// transfer, barqsync once it is done).
+    pub fn flist_end(&self, opts: &Options, receiving: bool, count: u64) {
+        if self.quiet || self.info.flist < 2 || opts.inc_recurse || !(opts.recursive || opts.dirs) {
+            return;
+        }
+        let mut s = String::from(if receiving { "receiving file list ... " } else { "building file list ... \n" });
+        if !receiving {
+            for n in (0..count).step_by(100) {
+                s += &format!(" {n} files...\r");
+            }
+        }
+        s += &format!("{count} file{}to consider", if count == 1 { " " } else { "s " });
+        self.line(s.as_bytes());
+    }
+
+    /// Informational message of barqsync's own, shown with `-v` or `-i`; may contain raw
+    /// name bytes.
     pub fn info(&self, msg: impl AsRef<[u8]>) {
         if self.verbose > 0 || self.itemize > 0 {
             self.escaped_line(msg.as_ref());
@@ -325,24 +572,27 @@ impl Output {
     }
 
     /// A message shown without `-v` but not with `-q` that may name entries (rsync's
-    /// `FINFO` lines, such as "cannot delete non-empty directory").
+    /// `FINFO` lines, such as "cannot delete non-empty directory", or those an `--info`
+    /// level asks for).
     pub fn note(&self, msg: impl AsRef<[u8]>) {
         if !self.quiet {
             self.escaped_line(msg.as_ref());
         }
     }
 
-    /// Always shown (unless redirected); used for summaries. Not escaped, so the
-    /// message may contain newlines but must not contain names.
+    /// Summary lines (not with `-q`). Not escaped, so the message may contain newlines
+    /// but must not contain names.
     pub fn always(&self, msg: impl AsRef<[u8]>) {
-        self.line(msg.as_ref());
+        if !self.quiet {
+            self.line(msg.as_ref());
+        }
     }
 
     /// A warning to stderr, without the program name in front (rsync's `FWARNING`, such
     /// as "file has vanished"); escaped like errors.
     pub fn warning(&self, msg: impl AsRef<[u8]>) {
         if let Some(f) = &self.forward {
-            return f(true, true, msg.as_ref());
+            return f(Msg::Log { stderr: true, escape: true, text: msg.as_ref().to_vec() });
         }
         self.flush();
         let mut line = Vec::new();
@@ -355,7 +605,7 @@ impl Output {
     /// [`path_msg`], not `Path::display()`, which turns invalid UTF-8 into U+FFFD.
     pub fn error(&self, msg: impl AsRef<[u8]>) {
         if let Some(f) = &self.forward {
-            return f(true, true, &[b"barqsync: ", msg.as_ref()].concat());
+            return f(Msg::Log { stderr: true, escape: true, text: [b"barqsync: ", msg.as_ref()].concat() });
         }
         self.flush();
         let mut line = b"barqsync: ".to_vec();
@@ -367,6 +617,39 @@ impl Output {
     pub fn flush(&self) {
         let _ = self.out.lock().unwrap().w.flush();
     }
+}
+
+/// rsync's `clean_fname` without options: no doubled `/`, no `.` components but a last
+/// one (`dir/.` stays), no trailing `/`; `.` when nothing is left.
+fn clean_fname(p: &[u8]) -> Vec<u8> {
+    let anchored = p.first() == Some(&b'/');
+    let mut out = Vec::with_capacity(p.len());
+    if anchored {
+        out.push(b'/');
+    }
+    let mut i = usize::from(anchored);
+    while i < p.len() {
+        if p[i] == b'/' {
+            i += 1;
+        } else if p[i] == b'.' && p.get(i + 1) == Some(&b'/') {
+            i += 2;
+        } else {
+            while i < p.len() {
+                out.push(p[i]);
+                i += 1;
+                if p[i - 1] == b'/' {
+                    break;
+                }
+            }
+        }
+    }
+    if out.len() > usize::from(anchored) && out.last() == Some(&b'/') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push(b'.');
+    }
+    out
 }
 
 /// A message naming `path`, built from its raw bytes: invalid UTF-8 then reaches
@@ -593,6 +876,11 @@ impl Stats {
         exit_code(Self::get(&self.errors), Self::get(&self.vanished), Self::get(&self.del_skipped))
     }
 
+    /// Entries in the file list ("Number of files").
+    pub fn entries(&self) -> u64 {
+        [&self.files, &self.dirs, &self.links, &self.specials].into_iter().map(Self::get).sum()
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot(Box::new(self.fields().map(Self::get)))
     }
@@ -612,13 +900,17 @@ impl Stats {
         c.load(Relaxed)
     }
 
-    /// The summary of `-v` and `--stats` (`full`). `io`: the bytes this side sent and
+    /// The summary at `--info=stats` level `level`: none at 0, the closing lines of `-v`
+    /// at 1, also `--stats`' counters from 2 on. `io`: the bytes this side sent and
     /// received, which rsync's lines report.
-    pub fn print(&self, out: &Output, elapsed: Duration, human: bool, full: bool, io: Io) {
+    pub fn print(&self, out: &Output, elapsed: Duration, human: bool, level: u8, io: Io) {
+        if level == 0 {
+            return;
+        }
         let g = Self::get;
         let num = |n: u64| if human { human_num(n) } else { n.to_string() };
         let secs = elapsed.as_secs_f64().max(1e-9);
-        if full {
+        if level > 1 {
             let total = g(&self.files) + g(&self.dirs) + g(&self.links) + g(&self.specials);
             out.always(format!(
                 "\nNumber of files: {} (reg: {}, dir: {}, link: {}, special: {})",

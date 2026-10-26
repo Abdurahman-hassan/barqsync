@@ -17,6 +17,10 @@ fn main() {
                 let _ = ce.print();
                 std::process::exit(code);
             }
+            Err(e) if e.is::<barqsync::cli::InfoHelp>() => {
+                print!("{e}");
+                std::process::exit(exit::OK);
+            }
             Err(e) => {
                 eprintln!("barqsync: {e:#}");
                 // A rules file that can't be read is a file I/O error for rsync.

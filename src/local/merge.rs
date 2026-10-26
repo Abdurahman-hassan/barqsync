@@ -48,6 +48,11 @@ impl Sources {
         &self.dirs[self.origin.get(idx as usize).copied().unwrap_or(0)]
     }
 
+    /// For each entry, the index in `dirs` of the directory it is from (empty: the first).
+    pub(crate) fn origins(&self) -> &[usize] {
+        &self.origin
+    }
+
     /// The later sources' directories that merge into directory entry `idx` (named
     /// `name`), each with its selection and root device. Those that `-x` or their
     /// selection leave out, and repeats of a directory already merged, are dropped.

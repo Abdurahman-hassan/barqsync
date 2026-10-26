@@ -10,7 +10,7 @@ use barqsync::cli::Options;
 use barqsync::delta::Op;
 use barqsync::entry::{DirEnt, Kind, Meta};
 use barqsync::fsops;
-use barqsync::output::{Output, StatsSnapshot};
+use barqsync::output::{Output, Side, StatsSnapshot};
 use barqsync::proto::{Conn, Frame, Msg, NeedReq, RootInfo, Wire, file_id};
 use barqsync::remote::{receiver, sender};
 use std::ffi::{OsStr, OsString};
@@ -106,7 +106,7 @@ fn receive(dest: &Path, args: &[&str], (wire, tokio): (Wire, bool), script: impl
     let (actual, peer) = pair(wire, tokio);
     let dest = dest.as_os_str().to_owned();
     let handle = std::thread::spawn(move || {
-        let out = Output::new(&opts);
+        let out = Output::new(&opts, Side::Pull);
         receiver::run(&actual, &opts, &dest, &out, false).0
     });
     script(&peer);
@@ -649,7 +649,7 @@ fn a_small_file_that_grew_is_sent_whole() {
         let (actual, peer) = pair(mode.0, mode.1);
         let sources = vec![OsString::from(format!("{}/", src.display()))];
         let handle = std::thread::spawn(move || {
-            let out = Output::new(&opts);
+            let out = Output::new(&opts, Side::Push);
             sender::run(&actual, &opts, &sources, &out, false).0
         });
         let grown = vec![7u8; 300 << 10];

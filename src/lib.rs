@@ -11,6 +11,7 @@ pub mod filter;
 pub mod fsops;
 pub mod ids;
 pub mod local;
+pub mod logformat;
 pub mod output;
 pub mod paths;
 pub mod progress;

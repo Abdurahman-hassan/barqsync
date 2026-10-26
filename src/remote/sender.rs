@@ -21,7 +21,7 @@ use crate::exit;
 use crate::filter::{DirRules, Filter, Side};
 use crate::fsops;
 use crate::local::prune::{self, Prune};
-use crate::output::{Output, StatsSnapshot, path_msg};
+use crate::output::{ItemRec, Output, StatsSnapshot, path_msg};
 use crate::paths::{join_rel, split_source, wants_contents};
 use crate::proto::{self, Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
 use rayon::Scope;
@@ -70,10 +70,19 @@ struct Sender<'a> {
     vanished: AtomicU64,
     /// `-m`: which source directories have content.
     prune: Prune,
+    /// A push whose items show `%f`: each listing's source directories, and which one
+    /// each entry is from, to find where a reported item came from (see [`ItemRec`]).
+    sources: Option<Mutex<ListingSources>>,
+    /// The first `src/` root directory: where the transfer root itself is from.
+    root_dir: Option<PathBuf>,
 }
 
 /// `--remove-source-files`: (root, path) -> where the entry is and what it was.
 type Removable = HashMap<(u16, Vec<u8>), (PathBuf, Meta)>;
+
+/// Listing id -> its source directories, and for each entry the index of its own (empty:
+/// the first).
+type ListingSources = HashMap<u32, (Vec<PathBuf>, Vec<usize>)>;
 
 /// A top directory of the transfer root, with its listing when it is named items.
 type Top = (SrcDir, Option<Vec<DirEnt>>);
@@ -179,6 +188,10 @@ impl Sender<'_> {
             }
         }
         let entries = listing.entries.clone();
+        if let Some(sources) = &self.sources {
+            let dirs = listing.sources.dirs.iter().map(|d| d.path.clone()).collect();
+            sources.lock().unwrap().insert(dir, (dirs, listing.sources.origins().to_vec()));
+        }
         // Errors name the listing by its (first) source directory.
         let path = listing.sources.dirs.first().map(|d| d.path.clone()).unwrap_or_default();
         self.listings.lock().unwrap().insert(dir, listing);
@@ -346,11 +359,28 @@ impl Sender<'_> {
                 continue;
             };
             match remove_source(self.opts, &path, &listed, None) {
-                Ok(()) if self.out.verbose() >= 2 => self.out.info([&b"sender removed "[..], &rel].concat()),
+                Ok(()) if self.out.levels().remove > 0 => self.out.note([&b"sender removed "[..], &rel].concat()),
                 Ok(()) => {}
                 Err(m) => self.err(m),
             }
         }
+    }
+
+    /// Where an item the remote receiver reported has its source here (`%f`): found by
+    /// its listing and index, the transfer root by `root_dir`.
+    fn item_source(&self, rec: &ItemRec) -> PathBuf {
+        let rel = Path::new(std::ffi::OsStr::from_bytes(&rec.rel));
+        let found = match rec.at {
+            None if rec.rel.is_empty() => self.root_dir.clone(),
+            None => None,
+            Some((dir, idx)) => self.sources.as_ref().and_then(|s| {
+                let sources = s.lock().unwrap();
+                let (dirs, origin) = sources.get(&dir)?;
+                let d = dirs.get(origin.get(idx as usize).copied().unwrap_or(0))?;
+                Some(d.join(rel.file_name()?))
+            }),
+        };
+        found.unwrap_or_else(|| rel.to_path_buf())
     }
 
     /// Send `SenderDone` once the scan is finished and every listing has been answered.
@@ -847,6 +877,8 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         failed: SendFailure::default(),
         vanished: AtomicU64::new(0),
         prune,
+        sources: out.uses(b'f').then(|| Mutex::new(HashMap::new())),
+        root_dir: roots.iter().find(|r| r.info.contents).map(|r| r.base.clone()),
     };
     // Every error so far was about reading a source root.
     if sender.errors.load(SeqCst) > 0 {
@@ -906,6 +938,8 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
                     break Ok(stats);
                 }
                 Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
+                Ok(Frame::Msg(Msg::Item(rec))) => out.peer_item(&rec, &sender.item_source(&rec)),
+                Ok(Frame::Msg(Msg::Deleted { rel, dir })) => out.deleting(&rel, dir, 0),
                 Ok(Frame::Msg(Msg::Fatal { msg })) => {
                     out.error(format!("remote: {msg}"));
                     break Err(exit::PROTOCOL);

@@ -56,7 +56,9 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
 ///     `Synced` names entries only; `IoError` (source read errors stop deletions).
 /// 11: `--filter`/`-F`/`-C` rules, `--max-delete`, `-m`, `--mkpath` and `--timeout` in the
-///     options; `KeepAlive`; vanished files and stopped deletions in the counters.
+///     options; `KeepAlive`; vanished files and stopped deletions in the counters;
+///     `--info` levels in the options; a push's items and deletions as `Item` and
+///     `Deleted` records for the client to format.
 pub const VERSION: u32 = 11;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.
@@ -167,6 +169,11 @@ pub enum Msg {
     /// Output produced on the server, printed by the client. `escape`: the text may
     /// contain file names and is escaped with the client's charset before printing.
     Log { stderr: bool, escape: bool, text: Vec<u8> },
+    /// Receiver (server) → sending client: an item to show, which the client formats
+    /// as rsync's sender does (`--out-format`, `-i`, `-v`).
+    Item(Box<crate::output::ItemRec>),
+    /// Receiver (server) → sending client: an entry deleted (`dir`: a directory).
+    Deleted { rel: Vec<u8>, dir: bool },
 
     // sender → receiver
     Roots(Vec<RootInfo>),
