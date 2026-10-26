@@ -8,6 +8,23 @@
   also reports vanished files and `--max-delete` stops. Upgrade barqsync on both machines
   together; this release cannot communicate with 0.4.x.
 
+### Security
+
+- The sending side now opens each source file without following symlinks, and only if it
+  is still the regular file it listed (same device and inode). A local user who could
+  write in the source tree could otherwise swap a listed file for a symlink between the
+  scan and the read, and have the symlink's target copied in its place, with the listed
+  file's owner and mode (the class of rsync's CVE-2024-12747). With `-L`, the open still
+  follows the symlink the listing resolved, but must reach the file that was listed.
+- The client now escapes every line a remote barqsync forwards to its terminal. Before,
+  it obeyed a flag in the forwarded message, so a malicious or compromised server could
+  write raw escape sequences to the terminal: fake output, a changed window title, colour.
+- The delta work one side can ask of the other is now bounded. A basis signature's block
+  size must be between 1 byte and 64 KiB (otherwise the file is sent whole), and a
+  refinement request that would sign more than four times the basis is declined, leaving
+  those ranges as literal data. A malicious peer could otherwise make the other side
+  allocate oversized buffers, or hash its file over and over for minutes.
+
 ### Added
 
 - rsync command lines that failed with "unexpected argument" now run unchanged:
@@ -46,6 +63,11 @@
 - A source that resolves to nothing no longer creates the destination directory.
 - An `--exclude-from`/`--include-from` file that can't be read now ends with exit 11, as
   with rsync, instead of 1.
+- SIGTERM and SIGHUP (from `kill`, `timeout`, systemd or a closed terminal) now stop a
+  transfer like Ctrl-C: the file being written is removed and the run ends with exit 20,
+  as with rsync. Before, they killed barqsync at once (exit 143 or 129) and left a
+  half-written temp file. A signal ignored at startup stays ignored, so `nohup barqsync`
+  still survives its terminal closing.
 
 ## 0.4.2 - 2026-10-21
 
