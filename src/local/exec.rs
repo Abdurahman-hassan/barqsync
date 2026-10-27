@@ -1006,7 +1006,14 @@ impl<'a> Engine<'a> {
             return Del::Failed;
         }
         if kind == Kind::Dir && !emptied {
-            let dev = if self.opts.one_file_system { fsops::lstat(path).ok().map(|m| m.dev) } else { None };
+            let dev = match self.opts.one_file_system.then(|| fsops::lstat(path)) {
+                None => None,
+                Some(Ok(m)) => Some(m.dev),
+                Some(Err(e)) => {
+                    self.err(path_msg("stat \"", path, format!("\" failed: {e}")));
+                    return Del::Failed;
+                }
+            };
             let r = self.delete_contents(path, rel, rules, dev);
             if r != Del::Done {
                 return r;
@@ -1065,8 +1072,19 @@ impl<'a> Engine<'a> {
             }
         };
         let mut ret = Del::Done;
-        // rsync: "mount point, X, pins parent directory".
-        let mount = |n: &OsStr| self.opts.one_file_system && !fsops::lstat(&path.join(n)).is_ok_and(|m| Some(m.dev) == dev);
+        // rsync: "mount point, X, pins parent directory". One that can't be checked stays
+        // too, as an error.
+        let mount = |n: &OsStr| {
+            let p = path.join(n);
+            match self.opts.one_file_system.then(|| fsops::lstat(&p)) {
+                None => false,
+                Some(Ok(m)) => Some(m.dev) != dev,
+                Some(Err(e)) => {
+                    self.err(path_msg("stat \"", &p, format!("\" failed: {e}")));
+                    true
+                }
+            }
+        };
         let mut kids: Vec<(OsString, Kind)> = kids
             .into_iter()
             .filter(|(n, k)| {
@@ -1616,11 +1634,16 @@ impl<'a> Engine<'a> {
             }
         }
         let root_dev = src_dev.unwrap_or(meta.dev);
+        let name = src_path.file_name().unwrap_or_default();
         let more = match ctx.sources {
-            Some(src) if descend != Descend::No => {
-                src.also_dirs(idx, src_path.file_name().unwrap_or_default(), self.opts.recursive, self.opts.one_file_system)
-            }
+            Some(src) if descend != Descend::No => src.also_dirs(idx, name, self.opts.recursive, self.opts.one_file_system),
             _ => Vec::new(),
+        };
+        // -x: a top directory (for any source that has it, when several merge) starts
+        // from its own device.
+        let top = match ctx.sources {
+            Some(src) => src.top(idx, name, self.opts.recursive),
+            None => select::top_dir(sel, name.as_bytes(), self.opts.recursive),
         };
         let job = DirJob {
             src: src_path,
@@ -1631,9 +1654,7 @@ impl<'a> Engine<'a> {
             depth: ctx.depth + 1,
             dst_is_new: is_new,
             root_dev: Some(root_dev),
-            // A directory sent whole from one sent in part (a named one, the end of a -R
-            // path) is a top one.
-            dst_dev: if select::may_delete(sel) { ctx.dst_dev.or(pre.map(|p| p.dev)) } else { pre.map(|p| p.dev) },
+            dst_dev: ctx.dst_dev.filter(|_| !top).or(pre.map(|p| p.dev)),
             src_meta: meta,
             pre,
             sel: match descend {

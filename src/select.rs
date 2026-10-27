@@ -107,6 +107,18 @@ pub fn may_delete(sel: Option<&Sel>) -> bool {
     sel.is_none_or(|s| s.contents)
 }
 
+/// Whether child directory `name` of a directory whose selection is `parent` is one of
+/// rsync's top directories: its contents are sent and its parent's aren't (a named
+/// directory, the end of a `-R` path, a `--files-from` directory with a trailing `/`).
+pub fn top_dir(parent: Option<&Sel>, name: &[u8], recursive: bool) -> bool {
+    !may_delete(parent)
+        && match descend(parent, name, recursive) {
+            Descend::All => true,
+            Descend::Some(s) => s.contents,
+            Descend::No => false,
+        }
+}
+
 /// Normalize a relative path: drop empty and `.` components, fold `x/..`. Returns the
 /// components and whether the path started with `./` (or was `.`).
 fn components(rel: &[u8]) -> (Vec<&[u8]>, bool) {
@@ -253,5 +265,20 @@ mod tests {
         assert_eq!(descend(None, b"x", true), Descend::All);
         assert!(!may_delete(Some(s)));
         assert!(may_delete(None));
+    }
+
+    #[test]
+    fn top_dirs() {
+        let roots = from_list(OsStr::new("s"), &[b"a/b/c".to_vec(), b"d".to_vec(), b"e/".to_vec()]);
+        let s = &roots[0].sel;
+        // `a` only leads to `a/b/c`, `d` is sent whole with -r, `e/` lists its contents.
+        assert!(!top_dir(Some(s), b"a", true));
+        assert!(top_dir(Some(s), b"d", true));
+        assert!(!top_dir(Some(s), b"d", false));
+        assert!(top_dir(Some(s), b"e", false));
+        let b = &s.children[&b"a".to_vec()].children[&b"b".to_vec()];
+        assert!(top_dir(Some(b), b"c", true));
+        // Nothing below a directory sent whole is one.
+        assert!(!top_dir(None, b"x", true));
     }
 }

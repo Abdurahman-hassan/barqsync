@@ -996,10 +996,16 @@ fn mount_fixture(dst: &Path) {
     Tree::new(dst).file("z", "z").file("old/o", "o").file("old/mnt/f", "f").file("old/mnt/d/g", "g").same_mtimes(BASE_TIME + 700_000);
 }
 
+/// A case of [`one_file_system_keeps_destination_mount_points`]: options, sources, the
+/// destination below r/ and f/, whether `old/mnt/d/g` stays, and the modes compared.
+#[cfg(target_os = "macos")]
+type MountCase<'a> = (&'a str, &'a [&'a str], &'a str, bool, &'a [&'a str]);
+
 /// `-x` with `--delete`: a destination directory on another filesystem (a mount point, a
 /// disk image here) is neither deleted nor emptied when the source lacks it, nothing in it
-/// is deleted when the source has it, unless it is a top directory, and it keeps a
-/// directory being deleted. As rsync, locally (both scanners), as a push and as a pull.
+/// is deleted when the source has it, unless it is a top directory (in any of the
+/// sources), and it keeps a directory being deleted. As rsync, locally (both scanners), as
+/// a push and as a pull.
 #[cfg(target_os = "macos")]
 #[test]
 fn one_file_system_keeps_destination_mount_points() {
@@ -1015,38 +1021,51 @@ fn one_file_system_keeps_destination_mount_points() {
     Tree::new(t.join("lacks")).file("a", "a").settle_mtimes();
     Tree::new(t.join("has")).file("mnt/new", "n").settle_mtimes();
     Tree::new(t.join("deep")).file("old/mnt/new", "n").settle_mtimes();
+    Tree::new(t.join("partial")).file("mnt/child/c", "c").settle_mtimes();
+    Tree::new(t.join("full")).file("mnt/m", "m").settle_mtimes();
     Tree::new(t.join("file")).file("mnt", "a file").settle_mtimes();
-    // A source and a destination as each mode gives them (`{host}` marks the remote side).
-    let paths = |mode: &str, src: &str, dst: &str| match mode {
-        "push" => (src.to_string(), format!("{{host}}{dst}")),
-        "pull" => (format!("{{host}}{src}"), dst.to_string()),
-        _ => (src.to_string(), dst.to_string()),
+    // `opts --delete`, the sources and the destination as `mode` gives them (`{host}`
+    // marks the remote side).
+    let args = |mode: &str, opts: &str, srcs: &[&str], dst: &str| -> Vec<String> {
+        let mut v = vec![opts.to_string(), "--delete".to_string()];
+        v.extend(srcs.iter().map(|s| if mode == "pull" { format!("{{host}}{s}") } else { s.to_string() }));
+        v.push(if mode == "push" { format!("{{host}}{dst}") } else { dst.to_string() });
+        v
     };
-    // (options, source, destination below r/ and f/, whether `old/mnt/d/g` stays): the
-    // mount point is extraneous, listed, inside the extraneous `old`, or a top directory
-    // (where a named directory or a -R path goes), whose extra entries go.
-    let cases = [
-        ("-aix", "lacks/", "old/", true),
-        ("-aix", "has/", "old/", true),
-        ("-aix", "lacks/", "", true),
-        ("-aix", "has/mnt", "old/", false),
-        ("-aixR", "deep/./old/mnt", "", false),
+    let all: &[&str] = &["local", "push", "pull"];
+    // The mount point is extraneous, listed, inside the extraneous `old`, or a top
+    // directory (where a named directory or a -R path goes), whose extra entries go.
+    // With several sources it is a top directory if it is one in any of them: not when
+    // one has `mnt` on the way to a -R path and another sends it whole, but when one
+    // names it. A push or a pull gets the sources as one listing that doesn't say which
+    // directories were named, so there a named `mnt` keeps its extra entries (see the
+    // implementation notes): that case is compared locally only.
+    let cases: [MountCase; 7] = [
+        ("-aix", &["lacks/"], "old/", true, all),
+        ("-aix", &["has/"], "old/", true, all),
+        ("-aix", &["lacks/"], "", true, all),
+        ("-aix", &["has/mnt"], "old/", false, all),
+        ("-aixR", &["deep/./old/mnt"], "", false, all),
+        ("-aixR", &["partial/./mnt/child", "full/./"], "old/", true, all),
+        ("-aix", &["full/", "has/mnt"], "old/", false, &["local"]),
     ];
-    for (opts, src, sub, kept) in cases {
-        for mode in ["local", "push", "pull"] {
-            let what = format!("{mode} {opts} {src} -> {sub}");
+    for (opts, srcs, sub, kept, modes) in cases {
+        for &mode in modes {
+            let what = format!("{mode} {opts} {srcs:?} -> {sub}");
             mount_fixture(&t.join("r"));
             mount_fixture(&t.join("f"));
-            let (s, d) = paths(mode, src, &format!("{{dst}}/{sub}"));
-            let args = [opts, "--delete", &s, &d];
-            let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+            let a = args(mode, opts, srcs, &format!("{{dst}}/{sub}"));
+            let a: Vec<&str> = a.iter().map(String::as_str).collect();
+            let (r, f) = if mode == "local" { both(t, &a, "r", "f") } else { both_remote(t, &a, "r", "f") }.unwrap();
             same_output(&r, &f, &[], &what);
             assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
             assert_eq!(t.join("f/old/mnt/d/g").exists(), kept, "{what}: {}", f.stdout);
             if mode == "local" {
                 mount_fixture(&t.join("f"));
-                let f = barqsync(t, &[opts, "--delete", "--scanner=jwalk", src, &format!("f/{sub}")]);
-                same_output(&r, &f, &[], &format!("jwalk {opts} {src} -> {sub}"));
+                let mut a = args(mode, opts, srcs, &format!("f/{sub}"));
+                a.insert(2, "--scanner=jwalk".into());
+                let f = barqsync(t, &a.iter().map(String::as_str).collect::<Vec<_>>());
+                same_output(&r, &f, &[], &format!("jwalk {what}"));
                 assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
             }
         }
@@ -1057,15 +1076,39 @@ fn one_file_system_keeps_destination_mount_points() {
     assert!(f.stdout.lines().any(|l| l == "cannot delete mount point: mnt"), "{}", f.stdout);
     // Not even to make way for a file: rsync deletes the files at the top of the mount
     // point then, barqsync leaves it alone.
-    for mode in ["local", "push", "pull"] {
+    for &mode in all {
         mount_fixture(&t.join("f"));
-        let (s, d) = paths(mode, "file/", "f/old/");
-        let args = ["-aix", "--delete", &s, &d];
-        let f = if mode == "local" { barqsync(t, &args) } else { barqsync_remote(t, &args) };
+        let a = args(mode, "-aix", &["file/"], "f/old/");
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        let f = if mode == "local" { barqsync(t, &a) } else { barqsync_remote(t, &a) };
         assert_eq!(f.code, 23, "{mode}: {}{}", f.stdout, f.stderr);
         assert!(f.stderr.contains("could not make way for new regular file: mnt"), "{mode}: {}", f.stderr);
         assert!(t.join("f/old/mnt/f").exists() && t.join("f/old/mnt/d/g").exists(), "{mode}: {}", f.stdout);
     }
+}
+
+/// `-x` with `--delete`: in a directory being deleted, a subdirectory that can't be
+/// checked for being a mount point (the directory's mode lacks `x`) stays, and the run
+/// reports it (exit 23), as rsync does.
+#[test]
+fn one_file_system_reports_directories_it_cannot_check() {
+    if skip_without_rsync() || unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    Tree::new(t.join("src")).file("a", "a").settle_mtimes();
+    for d in ["r", "f"] {
+        Tree::new(t.join(d)).dir("old/s1").dir("old/s2").chmod("old", 0o444);
+    }
+    let (r, f) = both(t, &["-aix", "--delete", "src/", "{dst}"], "r", "f").unwrap();
+    for d in ["r", "f"] {
+        Tree::new(t.join(d)).chmod("old", 0o755);
+    }
+    same_output(&r, &f, &[], "-x, old/ without x");
+    assert_eq!(f.code, 23, "{}", f.stderr);
+    assert!(f.stderr.contains("Permission denied"), "{}", f.stderr);
+    assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
 }
 
 // ---------------------------------------------------------------------------
