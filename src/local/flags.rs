@@ -444,8 +444,11 @@ impl Engine<'_> {
             if !self.alt_data_same(src, &m, &p, &mut cached) {
                 continue;
             }
-            // rsync's unchanged_attrs: with -X/-A the attributes and ACLs must match too.
-            if !self.rules.attrs_differ(src, &m).any() && self.extra_change(x, &p, &m).0 == (false, false) {
+            // rsync's unchanged_attrs: with -X/-A the attributes and ACLs must match too; an
+            // access time never counts, a creation time only with -t.
+            let d = self.rules.attrs_differ(src, &m);
+            let d = crate::diff::AttrDiff { atime: false, crtime: d.crtime && self.opts.times, ..d };
+            if !d.any() && self.extra_change(x, &p, &m).0 == (false, false) {
                 exact = Some((p, m));
                 break;
             }
@@ -469,6 +472,12 @@ impl Engine<'_> {
                     if let Err(e) = r {
                         self.dst_err(path_msg("link \"", dst_path, format!("\" failed: {e}")));
                         return AltFile::Done;
+                    }
+                    // -U: as rsync, the linked file gets the source's access (and with -N
+                    // creation) time, which the other names share.
+                    if let Some(a) = self.kept_atime(src) {
+                        self.put_crtime(dst_path, src);
+                        let _ = fsops::set_atime(dst_path, a, false);
                     }
                 }
             } else {

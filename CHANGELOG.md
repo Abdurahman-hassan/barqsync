@@ -6,8 +6,9 @@
 
 - Remote transfers now use protocol 11: the new options travel to the other side, which
   also reports vanished files and `--max-delete` stops. `--append` adds a request for
-  the data past a shorter file, `--delete-missing-args` entries for missing sources, and
-  the sender now names the owner and group of id 0 too.
+  the data past a shorter file, `--delete-missing-args` entries for missing sources,
+  `-U` and `-N` access and creation times, and the sender now names the owner and group
+  of id 0 too.
   Upgrade barqsync on both machines together; this release cannot communicate with 0.4.x.
 
 ### Security
@@ -62,6 +63,9 @@
     last one also for `--files-from` lists that name files whose directory is gone.
   - `--safe-links`, `--copy-unsafe-links` and `--munge-links`, with rsync 3.4's stricter
     test for unsafe symlinks.
+  - `-E`/`--executability`, `-U`/`--atimes` (`-UU` and `--open-noatime`: `O_NOATIME` on
+    Linux) and, on macOS, `-N`/`--crtimes`, itemized as rsync does (`u`, `n`, `b`).
+    Elsewhere `-N` is refused, as by rsync.
 - A source file that disappears between the scan and its transfer is now a warning
   ("file has vanished") and exit 24, as with rsync, instead of an error and exit 23.
 - `--stats` also prints rsync's "Total bytes sent/received" lines, and `-v` or `--stats`

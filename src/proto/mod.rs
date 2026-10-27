@@ -60,7 +60,8 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 ///     `--bwlimit`, `--usermap`/`--groupmap` (`--chown`) and `--append(-verify)` in the
 ///     options, `Sig::Append`, and id 0's name in `IdNames`; `-T`, `--delay-updates`,
 ///     `--force`, `--ignore-errors`, the missing-args options and the symlink options in
-///     the options, and missing entries (`DirEnt::missing`) in listings.
+///     the options, and missing entries (`DirEnt::missing`) in listings; `-E`, `-U`,
+///     `--open-noatime` and `-N` in the options, and access and creation times in `Meta`.
 pub const VERSION: u32 = 11;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.
@@ -1301,7 +1302,7 @@ mod tests {
     fn rich_messages() -> Vec<Msg> {
         use crate::entry::Kind;
         use std::os::unix::ffi::OsStringExt;
-        let meta = Meta { kind: Kind::File, size: 7, mtime: -3, mtime_ns: 9, mode: 0o644, uid: 1, gid: 2, dev: 3, ino: 4, rdev: 0, nlink: 1 };
+        let meta = Meta { kind: Kind::File, size: 7, mtime: -3, mtime_ns: 9, mode: 0o644, uid: 1, gid: 2, dev: 3, ino: 4, rdev: 0, nlink: 1, atime: 5, crtime: 6 };
         let name = std::ffi::OsString::from_vec(vec![b'a', 0xff, b'\n']);
         let mut sel = Sel { named: true, ..Sel::default() };
         sel.children.insert(b"sub".to_vec(), Sel { contents: true, ..Sel::default() });

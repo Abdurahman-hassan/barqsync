@@ -351,6 +351,8 @@ mod tests {
             ino: 0,
             rdev: 0,
             nlink: 1,
+            atime: 0,
+            crtime: 0,
         };
         m.apply(&mut meta);
         assert_eq!((meta.uid, meta.gid), (501, 20));

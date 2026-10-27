@@ -137,7 +137,7 @@ encryption are a tie. Method, raw data and more cases:
 | **Deleting** | `--delete`, `--delete-before`/`-during`/`-delay`/`-after`, `--delete-excluded`, `--max-delete`, `--force`, `--ignore-errors`, `--ignore-missing-args`, `--delete-missing-args`, `--remove-source-files` |
 | **Comparing** | `-c`, `--size-only`, `-I`, `--modify-window` |
 | **Writing** | `--inplace`, `--append`, `--append-verify`, `-T`, `--delay-updates`, `--partial`, `--partial-dir`, `-P`, `-S`, `-W`, `--no-whole-file`, `--fsync`, `--mkpath`, `-b`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest` |
-| **Links and metadata** | `-l`, `-L`, `-k`, `-K`, `--safe-links`, `--copy-unsafe-links`, `--munge-links`, `-H`, `-p`, `-t`, `-g`, `-o`, `-D`, `-O`, `-X` (extended attributes), `-A` (ACLs), `--numeric-ids`, `--chmod`, `--chown`, `--usermap`, `--groupmap` |
+| **Links and metadata** | `-l`, `-L`, `-k`, `-K`, `--safe-links`, `--copy-unsafe-links`, `--munge-links`, `-H`, `-p`, `-E`, `-t`, `-U`, `-N` (macOS), `-g`, `-o`, `-D`, `-O`, `-X` (extended attributes), `-A` (ACLs), `--numeric-ids`, `--chmod`, `--chown`, `--usermap`, `--groupmap` |
 | **Remote** | `-e`, `--remote-path`, `--timeout`, `--bwlimit`, `-s`, `--transport` (ssh, tcp, quic, auto), `--streams N`, `--strategy adaptive`, `--compress-level N` |
 | **Output** | `-i`, `--out-format`, `--progress`, `--info=progress2` |
 

@@ -54,6 +54,8 @@ pub fn run(opts: Options) -> i32 {
         return remote::server::run();
     }
     fsops::cache::set_enabled(opts.drop_cache);
+    entry::read_times(opts.atimes > 0, opts.crtimes);
+    fsops::set_open_noatime(opts.open_noatime);
     // rsync: a munged symlink must not lead anywhere, which it would if this existed.
     if opts.munge_links && std::fs::metadata("/rsyncd-munged").is_ok_and(|m| m.is_dir()) {
         eprintln!("barqsync: Symlink munging is unsafe when a /rsyncd-munged directory exists.");

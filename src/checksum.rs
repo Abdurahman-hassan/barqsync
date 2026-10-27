@@ -22,7 +22,8 @@ static POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 });
 
 pub fn file_sum(path: &Path) -> io::Result<Sum> {
-    let mut f = File::open(path)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = File::options().read(true).custom_flags(crate::fsops::read_flags()).open(path)?;
     let mut h = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {

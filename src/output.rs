@@ -77,6 +77,10 @@ pub struct Change {
     pub perms: bool,
     pub owner: bool,
     pub group: bool,
+    /// `-U`: the access time differs (`u`; with `-N`'s, `b`).
+    pub atime: bool,
+    /// `-N`: the creation time differs (`n`).
+    pub crtime: bool,
     /// `-A`: ACLs differ (`a`).
     pub acl: bool,
     /// `-X`: extended attributes differ (`x`).
@@ -89,7 +93,16 @@ impl Change {
     }
 
     pub fn any_attr(&self) -> bool {
-        self.value || self.size || self.time || self.perms || self.owner || self.group || self.acl || self.xattr
+        self.value
+            || self.size
+            || self.time
+            || self.perms
+            || self.owner
+            || self.group
+            || self.atime
+            || self.crtime
+            || self.acl
+            || self.xattr
     }
 
     fn anything(&self) -> bool {
@@ -242,6 +255,12 @@ impl Output {
             f[5] = set(c.perms, b'p');
             f[6] = set(c.owner, b'o');
             f[7] = set(c.group, b'g');
+            f[8] = match (c.atime, c.crtime) {
+                (true, true) => b'b',
+                (true, false) => b'u',
+                (false, true) => b'n',
+                (false, false) => b'.',
+            };
             f[9] = set(c.acl, b'a');
             f[10] = set(c.xattr, b'x');
         }

@@ -57,6 +57,11 @@ pub fn meta_from_stat(st: &libc::stat) -> Meta {
     } else {
         Kind::Socket
     };
+    #[cfg(target_os = "macos")]
+    let crtime = st.st_birthtime as i64;
+    #[cfg(not(target_os = "macos"))]
+    let crtime = 0;
+    let (atime, crtime) = Meta::extra_times(kind, st.st_atime as i64, crtime);
     Meta {
         kind,
         size: st.st_size as u64,
@@ -69,6 +74,8 @@ pub fn meta_from_stat(st: &libc::stat) -> Meta {
         ino: st.st_ino as u64,
         rdev: st.st_rdev as u64,
         nlink: st.st_nlink as u64,
+        atime,
+        crtime,
     }
 }
 
@@ -223,7 +230,7 @@ pub fn open_listed(path: &Path, listed: &Meta, follow: bool) -> io::Result<File>
     use std::os::unix::fs::OpenOptionsExt;
     // O_NONBLOCK: a FIFO put in its place would otherwise block the open until it has a
     // writer. It changes nothing for a regular file.
-    let flags = libc::O_NONBLOCK | if follow { 0 } else { libc::O_NOFOLLOW };
+    let flags = libc::O_NONBLOCK | read_flags() | if follow { 0 } else { libc::O_NOFOLLOW };
     let changed = || io::Error::other(CHANGED_SINCE_LISTED);
     let f = fs::OpenOptions::new().read(true).custom_flags(flags).open(path).map_err(|e| match e.raw_os_error() {
         // O_NOFOLLOW met a symlink.
@@ -235,6 +242,24 @@ pub fn open_listed(path: &Path, listed: &Meta, follow: bool) -> io::Result<File>
         return Err(changed());
     }
     Ok(f)
+}
+
+static OPEN_NOATIME: AtomicBool = AtomicBool::new(false);
+
+/// `--open-noatime` (`-UU`): files are read without updating their access time
+/// (`O_NOATIME`, which Linux has; elsewhere, as with rsync, nothing changes). Like
+/// rsync, a file this user may not open that way (not its owner) isn't read.
+pub fn set_open_noatime(on: bool) {
+    OPEN_NOATIME.store(on, Ordering::Relaxed);
+}
+
+/// The `open` flags [`set_open_noatime`] asks for, to read a file with.
+pub fn read_flags() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    if OPEN_NOATIME.load(Ordering::Relaxed) {
+        return libc::O_NOATIME;
+    }
+    0
 }
 
 /// Read a directory and `lstat` every child. Entries that vanish between `readdir`
@@ -730,15 +755,12 @@ pub fn fchown(f: &File, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
 }
 
 pub fn set_fd_mtime(f: &File, sec: i64, nsec: u32) -> io::Result<()> {
-    let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ };
-    let times = [omit, ts(sec, nsec)];
-    cvt(unsafe { libc::futimens(f.as_raw_fd(), times.as_ptr()) }).map(drop)
+    cvt(unsafe { libc::futimens(f.as_raw_fd(), [omit(), ts(sec, nsec)].as_ptr()) }).map(drop)
 }
 
 pub fn set_fd_mtime_now(f: &File) -> io::Result<()> {
-    let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ };
     let now = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW as _ };
-    cvt(unsafe { libc::futimens(f.as_raw_fd(), [omit, now].as_ptr()) }).map(drop)
+    cvt(unsafe { libc::futimens(f.as_raw_fd(), [omit(), now].as_ptr()) }).map(drop)
 }
 
 pub fn lchown(path: &Path, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
@@ -748,11 +770,10 @@ pub fn lchown(path: &Path, uid: Option<u32>, gid: Option<u32>) -> io::Result<()>
     std::os::unix::fs::lchown(path, uid, gid)
 }
 
-/// Path-based `utimensat`: one syscall, and it never opens the file (opening a FIFO would block).
-fn utimens(path: &Path, mtime: libc::timespec, flags: libc::c_int) -> io::Result<()> {
+/// Path-based `utimensat` of `[atime, mtime]`: one syscall, and it never opens the file
+/// (opening a FIFO would block).
+fn utimens(path: &Path, times: [libc::timespec; 2], flags: libc::c_int) -> io::Result<()> {
     let c = cstr(path)?;
-    let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ };
-    let times = [omit, mtime];
     cvt(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags) }).map(drop)
 }
 
@@ -760,16 +781,44 @@ fn ts(sec: i64, nsec: u32) -> libc::timespec {
     libc::timespec { tv_sec: sec as libc::time_t, tv_nsec: nsec as _ }
 }
 
+/// A time `utimensat` leaves as it is.
+fn omit() -> libc::timespec {
+    libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ }
+}
+
 pub fn set_mtime(path: &Path, sec: i64, nsec: u32) -> io::Result<()> {
-    utimens(path, ts(sec, nsec), 0)
+    utimens(path, [omit(), ts(sec, nsec)], 0)
 }
 
 pub fn set_symlink_mtime(path: &Path, sec: i64, nsec: u32) -> io::Result<()> {
-    utimens(path, ts(sec, nsec), libc::AT_SYMLINK_NOFOLLOW)
+    utimens(path, [omit(), ts(sec, nsec)], libc::AT_SYMLINK_NOFOLLOW)
 }
 
 pub fn touch_now(path: &Path) -> io::Result<()> {
-    utimens(path, libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW as _ }, 0)
+    utimens(path, [omit(), libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW as _ }], 0)
+}
+
+/// `-U`: the access time, in whole seconds as rsync sets it; `symlink`: of the link
+/// itself.
+pub fn set_atime(path: &Path, sec: i64, symlink: bool) -> io::Result<()> {
+    utimens(path, [ts(sec, 0), omit()], if symlink { libc::AT_SYMLINK_NOFOLLOW } else { 0 })
+}
+
+/// [`set_atime`] through a descriptor.
+pub fn set_fd_atime(f: &File, sec: i64) -> io::Result<()> {
+    cvt(unsafe { libc::futimens(f.as_raw_fd(), [ts(sec, 0), omit()].as_ptr()) }).map(drop)
+}
+
+/// `-N`: the creation time of `path` itself (not of a symlink's target), in seconds.
+/// Only macOS can set one, as rsync's `--crtimes` needs.
+pub fn set_crtime(path: &Path, sec: i64) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    return platform::set_crtime(path, sec);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, sec);
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 pub fn fsync_path(path: &Path) -> io::Result<()> {
