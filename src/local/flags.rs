@@ -667,9 +667,13 @@ impl Engine<'_> {
 
     /// `--append` locally: copy the source's data past the destination's end (`d.size`)
     /// onto it. With `--append-verify` the data already there must be the source's
-    /// start, or the whole file is rewritten.
+    /// start, or the whole file is rewritten. A source now shorter than it was listed is
+    /// left alone, as rsync's sender skips a "diminished" file: [`Diminished`].
     pub(crate) fn write_append(&self, job: &FileJob, d: &Meta, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
         let src = fsops::open_listed(&job.src_path, &job.meta, self.opts.follows_listed())?;
+        if src.metadata()?.len() < job.meta.size {
+            return Err(io::Error::other(Diminished));
+        }
         let out = fs::OpenOptions::new().read(true).write(true).open(&job.dst_path)?;
         let from = if self.opts.append > 1 && checksum::prefix_sum(&src, d.size)? != checksum::prefix_sum(&out, d.size)? {
             self.append_failed(job, d);
@@ -682,6 +686,11 @@ impl Engine<'_> {
         Stats::add(&self.stats.matched_bytes, from);
         out.set_len(end)?;
         self.finish_delta_file(&out, &job.meta, mode, uid, gid, Some((&job.dst_path, &job.src(false))))
+    }
+
+    /// rsync's warning for a file [`Diminished`] since it was listed, which is not sent.
+    pub(crate) fn diminished(&self, path: &Path) {
+        self.out.warning(path_msg("skipped diminished file: \"", &fsops::full_path(path), "\""));
     }
 
     // -----------------------------------------------------------------------
@@ -855,6 +864,19 @@ impl Engine<'_> {
         fsops::copy_from(src, tmp, size, allow_fast, mode)
     }
 }
+
+/// `--append`: the source is shorter than it was listed, so the destination keeps what it
+/// has and the source stays (rsync's "skipped diminished file").
+#[derive(Debug)]
+pub(crate) struct Diminished;
+
+impl std::fmt::Display for Diminished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("diminished since it was listed")
+    }
+}
+
+impl std::error::Error for Diminished {}
 
 #[cfg(test)]
 mod tests {

@@ -1547,6 +1547,19 @@ fn bwlimit_paces_transfers_like_rsync() {
         assert!(rt >= least && ft >= least, "{src} {dst}: rsync took {rt:?}, barqsync {ft:?}");
         assert_same_tree(&snap(&tmp.path().join(&dr), true), &snap(&tmp.path().join(&df), true));
     }
+    // A frame that takes longer than --timeout to arrive at this rate still moves, so it
+    // is no timeout: 96 KiB at 32 KiB/s, with one second allowed between bytes. Through
+    // both I/O layers.
+    Tree::new(tmp.path().join("slow")).file("f", noise(96 << 10, 8)).settle_mtimes();
+    for io in ["threads", "tokio"] {
+        for (i, (src, dst)) in [("slow/", "{host}t1"), ("{host}slow/", "t2")].into_iter().enumerate() {
+            let args = ["-a", "--bwlimit=32", "--timeout=1", src, dst];
+            let f = barqsync_env(tmp.path(), &args, &[("BARQSYNC_NET_IO", io), ("BARQSYNC_TRANSPORT", "ssh")]);
+            assert_eq!(f.code, 0, "{io} {src} {dst}: {}", f.stderr);
+            assert_eq!(fs::read(tmp.path().join(format!("t{}/f", i + 1))).unwrap(), noise(96 << 10, 8));
+            let _ = fs::remove_dir_all(tmp.path().join(format!("t{}", i + 1)));
+        }
+    }
     // rsync's size syntax, in KiB by default; 0 is no limit.
     let (r, f) = both(tmp.path(), &["-ai", "--bwlimit=0", "src/", "{dst}"], "zr", "zf").unwrap();
     same_output(&r, &f, &[], "--bwlimit=0");
@@ -1983,6 +1996,34 @@ fn symlink_safety_options_match_rsync() {
                 // (Without the destination itself, which each tool created a moment apart.)
                 assert_same_tree(&snap(&top.join(&dr), false), &snap(&top.join(&df), false));
             }
+        }
+    }
+}
+
+/// A source cut short after the scan is skipped with `--append`, as rsync's sender skips
+/// a "diminished" file: the destination keeps its data and attributes, and
+/// `--remove-source-files` leaves the source. (rsync can't be raced reliably, so a test
+/// hook cuts the file to half its length just before it is opened.)
+#[test]
+fn append_skips_a_diminished_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = noise(300_000, 4);
+    for (i, (src, dst)) in [("src/", "d0"), ("src/", "{host}d1"), ("{host}src/", "d2")].into_iter().enumerate() {
+        for mode in ["--append", "--append-verify"] {
+            Tree::new(tmp.path().join("src")).file("log", &data).file("ok", "complete").settle_mtimes();
+            let name = format!("d{i}");
+            Tree::new(tmp.path().join(&name)).file("log", &data[..200_000]).file("ok", "comp").same_mtimes(BASE_TIME + 7);
+            let args = ["-a", mode, "--remove-source-files", src, dst];
+            let f = barqsync_env(tmp.path(), &args, &[("BARQSYNC_TEST_SHRINK", "log")]);
+            let what = format!("{mode} {src} {dst}");
+            assert_eq!(f.code, 0, "{what}\n{}", f.stderr);
+            assert!(f.stderr.contains("skipped diminished file: \"") && f.stderr.contains("src/log\""), "{what}: {}", f.stderr);
+            let d = tmp.path().join(&name);
+            assert_eq!(fs::read(d.join("log")).unwrap(), &data[..200_000], "{what}");
+            assert_eq!(fs::metadata(d.join("log")).unwrap().mtime() as u64, BASE_TIME + 7, "{what}");
+            assert_eq!(fs::metadata(tmp.path().join("src/log")).unwrap().len(), 150_000, "{what}: the source stays");
+            assert_eq!(fs::read(d.join("ok")).unwrap(), b"complete", "{what}");
+            assert!(!tmp.path().join("src/ok").exists(), "{what}");
         }
     }
 }

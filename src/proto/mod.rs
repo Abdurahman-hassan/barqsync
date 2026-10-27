@@ -84,6 +84,26 @@ fn count(counter: &std::sync::atomic::AtomicU64, n: usize) {
     counter.fetch_add(n as u64, Ordering::Relaxed);
 }
 
+/// Milliseconds since the first call: the time base of `--timeout`'s idle checks.
+pub(crate) fn clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// When bytes last arrived on a connection (see [`clock`]).
+static LAST_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes arrived: the connection is alive even while a frame is still on its way (one
+/// can take longer than `--timeout` to arrive whole under `--bwlimit`).
+fn note_read() {
+    LAST_READ.store(clock(), Ordering::Relaxed);
+}
+
+/// When bytes last arrived on any connection (see [`clock`]).
+pub(crate) fn last_read() -> u64 {
+    LAST_READ.load(Ordering::Relaxed)
+}
+
 /// File id on the wire: directory id in the high half, index in its listing in the low half.
 pub fn file_id(dir: u32, idx: u32) -> u64 {
     (dir as u64) << 32 | idx as u64
@@ -333,13 +353,27 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
             match r.read(&mut hdr[got..]) {
                 Ok(0) if got == 0 && !pieces.pending() => return Ok(None),
                 Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(n) => got += n,
+                Ok(n) => {
+                    got += n;
+                    note_read();
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
         }
         let mut body = vec![0u8; body_len(&hdr)?];
-        r.read_exact(&mut body)?;
+        let mut got = 0;
+        while got < body.len() {
+            match r.read(&mut body[got..]) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => {
+                    got += n;
+                    note_read();
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
         count(&BYTES_RECEIVED, hdr.len() + body.len());
         if let Some(f) = pieces.add(hdr[4], body)? {
             return Ok(Some(f));

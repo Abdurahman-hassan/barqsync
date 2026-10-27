@@ -25,7 +25,7 @@ static DUE: Mutex<Option<Instant>> = Mutex::new(None);
 /// How far writes may run ahead of the rate before one waits (rsync's tenth of a second).
 const SLACK: Duration = Duration::from_millis(100);
 /// The longest single wait, so an interrupt is noticed.
-const NAP: Duration = Duration::from_millis(50);
+pub(crate) const NAP: Duration = Duration::from_millis(50);
 
 /// Limit what this process writes to its connections (a remote transfer).
 pub fn limit_connections(bytes_per_sec: u64) {

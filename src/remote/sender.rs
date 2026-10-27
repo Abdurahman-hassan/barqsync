@@ -597,10 +597,10 @@ impl Sender<'_> {
     /// `--append`: the receiver has the first `len` bytes of this file (`size` bytes now);
     /// send the rest as a delta keeping them. With `--append-verify` (`sum`) only if
     /// they match this file's start: otherwise the file goes whole, which tells the
-    /// receiver. A file now shorter than that is skipped, as rsync skips a "diminished"
-    /// file.
+    /// receiver. A file now shorter than it was listed is skipped, as rsync skips a
+    /// "diminished" file.
     fn send_append(&self, src: &Source, file: &File, size: u64, len: u64, sum: Option<Sum>, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
-        if size < len {
+        if size < src.meta.size {
             self.out.warning(path_msg("skipped diminished file: \"", &fsops::full_path(&src.path), "\""));
             self.send(Msg::FileEnd { id: src.id, ok: false });
             return Ok(0);

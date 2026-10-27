@@ -1951,6 +1951,7 @@ impl<'a> Engine<'a> {
         match r {
             Ok(()) => self.file_written(job),
             Err(e) if fsops::interrupted() => drop(e),
+            Err(e) if e.get_ref().is_some_and(|e| e.is::<super::flags::Diminished>()) => self.diminished(&job.src_path),
             Err(e) if e.kind() == io::ErrorKind::NotFound && fsops::lstat(&job.src_path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) => {
                 self.vanished(&job.src_path)
             }

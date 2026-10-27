@@ -152,14 +152,21 @@ pub fn same_open_file(a: &File, b: &File) -> io::Result<bool> {
 }
 
 /// Tests: with `BARQSYNC_TEST_VANISH=NAME`, a source file named NAME is removed just before
-/// it is opened to be sent, as if it was deleted after the scan.
+/// it is opened to be sent, as if it was deleted after the scan; with
+/// `BARQSYNC_TEST_SHRINK=NAME`, it is cut to half its length instead.
 pub fn test_vanish(path: &Path) {
-    static NAME: std::sync::LazyLock<Option<std::ffi::OsString>> =
-        std::sync::LazyLock::new(|| std::env::var_os("BARQSYNC_TEST_VANISH"));
-    if let Some(name) = NAME.as_deref()
-        && path.file_name() == Some(name)
-    {
+    static NAMES: std::sync::LazyLock<[Option<std::ffi::OsString>; 2]> = std::sync::LazyLock::new(|| {
+        [std::env::var_os("BARQSYNC_TEST_VANISH"), std::env::var_os("BARQSYNC_TEST_SHRINK")]
+    });
+    let named = |i: usize| NAMES[i].as_deref().is_some_and(|n| path.file_name() == Some(n));
+    if named(0) {
         let _ = fs::remove_file(path);
+    }
+    if named(1)
+        && let Ok(f) = fs::OpenOptions::new().write(true).open(path)
+        && let Ok(m) = f.metadata()
+    {
+        let _ = f.set_len(m.len() / 2);
     }
 }
 
