@@ -976,6 +976,99 @@ fn max_delete_matches_rsync() {
 }
 
 // ---------------------------------------------------------------------------
+// -x / --one-file-system
+// ---------------------------------------------------------------------------
+
+/// Reset `dst` (made by [`one_file_system_keeps_destination_mount_points`]): files `z` and
+/// `old/o`, and the mount point `old/mnt` holding `f` and `d/g`.
+#[cfg(target_os = "macos")]
+fn mount_fixture(dst: &Path) {
+    let (old, mnt) = (dst.join("old"), dst.join("old/mnt"));
+    for dir in [dst, &old, &mnt] {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p == old || p == mnt {
+                continue;
+            }
+            if p.is_dir() { fs::remove_dir_all(&p).unwrap() } else { fs::remove_file(&p).unwrap() }
+        }
+    }
+    Tree::new(dst).file("z", "z").file("old/o", "o").file("old/mnt/f", "f").file("old/mnt/d/g", "g").same_mtimes(BASE_TIME + 700_000);
+}
+
+/// `-x` with `--delete`: a destination directory on another filesystem (a mount point, a
+/// disk image here) is neither deleted nor emptied when the source lacks it, nothing in it
+/// is deleted when the source has it, unless it is a top directory, and it keeps a
+/// directory being deleted. As rsync, locally (both scanners), as a push and as a pull.
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_keeps_destination_mount_points() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let (Some(_r), Some(_f)) = (Volume::at(&t.join("r/old/mnt"), 5), Volume::at(&t.join("f/old/mnt"), 5)) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("lacks")).file("a", "a").settle_mtimes();
+    Tree::new(t.join("has")).file("mnt/new", "n").settle_mtimes();
+    Tree::new(t.join("deep")).file("old/mnt/new", "n").settle_mtimes();
+    Tree::new(t.join("file")).file("mnt", "a file").settle_mtimes();
+    // A source and a destination as each mode gives them (`{host}` marks the remote side).
+    let paths = |mode: &str, src: &str, dst: &str| match mode {
+        "push" => (src.to_string(), format!("{{host}}{dst}")),
+        "pull" => (format!("{{host}}{src}"), dst.to_string()),
+        _ => (src.to_string(), dst.to_string()),
+    };
+    // (options, source, destination below r/ and f/, whether `old/mnt/d/g` stays): the
+    // mount point is extraneous, listed, inside the extraneous `old`, or a top directory
+    // (where a named directory or a -R path goes), whose extra entries go.
+    let cases = [
+        ("-aix", "lacks/", "old/", true),
+        ("-aix", "has/", "old/", true),
+        ("-aix", "lacks/", "", true),
+        ("-aix", "has/mnt", "old/", false),
+        ("-aixR", "deep/./old/mnt", "", false),
+    ];
+    for (opts, src, sub, kept) in cases {
+        for mode in ["local", "push", "pull"] {
+            let what = format!("{mode} {opts} {src} -> {sub}");
+            mount_fixture(&t.join("r"));
+            mount_fixture(&t.join("f"));
+            let (s, d) = paths(mode, src, &format!("{{dst}}/{sub}"));
+            let args = [opts, "--delete", &s, &d];
+            let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
+            assert_eq!(t.join("f/old/mnt/d/g").exists(), kept, "{what}: {}", f.stdout);
+            if mode == "local" {
+                mount_fixture(&t.join("f"));
+                let f = barqsync(t, &[opts, "--delete", "--scanner=jwalk", src, &format!("f/{sub}")]);
+                same_output(&r, &f, &[], &format!("jwalk {opts} {src} -> {sub}"));
+                assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
+            }
+        }
+    }
+    // rsync's --info=mount, on with -vv.
+    mount_fixture(&t.join("f"));
+    let f = barqsync(t, &["-axvv", "--delete", "lacks/", "f/old/"]);
+    assert!(f.stdout.lines().any(|l| l == "cannot delete mount point: mnt"), "{}", f.stdout);
+    // Not even to make way for a file: rsync deletes the files at the top of the mount
+    // point then, barqsync leaves it alone.
+    for mode in ["local", "push", "pull"] {
+        mount_fixture(&t.join("f"));
+        let (s, d) = paths(mode, "file/", "f/old/");
+        let args = ["-aix", "--delete", &s, &d];
+        let f = if mode == "local" { barqsync(t, &args) } else { barqsync_remote(t, &args) };
+        assert_eq!(f.code, 23, "{mode}: {}{}", f.stdout, f.stderr);
+        assert!(f.stderr.contains("could not make way for new regular file: mnt"), "{mode}: {}", f.stderr);
+        assert!(t.join("f/old/mnt/f").exists() && t.join("f/old/mnt/d/g").exists(), "{mode}: {}", f.stdout);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // -m / --prune-empty-dirs
 // ---------------------------------------------------------------------------
 
