@@ -514,21 +514,39 @@ pub fn drop_temp(tmp: &Path) {
 }
 
 /// Rename `from` to `to`. Across filesystems (a `-T` directory on another one) that
-/// can't work, so, as rsync does, the data is copied over `to` instead (truncated and
-/// rewritten in place, or created) and `from` removed. Returns whether it was copied:
-/// `to` then still needs its attributes.
-pub fn rename_or_copy(from: &Path, to: &Path) -> io::Result<bool> {
+/// can't work, so, as rsync does, the data is copied instead ([`copy_into_place`]) and
+/// `from` removed. Returns the copy, still open, when it was made: it then needs its
+/// attributes again.
+pub fn rename_or_copy(from: &Path, to: &Path) -> io::Result<Option<File>> {
     match fs::rename(from, to) {
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let src = File::open(from)?;
-            let md = src.metadata()?;
-            let out = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(md.permissions().mode() & 0o777).open(to)?;
-            copy_buffered(&src, &out, md.len())?;
+            let out = copy_into_place(from, to)?;
             fs::remove_file(from)?;
-            Ok(true)
+            Ok(Some(out))
         }
-        r => r.map(|()| false),
+        r => r.map(|()| None),
+    }
+}
+
+/// Copy file `from` to `to`, on another filesystem: into a new file next to `to`, which
+/// then takes its place, so what was at `to` (a symlink, or a file with other names) is
+/// replaced, never written through, as rsync unlinks it before it copies. The copy is
+/// returned open, so its attributes can be set whatever its mode allows this user.
+fn copy_into_place(from: &Path, to: &Path) -> io::Result<File> {
+    use std::os::unix::fs::PermissionsExt;
+    let src = File::open(from)?;
+    let md = src.metadata()?;
+    let dir = to.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let (tmp, out) = with_temp(dir, to.file_name().unwrap_or_default(), |tmp| create_new(tmp, md.permissions().mode()))?;
+    match copy_buffered(&src, &out, md.len()).and_then(|_| fs::rename(&tmp, to)) {
+        Ok(()) => {
+            unregister_temp(&tmp);
+            Ok(out)
+        }
+        Err(e) => {
+            drop_temp(&tmp);
+            Err(e)
+        }
     }
 }
 
@@ -835,6 +853,35 @@ mod tests {
         for (a, b) in fast.iter().zip(&plain) {
             assert_eq!((&a.name, &a.meta, &a.link), (&b.name, &b.meta, &b.link));
         }
+    }
+
+    /// A copy across filesystems replaces what is at the destination: a symlink's target
+    /// and a hard link's other names are left alone, and a read-only copy still takes
+    /// its attributes through the descriptor returned.
+    #[test]
+    fn copies_into_place_replace_links() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("outside"), "keep").unwrap();
+        fs::write(d.join("new"), "new data").unwrap();
+        fs::set_permissions(d.join("new"), fs::Permissions::from_mode(0o444)).unwrap();
+        std::os::unix::fs::symlink(d.join("outside"), d.join("link")).unwrap();
+        fs::write(d.join("old"), "old").unwrap();
+        fs::hard_link(d.join("old"), d.join("backup")).unwrap();
+        for to in ["link", "old", "fresh"] {
+            let f = copy_into_place(&d.join("new"), &d.join(to)).unwrap();
+            fchmod(&f, 0o400).unwrap();
+            set_fd_mtime(&f, 1_600_000_000, 0).unwrap();
+            let m = fs::symlink_metadata(d.join(to)).unwrap();
+            assert!(m.is_file() && m.permissions().mode() & 0o777 == 0o400, "{to}");
+            assert_eq!(m.mtime(), 1_600_000_000, "{to}");
+            assert_eq!(fs::read(d.join(to)).unwrap(), b"new data", "{to}");
+        }
+        assert_eq!(fs::read(d.join("outside")).unwrap(), b"keep");
+        assert_eq!(fs::read(d.join("backup")).unwrap(), b"old");
+        let left: Vec<_> = fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n.as_bytes().starts_with(b".")).collect();
+        assert!(left.is_empty(), "temp files left: {left:?}");
     }
 
     #[test]

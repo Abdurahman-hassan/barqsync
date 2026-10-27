@@ -624,8 +624,15 @@ impl<'a> Engine<'a> {
     pub(crate) fn root_rules(&self, transfer_root: &Path, first_dir: &Path, dst: &Path) -> Rules {
         Rules {
             src: if self.remote.is_some() { DirRules::default() } else { self.filter.root(transfer_root, first_dir, Side::Sender) },
-            dst: if self.opts.delete { self.filter.root(dst, dst, Side::Receiver) } else { DirRules::default() },
+            dst: if self.deletes() { self.filter.root(dst, dst, Side::Receiver) } else { DirRules::default() },
         }
+    }
+
+    /// Something in the destination may be deleted, so its filter rules are kept track
+    /// of (its per-directory files read): `--delete`, a directory `--force` removes, a
+    /// `--delete-missing-args` entry.
+    fn deletes(&self) -> bool {
+        self.opts.delete || self.opts.force || self.opts.missing_args == 2
     }
 
     /// The source-side filter state of directory `dir` (at `rel`), from its parent's: its
@@ -867,9 +874,9 @@ impl<'a> Engine<'a> {
                 }
             }
         };
-        // The destination's own filter files decide what --delete leaves alone; one that
+        // The destination's own filter files decide what deletions leave alone; one that
         // can't be read leaves the whole directory alone.
-        let dst_rules = if self.opts.delete && !job.dst_is_new {
+        let dst_rules = if self.deletes() && !job.dst_is_new {
             self.filter.enter(&job.rules.dst, &job.dst, &job.rel).map_err(|m| self.err(m)).ok()
         } else {
             Some(job.rules.dst.clone())
@@ -1083,7 +1090,9 @@ impl<'a> Engine<'a> {
     /// source: rsync warns, once, that its parent is absent from the file list (unless it
     /// is listed as missing itself), and deletes it if the directories leading to it are
     /// directories here.
-    fn delete_missing(&self, dst: &Path, name: &OsStr, rel: &[u8], rules: &DirRules, absent: &mut Absent) {
+    ///
+    /// Returns whether something in `dst` itself was deleted (its time is then restored).
+    fn delete_missing(&self, dst: &Path, name: &OsStr, rel: &[u8], rules: &DirRules, absent: &mut Absent) -> bool {
         let path = dst.join(name);
         if let Some(cut) = name.as_bytes().iter().rposition(|&b| b == b'/') {
             let parent = &name.as_bytes()[..cut];
@@ -1097,16 +1106,17 @@ impl<'a> Engine<'a> {
             for part in &parts[..parts.len() - 1] {
                 dir.push(OsStr::from_bytes(part));
                 if !fsops::lstat(&dir).is_ok_and(|m| m.kind == Kind::Dir) {
-                    return;
+                    return false;
                 }
             }
         }
-        let Ok(meta) = fsops::lstat(&path) else { return };
+        let Ok(meta) = fsops::lstat(&path) else { return false };
         let is_dir = meta.kind == Kind::Dir;
         if self.filter.excluded(rules, rel, is_dir, Side::Receiver) {
-            return;
+            return false;
         }
-        self.delete_item(&path, rel, meta.kind, rules, is_dir && !(self.opts.delete || self.opts.force), false);
+        let r = self.delete_item(&path, rel, meta.kind, rules, is_dir && !(self.opts.delete || self.opts.force), false);
+        r == Del::Done && !name.as_bytes().contains(&b'/')
     }
 
     /// A directory sits where a non-directory (`what`, as in "regular file") must go.
@@ -1348,8 +1358,9 @@ impl<'a> Engine<'a> {
                 overlap.select(&dst_path);
             }
             if e.missing {
-                // Under the destination's name, a single file's new one included.
-                self.delete_missing(ctx.dst, dname, &join_rel(ctx.rel, dname), &ctx.rules.dst, &mut absent);
+                // Under the destination's name, a single file's new one included. The
+                // directory it was in gets its time back, as rsync's does.
+                changed |= self.delete_missing(ctx.dst, dname, &join_rel(ctx.rel, dname), &ctx.rules.dst, &mut absent);
                 continue;
             }
             let dst_kind = if ctx.dst_is_new { None } else { dst_map.get(dname).copied() };

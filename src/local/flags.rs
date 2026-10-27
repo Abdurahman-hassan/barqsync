@@ -99,10 +99,11 @@ pub fn missing_source(opts: &Options, name: &OsStr, e: &io::Error) -> Missing {
 
 /// The entries of a `-R`/`--files-from` selection `select::read_selected` couldn't read
 /// (`errs`): errors to report through `err`, or (see [`missing_source`]) named ones that
-/// are missing, left out or added to `ents`. A missing directory that only leads to named
+/// are missing, left out or added to `ents`. A missing directory that leads to named
 /// paths is no error with `--ignore-missing-args`; with `--delete-missing-args` it has
 /// vanished (`vanished`, exit 24), and the paths named below it are still deleted on the
-/// receiver, as rsync does: they become missing entries named by their path from here.
+/// receiver, as rsync does: they become missing entries named by their path from here,
+/// after the directory's own when it is named too.
 pub fn missing_selected(
     opts: &Options,
     sel: &crate::select::Sel,
@@ -132,10 +133,15 @@ pub fn missing_selected(
         let child = sel.children.get(name.as_bytes());
         match missing_source(opts, name, &e) {
             Missing::Error => err(path_msg("link_stat \"", &p, format!("\" failed: {e}"))),
-            Missing::Deleted(missing) if child.is_some_and(|c| c.named) => ents.push(missing),
-            Missing::Deleted(_) => {
-                vanished(&p);
-                named_below(child.expect("selected"), &p, name.as_bytes(), ents, vanished);
+            Missing::Deleted(missing) => {
+                let child = child.expect("selected");
+                if child.named {
+                    ents.push(missing);
+                }
+                if !child.children.is_empty() {
+                    vanished(&p);
+                    named_below(child, &p, name.as_bytes(), ents, vanished);
+                }
             }
             Missing::Ignored => {}
         }
@@ -293,8 +299,8 @@ impl Engine<'_> {
     /// Put `job`'s finished temp file `tmp` in place of the destination. With
     /// `--delay-updates` it waits in the partial dir instead until the transfer is done
     /// ([`Engine::finish_delayed`]). With `-T` on another filesystem the rename can't
-    /// work: as rsync does, the data is copied over the file instead, which then gets its
-    /// attributes again.
+    /// work: as rsync does, the data is copied instead, into a file that replaces the
+    /// destination and then gets its attributes again.
     pub(crate) fn place_file(&self, tmp: &Path, job: &FileJob) -> io::Result<()> {
         let held = self.partial_path(&job.dst_path).filter(|_| self.opts.delay_updates);
         let to = held.as_deref().unwrap_or(&job.dst_path);
@@ -302,9 +308,8 @@ impl Engine<'_> {
             use std::os::unix::fs::DirBuilderExt;
             fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         }
-        if fsops::rename_or_copy(tmp, to)? {
+        if let Some(f) = fsops::rename_or_copy(tmp, to)? {
             let (mode, uid, gid) = self.target_attrs(job);
-            let f = fs::OpenOptions::new().write(true).open(to)?;
             self.finish_delta_file(&f, &job.meta, mode, uid, gid, Some((to, &job.src(self.remote.is_some()))))?;
         }
         if let Some(held) = held {

@@ -202,6 +202,10 @@ Known differences:
   over ssh. Over ssh rsync's sender sends the excluded name anyway: its server then deletes
   it in a push, and its client refuses it in a pull ("rejecting excluded file-list name",
   exit 4).
+- In a push without `--delete` or `-m`, rsync's server gets none of the filter rules, so
+  what `--force` and `--delete-missing-args` delete there ignores receiver-side rules
+  (`P`, protecting per-directory files). barqsync's server applies them, as a local copy
+  or a pull does.
 - For a path listed below a directory missing at the source, rsync says the directory
   vanished once for each such path; barqsync says it once.
 - `--chown` or `--groupmap` followed by `--no-g` leaves groups alone, locally and remote.

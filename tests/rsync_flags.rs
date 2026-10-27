@@ -1848,10 +1848,14 @@ fn force_and_missing_args_match_rsync() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    Tree::new(tmp.path().join("src")).file("a", "a").file("x", "x").settle_mtimes();
+    Tree::new(tmp.path().join("src")).file("a", "a").file("x", "x").dir("emptysub").settle_mtimes();
     // A directory deleted at the source whose files are still listed (rsync: they are
     // deleted, the directory "vanished", exit 24).
     fs::write(tmp.path().join("list"), "a\ngone\nsub/gone2\nsub/deep\nsub/deep/gone3\n").unwrap();
+    // The missing directory named too: both it and what is named below it.
+    fs::write(tmp.path().join("list2"), "gonedir\ngonedir/k/q\n").unwrap();
+    // A missing file in a directory that has nothing else (-m).
+    fs::write(tmp.path().join("list3"), "emptysub/gone4\n").unwrap();
     let cases: &[&[&str]] = &[
         // A directory in the way of a file goes only with --delete or --force.
         &["-ai", "src/", "{dst}"],
@@ -1867,23 +1871,32 @@ fn force_and_missing_args_match_rsync() {
         &["-ai", "--delete-missing-args", "--exclude=gone", "src/a", "src/gone", "{dst}/"],
         &["-ai", "--ignore-missing-args", "--files-from=list", "src/", "{dst}/"],
         &["-ai", "--delete-missing-args", "--files-from=list", "src/", "{dst}/"],
+        &["-ai", "--delete-missing-args", "--files-from=list2", "src/", "{dst}/"],
+        &["-aim", "--delete-missing-args", "--files-from=list3", "src/", "{dst}/"],
+        &["-aim", "--ignore-missing-args", "--files-from=list3", "src/", "{dst}/"],
+        // A directory's own filter file protects what is in it from --force.
+        &["-ai", "--force", "-f", ": .rsync-filter", "src/", "{dst}"],
         // A single missing file copied to a new name deletes that name.
         &["-ai", "--delete-missing-args", "src/gone", "{dst}/target"],
     ];
     for (i, flags) in cases.iter().enumerate() {
         for (j, remote) in ["", "push", "pull"].into_iter().enumerate() {
-            if !remote.is_empty() && flags.contains(&"--exclude=gone") {
+            // (In a push without --delete, rsync's server has no filter rules at all.)
+            if (!remote.is_empty() && flags.contains(&"--exclude=gone")) || (remote == "push" && flags.contains(&"-f")) {
                 continue;
             }
             let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
             for d in [&dr, &df] {
                 Tree::new(tmp.path().join(d))
                     .file("x/inner/f", "i")
+                    .file("x/.rsync-filter", "P keep\n")
+                    .file("x/keep", "k")
                     .file("gone", "g")
                     .file("target", "t")
                     .file("gonedir/k/q", "q")
                     .file("sub/gone2", "g2")
-                    .file("sub/deep/gone3", "g3");
+                    .file("sub/deep/gone3", "g3")
+                    .file("emptysub/gone4", "g4");
             }
             let a: Vec<String> = flags
                 .iter()
@@ -1901,6 +1914,33 @@ fn force_and_missing_args_match_rsync() {
             let (rm, fm) = (messages(&r, tmp.path()), messages(&f, tmp.path()));
             assert_eq!(rm.iter().map(|l| l.replace(&dr, "D")).collect::<Vec<_>>(), fm.iter().map(|l| l.replace(&df, "D")).collect::<Vec<_>>(), "{what}");
         }
+    }
+}
+
+/// A file `--delete-missing-args` deletes leaves its directory's time as rsync does: the
+/// source's, when it had that time before.
+#[test]
+fn missing_args_keep_the_directory_time() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = Tree::new(tmp.path().join("src"));
+    src.file("sub/keep", "k").settle_mtimes();
+    let mtime = |p: &Path| fs::metadata(p).unwrap().mtime() as u64;
+    let (dir_time, keep_time) = (mtime(&src.path("sub")), mtime(&src.path("sub/keep")));
+    fs::write(tmp.path().join("list"), "sub/gone\n").unwrap();
+    for (j, (s, d)) in [("src/", "{dst}/"), ("src/", "{host}{dst}/"), ("{host}src/", "{dst}/")].into_iter().enumerate() {
+        let (dr, df) = (format!("r{j}"), format!("f{j}"));
+        for name in [&dr, &df] {
+            Tree::new(tmp.path().join(name)).file("sub/keep", "k").file("sub/gone", "g").mtime("sub/keep", keep_time).mtime("sub", dir_time);
+        }
+        let (r, f) = both_remote(tmp.path(), &["-ai", "--delete-missing-args", "--files-from=list", s, d], &dr, &df).unwrap();
+        let what = format!("{s} {d}");
+        same_output(&r, &f, &[(&dr, &df)], &what);
+        assert_eq!(mtime(&tmp.path().join(&dr).join("sub")), dir_time, "{what}: rsync");
+        assert_eq!(mtime(&tmp.path().join(&df).join("sub")), dir_time, "{what}");
+        assert!(!tmp.path().join(&df).join("sub/gone").exists(), "{what}");
     }
 }
 
