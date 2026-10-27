@@ -392,6 +392,9 @@ fn log_file_matches_rsync() {
         &["-av", "--log-file={dst}.log", "--log-file-format=%i %f"],
         // %l, %B and %M of what changed (not %b: its bytes are barqsync's, not rsync's).
         &["-a", "--delete", "--log-file={dst}.log", "--log-file-format=%o %n %l %B %M"],
+        // "X is uptodate": logged when another process says it (a local copy's, a push's
+        // server), not by a pull's client, which says it itself.
+        &["-a", "--info=name2", "--log-file={dst}.log"],
     ];
     let tmp = tempfile::tempdir().unwrap();
     let names = dst_names(cases.len());
@@ -406,6 +409,13 @@ fn log_file_matches_rsync() {
             assert_eq!(rl, fl, "{what}");
             assert!(fl.iter().any(|l| l.ends_with("file list")), "{what}: {fl:?}");
         }
+    }
+    // A failed push still logs its byte counts: rsync's sending side always does.
+    let (r, f) = both_remote(tmp.path(), &["-a", "--log-file={dst}.log", "src/", "{host}{dst}/missing/x"], "rfail", "ffail").unwrap();
+    assert!(r.code != 0 && f.code != 0, "{}", f.stderr);
+    for (log, dst) in [("rfail.log", "rfail"), ("ffail.log", "ffail")] {
+        let lines = log_lines(&tmp.path().join(log), dst);
+        assert!(lines.contains(&"<sent>".to_string()), "{log}: {lines:?}");
     }
     // A log that can't be opened is reported, and the run goes on (rsync: exit 0).
     let (r, f) = run_both(tmp.path(), Mode::Local, &["-a", "--log-file=nowhere/{dst}.log"], ("r0Local", "f0Local"));

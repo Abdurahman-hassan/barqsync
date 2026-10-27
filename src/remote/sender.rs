@@ -68,6 +68,8 @@ struct Sender<'a> {
     failed: SendFailure,
     /// Files that were gone when they were to be sent (rsync's "file has vanished").
     vanished: AtomicU64,
+    /// The size of the regular files listed so far (rsync's "total size").
+    listed_size: AtomicU64,
     /// `-m`: which source directories have content.
     prune: Prune,
     /// A push whose items show `%f`: each listing's source directories, and which one
@@ -180,6 +182,8 @@ impl Sender<'_> {
     /// Register a listing and send it. Registered first, so a quick `Need` finds it.
     fn send_listing(&self, root: u16, rel: Vec<u8>, listing: Listing) {
         let sums = if self.opts.checksum { self.checksums(&listing) } else { Vec::new() };
+        let size: u64 = listing.entries.iter().filter(|e| e.meta.kind == Kind::File).map(|e| e.meta.size).sum();
+        self.listed_size.fetch_add(size, SeqCst);
         let dir = self.next_dir.fetch_add(1, SeqCst);
         if self.removes() {
             let mut removable = self.removable.lock().unwrap();
@@ -825,16 +829,17 @@ fn root_extra(opts: &Options, r: &Rules, path: &Path, meta: &Meta, err: &mut dyn
         .flatten()
 }
 
-/// Run the sending side until the receiver reports completion. Returns the exit code
-/// and the receiver's counters (when it got that far). `report_removals`: end with
-/// `RemovalsDone` (see [`super::reports_removals`]).
-pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, report_removals: bool) -> (i32, Option<StatsSnapshot>) {
+/// Run the sending side until the receiver reports completion. Returns the exit code,
+/// the receiver's counters (when it got that far) and the size of the regular files
+/// listed (rsync's total size, which a failed run still logs). `report_removals`: end
+/// with `RemovalsDone` (see [`super::reports_removals`]).
+pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, report_removals: bool) -> (i32, Option<StatsSnapshot>, u64) {
     let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
         Err(e) => {
             out.error(format!("{e:#}"));
             let _ = conn.msg(Msg::Fatal { msg: format!("{e:#}") });
-            return (exit::SYNTAX, None);
+            return (exit::SYNTAX, None, 0);
         }
     };
     let errors = AtomicU64::new(0);
@@ -842,15 +847,15 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         let msg = "--files-from takes exactly one source directory".to_string();
         out.error(&msg);
         let _ = conn.msg(Msg::Fatal { msg });
-        return (exit::SYNTAX, None);
+        return (exit::SYNTAX, None, 0);
     }
     if opts.strategy == Strategy::Adaptive && opts.whole_file.is_none() {
         match adapt::probe(conn, out) {
             Ok(link) => conn.out.set_link(link),
-            Err(Stop::Interrupted) => return (exit::SIGNAL, None),
+            Err(Stop::Interrupted) => return (exit::SIGNAL, None, 0),
             Err(Stop::Io(e)) => {
                 out.error(format!("link probe failed: {e}"));
-                return (exit::PROTOCOL, None);
+                return (exit::PROTOCOL, None, 0);
             }
         }
     }
@@ -876,6 +881,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         io_error: Mutex::new(false),
         failed: SendFailure::default(),
         vanished: AtomicU64::new(0),
+        listed_size: AtomicU64::new(0),
         prune,
         sources: out.uses(b'f').then(|| Mutex::new(HashMap::new())),
         root_dir: roots.iter().find(|r| r.info.contents).map(|r| r.base.clone()),
@@ -902,7 +908,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         Ok(p) => p,
         Err(e) => {
             out.error(format!("failed to start worker threads: {e}"));
-            return (exit::IPC, None);
+            return (exit::IPC, None, 0);
         }
     };
     let sender = &sender;
@@ -969,6 +975,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         }
         r
     });
+    let listed = sender.listed_size.load(SeqCst);
     match result {
         Ok(stats) => {
             // The scope has waited for the removals; their output went out before this.
@@ -979,8 +986,8 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
             }
             // The receiver's counters include what this side said in `SenderDone`.
             let code = if sender.errors.load(SeqCst) > 0 { exit::PARTIAL } else { stats.exit_code() };
-            (code, Some(stats))
+            (code, Some(stats), listed)
         }
-        Err(code) => (code, None),
+        Err(code) => (code, None, listed),
     }
 }

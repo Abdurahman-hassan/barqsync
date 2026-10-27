@@ -275,17 +275,25 @@ impl Output {
         }
     }
 
-    /// Write `text` to the log, a line each, after the time and process id.
+    /// Write one message to the log, after the time and process id. As in rsync's log,
+    /// the control characters in it are escaped (`\#012` for a newline), so a name can't
+    /// make a record of its own.
     fn log(&self, text: &[u8]) {
         let Some(file) = self.log_file.get() else { return };
-        let stamp = format!("{} [{}] ", timestamp(), std::process::id());
-        let mut buf = Vec::with_capacity(stamp.len() + text.len() + 1);
-        for line in text.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-            buf.extend_from_slice(stamp.as_bytes());
-            escape(line, Charset::Any, &mut buf);
-            buf.push(b'\n');
+        let text = text.strip_suffix(b"\n").unwrap_or(text);
+        if text.is_empty() {
+            return;
         }
+        let mut buf = format!("{} [{}] ", timestamp(), std::process::id()).into_bytes();
+        escape(text, Charset::Any, &mut buf);
+        buf.push(b'\n');
         let _ = file.lock().unwrap_or_else(|e| e.into_inner()).write_all(&buf);
+    }
+
+    /// [`Output::log`] for text of barqsync's own, which holds no names but may hold
+    /// several lines (the summary): a record for each, as rsync logs its lines.
+    fn log_lines(&self, text: &[u8]) {
+        text.split(|&b| b == b'\n').for_each(|line| self.log(line));
     }
 
     /// The log's first line: rsync's sending side builds the file list, a receiving client
@@ -321,9 +329,13 @@ impl Output {
     /// compromised server must not be able to put control characters or terminal escape
     /// sequences on the user's screen through a `Log` frame. `_escape_it` (the peer's own
     /// mark) is ignored for that reason; the server's forwarded lines are single lines of
-    /// item text, errors or notices, which escaping leaves intact.
+    /// item text, errors or notices, which escaping leaves intact. The log takes what goes
+    /// to stdout: rsync's server writes its errors and warnings to its own stderr, which
+    /// never reaches the client's log.
     pub fn print_forwarded(&self, stderr: bool, _escape_it: bool, text: &[u8]) {
-        self.log(text);
+        if !stderr {
+            self.log(text);
+        }
         if self.quiet && !stderr {
             return;
         }
@@ -368,9 +380,10 @@ impl Output {
         &self.info
     }
 
-    /// Item lines show `%i` change summaries (so attribute differences are worth finding).
+    /// Item lines, on stdout or in the log, show `%i` change summaries (so attribute
+    /// differences are worth finding).
     pub fn itemizes(&self) -> bool {
-        self.has_i > 0
+        self.has_i > 0 || self.log.as_ref().is_some_and(|l| l.has_i)
     }
 
     /// Unchanged items are reported too: listed (`-ii`, `--info=name2` with `%i`), or
@@ -470,7 +483,14 @@ impl Output {
         }
         if !self.quiet && self.format.is_some() && self.has_i == 0 && self.info.name > 1 && it.meta.kind != Kind::Dir {
             let state: &[u8] = if it.change.any_attr() { b"" } else { b" is uptodate" };
-            self.escaped_line(&[it.rel, state].concat());
+            let line = [it.rel, state].concat();
+            // rsync's local copy says it from a process of its own, so its client logs it,
+            // as it logs what the server says in a push; in a pull it is the client's own
+            // line, which its log doesn't take.
+            if self.side == Side::Local {
+                self.log(&line);
+            }
+            self.escaped_line(&line);
         }
     }
 
@@ -695,7 +715,7 @@ impl Output {
     /// A notice shown without `-v` but not with `-q` (rsync's `FINFO` messages, which its
     /// log gets either way). Not escaped: it must not contain names.
     pub fn notice(&self, msg: impl AsRef<[u8]>) {
-        self.log(msg.as_ref());
+        self.log_lines(msg.as_ref());
         if !self.quiet {
             self.line(msg.as_ref());
         }
@@ -714,7 +734,7 @@ impl Output {
     /// Summary lines (not with `-q`). Not escaped, so the message may contain newlines
     /// but must not contain names.
     pub fn always(&self, msg: impl AsRef<[u8]>) {
-        self.log(msg.as_ref());
+        self.log_lines(msg.as_ref());
         if !self.quiet {
             self.line(msg.as_ref());
         }
@@ -1181,6 +1201,22 @@ mod tests {
         let mut out = Vec::new();
         escape(text, charset, &mut out);
         out
+    }
+
+    /// Each message is one log record, its control characters escaped, so a name with a
+    /// newline can't forge a record; barqsync's own summary lines are a record each.
+    #[test]
+    fn log_records_are_one_line_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("run.log");
+        let opts = Options::parse_from(["barqsync", format!("--log-file={}", path.display()).as_str(), "s", "d"]).unwrap();
+        let out = Output::new(&opts, Side::Local);
+        out.open_log(&opts);
+        out.note(b"payload\n*deleting  important");
+        out.always(b"\nsent 1 bytes  received 2 bytes\ntotal size is 3");
+        let log = std::fs::read_to_string(&path).unwrap();
+        let records: Vec<&str> = log.lines().map(|l| l.split_once("] ").unwrap().1).collect();
+        assert_eq!(records, ["payload\\#012*deleting  important", "sent 1 bytes  received 2 bytes", "total size is 3"]);
     }
 
     /// Expected output measured with glibc rsync 3.2.7 (LC_ALL=C, C.UTF-8, and `-8`) and

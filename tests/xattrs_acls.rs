@@ -435,6 +435,34 @@ fn xattrs_match_rsync_locally_and_over_the_wire() {
 }
 
 /// `-XX` also copies rsync's own `rsync.%...` attributes (`user.rsync.%...` on Linux).
+/// `--log-file`'s default format has `%i`: a transferred file's attribute changes are
+/// found for its log line (`x`) when stdout itemizes nothing, as rsync's log shows them.
+#[test]
+fn log_file_itemizes_attribute_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    if skip_x(tmp.path()) {
+        return;
+    }
+    let src = Tree::new(tmp.path().join("src"));
+    src.file("f", "new content").settle_mtimes();
+    set_x(&src.path("f"), &nm("note"), b"v").unwrap();
+    for (j, (s, d)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+        let (dr, df) = (format!("r{j}"), format!("f{j}"));
+        for name in [&dr, &df] {
+            Tree::new(tmp.path().join(name)).file("f", "old");
+        }
+        let (r, f) = both_remote(tmp.path(), &["-aX", "--log-file={dst}.log", s, d], &dr, &df).unwrap();
+        assert_eq!((r.code, f.code), (0, 0), "{s} {d}: {}", f.stderr);
+        // The item line, without the time and process id.
+        let item = |dst: &str| {
+            let log = fs::read_to_string(tmp.path().join(format!("{dst}.log"))).unwrap();
+            log.lines().map(|l| l.split_once("] ").unwrap().1.to_string()).find(|l| l.ends_with(" f")).unwrap_or_default()
+        };
+        assert_eq!(item(&dr), item(&df), "{s} {d}");
+        assert!(item(&df).ends_with("x f"), "{s} {d}: {}", item(&df));
+    }
+}
+
 #[test]
 fn double_x_copies_rsync_internal_attributes() {
     let tmp = tempfile::tempdir().unwrap();
