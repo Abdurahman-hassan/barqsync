@@ -94,7 +94,8 @@ fn read_back(f: &mut fs::File) -> String {
 
 /// Start a transfer of a big file, stop it with `act` while data flows, and check how
 /// the client ends and that nothing is left running.
-fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
+/// `extra`: more options for the client.
+fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str, extra: &[&str]) {
     let what = format!("{act:?} {transport} {} {net_io}", if pull { "pull" } else { "push" });
     let tmp = tempfile::tempdir().unwrap();
     let t = tmp.path();
@@ -153,6 +154,7 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
         "quic" => args.extend(["--transport=quic", "--streams=2"]),
         _ => args.extend(["--transport=tcp", "--streams=2"]),
     }
+    args.extend(extra);
     args.extend(if pull { ["fake:src/", "dst/"] } else { ["src/", "fake:dst/"] });
     let (mut so, mut se) = (tempfile::tempfile().unwrap(), tempfile::tempfile().unwrap());
     let mut cmd = Command::new(BIN);
@@ -275,7 +277,7 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str) {
 fn each_transport(act: Act, net_io: &str) {
     for transport in ["ssh", "tcp", "relay", "quic"] {
         for pull in [false, true] {
-            stop_midway(act, transport, pull, net_io);
+            stop_midway(act, transport, pull, net_io, &[]);
         }
     }
 }
@@ -300,7 +302,7 @@ fn an_interrupted_client_exits_20_and_ends_the_server() {
 fn an_interrupt_while_reaping_the_remote_shell_exits_20() {
     for net_io in ["threads", "tokio"] {
         for pull in [false, true] {
-            stop_midway(Act::IntClosing, "ssh", pull, net_io);
+            stop_midway(Act::IntClosing, "ssh", pull, net_io, &[]);
         }
     }
 }
@@ -308,6 +310,15 @@ fn an_interrupt_while_reaping_the_remote_shell_exits_20() {
 #[test]
 fn an_interrupted_server_ends_the_client_with_20() {
     each_transport(Act::IntServer, "threads");
+}
+
+/// A server interrupted while `--bwlimit` paces a frame out stops pacing it, so its notice
+/// reaches the client before the connection is torn down: 20, not a lost connection.
+#[test]
+fn an_interrupted_server_stops_pacing() {
+    for net_io in ["threads", "tokio"] {
+        stop_midway(Act::IntServer, "ssh", true, net_io, &["--bwlimit=256"]);
+    }
 }
 
 #[test]
@@ -325,7 +336,7 @@ fn ctrl_c_ends_a_client_whose_server_stopped_reading() {
 #[test]
 fn a_cut_pipe_ends_both_sides() {
     for pull in [false, true] {
-        stop_midway(Act::CutPipe, "ssh", pull, "threads");
+        stop_midway(Act::CutPipe, "ssh", pull, "threads", &[]);
     }
 }
 
