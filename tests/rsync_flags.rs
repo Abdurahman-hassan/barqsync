@@ -979,21 +979,21 @@ fn max_delete_matches_rsync() {
 // -x / --one-file-system
 // ---------------------------------------------------------------------------
 
-/// Reset `dst` (made by [`one_file_system_keeps_destination_mount_points`]): files `z` and
-/// `old/o`, and the mount point `old/mnt` holding `f` and `d/g`.
+/// Reset `dst` for the `-x` tests: files `z` and `old/o`, and the mount point at `mnt`
+/// (`old/mnt` or deeper) holding `f` and `d/g`. Anything else goes.
 #[cfg(target_os = "macos")]
-fn mount_fixture(dst: &Path) {
-    let (old, mnt) = (dst.join("old"), dst.join("old/mnt"));
-    for dir in [dst, &old, &mnt] {
+fn mount_fixture(dst: &Path, mnt: &str) {
+    let keep: Vec<_> = Path::new(mnt).ancestors().filter(|p| !p.as_os_str().is_empty()).map(|p| dst.join(p)).collect();
+    for dir in std::iter::once(dst).chain(keep.iter().map(|p| p.as_path())) {
         for e in fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
-            if p == old || p == mnt {
+            if keep.contains(&p) {
                 continue;
             }
             if p.is_dir() { fs::remove_dir_all(&p).unwrap() } else { fs::remove_file(&p).unwrap() }
         }
     }
-    Tree::new(dst).file("z", "z").file("old/o", "o").file("old/mnt/f", "f").file("old/mnt/d/g", "g").same_mtimes(BASE_TIME + 700_000);
+    Tree::new(dst).file("z", "z").file("old/o", "o").file(&format!("{mnt}/f"), "f").file(&format!("{mnt}/d/g"), "g").same_mtimes(BASE_TIME + 700_000);
 }
 
 /// A case of [`one_file_system_keeps_destination_mount_points`]: options, sources, the
@@ -1052,8 +1052,8 @@ fn one_file_system_keeps_destination_mount_points() {
     for (opts, srcs, sub, kept, modes) in cases {
         for &mode in modes {
             let what = format!("{mode} {opts} {srcs:?} -> {sub}");
-            mount_fixture(&t.join("r"));
-            mount_fixture(&t.join("f"));
+            mount_fixture(&t.join("r"), "old/mnt");
+            mount_fixture(&t.join("f"), "old/mnt");
             let a = args(mode, opts, srcs, &format!("{{dst}}/{sub}"));
             let a: Vec<&str> = a.iter().map(String::as_str).collect();
             let (r, f) = if mode == "local" { both(t, &a, "r", "f") } else { both_remote(t, &a, "r", "f") }.unwrap();
@@ -1061,7 +1061,7 @@ fn one_file_system_keeps_destination_mount_points() {
             assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
             assert_eq!(t.join("f/old/mnt/d/g").exists(), kept, "{what}: {}", f.stdout);
             if mode == "local" {
-                mount_fixture(&t.join("f"));
+                mount_fixture(&t.join("f"), "old/mnt");
                 let mut a = args(mode, opts, srcs, &format!("f/{sub}"));
                 a.insert(2, "--scanner=jwalk".into());
                 let f = barqsync(t, &a.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1071,19 +1071,59 @@ fn one_file_system_keeps_destination_mount_points() {
         }
     }
     // rsync's --info=mount, on with -vv.
-    mount_fixture(&t.join("f"));
+    mount_fixture(&t.join("f"), "old/mnt");
     let f = barqsync(t, &["-axvv", "--delete", "lacks/", "f/old/"]);
     assert!(f.stdout.lines().any(|l| l == "cannot delete mount point: mnt"), "{}", f.stdout);
     // Not even to make way for a file: rsync deletes the files at the top of the mount
     // point then, barqsync leaves it alone.
     for &mode in all {
-        mount_fixture(&t.join("f"));
+        mount_fixture(&t.join("f"), "old/mnt");
         let a = args(mode, "-aix", &["file/"], "f/old/");
         let a: Vec<&str> = a.iter().map(String::as_str).collect();
         let f = if mode == "local" { barqsync(t, &a) } else { barqsync_remote(t, &a) };
         assert_eq!(f.code, 23, "{mode}: {}{}", f.stdout, f.stderr);
         assert!(f.stderr.contains("could not make way for new regular file: mnt"), "{mode}: {}", f.stderr);
         assert!(t.join("f/old/mnt/f").exists() && t.join("f/old/mnt/d/g").exists(), "{mode}: {}", f.stdout);
+    }
+}
+
+/// `-x` with `--delete`: a mount point two levels into a directory being deleted
+/// (`old/sub/mnt`) keeps `old/sub` and `old`, and barqsync reports that as rsync does. A
+/// dry run lists `old/sub/` as deleted, since rsync's `delete_dir_contents` still deletes
+/// a child it couldn't empty and a dry run's `rmdir` succeeds. `--max-delete=0` counts it
+/// among the skipped deletions (exit 25), since the limit is checked first. Locally, as a
+/// push and as a pull.
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_nested_mount_point_in_dry_runs_and_limits() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let (Some(_r), Some(_f)) = (Volume::at(&t.join("r/old/sub/mnt"), 5), Volume::at(&t.join("f/old/sub/mnt"), 5)) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("src")).file("a", "a").settle_mtimes();
+    for (opt, code) in [("-n", 0), ("--max-delete=0", 25)] {
+        for mode in ["local", "push", "pull"] {
+            let what = format!("{mode} {opt}");
+            mount_fixture(&t.join("r"), "old/sub/mnt");
+            mount_fixture(&t.join("f"), "old/sub/mnt");
+            let (src, dst) = match mode {
+                "push" => ("src/", "{host}{dst}"),
+                "pull" => ("{host}src/", "{dst}"),
+                _ => ("src/", "{dst}"),
+            };
+            let args = ["-aix", "--delete", opt, src, dst];
+            let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
+            assert_eq!(f.code, code, "{what}: {}", f.stderr);
+            assert_eq!(f.items().contains(&"*deleting   old/sub/".to_string()), opt == "-n", "{what}: {}", f.stdout);
+            assert!(t.join("f/old/sub/mnt/d/g").exists(), "{what}: {}", f.stdout);
+        }
     }
 }
 
