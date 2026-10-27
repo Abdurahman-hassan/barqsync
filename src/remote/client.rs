@@ -37,6 +37,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // A local destination makes this a pull: items are shown as rsync's receiver shows them.
     let side = if matches!(parse_location(dest), Ok(Location::Local(_))) { Side::Pull } else { Side::Push };
     let out: &'static Output = Box::leak(Box::new(Output::new(opts, side)));
+    out.open_log(opts);
     let started = Instant::now();
 
     // Push (local sources, remote destination) or pull (remote sources on one host,
@@ -136,6 +137,8 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     }
     let mut server_opts = opts.clone();
+    // The log is this side's; the server only reports what goes in it.
+    server_opts.log_file = None;
     server_opts.paths = server_paths;
     server_opts.transport = if transport == Transport::Auto { Transport::Quic } else { transport };
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };
@@ -193,6 +196,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
 
     mark("setup done");
     out.flist_start(opts, server_is_sender);
+    out.log_start(server_is_sender);
     let keepalive = super::KeepAlive::start(&conn.out, opts.timeout);
     let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));
     // `confirmed`: this side has the peer's last frame, so the peer has everything this
@@ -247,6 +251,11 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
             dry_run: opts.dry_run,
         };
         totals.print(out, started.elapsed(), opts.human, opts.info.stats, io);
+        // rsync logs its byte counts unless the summary showed them, and after an error
+        // only as the sender.
+        if (code == exit::OK && opts.info.stats == 0) || (code != exit::OK && !server_is_sender) {
+            out.log_end(io, Stats::get(&totals.total_size));
+        }
     }
     out.flush();
     code

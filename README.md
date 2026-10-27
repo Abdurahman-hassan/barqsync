@@ -139,7 +139,7 @@ encryption are a tie. Method, raw data and more cases:
 | **Writing** | `--inplace`, `--partial`, `--partial-dir`, `-P`, `-S`, `-W`, `--no-whole-file`, `--fsync`, `--mkpath`, `-b`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest` |
 | **Links and metadata** | `-l`, `-L`, `-k`, `-K`, `-H`, `-p`, `-t`, `-g`, `-o`, `-D`, `-O`, `-X` (extended attributes), `-A` (ACLs), `--numeric-ids`, `--chmod` |
 | **Remote** | `-e`, `--remote-path`, `--timeout`, `-s`, `--transport` (ssh, tcp, quic, auto), `--streams N`, `--strategy adaptive`, `--compress-level N` |
-| **Output** | `-i`, `--out-format` (rsync's `%` escapes), `--info` (`name`, `del`, `skip`, `stats`, `flist`, `progress2`, ...), `--progress` |
+| **Output** | `-i`, `--out-format` (rsync's `%` escapes), `--log-file`, `--log-file-format`, `--info` (`name`, `del`, `skip`, `stats`, `flist`, `progress2`, ...), `--progress` |
 
 Every option, and where barqsync differs from rsync:
 [the implementation notes](docs/implementation.md#supported-options).

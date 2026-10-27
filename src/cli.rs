@@ -119,6 +119,12 @@ pub struct Cli {
     /// Output updates using the specified FORMAT (rsync's %-escapes, e.g. '%i %n%L')
     #[arg(long = "out-format", alias = "log-format", value_name = "FORMAT")]
     out_format: Option<String>,
+    /// Log what is done to FILE
+    #[arg(long = "log-file", value_name = "FILE")]
+    log_file: Option<OsString>,
+    /// Log updates using the specified FORMAT (default '%i %n%L')
+    #[arg(long = "log-file-format", value_name = "FORMAT")]
+    log_file_format: Option<String>,
     /// Show progress during transfer
     #[arg(long)]
     progress: bool,
@@ -426,6 +432,12 @@ pub struct Options {
     pub dry_run: bool,
     /// `--out-format`, checked (see [`crate::logformat`]).
     pub out_format: Option<String>,
+    /// `--log-file`: the client's log (never passed to the server).
+    #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
+    pub log_file: Option<OsString>,
+    /// The log's item format (`--log-file-format`, `%i %n%L` by default): set exactly when
+    /// the client logs, so a server knows to report what the client's log shows.
+    pub log_file_format: Option<String>,
     /// What informational output is shown (rsync's `--info` levels).
     pub info: Info,
     /// rsync would recurse incrementally: `-r`, unless `--delete-before`,
@@ -551,9 +563,15 @@ impl Options {
             None => None,
         };
         let format = cli.out_format.as_deref().map(crate::logformat::Format::parse).transpose()?;
+        // rsync: the log format counts only with a log file, and defaults to `%i %n%L`.
+        let log_file_format = cli.log_file.as_ref().map(|_| cli.log_file_format.clone().unwrap_or_else(|| "%i %n%L".into()));
+        if let Some(f) = log_file_format.as_deref().filter(|f| !f.is_empty()) {
+            crate::logformat::Format::parse(f).map_err(|e| anyhow::anyhow!("{}", e.to_string().replace("--out-format", "--log-file-format")))?;
+        }
         let delete_first_or_last = cli.delete_before || cli.delete_after;
         let given_info = cli.info.clone();
         let mut o = Options::from_cli(cli, m, filter_rules);
+        o.log_file_format = log_file_format;
         o.chmod = chmod;
         o.max_size = max_size;
         o.min_size = min_size;
@@ -612,6 +630,8 @@ impl Options {
             quiet,
             dry_run: c.dry_run,
             out_format: c.out_format,
+            log_file: c.log_file,
+            log_file_format: None,
             // Set from the resolved levels (see `parse_from`).
             info: Info::default(),
             inc_recurse: false,
@@ -1251,6 +1271,16 @@ mod tests {
         // rsync's old name for it.
         let o = Options::parse_from(["barqsync", "--log-format=%n", "s", "d"]).unwrap();
         assert_eq!(o.out_format.as_deref(), Some("%n"));
+    }
+
+    #[test]
+    fn log_file_format_needs_a_log_file() {
+        let parse = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat());
+        assert_eq!(parse(&["--log-file=x"]).unwrap().log_file_format.as_deref(), Some("%i %n%L"));
+        assert_eq!(parse(&["--log-file=x", "--log-file-format="]).unwrap().log_file_format.as_deref(), Some(""));
+        assert_eq!(parse(&["--log-file-format=%n"]).unwrap().log_file_format, None);
+        let e = parse(&["--log-file=x", "--log-file-format=%n %C"]).unwrap_err().to_string();
+        assert!(e.contains("--log-file-format escape %C"), "{e}");
     }
 
     #[test]
