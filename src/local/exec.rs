@@ -1643,14 +1643,19 @@ impl<'a> Engine<'a> {
             more,
             rules: Rules { src: ctx.src_rules(idx).clone(), dst: ctx.rules.dst.clone() },
         };
-        if descend == Descend::No {
-            // -d: the directory itself, without its contents.
+        // -x: a directory on another filesystem than its transfer root (a mount point) is
+        // created, but nothing in it is synced. A remote sender decides, and marks the ones
+        // it doesn't list.
+        let mount = match &self.remote {
+            Some(r) => r.mount(ctx.wire_dir, idx),
+            None => self.opts.one_file_system && meta.dev != root_dev,
+        };
+        if descend == Descend::No || mount {
+            // -d, or a mount point: the directory itself, without its contents.
             self.push_fixup(&job, false);
         } else if let Some(r) = &self.remote {
-            // The sender applies -x itself; the listing arrives as its own batch.
+            // Its listing arrives as its own batch.
             r.expect_dir(s, self, job);
-        } else if self.opts.one_file_system && meta.dev != root_dev {
-            self.push_fixup(&job, false);
         } else if let Some(p) = &self.pipeline {
             p.expect_dir(s, self, job);
         } else {

@@ -1068,6 +1068,54 @@ fn one_file_system_keeps_destination_mount_points() {
     }
 }
 
+/// `-x` with a mount point in the source (a disk image): its directory is made, but
+/// nothing on the mounted filesystem is sent, and `--delete` deletes nothing in the
+/// destination's copy of it. As rsync, locally, as a push and as a pull, into a new
+/// destination and into one with extra entries (in that copy too).
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_makes_source_mount_points_empty() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let Some(_v) = Volume::at(&t.join("src/mnt"), 5) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("src")).file("a", "a").file("sub/b", "b").file("mnt/m", "m").file("mnt/d/g", "g").settle_mtimes();
+    let paths = |mode: &str| match mode {
+        "push" => ("src/", "{host}{dst}/"),
+        "pull" => ("{host}src/", "{dst}/"),
+        _ => ("src/", "{dst}/"),
+    };
+    for mode in ["local", "push", "pull"] {
+        for existing in [false, true] {
+            let what = format!("{mode} into a {} destination", if existing { "full" } else { "new" });
+            for d in ["r", "f"] {
+                let _ = fs::remove_dir_all(t.join(d));
+                if existing {
+                    Tree::new(t.join(d))
+                        .file("z", "z")
+                        .file("sub/gone", "g")
+                        .file("mnt/x", "x")
+                        .file("mnt/old/y", "y")
+                        .same_mtimes(BASE_TIME + 700_000)
+                        .mtime("mnt/old", BASE_TIME + 700_000);
+                }
+            }
+            let (s, d) = paths(mode);
+            let args = ["-aix", "--delete", s, d];
+            let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap(&t.join("r"), true), &snap(&t.join("f"), true));
+            assert!(t.join("f/mnt").is_dir() && !t.join("f/mnt/m").exists(), "{what}: {}", f.stdout);
+            assert_eq!(t.join("f/mnt/old/y").exists(), existing, "{what}: {}", f.stdout);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // -m / --prune-empty-dirs
 // ---------------------------------------------------------------------------

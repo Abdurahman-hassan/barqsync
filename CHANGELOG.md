@@ -60,6 +60,12 @@
   directory goes), and one inside a directory being deleted keeps that directory
   ("cannot delete non-empty directory"). This holds for local copies, pushes and pulls.
   All earlier releases are affected.
+- With `-x`/`--one-file-system`, a push or a pull whose source holds a mount point (a
+  directory on another filesystem) no longer fails with "1 selected directories were
+  never listed" (exit 23), which also stopped `--delete`. As with rsync, and as local
+  copies already did, the destination gets the mount point's directory but nothing from
+  the mounted filesystem, and nothing in that directory is deleted. Releases 0.4.1 and
+  0.4.2 are affected; 0.4.0 didn't fail, but left that directory's time unset.
 - `--delete` no longer deletes after a file could not be written to the destination (a
   full disk, a quota, an I/O error, or data that never arrived complete). Before, a file
   renamed in the source could lose its old name on the destination without getting the

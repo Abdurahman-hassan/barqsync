@@ -64,8 +64,9 @@ fn entries(ents: &[DirEnt]) -> Result<(), String> {
 type Names = Vec<(Vec<u8>, Kind)>;
 
 /// The directory listings the receiver can still take: each root's own listing, and one
-/// for each subdirectory of a listing already taken (or, in a root of named items, for
-/// each item that is a directory). Each arrives once, under a listing id not used before.
+/// for each subdirectory of a listing already taken but a `-x` mount point (or, in a root
+/// of named items, for each item that is a directory). Each arrives once, under a listing
+/// id not used before.
 pub struct Listings {
     /// `(root, rel)` of the listings that may still arrive.
     expected: HashSet<(u16, Vec<u8>)>,
@@ -96,7 +97,8 @@ impl Listings {
     }
 
     /// Take listing `dir`, of directory `rel` in `root`, or say what is wrong with it.
-    pub fn take(&mut self, root: u16, dir: u32, rel: &[u8], ents: &[DirEnt], sums: &[Option<Sum>]) -> Result<(), String> {
+    /// `mounts`: its directories whose contents aren't sent (see `Msg::DirBatch`).
+    pub fn take(&mut self, root: u16, dir: u32, rel: &[u8], ents: &[DirEnt], sums: &[Option<Sum>], mounts: &[u32]) -> Result<(), String> {
         if self.done {
             return Err("listing after scan completion".into());
         }
@@ -116,15 +118,22 @@ impl Listings {
             return Err(format!("{} checksums for {} entries", sums.len(), ents.len()));
         }
         entries(ents)?;
+        if mounts.windows(2).any(|w| w[0] >= w[1]) || mounts.iter().any(|&i| ents.get(i as usize).is_none_or(|e| e.meta.kind != Kind::Dir)) {
+            return Err("mount points out of order or not among the listing's directories".into());
+        }
         if let Some(items) = items
             && rel.is_empty()
         {
-            // Its subdirectories were expected from the start.
-            let same = items.iter().map(|(n, k)| (n.as_slice(), *k)).eq(ents.iter().map(|e| (e.name.as_bytes(), e.meta.kind)));
+            // Its subdirectories were expected from the start. A named item is a top
+            // directory, which is never a mount point.
+            let same = mounts.is_empty()
+                && items.iter().map(|(n, k)| (n.as_slice(), *k)).eq(ents.iter().map(|e| (e.name.as_bytes(), e.meta.kind)));
             return if same { Ok(()) } else { Err("the listing of named items differs from the items".into()) };
         }
-        for e in ents.iter().filter(|e| e.meta.kind == Kind::Dir) {
-            self.expected.insert((root, join_rel(rel, &e.name)));
+        for (i, e) in ents.iter().enumerate().filter(|(_, e)| e.meta.kind == Kind::Dir) {
+            if mounts.binary_search(&(i as u32)).is_err() {
+                self.expected.insert((root, join_rel(rel, &e.name)));
+            }
         }
         Ok(())
     }
@@ -217,25 +226,43 @@ mod tests {
         let mut root = RootInfo { contents: true, meta: Some(ent(b"r", Kind::Dir).meta), items: vec![], sel: None, extra: None };
         roots(std::slice::from_ref(&root)).unwrap();
         let mut l = Listings::new(std::slice::from_ref(&root));
-        assert!(l.take(1, 0, b"", &[], &[]).is_err(), "unknown root");
-        assert!(l.take(0, 0, b"d", &[], &[]).is_err(), "no parent listed it");
-        l.take(0, 0, b"", &[ent(b"d", Kind::Dir), ent(b"f", Kind::File)], &[]).unwrap();
-        assert!(l.take(0, 0, b"", &[], &[]).is_err(), "root listed twice");
-        assert!(l.take(0, 1, b"f", &[], &[]).is_err(), "a file has no listing");
-        assert!(l.take(0, 0, b"d", &[], &[]).is_err(), "listing id reused");
-        assert!(l.take(0, 1, b"d", &[ent(b"x", Kind::File), ent(b"x", Kind::Dir)], &[]).is_err(), "duplicate names");
+        assert!(l.take(1, 0, b"", &[], &[], &[]).is_err(), "unknown root");
+        assert!(l.take(0, 0, b"d", &[], &[], &[]).is_err(), "no parent listed it");
+        l.take(0, 0, b"", &[ent(b"d", Kind::Dir), ent(b"f", Kind::File)], &[], &[]).unwrap();
+        assert!(l.take(0, 0, b"", &[], &[], &[]).is_err(), "root listed twice");
+        assert!(l.take(0, 1, b"f", &[], &[], &[]).is_err(), "a file has no listing");
+        assert!(l.take(0, 0, b"d", &[], &[], &[]).is_err(), "listing id reused");
+        assert!(l.take(0, 1, b"d", &[ent(b"x", Kind::File), ent(b"x", Kind::Dir)], &[], &[]).is_err(), "duplicate names");
         let mut l = Listings::new(std::slice::from_ref(&root));
-        assert!(l.take(0, 0, b"", &[ent(b"..", Kind::Dir)], &[]).is_err());
-        assert!(l.take(0, 1, b"", &[ent(b"f", Kind::File)], &[None, None]).is_err(), "checksums don't match");
+        assert!(l.take(0, 0, b"", &[ent(b"..", Kind::Dir)], &[], &[]).is_err());
+        assert!(l.take(0, 1, b"", &[ent(b"f", Kind::File)], &[None, None], &[]).is_err(), "checksums don't match");
         root.items = vec![ent(b"x", Kind::File)];
         assert!(roots(std::slice::from_ref(&root)).is_err(), "src/ root with items");
         let items = RootInfo { contents: false, meta: None, items: vec![ent(b"d", Kind::Dir), ent(b"f", Kind::File)], sel: None, extra: None };
         let mut l = Listings::new(std::slice::from_ref(&items));
-        l.take(0, 5, b"d", &[ent(b"s", Kind::Dir)], &[]).unwrap();
-        l.take(0, 6, b"d/s", &[], &[]).unwrap();
-        assert!(l.take(0, 7, b"", &[ent(b"d", Kind::Dir)], &[]).is_err(), "items differ");
+        l.take(0, 5, b"d", &[ent(b"s", Kind::Dir)], &[], &[]).unwrap();
+        l.take(0, 6, b"d/s", &[], &[], &[]).unwrap();
+        assert!(l.take(0, 7, b"", &[ent(b"d", Kind::Dir)], &[], &[]).is_err(), "items differ");
         let bad = RootInfo { items: vec![ent(b"a/b", Kind::File)], ..items };
         assert!(roots(&[bad]).is_err());
+    }
+
+    #[test]
+    fn mount_points_get_no_listing() {
+        let root = RootInfo { contents: true, meta: Some(ent(b"r", Kind::Dir).meta), items: vec![], sel: None, extra: None };
+        let ents = [ent(b"a", Kind::Dir), ent(b"f", Kind::File), ent(b"m", Kind::Dir), ent(b"n", Kind::Dir)];
+        for bad in [&[1][..], &[4], &[2, 2], &[3, 2]] {
+            let mut l = Listings::new(std::slice::from_ref(&root));
+            assert!(l.take(0, 0, b"", &ents, &[], bad).is_err(), "{bad:?}");
+        }
+        let mut l = Listings::new(std::slice::from_ref(&root));
+        l.take(0, 0, b"", &ents, &[], &[2, 3]).unwrap();
+        l.take(0, 1, b"a", &[], &[], &[]).unwrap();
+        assert!(l.take(0, 2, b"m", &[], &[], &[]).is_err(), "a mount point has no listing");
+        // A named item is a top directory, never a mount point.
+        let items = RootInfo { contents: false, meta: None, items: vec![ent(b"d", Kind::Dir)], sel: None, extra: None };
+        let mut l = Listings::new(std::slice::from_ref(&items));
+        assert!(l.take(0, 0, b"", &[ent(b"d", Kind::Dir)], &[], &[0]).is_err());
     }
 
     #[test]
