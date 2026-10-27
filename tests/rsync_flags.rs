@@ -1896,7 +1896,8 @@ fn force_and_missing_args_match_rsync() {
                     .file("gonedir/k/q", "q")
                     .file("sub/gone2", "g2")
                     .file("sub/deep/gone3", "g3")
-                    .file("emptysub/gone4", "g4");
+                    .file("emptysub/gone4", "g4")
+                    .same_mtimes(BASE_TIME + 100);
             }
             let a: Vec<String> = flags
                 .iter()
