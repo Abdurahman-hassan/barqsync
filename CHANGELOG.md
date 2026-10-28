@@ -51,6 +51,15 @@
 
 ### Fixed
 
+- With `-x`/`--one-file-system`, `--delete` no longer deletes on another filesystem
+  mounted inside the destination. Before, a mount point the source lacked was emptied:
+  everything on the mounted filesystem was deleted, and then removing the mount point
+  itself failed (exit 23). Now it stays, as with rsync, and `-vv` says "cannot delete
+  mount point". Nothing is deleted inside a mount point the source has either, unless
+  the transfer goes straight into it (it is the destination, or where a named source
+  directory goes), and one inside a directory being deleted keeps that directory
+  ("cannot delete non-empty directory"). This holds for local copies, pushes and pulls.
+  All earlier releases are affected.
 - `--delete` no longer deletes after a file could not be written to the destination (a
   full disk, a quota, an I/O error, or data that never arrived complete). Before, a file
   renamed in the source could lose its old name on the destination without getting the
