@@ -559,7 +559,16 @@ pub fn rename_or_copy(from: &Path, to: &Path) -> io::Result<Option<File>> {
 /// returned open, so its attributes can be set whatever its mode allows this user.
 fn copy_into_place(from: &Path, to: &Path) -> io::Result<File> {
     use std::os::unix::fs::PermissionsExt;
-    let src = File::open(from)?;
+    let src = match File::open(from) {
+        // A temp file of ours that got an existing file's mode, one its owner can't read
+        // (0200): it goes once copied, so let it be read.
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            let mode = fs::symlink_metadata(from)?.permissions().mode();
+            fs::set_permissions(from, fs::Permissions::from_mode(mode | 0o400))?;
+            File::open(from)?
+        }
+        r => r?,
+    };
     let md = src.metadata()?;
     let dir = to.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let (tmp, out) = with_temp(dir, to.file_name().unwrap_or_default(), |tmp| create_new(tmp, md.permissions().mode()))?;
@@ -905,8 +914,9 @@ mod tests {
     }
 
     /// A copy across filesystems replaces what is at the destination: a symlink's target
-    /// and a hard link's other names are left alone, and a read-only copy still takes
-    /// its attributes through the descriptor returned.
+    /// and a hard link's other names are left alone, a read-only copy still takes its
+    /// attributes through the descriptor returned, and a file its owner can't read (an
+    /// existing file's mode kept) is still copied.
     #[test]
     fn copies_into_place_replace_links() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -918,7 +928,10 @@ mod tests {
         std::os::unix::fs::symlink(d.join("outside"), d.join("link")).unwrap();
         fs::write(d.join("old"), "old").unwrap();
         fs::hard_link(d.join("old"), d.join("backup")).unwrap();
-        for to in ["link", "old", "fresh"] {
+        for to in ["link", "old", "fresh", "unreadable"] {
+            if to == "unreadable" {
+                fs::set_permissions(d.join("new"), fs::Permissions::from_mode(0o200)).unwrap();
+            }
             let f = copy_into_place(&d.join("new"), &d.join(to)).unwrap();
             fchmod(&f, 0o400).unwrap();
             set_fd_mtime(&f, 1_600_000_000, 0).unwrap();
