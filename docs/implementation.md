@@ -68,12 +68,11 @@ If `barqsync` is not found after installing, ensure Cargo's binary directory (`~
   ```
 
 macOS and Linux only. For remote transfers, barqsync has to be installed on both machines
-(like rsync), or pointed to with `--remote-path`, in the same release line. Version 0.4
-uses wire protocol 10 (0.3 moved to 9 for extended attributes and ACLs; 0.4 adds the
-pull's `RemovalsDone`), so 0.4.x cannot communicate with 0.3.x or earlier releases
-("protocol version mismatch"). The unreleased code moves to protocol 11 for the rsync
-options of M22 and those added since (`--bwlimit`, the id maps, `--append`, `-T`,
-`--delay-updates`, the deletion and symlink options), so it cannot communicate with 0.4.x.
+(like rsync), or pointed to with `--remote-path`, in the same release line. Version 0.5
+uses wire protocol 11 for the rsync options of M22 and those added since (`--bwlimit`,
+the id maps, `--append`, `-T`, `--delay-updates`, the deletion and symlink options,
+`--info`, `-U`/`-N`), so 0.5.x cannot communicate with 0.4.x (protocol 10) or earlier
+releases ("protocol version mismatch").
 Upgrade both ends together.
 
 ## Build from source
