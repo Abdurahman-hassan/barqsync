@@ -104,6 +104,10 @@ pub(crate) struct DirJob {
     /// The destination directory was just created (or would be, in a dry run): it is empty.
     dst_is_new: bool,
     root_dev: Option<u64>,
+    /// `-x`: the device of the top destination directory above (rsync's: the root, a
+    /// named directory, the end of a `-R` path). Nothing is deleted in a directory on
+    /// another one.
+    dst_dev: Option<u64>,
     src_meta: Meta,
     /// Destination directory metadata before we touched it (`None` when new).
     pre: Option<Meta>,
@@ -114,6 +118,19 @@ pub(crate) struct DirJob {
     pub(crate) more: Vec<SrcDir>,
     /// Filter state of the parent directory, which this one's own starts from.
     pub(crate) rules: Rules,
+}
+
+impl DirJob {
+    /// Drop the first source: the next merged one takes its place (false if there is
+    /// none). The directory keeps the first one's attributes.
+    fn next_source(&mut self) -> bool {
+        if self.more.is_empty() {
+            return false;
+        }
+        let d = self.more.remove(0);
+        (self.src, self.sel, self.root_dev, self.rules.src) = (d.path, d.sel, d.dev, d.rules);
+        true
+    }
 }
 
 pub(crate) struct Ctx<'p> {
@@ -128,6 +145,8 @@ pub(crate) struct Ctx<'p> {
     depth: usize,
     dst_is_new: bool,
     root_dev: Option<u64>,
+    /// See [`DirJob::dst_dev`] (`None` for named items: each directory is a top one).
+    dst_dev: Option<u64>,
     sel: Option<&'static Sel>,
     /// Listing id on the wire (remote: finds the sender's `-c` checksums).
     wire_dir: u32,
@@ -247,6 +266,15 @@ enum Del {
 /// A name for a message: the root shows as `.`.
 fn quoted(rel: &[u8]) -> &[u8] {
     if rel.is_empty() { b"." } else { rel }
+}
+
+/// Whether `path` is on another filesystem than the directory it is in (a mount point),
+/// or can't be told apart from one.
+fn mount_point(path: &Path) -> bool {
+    match (fsops::lstat(path), fsops::stat(split_dst(path).0)) {
+        (Ok(m), Ok(dir)) => m.dev != dir.dev,
+        _ => true,
+    }
 }
 
 /// rsync's file-list order for two names in one directory (each with whether it is a
@@ -701,6 +729,7 @@ impl<'a> Engine<'a> {
             depth: 0,
             dst_is_new: pre.is_none(),
             root_dev: Some(src_meta.dev),
+            dst_dev: pre.map(|p| p.dev),
             src_meta,
             pre,
             sel: None,
@@ -750,6 +779,7 @@ impl<'a> Engine<'a> {
             depth: 0,
             dst_is_new,
             root_dev: None,
+            dst_dev: None,
             sel,
             wire_dir,
             sources,
@@ -888,13 +918,17 @@ impl<'a> Engine<'a> {
             Some(src) => src.dirs.iter().any(|d| select::may_delete(d.sel)),
             None => select::may_delete(job.sel),
         };
+        // -x: as in rsync, nothing is deleted in a directory on another filesystem than
+        // the top one, and a directory on another one than this (a mount point) stays.
+        let dev = job.pre.map(|p| p.dev).filter(|_| self.opts.one_file_system);
         if let Some(dst_rules) = &dst_rules
             && self.opts.delete
             && !job.dst_is_new
             && full
+            && (dev.is_none() || dev == job.dst_dev)
             && self.may_delete()
         {
-            changed |= self.defer_extraneous(job, &entries, &dst_map, dst_rules);
+            changed |= self.defer_extraneous(job, &entries, &dst_map, dst_rules, dev);
         }
         let dst_handle = if job.dst_is_new || dst_metas.is_some() { None } else { fsops::DirHandle::open(&job.dst).ok() };
         let rules = Rules { src: src_rules.clone(), dst: dst_rules.unwrap_or_else(|| job.rules.dst.clone()) };
@@ -908,6 +942,7 @@ impl<'a> Engine<'a> {
             depth: job.depth,
             dst_is_new: job.dst_is_new,
             root_dev: job.root_dev,
+            dst_dev: job.dst_dev,
             sel: job.sel,
             wire_dir: job.wire_dir,
             sources,
@@ -919,19 +954,37 @@ impl<'a> Engine<'a> {
     }
 
     /// Queue what `dst_map` has and the listing doesn't for deletion, unless a
-    /// destination-side rule (`dst_rules`) protects it.
-    fn defer_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>, dst_rules: &DirRules) -> bool {
+    /// destination-side rule (`dst_rules`) protects it. `dev` (`-x`): the directory's
+    /// device; a directory on another one (a mount point) stays.
+    fn defer_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>, dst_rules: &DirRules, dev: Option<u64>) -> bool {
         let src_names: HashSet<&OsStr> = entries.iter().map(|(_, e, _)| e.name.as_os_str()).collect();
-        let extra: Vec<(&OsString, Kind)> = dst_map
+        // rsync's --info=mount (on with -vv) names each mount point here, listed or not.
+        let mounts = dev.is_some() && self.out.verbose() > 1;
+        let extra: Vec<&OsString> = dst_map
             .iter()
-            .filter(|(n, _)| !src_names.contains(n.as_os_str()))
+            .filter(|(n, k)| !src_names.contains(n.as_os_str()) || (mounts && **k == Kind::Dir))
             .filter(|(n, k)| !self.protected(dst_rules, &join_rel(&job.rel, n), n, **k == Kind::Dir, Side::Receiver))
-            .map(|(n, k)| (n, *k))
+            .map(|(n, _)| n)
             .collect();
+        let mut changed = false;
         let mut pending = self.deletions.lock().unwrap();
-        for (name, _) in &extra {
+        for name in extra {
             let path = job.dst.join(name);
-            match fsops::lstat(&path) {
+            let meta = fsops::lstat(&path);
+            if let (Ok(m), Some(dev)) = (&meta, dev)
+                && m.kind == Kind::Dir
+                && m.dev != dev
+            {
+                if mounts {
+                    self.out.note([b"cannot delete mount point: ", &join_rel(&job.rel, name)[..]].concat());
+                }
+                continue;
+            }
+            if src_names.contains(name.as_os_str()) {
+                continue;
+            }
+            changed = true;
+            match meta {
                 Ok(meta) => {
                     pending.entry(path).or_insert_with(|| Deletion { rel: join_rel(&job.rel, name), meta, rules: dst_rules.clone() });
                 }
@@ -939,7 +992,7 @@ impl<'a> Engine<'a> {
                 Err(e) => self.err(path_msg("stat before deletion \"", &path, format!("\" failed: {e}"))),
             }
         }
-        !extra.is_empty()
+        changed
     }
 
     /// Whether `--delete` leaves destination entry `name` (at `rel`, in a directory with
@@ -994,7 +1047,15 @@ impl<'a> Engine<'a> {
             return Del::Failed;
         }
         if kind == Kind::Dir && !emptied {
-            let r = self.delete_contents(path, rel, rules);
+            let dev = match self.opts.one_file_system.then(|| fsops::lstat(path)) {
+                None => None,
+                Some(Ok(m)) => Some(m.dev),
+                Some(Err(e)) => {
+                    self.err(path_msg("stat \"", path, format!("\" failed: {e}")));
+                    return Del::Failed;
+                }
+            };
+            let r = self.delete_contents(path, rel, rules, dev);
             if r != Del::Done {
                 return r;
             }
@@ -1034,8 +1095,9 @@ impl<'a> Engine<'a> {
     /// rsync's `delete_dir_contents`: delete what directory `path` (at `rel`, in a
     /// directory with destination-side filter state `parent`) holds, as it is being
     /// deleted. Its own filter files count; what a rule protects stays, perishable rules
-    /// aside, and so does the directory then.
-    fn delete_contents(&self, path: &Path, rel: &[u8], parent: &DirRules) -> Del {
+    /// aside, and so does the directory then. With `-x`, so does a directory that isn't
+    /// on device `dev` (`path`'s): a mount point.
+    fn delete_contents(&self, path: &Path, rel: &[u8], parent: &DirRules, dev: Option<u64>) -> Del {
         let rules = match self.filter.enter(parent, path, rel) {
             Ok(r) => r,
             Err(m) => {
@@ -1051,10 +1113,23 @@ impl<'a> Engine<'a> {
             }
         };
         let mut ret = Del::Done;
+        // rsync: "mount point, X, pins parent directory". One that can't be checked stays
+        // too, as an error.
+        let mount = |n: &OsStr| {
+            let p = path.join(n);
+            match self.opts.one_file_system.then(|| fsops::lstat(&p)) {
+                None => false,
+                Some(Ok(m)) => Some(m.dev) != dev,
+                Some(Err(e)) => {
+                    self.err(path_msg("stat \"", &p, format!("\" failed: {e}")));
+                    true
+                }
+            }
+        };
         let mut kids: Vec<(OsString, Kind)> = kids
             .into_iter()
             .filter(|(n, k)| {
-                let kept = self.protected(&rules, &join_rel(rel, n), n, *k == Kind::Dir, Side::Deleting);
+                let kept = self.protected(&rules, &join_rel(rel, n), n, *k == Kind::Dir, Side::Deleting) || (*k == Kind::Dir && mount(n));
                 if kept {
                     ret = Del::NotEmpty;
                 }
@@ -1067,7 +1142,7 @@ impl<'a> Engine<'a> {
                 return Del::Failed;
             }
             let (p, r) = (path.join(&name), join_rel(rel, &name));
-            if kind == Kind::Dir && self.delete_contents(&p, &r, &rules) != Del::Done {
+            if kind == Kind::Dir && self.delete_contents(&p, &r, &rules, dev) != Del::Done {
                 ret = Del::NotEmpty;
             }
             if self.delete_item(&p, &r, kind, &rules, true, false) != Del::Done {
@@ -1130,7 +1205,10 @@ impl<'a> Engine<'a> {
             return false;
         }
         // rsync: with --delete or --force, what the directory holds goes too.
-        let r = if self.opts.delete || self.opts.force {
+        let r = if (self.opts.delete || self.opts.force) && self.opts.one_file_system && mount_point(path) {
+            // -x: not even to make way (rsync deletes the files at the top of it).
+            Del::NotEmpty
+        } else if self.opts.delete || self.opts.force {
             self.delete_item(path, rel, Kind::Dir, rules, false, true)
         } else if self.dry() {
             return true;
@@ -1661,14 +1739,19 @@ impl<'a> Engine<'a> {
                 self.err(path_msg("set_xattr/set_acl \"", &dst_path, format!("\" failed: {e}")));
             }
         }
-        let root_dev = src_dev.unwrap_or(meta.dev);
+        let name = src_path.file_name().unwrap_or_default();
+        let root_dev = select::root_dev(sel, name.as_bytes(), meta.dev, src_dev);
         let more = match ctx.sources {
-            Some(src) if descend != Descend::No => {
-                src.also_dirs(idx, src_path.file_name().unwrap_or_default(), self.opts.recursive, self.opts.one_file_system)
-            }
+            Some(src) if descend != Descend::No => src.also_dirs(idx, name, self.opts.recursive, self.opts.one_file_system),
             _ => Vec::new(),
         };
-        let job = DirJob {
+        // -x: a top directory (for any source that has it, when several merge) starts
+        // from its own device.
+        let top = match ctx.sources {
+            Some(src) => src.top(idx, name, self.opts.recursive),
+            None => select::top_dir(sel, name.as_bytes(), self.opts.recursive),
+        };
+        let mut job = DirJob {
             src: src_path,
             dst: dst_path,
             rel,
@@ -1677,6 +1760,7 @@ impl<'a> Engine<'a> {
             depth: ctx.depth + 1,
             dst_is_new: is_new,
             root_dev: Some(root_dev),
+            dst_dev: ctx.dst_dev.filter(|_| !top).or(pre.map(|p| p.dev)),
             src_meta: meta,
             pre,
             sel: match descend {
@@ -1686,14 +1770,20 @@ impl<'a> Engine<'a> {
             more,
             rules: Rules { src: ctx.src_rules(idx).clone(), dst: ctx.rules.dst.clone() },
         };
-        if descend == Descend::No {
-            // -d: the directory itself, without its contents.
+        // -x: a directory on another filesystem than its transfer root (a mount point) is
+        // created, but nothing in it is synced, unless later sources have it on their own
+        // filesystem: then they alone fill it, as rsync's receiver merges their
+        // FLAG_CONTENT_DIR. A remote sender decides, and marks the ones it doesn't list.
+        let mount = match &self.remote {
+            Some(r) => r.mount(ctx.wire_dir, idx),
+            None => self.opts.one_file_system && meta.dev != root_dev && !job.next_source(),
+        };
+        if descend == Descend::No || mount {
+            // -d, or a mount point: the directory itself, without its contents.
             self.push_fixup(&job, false);
         } else if let Some(r) = &self.remote {
-            // The sender applies -x itself; the listing arrives as its own batch.
+            // Its listing arrives as its own batch.
             r.expect_dir(s, self, job);
-        } else if self.opts.one_file_system && meta.dev != root_dev {
-            self.push_fixup(&job, false);
         } else if let Some(p) = &self.pipeline {
             p.expect_dir(s, self, job);
         } else {

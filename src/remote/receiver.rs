@@ -163,6 +163,8 @@ pub struct RemoteState {
     pack_done: Condvar,
     /// `-c`: the sender's checksums, per listing.
     sums: Mutex<HashMap<u32, Vec<Option<Sum>>>>,
+    /// `-x`: the mount points the sender doesn't list, per listing (see `Msg::DirBatch`).
+    mounts: Mutex<HashMap<u32, Vec<u32>>>,
     /// Sender uid/gid -> local uid/gid, by name (see [`crate::ids`]).
     ids: Mutex<IdMap>,
     /// `--remove-source-files`: entries to report back to the sender, per root.
@@ -286,6 +288,7 @@ impl RemoteState {
             packs: Mutex::new(0),
             pack_done: Condvar::new(),
             sums: Mutex::new(HashMap::new()),
+            mounts: Mutex::new(HashMap::new()),
             ids: Mutex::new(ids),
             synced: Mutex::new(HashMap::new()),
             xattr_wait: Mutex::new(HashMap::new()),
@@ -359,6 +362,12 @@ impl RemoteState {
         self.sums.lock().unwrap().get(&dir)?.get(idx as usize).copied().flatten()
     }
 
+    /// `-x`: whether directory `idx` of listing `dir` is a mount point the sender doesn't
+    /// list: it is created, and nothing in it is synced.
+    pub(crate) fn mount(&self, dir: u32, idx: u32) -> bool {
+        self.mounts.lock().unwrap().get(&dir).is_some_and(|m| m.binary_search(&idx).is_ok())
+    }
+
     /// `--remove-source-files`: the receiver has this entry; tell the sender (in batches),
     /// or, while it waits for attribute values, once they are written.
     pub(crate) fn synced(&self, root: u16, rel: &[u8]) {
@@ -419,7 +428,8 @@ impl RemoteState {
     // Listings
     // -----------------------------------------------------------------------
 
-    /// Called by the engine for each subdirectory it created or found.
+    /// Called by the engine for each subdirectory it created or found, but a mount point
+    /// (see [`RemoteState::mount`]).
     pub(crate) fn expect_dir<'s, 'a: 's>(&self, s: &Scope<'s>, eng: &'s Engine<'a>, mut job: DirJob) {
         let key = (job.root, job.rel.clone());
         let mut slots = self.slots.lock().unwrap();
@@ -445,9 +455,13 @@ impl RemoteState {
         rel: Vec<u8>,
         mut entries: Vec<DirEnt>,
         sums: Vec<Option<Sum>>,
+        mounts: Vec<u32>,
     ) {
         if !sums.is_empty() {
             self.sums.lock().unwrap().insert(dir, sums);
+        }
+        if !mounts.is_empty() {
+            self.mounts.lock().unwrap().insert(dir, mounts);
         }
         {
             let ids = self.ids.lock().unwrap();
@@ -476,9 +490,7 @@ impl RemoteState {
                 s.spawn(move |s| {
                     let entries = entries.into_iter().enumerate().map(|(i, e)| (i as u32, e, rename.clone())).collect();
                     eng.run_items(s, Path::new(""), &dst_dir, root, dir, entries, dst_is_new, sel, None, &rules);
-                    let r = eng.remote.as_ref().unwrap();
-                    r.sums.lock().unwrap().remove(&dir);
-                    r.task_done();
+                    eng.remote.as_ref().unwrap().listing_done(dir);
                 });
             }
             _ => {
@@ -493,10 +505,15 @@ impl RemoteState {
             let dir = job.wire_dir;
             let entries = entries.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
             eng.process_listing(s, job, entries);
-            let r = eng.remote.as_ref().unwrap();
-            r.sums.lock().unwrap().remove(&dir);
-            r.task_done();
+            eng.remote.as_ref().unwrap().listing_done(dir);
         });
+    }
+
+    /// The task processing listing `dir` is done: what was kept for its entries goes.
+    fn listing_done(&self, dir: u32) {
+        self.sums.lock().unwrap().remove(&dir);
+        self.mounts.lock().unwrap().remove(&dir);
+        self.task_done();
     }
 
     fn task_done(&self) {
@@ -1297,12 +1314,12 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             let r = match frame {
                 Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
                 Frame::Msg(m) => match m {
-                    Msg::DirBatch { root, dir, rel, entries, sums } => match listings
-                        .take(root, dir, &rel, &entries, &sums)
+                    Msg::DirBatch { root, dir, rel, entries, sums, mounts } => match listings
+                        .take(root, dir, &rel, &entries, &sums, &mounts)
                         .and_then(|()| check::missing(entries.iter(), opts))
                     {
                         Ok(()) => {
-                            remote.on_batch(s, engine, root, dir, rel, entries, sums);
+                            remote.on_batch(s, engine, root, dir, rel, entries, sums, mounts);
                             Ok(())
                         }
                         Err(e) => {
