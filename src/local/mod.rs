@@ -12,7 +12,7 @@ use crate::entry::Kind;
 use crate::exit;
 use crate::filter::Filter;
 use crate::fsops;
-use crate::output::{Output, Stats, path_msg};
+use crate::output::{Output, Side, Stats, path_msg};
 use crate::paths::{split_source, wants_contents};
 use crate::select::{self, Sel};
 use exec::Engine;
@@ -108,11 +108,11 @@ pub fn plan(opts: &Options, sources: &[OsString], dest: &OsString, out: &Output)
         let shown = if raw.len() > 1 { &raw[..raw.iter().rposition(|&c| c != b'/').map_or(0, |p| p + 1)] } else { raw };
         let created = [b"created directory ", shown].concat();
         if opts.dry_run {
-            out.info(&created);
+            out.created(&created);
         } else {
             match fs::create_dir(&dest_path) {
                 Ok(()) => {
-                    out.info(&created);
+                    out.created(&created);
                     dest_exists = true;
                     dest_created = true;
                 }
@@ -157,7 +157,7 @@ pub(crate) fn make_dest_path(dir: &Path, opts: &Options, out: &Output) -> Result
             let raw = dir.as_os_str().as_bytes();
             let shown = &raw[..raw.iter().rposition(|&c| c != b'/').map_or(raw.len(), |p| p + 1)];
             let what = if n == 1 { "directory" } else { "directories" };
-            out.info([format!("created {n} {what} for ").as_bytes(), shown].concat());
+            out.created([format!("created {n} {what} for ").as_bytes(), shown].concat());
             Ok(n)
         }
         Err(e) => {
@@ -169,8 +169,9 @@ pub(crate) fn make_dest_path(dir: &Path, opts: &Options, out: &Output) -> Result
 
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // Process-lifetime output, shared with the progress thread.
-    let out: &'static Output = Box::leak(Box::new(Output::new(opts)));
+    let out: &'static Output = Box::leak(Box::new(Output::new(opts, Side::Local)));
     crate::bwlimit::limit_copies(opts.bwlimit);
+    out.open_log(opts);
     let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
         Err(e) => {
@@ -179,6 +180,9 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     };
     let started = Instant::now();
+    // As rsync's sending side does, before the receiving side creates the destination.
+    out.flist_start(opts, false);
+    out.log_start(false);
     let plan = match plan(opts, sources, dest, out) {
         Ok(p) => p,
         Err(code) => return code,
@@ -263,12 +267,15 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         return exit::SIGNAL;
     }
 
-    if opts.stats || opts.verbose > 0 {
-        // No connection: what is "sent" is the file data written.
-        let io = crate::output::Io { sent: Stats::get(&engine.stats.literal_bytes), received: 0, dry_run: opts.dry_run };
-        engine.stats.print(out, started.elapsed(), opts.human, opts.stats, io);
+    out.flist_end(opts, false, engine.stats.entries());
+    // No connection: what is "sent" is the file data written.
+    let io = crate::output::Io { sent: Stats::get(&engine.stats.literal_bytes), received: 0, dry_run: opts.dry_run };
+    engine.stats.print(out, started.elapsed(), opts.human, opts.info.stats, io);
+    let code = if fsops::interrupted() { exit::SIGNAL } else { engine.stats.exit_code() };
+    // rsync logs its byte counts unless the summary showed them (and after an error).
+    if code != exit::OK || opts.info.stats == 0 {
+        out.log_end(io, Stats::get(&engine.stats.total_size));
     }
     out.flush();
-
-    if fsops::interrupted() { exit::SIGNAL } else { engine.stats.exit_code() }
+    code
 }

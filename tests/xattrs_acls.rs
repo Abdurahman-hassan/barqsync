@@ -435,6 +435,34 @@ fn xattrs_match_rsync_locally_and_over_the_wire() {
 }
 
 /// `-XX` also copies rsync's own `rsync.%...` attributes (`user.rsync.%...` on Linux).
+/// `--log-file`'s default format has `%i`: a transferred file's attribute changes are
+/// found for its log line (`x`) when stdout itemizes nothing, as rsync's log shows them.
+#[test]
+fn log_file_itemizes_attribute_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    if skip_x(tmp.path()) {
+        return;
+    }
+    let src = Tree::new(tmp.path().join("src"));
+    src.file("f", "new content").settle_mtimes();
+    set_x(&src.path("f"), &nm("note"), b"v").unwrap();
+    for (j, (s, d)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+        let (dr, df) = (format!("r{j}"), format!("f{j}"));
+        for name in [&dr, &df] {
+            Tree::new(tmp.path().join(name)).file("f", "old");
+        }
+        let (r, f) = both_remote(tmp.path(), &["-aX", "--log-file={dst}.log", s, d], &dr, &df).unwrap();
+        assert_eq!((r.code, f.code), (0, 0), "{s} {d}: {}", f.stderr);
+        // The item line, without the time and process id.
+        let item = |dst: &str| {
+            let log = fs::read_to_string(tmp.path().join(format!("{dst}.log"))).unwrap();
+            log.lines().map(|l| l.split_once("] ").unwrap().1.to_string()).find(|l| l.ends_with(" f")).unwrap_or_default()
+        };
+        assert_eq!(item(&dr), item(&df), "{s} {d}");
+        assert!(item(&df).ends_with("x f"), "{s} {d}: {}", item(&df));
+    }
+}
+
 #[test]
 fn double_x_copies_rsync_internal_attributes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -483,6 +511,37 @@ fn without_x_attributes_are_neither_copied_nor_touched() {
         check(&cwd, &second, dr, df, &format!("{how:?} -ai --no-whole-file"));
         assert_eq!(get_x(&cwd.join(df).join("plain"), &nm("kept")).as_deref(), Some(&b"k"[..]));
         assert!(get_x(&cwd.join(df).join("big.bin"), &nm("onbig")).is_none());
+    }
+}
+
+/// `--ignore-existing --info=skip2`: a file whose data and times match but whose
+/// attributes differ is named an "attr change", as rsync names it.
+#[test]
+fn skip2_names_attribute_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    if skip_x(tmp.path()) {
+        return;
+    }
+    let skipped = |o: &RunOut| -> Vec<String> {
+        let mut v: Vec<String> = o.stdout.lines().filter(|l| l.contains(" exists")).map(str::to_string).collect();
+        v.sort();
+        v
+    };
+    for (i, how) in [How::Local, How::Push("ssh"), How::Pull("ssh")].iter().enumerate() {
+        let cwd = tmp.path().join(format!("s{i}"));
+        Tree::new(cwd.join("src")).file("same", "s").file("tagged", "t").settle_mtimes();
+        set_x(&cwd.join("src/tagged"), &nm("tag"), b"v").unwrap();
+        let (dr, df) = ("d-r", "d-f");
+        for d in [dr, df] {
+            let r = barqsync(&cwd, &["-aX", "src/", d]);
+            assert_eq!(r.code, 0, "{}", r.stderr);
+            set_x(&cwd.join(d).join("tagged"), &nm("tag"), b"other").unwrap();
+        }
+        let (r, f) = sync(&cwd, *how, &["-aX", "--ignore-existing", "--info=skip2"], dr, df);
+        same_code(&r, &f, &format!("{how:?}"));
+        assert_eq!(skipped(&r), skipped(&f), "{how:?}\n--- rsync:\n{}--- barqsync:\n{}", r.stdout, f.stdout);
+        assert!(skipped(&f).contains(&"tagged exists (attr change)".to_string()), "{how:?}: {}", f.stdout);
+        assert_eq!(get_x(&cwd.join(df).join("tagged"), &nm("tag")).as_deref(), Some(&b"other"[..]), "{how:?}: left alone");
     }
 }
 

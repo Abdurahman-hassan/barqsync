@@ -2,6 +2,8 @@
 //! error (rsync's "IO error encountered -- skipping file deletion"), and nothing after
 //! a file could not be written to the destination.
 
+mod common;
+
 use std::fs;
 use std::io::{Read, Seek};
 use std::os::unix::fs::PermissionsExt;
@@ -350,39 +352,12 @@ fn a_failed_write_stops_deletion() {
     }
 }
 
-/// A small APFS volume of its own (a disk image), detached when dropped.
-#[cfg(target_os = "macos")]
-struct Volume {
-    mount: std::path::PathBuf,
-    _image: tempfile::TempDir,
-}
-
-#[cfg(target_os = "macos")]
-impl Volume {
-    fn new(mib: u32) -> Option<Volume> {
-        let image = tempfile::tempdir().unwrap();
-        let (dmg, mount) = (image.path().join("vol.dmg"), image.path().join("mnt"));
-        let ok = |c: &mut Command| c.stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-        let size = format!("{mib}m");
-        let created = ok(Command::new("hdiutil").args(["create", "-size", &size, "-fs", "APFS", "-volname", "barqsync-test"]).arg(&dmg));
-        let attached = created && ok(Command::new("hdiutil").args(["attach", "-nobrowse", "-mountpoint"]).arg(&mount).arg(&dmg));
-        attached.then_some(Volume { mount, _image: image })
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for Volume {
-    fn drop(&mut self) {
-        let _ = Command::new("hdiutil").args(["detach", "-force"]).arg(&self.mount).stdout(Stdio::null()).status();
-    }
-}
-
 /// [`a_failed_write_stops_deletion`] on a disk that is really full: a 32 MiB volume that
 /// holds the 20 MiB `old.bin` has no room for the 20 MiB `new.bin`.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_full_disk_stops_deletion() {
-    let Some(vol) = Volume::new(32) else {
+    let Some(vol) = common::Volume::new(32) else {
         eprintln!("SKIP: no disk image could be attached");
         return;
     };

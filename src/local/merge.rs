@@ -48,16 +48,31 @@ impl Sources {
         &self.dirs[self.origin.get(idx as usize).copied().unwrap_or(0)]
     }
 
+    /// Whether directory entry `idx` (named `name`) is a top directory (see
+    /// [`select::top_dir`]) for any of the sources that have it, as rsync's file list
+    /// keeps that mark when it merges names.
+    pub(crate) fn top(&self, idx: u32, name: &OsStr, recursive: bool) -> bool {
+        let own = self.origin.get(idx as usize).copied().unwrap_or(0);
+        let also = self.also.get(&idx).into_iter().flatten().map(|&(k, _)| k);
+        std::iter::once(own).chain(also).any(|k| select::top_dir(self.dirs[k].sel, name.as_bytes(), recursive))
+    }
+
+    /// For each entry, the index in `dirs` of the directory it is from (empty: the first).
+    pub(crate) fn origins(&self) -> &[usize] {
+        &self.origin
+    }
+
     /// The later sources' directories that merge into directory entry `idx` (named
     /// `name`), each with its selection and root device. Those that `-x` or their
-    /// selection leave out, and repeats of a directory already merged, are dropped.
+    /// selection leave out, and repeats of a directory already merged, are dropped. With
+    /// `-x`, these fill the directory alone when entry `idx` is a mount point.
     pub(crate) fn also_dirs(&self, idx: u32, name: &OsStr, recursive: bool, one_fs: bool) -> Vec<SrcDir> {
         let Some(also) = self.also.get(&idx) else { return Vec::new() };
         let own = self.dir_of(idx).path.join(name);
         let mut out: Vec<SrcDir> = Vec::new();
         for &(k, dev) in also {
             let d = &self.dirs[k];
-            let root_dev = d.dev.unwrap_or(dev);
+            let root_dev = select::root_dev(d.sel, name.as_bytes(), dev, d.dev);
             if one_fs && dev != root_dev {
                 continue;
             }

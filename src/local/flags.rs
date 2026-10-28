@@ -9,7 +9,7 @@ use crate::checksum::{self, Sum};
 use crate::cli::Options;
 use crate::entry::{DirEnt, Kind, Meta};
 use crate::fsops::{self, Copied};
-use crate::output::{Change, Link, Stats, path_msg};
+use crate::output::{Change, Item, Link, Stats, path_msg};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -254,6 +254,18 @@ impl Engine<'_> {
         }
         self.backup_root = self.opts.backup_dir.as_deref().map(resolve);
         self.temp_root = self.opts.temp_dir.as_deref().map(resolve);
+        // rsync names the backup directory with --info=backup (-vv), "(new)" until it exists.
+        if let (Some(dir), Some(root)) = (&self.opts.backup_dir, &self.backup_root)
+            && self.out.levels().backup > 0
+        {
+            let raw = dir.as_bytes();
+            let shown = &raw[..raw.iter().rposition(|&c| c != b'/').map_or(raw.len().min(1), |p| p + 1)];
+            match fs::metadata(root) {
+                Ok(m) if m.is_dir() => self.out.note([b"backup_dir is ", shown].concat()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => self.out.note([b"(new) backup_dir is ", shown].concat()),
+                _ => {}
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -375,9 +387,9 @@ impl Engine<'_> {
             self.opts.max_size.is_some_and(|m| meta.size > m),
             self.opts.min_size.is_some_and(|m| meta.size < m),
         );
-        if (over || under) && self.out.verbose() >= 2 {
+        if (over || under) && self.out.levels().skip > 0 {
             let why: &[u8] = if over { b" is over max-size" } else { b" is under min-size" };
-            self.out.info([rel, why].concat());
+            self.out.note([rel, why].concat());
         }
         over || under
     }
@@ -418,6 +430,7 @@ impl Engine<'_> {
     pub(crate) fn try_alt_file(
         &self,
         root: u16,
+        at: Option<(u32, u32)>,
         x: &Src,
         rel: &[u8],
         src_path: &Path,
@@ -454,10 +467,11 @@ impl Engine<'_> {
             }
             same_data.get_or_insert((p, m));
         }
+        let item = |change| Item::new(rel, src, change).from(src_path, at);
         if let Some((p, _)) = exact {
             if self.opts.alt_link {
-                if self.opts.itemize >= 2 {
-                    self.out.item(rel, Kind::File, Link::None, Change { hardlink: true, ..Change::default() }, false);
+                if self.out.all_items() {
+                    self.out.item(&item(Change { hardlink: true, ..Change::default() }));
                 }
                 if dst_meta.is_none() {
                     Stats::add(&self.stats.created, 1);
@@ -481,7 +495,7 @@ impl Engine<'_> {
                     }
                 }
             } else {
-                self.out.item(rel, Kind::File, Link::None, Change::default(), false);
+                self.out.item(&item(Change::default()));
                 if dst_meta.is_some()
                     && !self.dry()
                     && let Err(e) = self.remove_or_backup(dst_path)
@@ -497,7 +511,7 @@ impl Engine<'_> {
             // Compared with the alt file it is copied from, as rsync does.
             let (xattr, acl) = self.extra_change(x, &p, &m).0;
             let change = Change { local: true, xattr, acl, ..self.attr_change(src, &m, false) };
-            self.out.item(rel, Kind::File, Link::None, change, true);
+            self.out.item(&item(change));
             if dst_meta.is_none() {
                 Stats::add(&self.stats.created, 1);
             }
@@ -538,8 +552,8 @@ impl Engine<'_> {
     }
 
     /// A new symlink identical to one in an alt-dest directory: hard-link it
-    /// (`--link-dest`) or leave it out (`--compare-dest`).
-    pub(crate) fn alt_symlink(&self, rel: &[u8], target: &[u8], dst_path: &Path) -> bool {
+    /// (`--link-dest`) or leave it out (`--compare-dest`). `it`: the symlink's item.
+    pub(crate) fn alt_symlink(&self, it: &Item, target: &[u8], dst_path: &Path) -> bool {
         let dest_rel = self.dest_rel(dst_path);
         let Some(p) = self.alt_dirs.iter().map(|a| a.join(&dest_rel)).find(|p| {
             fsops::lstat(p).is_ok_and(|m| m.kind == Kind::Symlink)
@@ -548,8 +562,8 @@ impl Engine<'_> {
             return false;
         };
         let change = Change { hardlink: self.opts.alt_link, ..Change::default() };
-        if self.opts.itemize >= 2 {
-            self.out.item(rel, Kind::Symlink, Link::Sym(target), change, false);
+        if self.out.all_items() {
+            self.out.item(&Item { change, link: Link::Sym(target), ..*it });
         }
         if self.opts.alt_link && !self.dry() {
             Stats::add(&self.stats.created, 1);
@@ -674,7 +688,7 @@ impl Engine<'_> {
             self.out.warning([&b"WARNING: "[..], &job.rel, b" failed verification -- update retained (will try again)."].concat());
         }
         let change = Change { transfer: true, time: !self.rules.same_mtime(&job.meta, d), ..Change::default() };
-        self.out.item(&job.rel, Kind::File, Link::None, change, true);
+        self.out.item(&Item::new(&job.rel, &job.meta, change).from(&job.src_path, Some((job.wire_dir, job.idx))));
         Stats::add(&self.stats.transferred, 1);
         Stats::add(&self.stats.transferred_bytes, job.meta.size);
     }
@@ -682,8 +696,9 @@ impl Engine<'_> {
     /// `--append` locally: copy the source's data past the destination's end (`d.size`)
     /// onto it. With `--append-verify` the data already there must be the source's
     /// start, or the whole file is rewritten. A source now shorter than it was listed is
-    /// left alone, as rsync's sender skips a "diminished" file: [`Diminished`].
-    pub(crate) fn write_append(&self, job: &FileJob, d: &Meta, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    /// left alone, as rsync's sender skips a "diminished" file: [`Diminished`]. Returns
+    /// the literal data it took.
+    pub(crate) fn write_append(&self, job: &FileJob, d: &Meta, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<u64> {
         let src = fsops::open_listed(&job.src_path, &job.meta, self.opts.follows_listed())?;
         if src.metadata()?.len() < job.meta.size {
             return Err(io::Error::other(Diminished));
@@ -699,7 +714,8 @@ impl Engine<'_> {
         Stats::add(&self.stats.literal_bytes, end - from);
         Stats::add(&self.stats.matched_bytes, from);
         out.set_len(end)?;
-        self.finish_delta_file(&out, &job.meta, mode, uid, gid, Some((&job.dst_path, &job.src(false))))
+        self.finish_delta_file(&out, &job.meta, mode, uid, gid, Some((&job.dst_path, &job.src(false))))?;
+        Ok(end - from)
     }
 
     /// rsync's warning for a file [`Diminished`] since it was listed, which is not sent.
@@ -721,7 +737,7 @@ impl Engine<'_> {
             return r.synced(root, rel);
         }
         match remove_source(self.opts, src_path, meta, Some(dst_path)) {
-            Ok(()) if self.out.verbose() >= 2 => self.out.info([b"sender removed ", rel].concat()),
+            Ok(()) if self.out.levels().remove > 0 => self.out.note([b"sender removed ", rel].concat()),
             Ok(()) => {}
             Err(m) => self.err(m),
         }
@@ -779,10 +795,10 @@ impl Engine<'_> {
     }
 
     fn report_backup(&self, dst: &Path, b: &Path) {
-        if self.out.verbose() >= 2 {
+        if self.out.levels().backup > 0 {
             let to = b.strip_prefix(&self.dest_root).unwrap_or(b);
             let msg = path_msg("backed up ", &self.dest_rel(dst), path_msg(" to ", to, ""));
-            self.out.info(msg);
+            self.out.note(msg);
         }
     }
 

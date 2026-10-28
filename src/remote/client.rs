@@ -4,7 +4,7 @@
 use super::{Stop, Transport, auto, quic, receiver, recv, relay, sender, streams};
 use crate::cli::Options;
 use crate::exit;
-use crate::output::{Output, Stats};
+use crate::output::{Output, Side, Stats};
 use crate::paths::{Location, parse_location};
 use crate::proto::{Conn, Frame, MAGIC, Msg, VERSION};
 use crate::timing::mark;
@@ -34,7 +34,10 @@ fn no_handshake_message(status: Option<i32>, remote: &str) -> String {
 }
 
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
-    let out: &'static Output = Box::leak(Box::new(Output::new(opts)));
+    // A local destination makes this a pull: items are shown as rsync's receiver shows them.
+    let side = if matches!(parse_location(dest), Ok(Location::Local(_))) { Side::Pull } else { Side::Push };
+    let out: &'static Output = Box::leak(Box::new(Output::new(opts, side)));
+    out.open_log(opts);
     let started = Instant::now();
     crate::bwlimit::limit_connections(opts.bwlimit);
 
@@ -135,6 +138,8 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
         }
     }
     let mut server_opts = opts.clone();
+    // The log is this side's; the server only reports what goes in it.
+    server_opts.log_file = None;
     server_opts.paths = server_paths;
     // rsync: each side needs its own --munge-links; the server's is never this one.
     server_opts.munge_links = false;
@@ -193,19 +198,22 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
 
     mark("setup done");
+    out.flist_start(opts, server_is_sender);
+    out.log_start(server_is_sender);
     let keepalive = super::KeepAlive::start(&conn.out, opts.timeout);
     let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));
     // `confirmed`: this side has the peer's last frame, so the peer has everything this
     // side sent: the sender (of a push) once it has `ReceiverDone`, the receiver of a pull
     // that reports removals once it has `RemovalsDone`.
-    let (code, stats, confirmed) = if server_is_sender {
+    // `listed`: the size of what this side listed, as a sender (for the log).
+    let (code, stats, confirmed, listed) = if server_is_sender {
         let removals = super::reports_removals(opts, server_is_sender);
         let (code, stats, confirmed) = receiver::run(&conn, opts, dest, out, removals);
-        (code, Some(stats), confirmed)
+        (code, Some(stats), confirmed, 0)
     } else {
-        let (code, stats) = sender::run(&conn, opts, sources, out, false);
+        let (code, stats, listed) = sender::run(&conn, opts, sources, out, false);
         let confirmed = stats.is_some();
-        (code, stats, confirmed)
+        (code, stats, confirmed, listed)
     };
     drop(keepalive);
     if let Some(r) = reporter {
@@ -235,18 +243,25 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     mark("remote shell exited");
     relay::reap(Duration::from_secs(if clean { 5 } else { 1 }));
     out.flush();
+    let io = crate::output::Io {
+        sent: crate::proto::BYTES_SENT.load(std::sync::atomic::Ordering::Relaxed),
+        received: crate::proto::BYTES_RECEIVED.load(std::sync::atomic::Ordering::Relaxed),
+        dry_run: opts.dry_run,
+    };
+    let mut total_size = listed;
     if let Some(s) = stats
-        && (opts.stats || opts.verbose > 0)
         && code != exit::SIGNAL
     {
         let totals = Stats::default();
         totals.absorb(&s);
-        let io = crate::output::Io {
-            sent: crate::proto::BYTES_SENT.load(std::sync::atomic::Ordering::Relaxed),
-            received: crate::proto::BYTES_RECEIVED.load(std::sync::atomic::Ordering::Relaxed),
-            dry_run: opts.dry_run,
-        };
-        totals.print(out, started.elapsed(), opts.human, opts.stats, io);
+        out.flist_end(opts, server_is_sender, totals.entries());
+        totals.print(out, started.elapsed(), opts.human, opts.info.stats, io);
+        total_size = Stats::get(&totals.total_size);
+    }
+    // rsync logs its byte counts unless the summary showed them, and after an error
+    // (whether or not the receiver's counters came) only as the sender.
+    if (code == exit::OK && opts.info.stats == 0) || (code != exit::OK && !server_is_sender) {
+        out.log_end(io, total_size);
     }
     out.flush();
     code

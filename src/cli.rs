@@ -146,9 +146,15 @@ pub struct Cli {
     /// Perform a trial run with no changes made
     #[arg(short = 'n', long = "dry-run")]
     dry_run: bool,
-    /// Output updates using the specified FORMAT (%n name, %L link target)
-    #[arg(long = "out-format", value_name = "FORMAT")]
+    /// Output updates using the specified FORMAT (rsync's %-escapes, e.g. '%i %n%L')
+    #[arg(long = "out-format", alias = "log-format", value_name = "FORMAT")]
     out_format: Option<String>,
+    /// Log what is done to FILE
+    #[arg(long = "log-file", value_name = "FILE")]
+    log_file: Option<OsString>,
+    /// Log updates using the specified FORMAT (default '%i %n%L')
+    #[arg(long = "log-file-format", value_name = "FORMAT")]
+    log_file_format: Option<String>,
     /// Show progress during transfer
     #[arg(long)]
     progress: bool,
@@ -167,7 +173,7 @@ pub struct Cli {
     /// Create temporary files in directory DIR
     #[arg(short = 'T', long = "temp-dir", value_name = "DIR")]
     temp_dir: Option<OsString>,
-    /// Fine-grained output flags; `progress2` (or `progress`) shows overall progress
+    /// Fine-grained informational output (`--info=help` lists the flags)
     #[arg(long, value_name = "FLAGS")]
     info: Vec<String>,
     /// Give some file-transfer stats
@@ -459,7 +465,8 @@ pub struct Cli {
     sender: bool,
 
     /// SRC... DEST
-    #[arg(value_name = "PATH", required_unless_present = "server", num_args = 1..)]
+    // `--info=help` needs none (they are still checked before a transfer).
+    #[arg(value_name = "PATH", required_unless_present_any = ["server", "info"], num_args = 1..)]
     paths: Vec<OsString>,
 }
 
@@ -512,10 +519,26 @@ pub struct Options {
 
     pub verbose: u8,
     pub itemize: u8,
+    /// `-q`: nothing is printed on stdout (warnings and errors still go to stderr).
     pub quiet: bool,
     pub dry_run: bool,
+    /// `--out-format`, checked (see [`crate::logformat`]).
     pub out_format: Option<String>,
+    /// `--log-file`: the client's log (never passed to the server).
+    #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
+    pub log_file: Option<OsString>,
+    /// The log's item format (`--log-file-format`, `%i %n%L` by default): set exactly when
+    /// the client logs, so a server knows to report what the client's log shows.
+    pub log_file_format: Option<String>,
+    /// What informational output is shown (rsync's `--info` levels).
+    pub info: Info,
+    /// rsync would recurse incrementally: `-r`, unless `--delete-before`,
+    /// `--delete-after` or `-m` need the whole file list first. Only the file-list
+    /// messages (`--info=flist`) depend on it.
+    pub inc_recurse: bool,
+    /// Progress is shown (`--progress`, `-P`, or `--info=progress`).
     pub progress: bool,
+    /// `--stats` was given (`info.stats` says what is shown).
     pub stats: bool,
     pub human: bool,
     pub eight_bit_output: bool,
@@ -664,7 +687,16 @@ impl Options {
             Some(f) => Some(read_files_from(f, from0)?),
             None => None,
         };
+        let format = cli.out_format.as_deref().map(crate::logformat::Format::parse).transpose()?;
+        // rsync: the log format counts only with a log file, and defaults to `%i %n%L`.
+        let log_file_format = cli.log_file.as_ref().map(|_| cli.log_file_format.clone().unwrap_or_else(|| "%i %n%L".into()));
+        if let Some(f) = log_file_format.as_deref().filter(|f| !f.is_empty()) {
+            crate::logformat::Format::parse(f).map_err(|e| anyhow::anyhow!("{}", e.to_string().replace("--out-format", "--log-file-format")))?;
+        }
+        let delete_first_or_last = cli.delete_before || cli.delete_after;
+        let given_info = cli.info.clone();
         let mut o = Options::from_cli(cli, m, filter_rules);
+        o.log_file_format = log_file_format;
         o.chmod = chmod;
         o.max_size = max_size;
         o.min_size = min_size;
@@ -698,6 +730,16 @@ impl Options {
             o.recursive = toggle(m, &["recursive"], &["no_recursive"]).unwrap_or(false);
         }
         o.files_from = files_from;
+        // An item is reported before its data is sent, unless %b needs the byte count
+        // (rsync's log_before_transfer; -i and -v formats have no %b).
+        let logs_after = match &format {
+            Some(f) => f.has(b'b'),
+            None => o.itemize == 0,
+        };
+        let progress = toggle(m, &["progress", "partial_progress"], &["no_progress"]).unwrap_or(false);
+        o.info = Info::resolve(&given_info, o.verbose, o.stats, progress, logs_after)?;
+        o.progress = o.info.progress > 0;
+        o.inc_recurse = o.recursive && !delete_first_or_last && !o.prune_empty_dirs;
         if o.delete && !o.recursive && !o.dirs {
             bail!("--delete does not work without --recursive (-r) or --dirs (-d).");
         }
@@ -750,8 +792,12 @@ impl Options {
             quiet,
             dry_run: c.dry_run,
             out_format: c.out_format,
-            progress: on(&["progress", "partial_progress"], &["no_progress"])
-                || c.info.iter().flat_map(|f| f.split(',')).any(|f| f.starts_with("progress") && f != "progress0"),
+            log_file: c.log_file,
+            log_file_format: None,
+            // Set from the resolved levels (see `parse_from`).
+            info: Info::default(),
+            inc_recurse: false,
+            progress: false,
             stats: c.stats,
             human: on(&["human"], &["no_human"]),
             eight_bit_output: on(&["eight_bit_output"], &["no_eight_bit_output"]),
@@ -833,6 +879,183 @@ impl Options {
             sender: c.sender,
             paths: c.paths,
         }
+    }
+}
+
+/// rsync's `--info` levels (0: silent), as `-v`, `--stats`, `--progress` and `--info`
+/// leave them. barqsync shows what rsync shows at each level, except that `copy` and
+/// `mount` messages are never produced (naming them is refused) and `progress` is
+/// always the overall line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct Info {
+    /// "backup_dir is", "backed up X to Y".
+    pub backup: u8,
+    pub copy: u8,
+    /// "deleting X" without an item format.
+    pub del: u8,
+    /// The file-list messages (2: the number of files, without incremental recursion).
+    pub flist: u8,
+    /// Nothing barqsync does: rsync's are about daemons and busy executables.
+    pub misc: u8,
+    pub mount: u8,
+    /// 1: changed items; 2: also unchanged ones ("X is uptodate").
+    pub name: u8,
+    /// "skipping non-regular file".
+    pub nonreg: u8,
+    pub progress: u8,
+    /// "sender removed X".
+    pub remove: u8,
+    /// Files left alone by `-u`, `--existing`, `--ignore-existing`, `--max-size`, `--min-size`.
+    pub skip: u8,
+    /// 1: the summary lines; 2: `--stats` (3: the same).
+    pub stats: u8,
+    /// Nothing barqsync does: rsync's are about `--copy-unsafe-links`.
+    pub symsafe: u8,
+}
+
+/// rsync's `--info` words in its order, with its descriptions.
+const INFO_WORDS: [(&str, &str); 13] = [
+    ("BACKUP", "Mention files backed up"),
+    ("COPY", "Mention files copied locally on the receiving side"),
+    ("DEL", "Mention deletions on the receiving side"),
+    ("FLIST", "Mention file-list receiving/sending (levels 1-2)"),
+    ("MISC", "Mention miscellaneous information (levels 1-2)"),
+    ("MOUNT", "Mention mounts that were found or skipped"),
+    ("NAME", "Mention 1) updated file/dir names, 2) unchanged names"),
+    ("NONREG", "Mention skipped non-regular files (default 1, 0 disables)"),
+    ("PROGRESS", "Mention 1) per-file progress or 2) total transfer progress"),
+    ("REMOVE", "Mention files removed on the sending side"),
+    ("SKIP", "Mention files skipped due to transfer overrides (levels 1-2)"),
+    ("STATS", "Mention statistics at end of run (levels 1-3)"),
+    ("SYMSAFE", "Mention symlinks that are unsafe"),
+];
+
+/// What each `-v` adds, as in rsync (`NAME2` is level 2 of `NAME`).
+const INFO_VERBOSITY: [&str; 3] =
+    ["NONREG", "COPY,DEL,FLIST,MISC,NAME,STATS,SYMSAFE", "BACKUP,MISC2,MOUNT,NAME2,REMOVE,SKIP"];
+
+/// rsync's largest level for any word.
+const INFO_MAX: u8 = 4;
+
+/// `--info=help`: the text to print (on stdout, then exit 0).
+#[derive(Debug)]
+pub struct InfoHelp(pub String);
+
+impl std::fmt::Display for InfoHelp {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InfoHelp {}
+
+impl Info {
+    fn level(&mut self, word: usize) -> &mut u8 {
+        match word {
+            0 => &mut self.backup,
+            1 => &mut self.copy,
+            2 => &mut self.del,
+            3 => &mut self.flist,
+            4 => &mut self.misc,
+            5 => &mut self.mount,
+            6 => &mut self.name,
+            7 => &mut self.nonreg,
+            8 => &mut self.progress,
+            9 => &mut self.remove,
+            10 => &mut self.skip,
+            11 => &mut self.stats,
+            _ => &mut self.symsafe,
+        }
+    }
+
+    /// Apply comma-separated `WORD[N]` items (rsync's `parse_output_words`) to `levels`:
+    /// N defaults to 1 and is at most 4, `ALL[N]` and `NONE` set every word, case doesn't
+    /// matter. Returns the words named (`ALL` names none).
+    fn parse(arg: &str, levels: &mut [Option<u8>; 13]) -> Result<[bool; 13]> {
+        let mut named = [false; 13];
+        for item in arg.split(',').filter(|w| !w.is_empty()) {
+            let b = item.as_bytes();
+            // A level is the digits at the end of a word that doesn't start with one.
+            let len = if b[0].is_ascii_digit() { b.len() } else { b.len() - b.iter().rev().take_while(|c| c.is_ascii_digit()).count() };
+            let (word, digits) = item.split_at(len);
+            let level = if digits.is_empty() { 1 } else { digits.parse::<u32>().map_or(INFO_MAX, |n| n.min(u32::from(INFO_MAX)) as u8) };
+            if word.eq_ignore_ascii_case("help") {
+                return Err(InfoHelp(Info::help()).into());
+            }
+            let (all, level) = match word {
+                w if w.eq_ignore_ascii_case("none") => (true, 0),
+                w if w.eq_ignore_ascii_case("all") => (true, level),
+                _ => (false, level),
+            };
+            if all {
+                levels.iter_mut().for_each(|l| *l = Some(level));
+                continue;
+            }
+            match INFO_WORDS.iter().position(|(w, _)| w.eq_ignore_ascii_case(word)) {
+                Some(i) => {
+                    levels[i] = Some(level);
+                    named[i] = true;
+                }
+                None => bail!("Unknown --info item: \"{word}\""),
+            }
+        }
+        Ok(named)
+    }
+
+    /// The levels after `given` (each `--info` argument, in order) and, for the words
+    /// they leave alone, what `-v` (`verbose` times), `--stats` and `--progress` imply.
+    /// `logs_after`: items are reported after their data (`%b`, or no format yet), when
+    /// `--progress` also implies `NAME`.
+    pub fn resolve(given: &[String], verbose: u8, stats: bool, progress: bool, logs_after: bool) -> Result<Info> {
+        let mut user = [None; 13];
+        let mut named = [false; 13];
+        for arg in given {
+            let n = Info::parse(arg, &mut user)?;
+            named.iter_mut().zip(n).for_each(|(a, b)| *a |= b);
+        }
+        // Their messages are rsync's for situations barqsync handles otherwise (a failed
+        // --link-dest copy is an error; mount points aren't kept or reported).
+        for (i, word) in [(1, "copy"), (5, "mount")] {
+            if named[i] && user[i].is_some_and(|l| l > 0) {
+                bail!("--info={word} is not supported");
+            }
+        }
+        let mut implied = [None; 13];
+        for words in INFO_VERBOSITY.iter().take(usize::from(verbose.min(2)) + 1) {
+            Info::parse(words, &mut implied)?;
+        }
+        if stats {
+            Info::parse(if verbose > 1 { "STATS3" } else { "STATS2" }, &mut implied)?;
+        }
+        if progress {
+            let name = user[6].or(implied[6]).unwrap_or(0);
+            if logs_after && name == 0 {
+                implied[6] = Some(1);
+            }
+            Info::parse("FLIST2,PROGRESS", &mut implied)?;
+        }
+        let mut info = Info::default();
+        for i in 0..13 {
+            *info.level(i) = user[i].or(implied[i]).unwrap_or(0);
+        }
+        Ok(info)
+    }
+
+    /// rsync's `--info=help` text.
+    fn help() -> String {
+        let mut s = String::from("Use OPT or OPT1 for level 1 output, OPT2 for level 2, etc.; OPT0 silences.\n\n");
+        for (word, what) in INFO_WORDS {
+            s += &format!("{word:<10} {what}\n");
+        }
+        s += &format!("\n{:<10} Set all --info options (e.g. all{INFO_MAX})\n", "ALL");
+        s += &format!("{:<10} Silence all --info options (same as all0)\n", "NONE");
+        s += &format!("{:<10} Output this help message\n\n", "HELP");
+        s += "Options added at each level of verbosity:\n";
+        for (i, words) in INFO_VERBOSITY.iter().enumerate() {
+            s += &format!("{i}) {words}\n");
+        }
+        s
     }
 }
 
@@ -1351,6 +1574,74 @@ mod tests {
         let l = o(&["--safe-links", "--copy-unsafe-links", "--munge-links"]);
         assert!(l.safe_links && l.copy_unsafe_links && l.munge_links && l.follows_listed());
         assert!(!o(&["--munge-links", "--no-munge-links"]).munge_links);
+    }
+
+    #[test]
+    fn info_levels_resolve_like_rsync() {
+        let info = |args: &[&str]| {
+            let mut argv = vec!["barqsync"];
+            argv.extend_from_slice(args);
+            argv.extend(["s", "d"]);
+            Options::parse_from(argv).map(|o| (o.info, o.progress))
+        };
+        let none = Info { nonreg: 1, ..Info::default() };
+        assert_eq!(info(&[]).unwrap().0, none);
+        let v = Info { copy: 1, del: 1, flist: 1, misc: 1, name: 1, stats: 1, symsafe: 1, ..none };
+        assert_eq!(info(&["-v"]).unwrap().0, v);
+        let vv = Info { backup: 1, misc: 2, mount: 1, name: 2, remove: 1, skip: 1, ..v };
+        assert_eq!(info(&["-vv"]).unwrap().0, vv);
+        // --info wins over what -v implies, before or after it; the last setting counts.
+        for args in [&["-v", "--info=name0"][..], &["--info=name0", "-v"], &["--info=name2,NAME0", "-v"]] {
+            assert_eq!(info(args).unwrap().0, Info { name: 0, ..v }, "{args:?}");
+        }
+        assert_eq!(info(&["--stats"]).unwrap().0.stats, 2);
+        assert_eq!(info(&["-vv", "--stats"]).unwrap().0.stats, 3);
+        assert_eq!(info(&["--stats", "--info=stats0"]).unwrap().0.stats, 0);
+        assert_eq!(info(&["--info=stats9"]).unwrap().0.stats, 4, "at most 4");
+        // --progress implies NAME (items are reported before their data otherwise) and FLIST2.
+        let (p, on) = info(&["--progress"]).unwrap();
+        assert_eq!((p.name, p.flist, p.progress, on), (1, 2, 1, true));
+        assert_eq!(info(&["--progress", "--out-format=%n"]).unwrap().0.name, 0);
+        assert_eq!(info(&["--progress", "--out-format=%n %b"]).unwrap().0.name, 1);
+        assert!(!info(&["-P", "--info=progress0"]).unwrap().1);
+        assert_eq!(info(&["--info=progress2"]).unwrap().0.progress, 2);
+        assert_eq!(info(&["-v", "--info=NONE,del"]).unwrap().0, Info { del: 1, ..Info::default() });
+        assert_eq!(info(&["--info=all2,,skip0"]).unwrap().0, Info {
+            backup: 2, copy: 2, del: 2, flist: 2, misc: 2, mount: 2, name: 2, nonreg: 2, progress: 2, remove: 2, skip: 0, stats: 2, symsafe: 2
+        });
+        for bad in ["--info=bogus", "--info=name,5", "--info=nam2"] {
+            let e = info(&[bad]).unwrap_err().to_string();
+            assert!(e.starts_with("Unknown --info item: \""), "{bad}: {e}");
+        }
+        assert_eq!(info(&["--info=nam2"]).unwrap_err().to_string(), "Unknown --info item: \"nam\"");
+        // Messages barqsync never produces are refused when asked for.
+        for bad in ["--info=copy", "--info=MOUNT2"] {
+            assert!(info(&[bad]).unwrap_err().to_string().ends_with("is not supported"), "{bad}");
+        }
+        assert!(info(&["--info=copy0,mount0"]).is_ok());
+        let help = info(&["--info=help"]).unwrap_err();
+        assert!(help.is::<InfoHelp>() && help.to_string().contains("\nSKIP       Mention files skipped"));
+    }
+
+    #[test]
+    fn out_format_is_checked() {
+        let parse = |f: &str| Options::parse_from(["barqsync", "--out-format", f, "s", "d"]);
+        assert!(parse("%o %f %l %b %'10n %%C").is_ok());
+        assert!(parse("%n %C").unwrap_err().to_string().contains("%C (the file checksum) is not supported"));
+        assert!(parse("%-3c").is_err());
+        // rsync's old name for it.
+        let o = Options::parse_from(["barqsync", "--log-format=%n", "s", "d"]).unwrap();
+        assert_eq!(o.out_format.as_deref(), Some("%n"));
+    }
+
+    #[test]
+    fn log_file_format_needs_a_log_file() {
+        let parse = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat());
+        assert_eq!(parse(&["--log-file=x"]).unwrap().log_file_format.as_deref(), Some("%i %n%L"));
+        assert_eq!(parse(&["--log-file=x", "--log-file-format="]).unwrap().log_file_format.as_deref(), Some(""));
+        assert_eq!(parse(&["--log-file-format=%n"]).unwrap().log_file_format, None);
+        let e = parse(&["--log-file=x", "--log-file-format=%n %C"]).unwrap_err().to_string();
+        assert!(e.contains("--log-file-format escape %C"), "{e}");
     }
 
     #[test]

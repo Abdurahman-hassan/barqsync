@@ -114,6 +114,8 @@ impl AttrDiff {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileAction {
     Skip,
+    /// `-u`: the receiver's file is newer; it is neither updated nor itemized.
+    Newer,
     /// Data must be (re)written.
     Transfer,
     /// Data is identical; only attributes need fixing.
@@ -149,10 +151,23 @@ pub fn file_action_ext(
     if r.ignore_existing {
         return FileAction::Skip;
     }
-    if r.update && dst.mtime > src.mtime && !r.same_mtime(src, dst) {
-        return FileAction::Skip;
+    // rsync's test, window included: not more than `--modify-window` newer than the
+    // receiver's file.
+    if r.update && src.mtime - dst.mtime < r.modify_window {
+        return FileAction::Newer;
     }
-    let data_same = if r.checksum {
+    if !same_data(src, dst, r, same_sum) {
+        return FileAction::Transfer;
+    }
+    let (xattr, acl) = ext();
+    let diff = AttrDiff { xattr, acl, ..r.attrs_differ(src, dst) };
+    if diff.any() { FileAction::Attrs(diff) } else { FileAction::Skip }
+}
+
+/// The quick check: whether `dst` holds `src`'s data (same size and time, or with `-c`
+/// the same checksum, `same_sum`).
+pub fn same_data(src: &Meta, dst: &Meta, r: &DiffRules, same_sum: bool) -> bool {
+    if r.checksum {
         src.size == dst.size && same_sum
     } else if r.ignore_times {
         false
@@ -160,13 +175,7 @@ pub fn file_action_ext(
         src.size == dst.size
     } else {
         src.size == dst.size && r.same_mtime(src, dst)
-    };
-    if !data_same {
-        return FileAction::Transfer;
     }
-    let (xattr, acl) = ext();
-    let diff = AttrDiff { xattr, acl, ..r.attrs_differ(src, dst) };
-    if diff.any() { FileAction::Attrs(diff) } else { FileAction::Skip }
 }
 
 #[cfg(test)]
@@ -263,7 +272,13 @@ mod tests {
         let mut r = rules();
         r.update = true;
         let s = file(10, 100, 0, 0o644);
-        assert_eq!(file_action(&s, Some(&file(99, 200, 0, 0o644)), &r), FileAction::Skip);
+        assert_eq!(file_action(&s, Some(&file(99, 200, 0, 0o644)), &r), FileAction::Newer);
+        // Same time: the quick check decides. Like rsync, a window also covers a receiver
+        // file up to that much older.
+        assert_eq!(file_action(&s, Some(&file(99, 100, 0, 0o644)), &r), FileAction::Transfer);
+        r.modify_window = 2;
+        assert_eq!(file_action(&s, Some(&file(99, 99, 0, 0o644)), &r), FileAction::Newer);
+        assert_eq!(file_action(&s, Some(&file(99, 98, 0, 0o644)), &r), FileAction::Transfer);
     }
 
     #[test]

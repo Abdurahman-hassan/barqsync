@@ -23,7 +23,7 @@ use crate::diff::{AttrDiff, DiffRules, FileAction, file_action_ext};
 use crate::entry::{DirEnt, Extra, Kind, Meta};
 use crate::filter::{DirRules, Filter, Side};
 use crate::fsops::{self, Copied};
-use crate::output::{Change, Link, Output, Stats, path_msg};
+use crate::output::{Change, Item, Link, Output, Stats, path_msg};
 use crate::paths::join_rel;
 use crate::checksum::{self, Sum};
 use crate::select::{self, Descend, Sel};
@@ -104,6 +104,10 @@ pub(crate) struct DirJob {
     /// The destination directory was just created (or would be, in a dry run): it is empty.
     dst_is_new: bool,
     root_dev: Option<u64>,
+    /// `-x`: the device of the top destination directory above (rsync's: the root, a
+    /// named directory, the end of a `-R` path). Nothing is deleted in a directory on
+    /// another one.
+    dst_dev: Option<u64>,
     src_meta: Meta,
     /// Destination directory metadata before we touched it (`None` when new).
     pre: Option<Meta>,
@@ -114,6 +118,19 @@ pub(crate) struct DirJob {
     pub(crate) more: Vec<SrcDir>,
     /// Filter state of the parent directory, which this one's own starts from.
     pub(crate) rules: Rules,
+}
+
+impl DirJob {
+    /// Drop the first source: the next merged one takes its place (false if there is
+    /// none). The directory keeps the first one's attributes.
+    fn next_source(&mut self) -> bool {
+        if self.more.is_empty() {
+            return false;
+        }
+        let d = self.more.remove(0);
+        (self.src, self.sel, self.root_dev, self.rules.src) = (d.path, d.sel, d.dev, d.rules);
+        true
+    }
 }
 
 pub(crate) struct Ctx<'p> {
@@ -128,6 +145,8 @@ pub(crate) struct Ctx<'p> {
     depth: usize,
     dst_is_new: bool,
     root_dev: Option<u64>,
+    /// See [`DirJob::dst_dev`] (`None` for named items: each directory is a top one).
+    dst_dev: Option<u64>,
     sel: Option<&'static Sel>,
     /// Listing id on the wire (remote: finds the sender's `-c` checksums).
     wire_dir: u32,
@@ -141,6 +160,10 @@ pub(crate) struct Ctx<'p> {
 pub(crate) struct FileJob {
     /// Index in the source listing (remote: identifies the file on the wire).
     pub(crate) idx: u32,
+    /// The listing's id on the wire (remote).
+    pub(crate) wire_dir: u32,
+    /// `%b` (see [`Output::after`]): the item line, reported once the file's data is.
+    pub(crate) item: Option<Change>,
     pub(crate) src_path: PathBuf,
     pub(crate) dst_path: PathBuf,
     pub(crate) rel: Vec<u8>,
@@ -195,6 +218,8 @@ struct HardGroup {
 
 struct Follower {
     root: u16,
+    /// Its listing and index there (see [`Item::at`]).
+    at: (u32, u32),
     src_path: PathBuf,
     dst_path: PathBuf,
     rel: Vec<u8>,
@@ -249,6 +274,15 @@ enum Del {
 /// A name for a message: the root shows as `.`.
 fn quoted(rel: &[u8]) -> &[u8] {
     if rel.is_empty() { b"." } else { rel }
+}
+
+/// Whether `path` is on another filesystem than the directory it is in (a mount point),
+/// or can't be told apart from one.
+fn mount_point(path: &Path) -> bool {
+    match (fsops::lstat(path), fsops::stat(split_dst(path).0)) {
+        (Ok(m), Ok(dir)) => m.dev != dir.dev,
+        _ => true,
+    }
 }
 
 /// rsync's file-list order for two names in one directory (each with whether it is a
@@ -428,28 +462,29 @@ impl<'a> Engine<'a> {
         (self.opts.atimes > 0 && src.kind != Kind::Dir).then_some(src.atime)
     }
 
-    /// Report a directory: new (`cd+++++++++`), or what differs. Plain `-v` shows it
-    /// only when new or its time differs.
-    fn report_dir(&self, rel: &[u8], src: &Meta, pre: Option<&Meta>, (xattr, acl): (bool, bool)) {
+    /// Report a directory: new (`cd+++++++++`), or what differs, which plain `-v` shows
+    /// too. `from`: where its source is (see [`Item`]).
+    fn report_dir(&self, rel: &[u8], src: &Meta, pre: Option<&Meta>, (xattr, acl): (bool, bool), from: (&Path, Option<(u32, u32)>)) {
+        let item = |change| Item::new(rel, src, change).from(from.0, from.1);
         if pre.is_none()
             && let Some(alt) = self.alt_dir_meta(rel)
         {
             // A new directory with an alt-dest counterpart is itemized against it.
-            let significant = self.dir_times() && !self.rules.same_mtime(src, &alt);
-            let change = Change { local: true, time: significant, ..self.attr_change(src, &alt, false) };
-            if change.any_attr() || self.opts.itemize >= 2 || significant {
-                self.out.item(rel, Kind::Dir, Link::None, change, significant);
+            let time = self.dir_times() && !self.rules.same_mtime(src, &alt);
+            let change = Change { local: true, time, ..self.attr_change(src, &alt, false) };
+            if change.any_attr() || self.out.all_items() {
+                self.out.item(&item(change));
             }
             return;
         }
-        let (change, significant) = match pre {
-            None => (Change::new_local(), true),
+        let change = match pre {
+            None => Change::new_local(),
             Some(p) => {
                 let differs = self.dir_times() && !self.rules.same_mtime(src, p);
-                (Change { time: differs, xattr, acl, ..self.attr_change(src, p, false) }, differs)
+                Change { time: differs, xattr, acl, ..self.attr_change(src, p, false) }
             }
         };
-        self.out.item(rel, Kind::Dir, Link::None, change, significant);
+        self.out.item(&item(change));
     }
 
     /// Directory mtimes are preserved: `-t`, unless `-O` (which `-b` without
@@ -706,7 +741,7 @@ impl<'a> Engine<'a> {
             Some(p) => self.extra_change(&x, &dst, p),
             None => ((false, false), None),
         };
-        self.report_dir(b"", &src_meta, pre.as_ref(), ext);
+        self.report_dir(b"", &src_meta, pre.as_ref(), ext, (&src, None));
         if !self.dry() && self.extras_on() && (pre.is_none() || ext.0 || ext.1) {
             let cur = pre.map_or(0o777 & !self.umask, |p| p.mode);
             if let Err(e) = self.apply_extra(&dst, &x, have, cur) {
@@ -722,6 +757,7 @@ impl<'a> Engine<'a> {
             depth: 0,
             dst_is_new: pre.is_none(),
             root_dev: Some(src_meta.dev),
+            dst_dev: pre.map(|p| p.dev),
             src_meta,
             pre,
             sel: None,
@@ -771,6 +807,7 @@ impl<'a> Engine<'a> {
             depth: 0,
             dst_is_new,
             root_dev: None,
+            dst_dev: None,
             sel,
             wire_dir,
             sources,
@@ -909,13 +946,17 @@ impl<'a> Engine<'a> {
             Some(src) => src.dirs.iter().any(|d| select::may_delete(d.sel)),
             None => select::may_delete(job.sel),
         };
+        // -x: as in rsync, nothing is deleted in a directory on another filesystem than
+        // the top one, and a directory on another one than this (a mount point) stays.
+        let dev = job.pre.map(|p| p.dev).filter(|_| self.opts.one_file_system);
         if let Some(dst_rules) = &dst_rules
             && self.opts.delete
             && !job.dst_is_new
             && full
+            && (dev.is_none() || dev == job.dst_dev)
             && self.may_delete()
         {
-            changed |= self.defer_extraneous(job, &entries, &dst_map, dst_rules);
+            changed |= self.defer_extraneous(job, &entries, &dst_map, dst_rules, dev);
         }
         let dst_handle = if job.dst_is_new || dst_metas.is_some() { None } else { fsops::DirHandle::open(&job.dst).ok() };
         let rules = Rules { src: src_rules.clone(), dst: dst_rules.unwrap_or_else(|| job.rules.dst.clone()) };
@@ -929,6 +970,7 @@ impl<'a> Engine<'a> {
             depth: job.depth,
             dst_is_new: job.dst_is_new,
             root_dev: job.root_dev,
+            dst_dev: job.dst_dev,
             sel: job.sel,
             wire_dir: job.wire_dir,
             sources,
@@ -940,19 +982,37 @@ impl<'a> Engine<'a> {
     }
 
     /// Queue what `dst_map` has and the listing doesn't for deletion, unless a
-    /// destination-side rule (`dst_rules`) protects it.
-    fn defer_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>, dst_rules: &DirRules) -> bool {
+    /// destination-side rule (`dst_rules`) protects it. `dev` (`-x`): the directory's
+    /// device; a directory on another one (a mount point) stays.
+    fn defer_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>, dst_rules: &DirRules, dev: Option<u64>) -> bool {
         let src_names: HashSet<&OsStr> = entries.iter().map(|(_, e, _)| e.name.as_os_str()).collect();
-        let extra: Vec<(&OsString, Kind)> = dst_map
+        // rsync's --info=mount (on with -vv) names each mount point here, listed or not.
+        let mounts = dev.is_some() && self.out.verbose() > 1;
+        let extra: Vec<&OsString> = dst_map
             .iter()
-            .filter(|(n, _)| !src_names.contains(n.as_os_str()))
+            .filter(|(n, k)| !src_names.contains(n.as_os_str()) || (mounts && **k == Kind::Dir))
             .filter(|(n, k)| !self.protected(dst_rules, &join_rel(&job.rel, n), n, **k == Kind::Dir, Side::Receiver))
-            .map(|(n, k)| (n, *k))
+            .map(|(n, _)| n)
             .collect();
+        let mut changed = false;
         let mut pending = self.deletions.lock().unwrap();
-        for (name, _) in &extra {
+        for name in extra {
             let path = job.dst.join(name);
-            match fsops::lstat(&path) {
+            let meta = fsops::lstat(&path);
+            if let (Ok(m), Some(dev)) = (&meta, dev)
+                && m.kind == Kind::Dir
+                && m.dev != dev
+            {
+                if mounts {
+                    self.out.note([b"cannot delete mount point: ", &join_rel(&job.rel, name)[..]].concat());
+                }
+                continue;
+            }
+            if src_names.contains(name.as_os_str()) {
+                continue;
+            }
+            changed = true;
+            match meta {
                 Ok(meta) => {
                     pending.entry(path).or_insert_with(|| Deletion { rel: join_rel(&job.rel, name), meta, rules: dst_rules.clone() });
                 }
@@ -960,7 +1020,7 @@ impl<'a> Engine<'a> {
                 Err(e) => self.err(path_msg("stat before deletion \"", &path, format!("\" failed: {e}"))),
             }
         }
-        !extra.is_empty()
+        changed
     }
 
     /// Whether `--delete` leaves destination entry `name` (at `rel`, in a directory with
@@ -1015,7 +1075,15 @@ impl<'a> Engine<'a> {
             return Del::Failed;
         }
         if kind == Kind::Dir && !emptied {
-            let r = self.delete_contents(path, rel, rules);
+            let dev = match self.opts.one_file_system.then(|| fsops::lstat(path)) {
+                None => None,
+                Some(Ok(m)) => Some(m.dev),
+                Some(Err(e)) => {
+                    self.err(path_msg("stat \"", path, format!("\" failed: {e}")));
+                    return Del::Failed;
+                }
+            };
+            let r = self.delete_contents(path, rel, rules, dev);
             if r != Del::Done {
                 return r;
             }
@@ -1024,6 +1092,7 @@ impl<'a> Engine<'a> {
             Stats::add(&self.stats.del_skipped, 1);
             return Del::AtLimit;
         }
+        let mode = if !room && self.out.deletion_modes() { fsops::lstat(path).map_or(0, |m| m.mode) } else { 0 };
         let r = if kind == Kind::Dir {
             if self.dry() { Ok(()) } else { fs::remove_dir(path) }
         } else if self.dry() {
@@ -1034,7 +1103,7 @@ impl<'a> Engine<'a> {
         match r {
             Ok(()) => {
                 if !room {
-                    self.out.deleting(rel, kind == Kind::Dir);
+                    self.out.deleting(rel, kind == Kind::Dir, mode);
                     Stats::add(&self.stats.deleted, 1);
                 }
                 Del::Done
@@ -1055,8 +1124,9 @@ impl<'a> Engine<'a> {
     /// rsync's `delete_dir_contents`: delete what directory `path` (at `rel`, in a
     /// directory with destination-side filter state `parent`) holds, as it is being
     /// deleted. Its own filter files count; what a rule protects stays, perishable rules
-    /// aside, and so does the directory then.
-    fn delete_contents(&self, path: &Path, rel: &[u8], parent: &DirRules) -> Del {
+    /// aside, and so does the directory then. With `-x`, so does a directory that isn't
+    /// on device `dev` (`path`'s): a mount point.
+    fn delete_contents(&self, path: &Path, rel: &[u8], parent: &DirRules, dev: Option<u64>) -> Del {
         let rules = match self.filter.enter(parent, path, rel) {
             Ok(r) => r,
             Err(m) => {
@@ -1072,10 +1142,23 @@ impl<'a> Engine<'a> {
             }
         };
         let mut ret = Del::Done;
+        // rsync: "mount point, X, pins parent directory". One that can't be checked stays
+        // too, as an error.
+        let mount = |n: &OsStr| {
+            let p = path.join(n);
+            match self.opts.one_file_system.then(|| fsops::lstat(&p)) {
+                None => false,
+                Some(Ok(m)) => Some(m.dev) != dev,
+                Some(Err(e)) => {
+                    self.err(path_msg("stat \"", &p, format!("\" failed: {e}")));
+                    true
+                }
+            }
+        };
         let mut kids: Vec<(OsString, Kind)> = kids
             .into_iter()
             .filter(|(n, k)| {
-                let kept = self.protected(&rules, &join_rel(rel, n), n, *k == Kind::Dir, Side::Deleting);
+                let kept = self.protected(&rules, &join_rel(rel, n), n, *k == Kind::Dir, Side::Deleting) || (*k == Kind::Dir && mount(n));
                 if kept {
                     ret = Del::NotEmpty;
                 }
@@ -1088,7 +1171,7 @@ impl<'a> Engine<'a> {
                 return Del::Failed;
             }
             let (p, r) = (path.join(&name), join_rel(rel, &name));
-            if kind == Kind::Dir && self.delete_contents(&p, &r, &rules) != Del::Done {
+            if kind == Kind::Dir && self.delete_contents(&p, &r, &rules, dev) != Del::Done {
                 ret = Del::NotEmpty;
             }
             if self.delete_item(&p, &r, kind, &rules, true, false) != Del::Done {
@@ -1151,7 +1234,10 @@ impl<'a> Engine<'a> {
             return false;
         }
         // rsync: with --delete or --force, what the directory holds goes too.
-        let r = if self.opts.delete || self.opts.force {
+        let r = if (self.opts.delete || self.opts.force) && self.opts.one_file_system && mount_point(path) {
+            // -x: not even to make way (rsync deletes the files at the top of it).
+            Del::NotEmpty
+        } else if self.opts.delete || self.opts.force {
             self.delete_item(path, rel, Kind::Dir, rules, false, true)
         } else if self.dry() {
             return true;
@@ -1208,7 +1294,8 @@ impl<'a> Engine<'a> {
 
     /// `-H`: true if this name leads its hard-link group (and is transferred normally);
     /// otherwise it is queued to be linked to the leader at the end.
-    fn claim_leader(&self, root: u16, x: &Src, src_path: &Path, dst_path: &Path, rel: &[u8], rules: &DirRules) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn claim_leader(&self, root: u16, at: (u32, u32), x: &Src, src_path: &Path, dst_path: &Path, rel: &[u8], rules: &DirRules) -> bool {
         let meta = x.meta;
         let mut groups = self.hardlinks.lock().unwrap();
         match groups.entry((meta.dev, meta.ino)) {
@@ -1222,6 +1309,7 @@ impl<'a> Engine<'a> {
                     && fsops::lstat(dst_path).is_ok_and(|d| d.kind == Kind::File && self.extra_change(x, dst_path, &d).0.0);
                 o.get_mut().followers.push(Follower {
                     root,
+                    at,
                     src_path: src_path.to_path_buf(),
                     dst_path: dst_path.to_path_buf(),
                     rel: rel.to_vec(),
@@ -1260,8 +1348,8 @@ impl<'a> Engine<'a> {
                 {
                     // Already linked: rsync shows `hf` without naming the leader.
                     let change = Change { hardlink: true, xattr: f.xattr || g.xattr, ..Change::default() };
-                    if change.xattr || self.opts.itemize >= 2 {
-                        self.out.item(&f.rel, Kind::File, Link::None, change, false);
+                    if change.xattr || self.out.all_items() {
+                        self.out.item(&Item::new(&f.rel, &f.meta, change).from(&f.src_path, Some(f.at)));
                     }
                     self.source_done(f.root, &f.src_path, &f.dst_path, &f.rel, &f.meta);
                     continue;
@@ -1271,7 +1359,9 @@ impl<'a> Engine<'a> {
                     if self.remote.is_none() {
                         let dst_meta = dst.filter(|d| d.kind == Kind::File);
                         let job = FileJob {
-                            idx: 0,
+                            idx: f.at.1,
+                            wire_dir: f.at.0,
+                            item: None,
                             src_path: f.src_path,
                             dst_path: f.dst_path,
                             rel: f.rel,
@@ -1298,7 +1388,7 @@ impl<'a> Engine<'a> {
                     },
                     _ => Change { hardlink: true, new: true, ..Change::default() },
                 };
-                self.out.item(&f.rel, Kind::File, Link::Hard(&g.leader_rel), change, true);
+                self.out.item(&Item::new(&f.rel, &f.meta, change).link(Link::Hard(&g.leader_rel)).from(&f.src_path, Some(f.at)));
                 if dst.is_none() {
                     Stats::add(&self.stats.created, 1);
                 }
@@ -1392,21 +1482,38 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let dst_kind = if ctx.dst_is_new { None } else { dst_map.get(dname).copied() };
-            if self.opts.existing && dst_kind.is_none() && !(e.meta.kind == Kind::Dir && !self.opts.recursive && !self.opts.dirs) {
-                // --existing: nothing new is created, not even directories.
-                continue;
-            }
+            // Each entry listed counts ("Number of files", --info=flist2), whatever is done
+            // with it; a directory counts where it is handled.
             match e.meta.kind {
-                Kind::Dir => changed |= self.handle_dir(s, ctx, e.meta, e.extra.as_deref(), idx, rel, src_path, dst_path, dst_kind),
+                Kind::Dir => {}
                 Kind::File => {
                     Stats::add(&self.stats.files, 1);
                     Stats::add(&self.stats.total_size, e.meta.size);
-                    if self.size_filtered(&e.meta, &rel) {
+                }
+                Kind::Symlink => Stats::add(&self.stats.links, 1),
+                _ => Stats::add(&self.stats.specials, 1),
+            }
+            if self.opts.existing && dst_kind.is_none() && !(e.meta.kind == Kind::Dir && !self.opts.recursive && !self.opts.dirs) {
+                // --existing: nothing new is created, not even directories.
+                if e.meta.kind == Kind::Dir {
+                    Stats::add(&self.stats.dirs, 1);
+                }
+                if self.out.levels().skip > 0 {
+                    let what: &[u8] = if e.meta.kind == Kind::Dir { b"directory" } else { b"file" };
+                    self.out.note([b"not creating new ", what, b" \"", &rel, b"\""].concat());
+                }
+                continue;
+            }
+            let at = Some((ctx.wire_dir, idx));
+            match e.meta.kind {
+                Kind::Dir => changed |= self.handle_dir(s, ctx, e.meta, e.extra.as_deref(), idx, rel, src_path, dst_path, dst_kind),
+                Kind::File => {
+                    if self.ignored_existing(ctx, &rel, &e, dname, &dst_path, dst_kind, same_sums.contains(&idx)) || self.size_filtered(&e.meta, &rel) {
                         continue;
                     }
                     let leads = || {
                         let x = Src { kind: Kind::File, meta: &e.meta, extra: e.extra.as_deref(), from: XSource::Full(&[]) };
-                        self.claim_leader(ctx.root, &x, &src_path, &dst_path, &rel, &ctx.rules.dst)
+                        self.claim_leader(ctx.root, (ctx.wire_dir, idx), &x, &src_path, &dst_path, &rel, &ctx.rules.dst)
                     };
                     if self.opts.hard_links && e.meta.nlink > 1 && !leads() {
                         // Linked at the end, which modifies this directory.
@@ -1449,7 +1556,7 @@ impl<'a> Engine<'a> {
                         && dst_meta.is_none_or(|d| d.kind == Kind::File)
                     {
                         let mut src_sum = || self.src_sum(ctx.wire_dir, idx, &src_path);
-                        match self.try_alt_file(ctx.root, &src, &rel, &src_path, &dst_path, dst_meta.as_ref(), &mut src_sum) {
+                        match self.try_alt_file(ctx.root, at, &src, &rel, &src_path, &dst_path, dst_meta.as_ref(), &mut src_sum) {
                             super::flags::AltFile::Done => {
                                 changed = true;
                                 continue;
@@ -1459,8 +1566,14 @@ impl<'a> Engine<'a> {
                         }
                     }
                     match action {
+                        // -u: rsync neither itemizes nor touches it.
+                        FileAction::Newer => {
+                            if self.out.levels().skip > 0 {
+                                self.out.note([&rel[..], b" is newer"].concat());
+                            }
+                        }
                         FileAction::Skip => {
-                            self.out.item(&rel, Kind::File, Link::None, Change::default(), false);
+                            self.out.item(&Item::new(&rel, &e.meta, Change::default()).from(&src_path, at));
                             self.source_done(ctx.root, &src_path, &dst_path, &rel, &e.meta);
                         }
                         FileAction::Attrs(a) => {
@@ -1470,7 +1583,7 @@ impl<'a> Engine<'a> {
                             if let Some(d) = &dst_meta {
                                 let mut change = Change { xattr: a.xattr, acl: a.acl, ..self.attr_change(&e.meta, d, false) };
                                 change.perms = self.perms_shown(&e.meta, d, change.perms, a.acl);
-                                self.out.item(&rel, Kind::File, Link::None, change, false);
+                                self.out.item(&Item::new(&rel, &e.meta, change).from(&src_path, at));
                             }
                             if !self.dry() {
                                 match &self.pipeline {
@@ -1500,6 +1613,8 @@ impl<'a> Engine<'a> {
                             };
                             let mut job = FileJob {
                                 idx,
+                                wire_dir: ctx.wire_dir,
+                                item: None,
                                 src_path,
                                 dst_path,
                                 rel,
@@ -1518,9 +1633,11 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Kind::Symlink => {
-                    Stats::add(&self.stats.links, 1);
+                    if self.ignored_existing(ctx, &rel, &e, dname, &dst_path, dst_kind, false) {
+                        continue;
+                    }
                     if !self.opts.links {
-                        self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
+                        self.non_regular(&rel);
                         continue;
                     }
                     // --safe-links: the receiver ignores a symlink that leads outside the
@@ -1533,25 +1650,74 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     let from = self.xsource(ctx, idx, &src_path, &rel, &dst_path);
-                    changed |= self.handle_symlink(ctx.root, &e, from, &rel, &src_path, &dst_path, dst_kind, &ctx.rules.dst);
+                    changed |= self.handle_symlink(ctx.root, at, &e, from, &rel, &src_path, &dst_path, dst_kind, &ctx.rules.dst);
                 }
                 kind => {
-                    Stats::add(&self.stats.specials, 1);
+                    if self.ignored_existing(ctx, &rel, &e, dname, &dst_path, dst_kind, false) {
+                        continue;
+                    }
                     let allowed = match kind {
                         Kind::CharDev | Kind::BlockDev => self.opts.devices,
                         Kind::Fifo => self.opts.specials,
                         _ => false,
                     };
                     if !allowed {
-                        self.out.info([b"skipping non-regular file \"", quoted(&rel), b"\""].concat());
+                        self.non_regular(&rel);
                         continue;
                     }
                     let src = Src { kind, meta: &e.meta, extra: e.extra.as_deref(), from: self.xsource(ctx, idx, &src_path, &rel, &dst_path) };
-                    changed |= self.handle_special(ctx.root, &src, &rel, &src_path, &dst_path, dst_kind, &ctx.rules.dst);
+                    changed |= self.handle_special(ctx.root, at, &src, &rel, &src_path, &dst_path, dst_kind, &ctx.rules.dst);
                 }
             }
         }
         (changed && !self.dry(), files)
+    }
+
+    /// `--ignore-existing`: a non-directory the destination has an entry for is left
+    /// alone, whatever that entry is (rsync), and said with `--info=skip` ("X exists"; at
+    /// level 2 with what differs). `same_sum`: `-c` found the data the same.
+    #[allow(clippy::too_many_arguments)]
+    fn ignored_existing(&self, ctx: &Ctx, rel: &[u8], e: &DirEnt, dname: &OsStr, dst_path: &Path, dst_kind: Option<Kind>, same_sum: bool) -> bool {
+        if !self.opts.ignore_existing || dst_kind.is_none() {
+            return false;
+        }
+        let skip = self.out.levels().skip;
+        if skip > 0 {
+            let why = match ctx.lstat_dst(dname, dst_path) {
+                Ok(d) if skip > 1 => self.existing_change(e, dst_path, &d, same_sum),
+                _ => "",
+            };
+            self.out.note([rel, b" exists", why.as_bytes()].concat());
+        }
+        true
+    }
+
+    /// `--info=skip2`: how an entry `--ignore-existing` left alone differs from the source
+    /// (rsync's suffixes).
+    fn existing_change(&self, e: &DirEnt, dst_path: &Path, d: &Meta, same_sum: bool) -> &'static str {
+        let src = &e.meta;
+        if d.kind != src.kind {
+            return " (type change)";
+        }
+        let same_data = match src.kind {
+            Kind::File => crate::diff::same_data(src, d, &self.rules, same_sum),
+            Kind::Symlink => fs::read_link(dst_path).is_ok_and(|t| Some(t.as_os_str().as_bytes()) == e.link.as_deref()),
+            _ => d.rdev == src.rdev,
+        };
+        if !same_data {
+            return if self.opts.checksum && src.kind == Kind::File { " (sum change)" } else { " (file change)" };
+        }
+        let a = self.rules.attrs_differ(src, d);
+        let x = Src { kind: src.kind, meta: src, extra: e.extra.as_deref(), from: XSource::Full(&[]) };
+        let (xattr, acl) = self.extra_change(&x, dst_path, d).0;
+        if a.mtime || a.owner || (a.mode && src.kind != Kind::Symlink) || xattr || acl { " (attr change)" } else { " (uptodate)" }
+    }
+
+    /// A symlink without `-l`, or a device or special file without `-D`.
+    fn non_regular(&self, rel: &[u8]) {
+        if self.out.levels().nonreg > 0 {
+            self.out.note([b"skipping non-regular file \"", quoted(rel), b"\""].concat());
+        }
     }
 
     /// The source file's `-c` checksum: sent by the remote sender, or computed here.
@@ -1662,7 +1828,7 @@ impl<'a> Engine<'a> {
             Some(p) if kept_link.is_none() => self.extra_change(&x, &dst_path, p),
             _ => ((false, false), None),
         };
-        self.report_dir(&rel, &meta, pre.as_ref(), ext);
+        self.report_dir(&rel, &meta, pre.as_ref(), ext, (&src_path, Some((ctx.wire_dir, idx))));
         if is_new {
             Stats::add(&self.stats.created, 1);
             if !self.dry() {
@@ -1689,14 +1855,19 @@ impl<'a> Engine<'a> {
                 self.err(path_msg("set_xattr/set_acl \"", &dst_path, format!("\" failed: {e}")));
             }
         }
-        let root_dev = src_dev.unwrap_or(meta.dev);
+        let name = src_path.file_name().unwrap_or_default();
+        let root_dev = select::root_dev(sel, name.as_bytes(), meta.dev, src_dev);
         let more = match ctx.sources {
-            Some(src) if descend != Descend::No => {
-                src.also_dirs(idx, src_path.file_name().unwrap_or_default(), self.opts.recursive, self.opts.one_file_system)
-            }
+            Some(src) if descend != Descend::No => src.also_dirs(idx, name, self.opts.recursive, self.opts.one_file_system),
             _ => Vec::new(),
         };
-        let job = DirJob {
+        // -x: a top directory (for any source that has it, when several merge) starts
+        // from its own device.
+        let top = match ctx.sources {
+            Some(src) => src.top(idx, name, self.opts.recursive),
+            None => select::top_dir(sel, name.as_bytes(), self.opts.recursive),
+        };
+        let mut job = DirJob {
             src: src_path,
             dst: dst_path,
             rel,
@@ -1705,6 +1876,7 @@ impl<'a> Engine<'a> {
             depth: ctx.depth + 1,
             dst_is_new: is_new,
             root_dev: Some(root_dev),
+            dst_dev: ctx.dst_dev.filter(|_| !top).or(pre.map(|p| p.dev)),
             src_meta: meta,
             pre,
             sel: match descend {
@@ -1714,14 +1886,20 @@ impl<'a> Engine<'a> {
             more,
             rules: Rules { src: ctx.src_rules(idx).clone(), dst: ctx.rules.dst.clone() },
         };
-        if descend == Descend::No {
-            // -d: the directory itself, without its contents.
+        // -x: a directory on another filesystem than its transfer root (a mount point) is
+        // created, but nothing in it is synced, unless later sources have it on their own
+        // filesystem: then they alone fill it, as rsync's receiver merges their
+        // FLAG_CONTENT_DIR. A remote sender decides, and marks the ones it doesn't list.
+        let mount = match &self.remote {
+            Some(r) => r.mount(ctx.wire_dir, idx),
+            None => self.opts.one_file_system && meta.dev != root_dev && !job.next_source(),
+        };
+        if descend == Descend::No || mount {
+            // -d, or a mount point: the directory itself, without its contents.
             self.push_fixup(&job, false);
         } else if let Some(r) = &self.remote {
-            // The sender applies -x itself; the listing arrives as its own batch.
+            // Its listing arrives as its own batch.
             r.expect_dir(s, self, job);
-        } else if self.opts.one_file_system && meta.dev != root_dev {
-            self.push_fixup(&job, false);
         } else if let Some(p) = &self.pipeline {
             p.expect_dir(s, self, job);
         } else {
@@ -1734,6 +1912,7 @@ impl<'a> Engine<'a> {
     fn handle_symlink(
         &self,
         root: u16,
+        at: Option<(u32, u32)>,
         e: &DirEnt,
         from: XSource,
         rel: &[u8],
@@ -1759,7 +1938,7 @@ impl<'a> Engine<'a> {
                     let change = d.map(|d| self.attr_change(meta, &d, false)).unwrap_or_default();
                     // Symlink permissions aren't synced.
                     let change = Change { perms: false, xattr, ..change };
-                    self.out.item(rel, Kind::Symlink, Link::Sym(target.as_os_str().as_bytes()), change, false);
+                    self.out.item(&Item::new(rel, meta, change).link(Link::Sym(target.as_os_str().as_bytes())).from(src_path, at));
                     if !self.dry()
                         && let Some(d) = d
                     {
@@ -1785,7 +1964,7 @@ impl<'a> Engine<'a> {
                 }
             }
             Some(Kind::Dir) if !self.remove_conflicting_dir(dst_path, rel, rules, "symlink") => return false,
-            None if self.alt_symlink(rel, target.as_os_str().as_bytes(), dst_path) => {
+            None if self.alt_symlink(&Item::new(rel, meta, Change::default()).from(src_path, at), target.as_os_str().as_bytes(), dst_path) => {
                 self.source_done(root, src_path, dst_path, rel, meta);
                 return true;
             }
@@ -1802,7 +1981,7 @@ impl<'a> Engine<'a> {
             },
             _ => Change::new_local(),
         };
-        self.out.item(rel, Kind::Symlink, Link::Sym(target.as_os_str().as_bytes()), change, true);
+        self.out.item(&Item::new(rel, meta, change).link(Link::Sym(target.as_os_str().as_bytes())).from(src_path, at));
         if dst_kind.is_none() {
             Stats::add(&self.stats.created, 1);
         }
@@ -1842,7 +2021,7 @@ impl<'a> Engine<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_special(&self, root: u16, x: &Src, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>, rules: &DirRules) -> bool {
+    fn handle_special(&self, root: u16, at: Option<(u32, u32)>, x: &Src, rel: &[u8], src_path: &Path, dst_path: &Path, dst_kind: Option<Kind>, rules: &DirRules) -> bool {
         let meta = x.meta;
         match dst_kind {
             Some(k) if k == meta.kind => {
@@ -1852,7 +2031,7 @@ impl<'a> Engine<'a> {
                     let ((xattr, acl), have) = self.extra_change(x, dst_path, &d);
                     let mut change = Change { xattr, acl, ..self.attr_change(meta, &d, false) };
                     change.perms = self.perms_shown(meta, &d, change.perms, acl);
-                    self.out.item(rel, meta.kind, Link::None, change, false);
+                    self.out.item(&Item::new(rel, meta, change).from(src_path, at));
                     let a = AttrDiff { xattr, acl, ..self.rules.attrs_differ(meta, &d) };
                     if !a.any() || self.dry() || self.fix_attrs(dst_path, x, a, have) {
                         self.source_done(root, src_path, dst_path, rel, meta);
@@ -1865,7 +2044,7 @@ impl<'a> Engine<'a> {
             }
             _ => {}
         }
-        self.out.item(rel, meta.kind, Link::None, Change::new_local(), true);
+        self.out.item(&Item::new(rel, meta, Change::new_local()).from(src_path, at));
         Stats::add(&self.stats.created, 1);
         if self.dry() {
             return true;
@@ -1952,7 +2131,9 @@ impl<'a> Engine<'a> {
     // -----------------------------------------------------------------------
 
     /// Report a file that is about to be (re)written: the item line and the counters.
-    pub(crate) fn note_transfer(&self, job: &FileJob) {
+    /// With `%b` (see [`Output::after`]) the line waits for the file's data: then its
+    /// change is returned, for [`Engine::report_transfer`].
+    pub(crate) fn note_transfer(&self, job: &FileJob) -> Option<Change> {
         // With -c, rsync marks a rewritten file's checksum as changed (`>fc`).
         let change = match job.dst_meta.filter(|d| d.kind == Kind::File).or(job.alt) {
             Some(d) => {
@@ -1973,12 +2154,26 @@ impl<'a> Engine<'a> {
             }
             None => Change { new: true, transfer: true, ..Change::default() },
         };
-        self.out.item(&job.rel, Kind::File, Link::None, change, true);
         crate::progress::planned(job.meta.size);
         Stats::add(&self.stats.transferred, 1);
         Stats::add(&self.stats.transferred_bytes, job.meta.size);
         if job.dst_meta.is_none() {
             Stats::add(&self.stats.created, 1);
+        }
+        // A dry run sends nothing: rsync shows 0 then.
+        if self.out.after() && !self.dry() {
+            return Some(change);
+        }
+        self.report_transfer(job, Some(change), 0);
+        None
+    }
+
+    /// The item line of a file being written (`change`, if it is to be reported now),
+    /// `bytes` of its data sent.
+    pub(crate) fn report_transfer(&self, job: &FileJob, change: Option<Change>, bytes: u64) {
+        if let Some(change) = change {
+            let at = Some((job.wire_dir, job.idx));
+            self.out.item(&Item::new(&job.rel, &job.meta, change).from(&job.src_path, at).bytes(bytes));
         }
     }
 
@@ -1996,12 +2191,13 @@ impl<'a> Engine<'a> {
         if fsops::interrupted() {
             return;
         }
-        self.note_transfer(job);
+        let deferred = self.note_transfer(job);
         if self.dry() {
             crate::progress::done(job.meta.size);
             return;
         }
         if !self.backup_existing_file(job) {
+            self.report_transfer(job, deferred, 0);
             crate::progress::done(job.meta.size);
             return;
         }
@@ -2010,13 +2206,17 @@ impl<'a> Engine<'a> {
         let (r, counted) = crate::progress::tracking(|| crate::bwlimit::paced(|| self.write_file(job)));
         crate::progress::done(job.meta.size.saturating_sub(counted));
         match r {
-            Ok(()) => self.file_written(job),
+            Ok(literal) => {
+                self.report_transfer(job, deferred, literal);
+                self.file_written(job)
+            }
             Err(e) if fsops::interrupted() => drop(e),
             Err(e) if e.get_ref().is_some_and(|e| e.is::<super::flags::Diminished>()) => self.diminished(&job.src_path),
             Err(e) if e.kind() == io::ErrorKind::NotFound && fsops::lstat(&job.src_path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) => {
                 self.vanished(&job.src_path)
             }
             Err(e) => {
+                self.report_transfer(job, deferred, 0);
                 let to = path_msg("\" -> \"", &job.dst_path, format!("\" failed: {e}"));
                 self.dst_err(path_msg("copy \"", &job.src_path, to));
             }
@@ -2030,7 +2230,9 @@ impl<'a> Engine<'a> {
         self.out.warning(path_msg("file has vanished: \"", &fsops::full_path(path), "\""));
     }
 
-    fn write_file(&self, job: &FileJob) -> io::Result<()> {
+    /// Write the file; returns the literal data it took (the whole file, or what a delta
+    /// didn't find in the old one).
+    fn write_file(&self, job: &FileJob) -> io::Result<u64> {
         let src = &job.meta;
         let (mode, uid, gid) = self.target_attrs(job);
 
@@ -2039,8 +2241,8 @@ impl<'a> Engine<'a> {
         }
         if self.delta_candidate(job) {
             match self.write_delta(job, mode, uid, gid) {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
+                Ok(Some(literal)) => return Ok(literal),
+                Ok(None) => {}
                 Err(e) if fsops::interrupted() => return Err(e),
                 // E.g. a file changed size while it was being hashed: send it whole.
                 Err(_) => {}
@@ -2066,7 +2268,7 @@ impl<'a> Engine<'a> {
             if self.opts.fsync {
                 fsops::fsync_path(&job.dst_path)?;
             }
-            return Ok(());
+            return Ok(src.size);
         }
 
         // A clone or an in-kernel copy can't be paced to --bwlimit.
@@ -2082,7 +2284,7 @@ impl<'a> Engine<'a> {
                 .copy_from(&src_file, &job.dst_path, src.size, allow_fast, mode)
                 .and_then(|copied| self.apply_new_file_attrs(&job.dst_path, copied, mode, uid, gid, mtime, Some(&job.src(false))))
                 .and_then(|()| fsops::check_interrupt());
-            return self.finish_or_keep(&job.dst_path, job, r);
+            return self.finish_or_keep(&job.dst_path, job, r).map(|()| src.size);
         }
         let (tmp, copied) = self.with_temp(&job.dst_path, |tmp| {
             // An interrupted copy is kept with --partial before the temp is discarded.
@@ -2096,7 +2298,7 @@ impl<'a> Engine<'a> {
             .apply_new_file_attrs(&tmp, copied, mode, uid, gid, mtime, Some(&job.src(false)))
             .and_then(|()| fsops::check_interrupt())
             .and_then(|()| self.place_file(&tmp, job));
-        self.finish_or_keep(&tmp, job, r)
+        self.finish_or_keep(&tmp, job, r).map(|()| src.size)
     }
 
     /// Delta transfer is opt-in locally (`--no-whole-file`), like rsync, and needs an
@@ -2108,13 +2310,14 @@ impl<'a> Engine<'a> {
     }
 
     /// Update `job.dst_path` from the old destination file plus the changed ranges of
-    /// the source. Returns `Ok(false)` when nothing matched (a whole-file copy is cheaper).
+    /// the source. Returns the literal data it took, or `None` when nothing matched (a
+    /// whole-file copy is cheaper).
     ///
     /// When matched ranges sit at the same offsets, the old file is cloned (APFS,
     /// btrfs, XFS) and only the changed ranges are written; otherwise the new file is
     /// rebuilt in parallel from both files. With `--inplace` and an in-place delta,
     /// the changed ranges are written straight into the destination.
-    fn write_delta(&self, job: &FileJob, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<bool> {
+    fn write_delta(&self, job: &FileJob, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<Option<u64>> {
         let new = fsops::open_listed(&job.src_path, &job.meta, self.opts.follows_listed())?;
         let basis = fs::File::open(job.basis_path())?;
         let basis_size = basis.metadata()?.len();
@@ -2123,7 +2326,7 @@ impl<'a> Engine<'a> {
             maps = match (cdc::Mapped::new(&new, job.meta.size), cdc::Mapped::new(&basis, basis_size)) {
                 (Ok(n), Ok(b)) => (n, b),
                 // Changed since it was listed: copy it whole instead.
-                (Err(e), _) | (_, Err(e)) if cdc::is_changed(&e) => return Ok(false),
+                (Err(e), _) | (_, Err(e)) if cdc::is_changed(&e) => return Ok(None),
                 (Err(e), _) | (_, Err(e)) => return Err(e),
             };
             (cdc::local_delta(maps.0.bytes(), maps.1.bytes(), &delta::Params::DEFAULT), &maps.0, &maps.1)
@@ -2132,7 +2335,7 @@ impl<'a> Engine<'a> {
             (delta::local_delta(&reads.0, job.meta.size, &reads.1, basis_size, &delta::Params::DEFAULT)?, &reads.0, &reads.1)
         };
         if d.matched_bytes() == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         Stats::add(&self.stats.delta_files, 1);
         Stats::add(&self.stats.literal_bytes, d.literal_bytes());
@@ -2144,7 +2347,7 @@ impl<'a> Engine<'a> {
             let out = fs::OpenOptions::new().write(true).open(&job.dst_path)?;
             apply(&d, basis_r, new_r, &out, true)?;
             self.finish_delta_file(&out, &job.meta, mode, uid, gid, Some((&job.dst_path, &job.src(false))))?;
-            return Ok(true);
+            return Ok(Some(d.literal_bytes()));
         }
 
         let want_clone = !self.opts.no_clone && d.in_place_bytes() > 0;
@@ -2166,7 +2369,7 @@ impl<'a> Engine<'a> {
             fsops::check_interrupt()?;
             self.place_file(&tmp, job)
         })();
-        finish_temp(&tmp, r).map(|()| true)
+        finish_temp(&tmp, r).map(|()| Some(d.literal_bytes()))
     }
 
     /// Attributes for a delta-built file. It may be a clone of the old file, which

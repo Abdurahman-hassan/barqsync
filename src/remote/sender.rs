@@ -21,7 +21,7 @@ use crate::exit;
 use crate::filter::{DirRules, Filter, Side};
 use crate::fsops;
 use crate::local::prune::{self, Prune};
-use crate::output::{Output, StatsSnapshot, path_msg};
+use crate::output::{ItemRec, Output, StatsSnapshot, path_msg};
 use crate::paths::{join_rel, split_source, wants_contents};
 use crate::proto::{self, Conn, Frame, FrameSender, Msg, NeedReq, RootInfo, Sig, SyncedFiles, file_id};
 use rayon::Scope;
@@ -68,12 +68,23 @@ struct Sender<'a> {
     failed: SendFailure,
     /// Files that were gone when they were to be sent (rsync's "file has vanished").
     vanished: AtomicU64,
+    /// The size of the regular files listed so far (rsync's "total size").
+    listed_size: AtomicU64,
     /// `-m`: which source directories have content.
     prune: Prune,
+    /// A push whose items show `%f`: each listing's source directories, and which one
+    /// each entry is from, to find where a reported item came from (see [`ItemRec`]).
+    sources: Option<Mutex<ListingSources>>,
+    /// The first `src/` root directory: where the transfer root itself is from.
+    root_dir: Option<PathBuf>,
 }
 
 /// `--remove-source-files`: (root, path) -> where the entry is and what it was.
 type Removable = HashMap<(u16, Vec<u8>), (PathBuf, Meta)>;
+
+/// Listing id -> its source directories, and for each entry the index of its own (empty:
+/// the first).
+type ListingSources = HashMap<u32, (Vec<PathBuf>, Vec<usize>)>;
 
 /// A top directory of the transfer root, with its listing when it is named items.
 type Top = (SrcDir, Option<Vec<DirEnt>>);
@@ -169,8 +180,11 @@ impl Sender<'_> {
     }
 
     /// Register a listing and send it. Registered first, so a quick `Need` finds it.
-    fn send_listing(&self, root: u16, rel: Vec<u8>, listing: Listing) {
+    /// `mounts`: its `-x` mount points (see `Msg::DirBatch`).
+    fn send_listing(&self, root: u16, rel: Vec<u8>, listing: Listing, mounts: Vec<u32>) {
         let sums = if self.opts.checksum { self.checksums(&listing) } else { Vec::new() };
+        let size: u64 = listing.entries.iter().filter(|e| e.meta.kind == Kind::File).map(|e| e.meta.size).sum();
+        self.listed_size.fetch_add(size, SeqCst);
         let dir = self.next_dir.fetch_add(1, SeqCst);
         if self.removes() {
             let mut removable = self.removable.lock().unwrap();
@@ -179,11 +193,15 @@ impl Sender<'_> {
             }
         }
         let entries = listing.entries.clone();
+        if let Some(sources) = &self.sources {
+            let dirs = listing.sources.dirs.iter().map(|d| d.path.clone()).collect();
+            sources.lock().unwrap().insert(dir, (dirs, listing.sources.origins().to_vec()));
+        }
         // Errors name the listing by its (first) source directory.
         let path = listing.sources.dirs.first().map(|d| d.path.clone()).unwrap_or_default();
         self.listings.lock().unwrap().insert(dir, listing);
         self.name_ids(entries.iter().map(|e| (&e.meta, e.extra.as_deref())));
-        self.send_for(Msg::DirBatch { root, dir, rel, entries, sums }, "the listing of \"", &path);
+        self.send_for(Msg::DirBatch { root, dir, rel, entries, sums, mounts }, "the listing of \"", &path);
     }
 
     /// `-c`: checksums of the listing's regular files, hashed in parallel.
@@ -265,19 +283,35 @@ impl Sender<'_> {
         let lists = dirs.iter().zip(lists).map(|(d, l)| l.into_iter().filter(|e| sends(d, e)).collect()).collect();
         let (entries, sources) = merge::merge(dirs, lists);
         let (recursive, one_fs) = (self.opts.recursive, self.opts.one_file_system);
+        let mut mounts = Vec::new();
         let subdirs: Vec<(Vec<u8>, Vec<SrcDir>)> = entries
             .iter()
             .enumerate()
             .filter_map(|(i, e)| {
                 let d = sources.dir_of(i as u32);
-                let dev = d.dev.unwrap_or(e.meta.dev);
-                let sub = self.descend_into(d.sel, e, dev)?;
-                let mut srcs = vec![SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev), rules: d.rules.clone() }];
-                srcs.extend(sources.also_dirs(i as u32, &e.name, recursive, one_fs));
+                let dev = select::root_dev(d.sel, e.name.as_bytes(), e.meta.dev, d.dev);
+                // -x: a mount point isn't listed from its root. Later sources that have the
+                // directory on their own filesystem fill it alone (rsync's receiver merges
+                // their FLAG_CONTENT_DIR); with none, its contents aren't sent, and the
+                // receiver is told so, since it can't tell from merged listings which root
+                // the directory is in.
+                let mount = one_fs && e.meta.kind == Kind::Dir && e.meta.dev != dev;
+                let Some(sub) = self.descend_into(d.sel, e) else {
+                    if mount {
+                        mounts.push(i as u32);
+                    }
+                    return None;
+                };
+                let own = (!mount).then(|| SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev), rules: d.rules.clone() });
+                let srcs: Vec<SrcDir> = own.into_iter().chain(sources.also_dirs(i as u32, &e.name, recursive, one_fs)).collect();
+                if srcs.is_empty() {
+                    mounts.push(i as u32);
+                    return None;
+                }
                 Some((join_rel(&rel, &e.name), srcs))
             })
             .collect();
-        self.send_listing(root, rel, Listing { entries, sources });
+        self.send_listing(root, rel, Listing { entries, sources }, mounts);
         for (crel, srcs) in subdirs {
             s.spawn(move |s| self.walk_dir(s, root, crel, srcs));
         }
@@ -291,10 +325,10 @@ impl Sender<'_> {
         self.listing(dir, rel, ents)
     }
 
-    /// Whether the listing of subdirectory `e` is sent (and with which selection). The
-    /// receiver makes the same decision with [`select::descend`].
-    fn descend_into(&self, sel: Option<&'static Sel>, e: &DirEnt, root_dev: u64) -> Option<Option<&'static Sel>> {
-        if e.meta.kind != Kind::Dir || (self.opts.one_file_system && e.meta.dev != root_dev) {
+    /// Whether the listing of subdirectory `e` is sent (unless `-x` stops at it), and with
+    /// which selection. The receiver makes the same decision with [`select::descend`].
+    fn descend_into(&self, sel: Option<&'static Sel>, e: &DirEnt) -> Option<Option<&'static Sel>> {
+        if e.meta.kind != Kind::Dir {
             return None;
         }
         match select::descend(sel, e.name.as_bytes(), self.opts.recursive) {
@@ -345,11 +379,28 @@ impl Sender<'_> {
                 continue;
             };
             match remove_source(self.opts, &path, &listed, None) {
-                Ok(()) if self.out.verbose() >= 2 => self.out.info([&b"sender removed "[..], &rel].concat()),
+                Ok(()) if self.out.levels().remove > 0 => self.out.note([&b"sender removed "[..], &rel].concat()),
                 Ok(()) => {}
                 Err(m) => self.err(m),
             }
         }
+    }
+
+    /// Where an item the remote receiver reported has its source here (`%f`): found by
+    /// its listing and index, the transfer root by `root_dir`.
+    fn item_source(&self, rec: &ItemRec) -> PathBuf {
+        let rel = Path::new(std::ffi::OsStr::from_bytes(&rec.rel));
+        let found = match rec.at {
+            None if rec.rel.is_empty() => self.root_dir.clone(),
+            None => None,
+            Some((dir, idx)) => self.sources.as_ref().and_then(|s| {
+                let sources = s.lock().unwrap();
+                let (dirs, origin) = sources.get(&dir)?;
+                let d = dirs.get(origin.get(idx as usize).copied().unwrap_or(0))?;
+                Some(d.join(rel.file_name()?))
+            }),
+        };
+        found.unwrap_or_else(|| rel.to_path_buf())
     }
 
     /// Send `SenderDone` once the scan is finished and every listing has been answered.
@@ -833,16 +884,17 @@ fn root_extra(opts: &Options, r: &Rules, path: &Path, meta: &Meta, err: &mut dyn
         .flatten()
 }
 
-/// Run the sending side until the receiver reports completion. Returns the exit code
-/// and the receiver's counters (when it got that far). `report_removals`: end with
-/// `RemovalsDone` (see [`super::reports_removals`]).
-pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, report_removals: bool) -> (i32, Option<StatsSnapshot>) {
+/// Run the sending side until the receiver reports completion. Returns the exit code,
+/// the receiver's counters (when it got that far) and the size of the regular files
+/// listed (rsync's total size, which a failed run still logs). `report_removals`: end
+/// with `RemovalsDone` (see [`super::reports_removals`]).
+pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, report_removals: bool) -> (i32, Option<StatsSnapshot>, u64) {
     let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
         Err(e) => {
             out.error(format!("{e:#}"));
             let _ = conn.msg(Msg::Fatal { msg: format!("{e:#}") });
-            return (exit::SYNTAX, None);
+            return (exit::SYNTAX, None, 0);
         }
     };
     let errors = AtomicU64::new(0);
@@ -850,15 +902,15 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         let msg = "--files-from takes exactly one source directory".to_string();
         out.error(&msg);
         let _ = conn.msg(Msg::Fatal { msg });
-        return (exit::SYNTAX, None);
+        return (exit::SYNTAX, None, 0);
     }
     if opts.strategy == Strategy::Adaptive && opts.whole_file.is_none() {
         match adapt::probe(conn, out) {
             Ok(link) => conn.out.set_link(link),
-            Err(Stop::Interrupted) => return (exit::SIGNAL, None),
+            Err(Stop::Interrupted) => return (exit::SIGNAL, None, 0),
             Err(Stop::Io(e)) => {
                 out.error(format!("link probe failed: {e}"));
-                return (exit::PROTOCOL, None);
+                return (exit::PROTOCOL, None, 0);
             }
         }
     }
@@ -885,7 +937,10 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         io_error: Mutex::new(false),
         failed: SendFailure::default(),
         vanished,
+        listed_size: AtomicU64::new(0),
         prune,
+        sources: out.uses(b'f').then(|| Mutex::new(HashMap::new())),
+        root_dir: roots.iter().find(|r| r.info.contents).map(|r| r.base.clone()),
     };
     // Every error so far was about reading a source root.
     if sender.errors.load(SeqCst) > 0 {
@@ -909,7 +964,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         Ok(p) => p,
         Err(e) => {
             out.error(format!("failed to start worker threads: {e}"));
-            return (exit::IPC, None);
+            return (exit::IPC, None, 0);
         }
     };
     let sender = &sender;
@@ -945,6 +1000,8 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
                     break Ok(stats);
                 }
                 Ok(Frame::Msg(Msg::Log { stderr, escape, text })) => out.print_forwarded(stderr, escape, &text),
+                Ok(Frame::Msg(Msg::Item(rec))) => out.peer_item(&rec, &sender.item_source(&rec)),
+                Ok(Frame::Msg(Msg::Deleted { rel, dir })) => out.deleting(&rel, dir, 0),
                 Ok(Frame::Msg(Msg::Fatal { msg })) => {
                     out.error(format!("remote: {msg}"));
                     break Err(exit::PROTOCOL);
@@ -974,6 +1031,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         }
         r
     });
+    let listed = sender.listed_size.load(SeqCst);
     match result {
         Ok(stats) => {
             // The scope has waited for the removals; their output went out before this.
@@ -984,8 +1042,8 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
             }
             // The receiver's counters include what this side said in `SenderDone`.
             let code = if sender.errors.load(SeqCst) > 0 { exit::PARTIAL } else { stats.exit_code() };
-            (code, Some(stats))
+            (code, Some(stats), listed)
         }
-        Err(code) => (code, None),
+        Err(code) => (code, None, listed),
     }
 }

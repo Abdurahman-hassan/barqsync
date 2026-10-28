@@ -56,7 +56,9 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
 ///     `Synced` names entries only; `IoError` (source read errors stop deletions).
 /// 11: `--filter`/`-F`/`-C` rules, `--max-delete`, `-m`, `--mkpath` and `--timeout` in the
-///     options; `KeepAlive`; vanished files and stopped deletions in the counters. Also
+///     options; `KeepAlive`; vanished files and stopped deletions in the counters; `-x`
+///     mount points in `DirBatch`; `--info` levels in the options; a push's items and
+///     deletions as `Item` and `Deleted` records for the client to format. Also
 ///     `--bwlimit`, `--usermap`/`--groupmap` (`--chown`) and `--append(-verify)` in the
 ///     options, `Sig::Append`, and id 0's name in `IdNames`; `-T`, `--delay-updates`,
 ///     `--force`, `--ignore-errors`, the missing-args options and the symlink options in
@@ -196,11 +198,21 @@ pub enum Msg {
     /// Output produced on the server, printed by the client. `escape`: the text may
     /// contain file names and is escaped with the client's charset before printing.
     Log { stderr: bool, escape: bool, text: Vec<u8> },
+    /// Receiver (server) → sending client: an item to show, which the client formats
+    /// as rsync's sender does (`--out-format`, `-i`, `-v`).
+    Item(Box<crate::output::ItemRec>),
+    /// Receiver (server) → sending client: an entry deleted (`dir`: a directory).
+    Deleted { rel: Vec<u8>, dir: bool },
 
     // sender → receiver
     Roots(Vec<RootInfo>),
     /// `-c`: `sums[i]` is the checksum of regular file `entries[i]` (empty otherwise).
-    DirBatch { root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt>, sums: Vec<Option<Sum>> },
+    /// `-x`: `mounts` are the directories among `entries` (indices, ascending) on another
+    /// filesystem than their transfer root (mount points) that no later source merging
+    /// into them fills. They are created, but their contents are not sent: no listing
+    /// follows for them, and nothing in them is deleted (rsync's directories without
+    /// `FLAG_CONTENT_DIR`).
+    DirBatch { root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt>, sums: Vec<Option<Sum>>, mounts: Vec<u32> },
     /// User and group names for ids in the listings that follow (no `--numeric-ids`).
     IdNames { users: Names, groups: Names },
     ScanDone { dirs: u32 },
@@ -1335,7 +1347,7 @@ mod tests {
         vec![
             Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender: false, opts: Box::new(opts) },
             Msg::Roots(vec![RootInfo { contents: true, meta: Some(meta), items: Vec::new(), sel: Some(sel), extra: Some(Box::new(extra)) }]),
-            Msg::DirBatch { root: 1, dir: 2, rel: b"x/y".to_vec(), entries: vec![ent, plain, mac_ent], sums: vec![Some([1; 16])] },
+            Msg::DirBatch { root: 1, dir: 2, rel: b"x/y".to_vec(), entries: vec![ent, plain, mac_ent], sums: vec![Some([1; 16])], mounts: vec![1] },
             Msg::Need { dir: 2, files: vec![NeedReq { idx: 0, sig: Some(Sig::Cdc(sig)) }], xattrs: vec![1, 5] },
             Msg::Need { dir: 3, files: vec![NeedReq { idx: 1, sig: Some(Sig::Chunks(chunks)) }], xattrs: Vec::new() },
             Msg::Refine { id: file_id(3, 1), grain: Grain::of(&p), gaps: reqs },
