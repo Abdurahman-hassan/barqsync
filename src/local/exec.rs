@@ -987,7 +987,7 @@ impl<'a> Engine<'a> {
     fn defer_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>, dst_rules: &DirRules, dev: Option<u64>) -> bool {
         let src_names: HashSet<&OsStr> = entries.iter().map(|(_, e, _)| e.name.as_os_str()).collect();
         // rsync's --info=mount (on with -vv) names each mount point here, listed or not.
-        let mounts = dev.is_some() && self.out.verbose() > 1;
+        let mounts = dev.is_some() && self.out.levels().mount > 0;
         let extra: Vec<&OsString> = dst_map
             .iter()
             .filter(|(n, k)| !src_names.contains(n.as_os_str()) || (mounts && **k == Kind::Dir))

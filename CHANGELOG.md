@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `--info=mount` is accepted: with `-x` and `--delete` it shows rsync's "cannot delete
+  mount point: X" for each mount point in a destination directory, as `-vv` already did,
+  and `--info=mount0` turns that off. 0.5.0 refused it (exit 1).
+
 ## 0.5.0 - 2026-10-28
 
 ### Compatibility
