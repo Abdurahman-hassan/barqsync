@@ -169,7 +169,8 @@ impl Sender<'_> {
     }
 
     /// Register a listing and send it. Registered first, so a quick `Need` finds it.
-    fn send_listing(&self, root: u16, rel: Vec<u8>, listing: Listing) {
+    /// `mounts`: its `-x` mount points (see `Msg::DirBatch`).
+    fn send_listing(&self, root: u16, rel: Vec<u8>, listing: Listing, mounts: Vec<u32>) {
         let sums = if self.opts.checksum { self.checksums(&listing) } else { Vec::new() };
         let dir = self.next_dir.fetch_add(1, SeqCst);
         if self.removes() {
@@ -183,7 +184,7 @@ impl Sender<'_> {
         let path = listing.sources.dirs.first().map(|d| d.path.clone()).unwrap_or_default();
         self.listings.lock().unwrap().insert(dir, listing);
         self.name_ids(entries.iter().map(|e| (&e.meta, e.extra.as_deref())));
-        self.send_for(Msg::DirBatch { root, dir, rel, entries, sums }, "the listing of \"", &path);
+        self.send_for(Msg::DirBatch { root, dir, rel, entries, sums, mounts }, "the listing of \"", &path);
     }
 
     /// `-c`: checksums of the listing's regular files, hashed in parallel.
@@ -265,19 +266,26 @@ impl Sender<'_> {
         let lists = dirs.iter().zip(lists).map(|(d, l)| l.into_iter().filter(|e| sends(d, e)).collect()).collect();
         let (entries, sources) = merge::merge(dirs, lists);
         let (recursive, one_fs) = (self.opts.recursive, self.opts.one_file_system);
+        let mut mounts = Vec::new();
         let subdirs: Vec<(Vec<u8>, Vec<SrcDir>)> = entries
             .iter()
             .enumerate()
             .filter_map(|(i, e)| {
                 let d = sources.dir_of(i as u32);
                 let dev = d.dev.unwrap_or(e.meta.dev);
-                let sub = self.descend_into(d.sel, e, dev)?;
+                if one_fs && e.meta.kind == Kind::Dir && e.meta.dev != dev {
+                    // -x: a mount point. Its contents aren't sent, and the receiver is told
+                    // so, since it can't tell from merged listings which root it is in.
+                    mounts.push(i as u32);
+                    return None;
+                }
+                let sub = self.descend_into(d.sel, e)?;
                 let mut srcs = vec![SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev), rules: d.rules.clone() }];
                 srcs.extend(sources.also_dirs(i as u32, &e.name, recursive, one_fs));
                 Some((join_rel(&rel, &e.name), srcs))
             })
             .collect();
-        self.send_listing(root, rel, Listing { entries, sources });
+        self.send_listing(root, rel, Listing { entries, sources }, mounts);
         for (crel, srcs) in subdirs {
             s.spawn(move |s| self.walk_dir(s, root, crel, srcs));
         }
@@ -292,10 +300,10 @@ impl Sender<'_> {
         self.listing(dir, ents)
     }
 
-    /// Whether the listing of subdirectory `e` is sent (and with which selection). The
-    /// receiver makes the same decision with [`select::descend`].
-    fn descend_into(&self, sel: Option<&'static Sel>, e: &DirEnt, root_dev: u64) -> Option<Option<&'static Sel>> {
-        if e.meta.kind != Kind::Dir || (self.opts.one_file_system && e.meta.dev != root_dev) {
+    /// Whether the listing of subdirectory `e` (not a `-x` mount point) is sent, and with
+    /// which selection. The receiver makes the same decision with [`select::descend`].
+    fn descend_into(&self, sel: Option<&'static Sel>, e: &DirEnt) -> Option<Option<&'static Sel>> {
+        if e.meta.kind != Kind::Dir {
             return None;
         }
         match select::descend(sel, e.name.as_bytes(), self.opts.recursive) {

@@ -56,7 +56,8 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
 ///     `Synced` names entries only; `IoError` (source read errors stop deletions).
 /// 11: `--filter`/`-F`/`-C` rules, `--max-delete`, `-m`, `--mkpath` and `--timeout` in the
-///     options; `KeepAlive`; vanished files and stopped deletions in the counters.
+///     options; `KeepAlive`; vanished files and stopped deletions in the counters; `-x`
+///     mount points in `DirBatch`.
 pub const VERSION: u32 = 11;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.
@@ -171,7 +172,11 @@ pub enum Msg {
     // sender → receiver
     Roots(Vec<RootInfo>),
     /// `-c`: `sums[i]` is the checksum of regular file `entries[i]` (empty otherwise).
-    DirBatch { root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt>, sums: Vec<Option<Sum>> },
+    /// `-x`: `mounts` are the directories among `entries` (indices, ascending) on another
+    /// filesystem than their transfer root. They are created, but their contents are not
+    /// sent: no listing follows for them, and nothing in them is deleted (rsync's
+    /// directories without `FLAG_CONTENT_DIR`).
+    DirBatch { root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt>, sums: Vec<Option<Sum>>, mounts: Vec<u32> },
     /// User and group names for ids in the listings that follow (no `--numeric-ids`).
     IdNames { users: Names, groups: Names },
     ScanDone { dirs: u32 },
@@ -1280,7 +1285,7 @@ mod tests {
         vec![
             Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender: false, opts: Box::new(opts) },
             Msg::Roots(vec![RootInfo { contents: true, meta: Some(meta), items: Vec::new(), sel: Some(sel), extra: Some(Box::new(extra)) }]),
-            Msg::DirBatch { root: 1, dir: 2, rel: b"x/y".to_vec(), entries: vec![ent, plain, mac_ent], sums: vec![Some([1; 16])] },
+            Msg::DirBatch { root: 1, dir: 2, rel: b"x/y".to_vec(), entries: vec![ent, plain, mac_ent], sums: vec![Some([1; 16])], mounts: vec![1] },
             Msg::Need { dir: 2, files: vec![NeedReq { idx: 0, sig: Some(Sig::Cdc(sig)) }], xattrs: vec![1, 5] },
             Msg::Need { dir: 3, files: vec![NeedReq { idx: 1, sig: Some(Sig::Chunks(chunks)) }], xattrs: Vec::new() },
             Msg::Refine { id: file_id(3, 1), grain: Grain::of(&p), gaps: reqs },
