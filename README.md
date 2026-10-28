@@ -147,7 +147,7 @@ Every option, and where barqsync differs from rsync:
 ## Good to know
 
 - **macOS and Linux only.**
-- **Upgrade both machines to 0.5.0.** It runs most remaining everyday rsync command
+- **Upgrade both machines to 0.5.1.** The 0.5.x line runs most remaining everyday rsync command
   lines (`--bwlimit`, `--chown`, `--append`, `-T`, `--delay-updates`, `--log-file`,
   `--out-format` escapes, `--info`, `-E`/`-U`/`-N` and more), deletes nothing after a
   file fails to be written, and hardens remote transfers against hostile peers. See
