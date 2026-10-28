@@ -440,6 +440,12 @@ const TEMP_SUFFIX_LEN: usize = 7; // ".XXXXXX"
 /// `.<name>.XXXXXX` in the same directory, truncated to fit NAME_MAX. Works on raw
 /// bytes so non-UTF-8 names never collapse onto a shared temp name.
 pub fn temp_name(final_name: &OsStr) -> OsString {
+    temp_name_with(final_name, true)
+}
+
+/// [`temp_name`], without the leading `.` when `dot` is false (a `-T` directory's temp
+/// files, as rsync names them there).
+pub fn temp_name_with(final_name: &OsStr, dot: bool) -> OsString {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut name = final_name.as_bytes();
     let budget = MAX_NAME - 1 - TEMP_SUFFIX_LEN;
@@ -453,7 +459,9 @@ pub fn temp_name(final_name: &OsStr) -> OsString {
         name = &name[..cut];
     }
     let mut out = Vec::with_capacity(1 + name.len() + TEMP_SUFFIX_LEN);
-    out.push(b'.');
+    if dot {
+        out.push(b'.');
+    }
     out.extend_from_slice(name);
     out.push(b'.');
     let mut r = next_rand();
@@ -471,10 +479,20 @@ use std::os::unix::ffi::OsStringExt;
 pub fn with_temp<T>(
     dir: &Path,
     final_name: &OsStr,
+    create: impl FnMut(&Path) -> io::Result<T>,
+) -> io::Result<(PathBuf, T)> {
+    with_temp_in(dir, final_name, true, create)
+}
+
+/// [`with_temp`], the names without their leading `.` when `dot` is false.
+pub fn with_temp_in<T>(
+    dir: &Path,
+    final_name: &OsStr,
+    dot: bool,
     mut create: impl FnMut(&Path) -> io::Result<T>,
 ) -> io::Result<(PathBuf, T)> {
     for _ in 0..64 {
-        let tmp = dir.join(temp_name(final_name));
+        let tmp = dir.join(temp_name_with(final_name, dot));
         register_temp(&tmp);
         match create(&tmp) {
             Ok(v) => return Ok((tmp, v)),
@@ -493,6 +511,52 @@ pub fn with_temp<T>(
 pub fn drop_temp(tmp: &Path) {
     let _ = fs::remove_file(tmp);
     unregister_temp(tmp);
+}
+
+/// Rename `from` to `to`. Across filesystems (a `-T` directory on another one) that
+/// can't work, so, as rsync does, the data is copied instead ([`copy_into_place`]) and
+/// `from` removed. Returns the copy, still open, when it was made: it then needs its
+/// attributes again.
+pub fn rename_or_copy(from: &Path, to: &Path) -> io::Result<Option<File>> {
+    match fs::rename(from, to) {
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            let out = copy_into_place(from, to)?;
+            fs::remove_file(from)?;
+            Ok(Some(out))
+        }
+        r => r.map(|()| None),
+    }
+}
+
+/// Copy file `from` to `to`, on another filesystem: into a new file next to `to`, which
+/// then takes its place, so what was at `to` (a symlink, or a file with other names) is
+/// replaced, never written through, as rsync unlinks it before it copies. The copy is
+/// returned open, so its attributes can be set whatever its mode allows this user.
+fn copy_into_place(from: &Path, to: &Path) -> io::Result<File> {
+    use std::os::unix::fs::PermissionsExt;
+    let src = match File::open(from) {
+        // A temp file of ours that got an existing file's mode, one its owner can't read
+        // (0200): it goes once copied, so let it be read.
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            let mode = fs::symlink_metadata(from)?.permissions().mode();
+            fs::set_permissions(from, fs::Permissions::from_mode(mode | 0o400))?;
+            File::open(from)?
+        }
+        r => r?,
+    };
+    let md = src.metadata()?;
+    let dir = to.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let (tmp, out) = with_temp(dir, to.file_name().unwrap_or_default(), |tmp| create_new(tmp, md.permissions().mode()))?;
+    match copy_buffered(&src, &out, md.len()).and_then(|_| fs::rename(&tmp, to)) {
+        Ok(()) => {
+            unregister_temp(&tmp);
+            Ok(out)
+        }
+        Err(e) => {
+            drop_temp(&tmp);
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -798,6 +862,39 @@ mod tests {
         for (a, b) in fast.iter().zip(&plain) {
             assert_eq!((&a.name, &a.meta, &a.link), (&b.name, &b.meta, &b.link));
         }
+    }
+
+    /// A copy across filesystems replaces what is at the destination: a symlink's target
+    /// and a hard link's other names are left alone, a read-only copy still takes its
+    /// attributes through the descriptor returned, and a file its owner can't read (an
+    /// existing file's mode kept) is still copied.
+    #[test]
+    fn copies_into_place_replace_links() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("outside"), "keep").unwrap();
+        fs::write(d.join("new"), "new data").unwrap();
+        fs::set_permissions(d.join("new"), fs::Permissions::from_mode(0o444)).unwrap();
+        std::os::unix::fs::symlink(d.join("outside"), d.join("link")).unwrap();
+        fs::write(d.join("old"), "old").unwrap();
+        fs::hard_link(d.join("old"), d.join("backup")).unwrap();
+        for to in ["link", "old", "fresh", "unreadable"] {
+            if to == "unreadable" {
+                fs::set_permissions(d.join("new"), fs::Permissions::from_mode(0o200)).unwrap();
+            }
+            let f = copy_into_place(&d.join("new"), &d.join(to)).unwrap();
+            fchmod(&f, 0o400).unwrap();
+            set_fd_mtime(&f, 1_600_000_000, 0).unwrap();
+            let m = fs::symlink_metadata(d.join(to)).unwrap();
+            assert!(m.is_file() && m.permissions().mode() & 0o777 == 0o400, "{to}");
+            assert_eq!(m.mtime(), 1_600_000_000, "{to}");
+            assert_eq!(fs::read(d.join(to)).unwrap(), b"new data", "{to}");
+        }
+        assert_eq!(fs::read(d.join("outside")).unwrap(), b"keep");
+        assert_eq!(fs::read(d.join("backup")).unwrap(), b"old");
+        let left: Vec<_> = fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n.as_bytes().starts_with(b".")).collect();
+        assert!(left.is_empty(), "temp files left: {left:?}");
     }
 
     #[test]

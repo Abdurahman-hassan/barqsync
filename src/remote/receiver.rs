@@ -469,6 +469,7 @@ impl RemoteState {
                 entries.iter_mut().for_each(|e| ids.apply(&mut e.meta));
             }
         }
+        munge(eng.opts, &mut entries);
         if eng.extras_on() {
             let ids = self.ids.lock().unwrap();
             for e in &mut entries {
@@ -621,8 +622,7 @@ impl RemoteState {
                 }
             };
         }
-        let (dir, name) = split_dst(&job.dst_path);
-        let (tmp, f) = fsops::with_temp(dir, name, |t| fsops::create_new(t, mode))?;
+        let (tmp, f) = eng.with_temp(&job.dst_path, |t| fsops::create_new(t, mode))?;
         Ok((f, tmp, true, true, true))
     }
 
@@ -708,8 +708,7 @@ impl RemoteState {
             (f, job.dst_path.clone(), false, false, true)
         } else {
             let want_clone = !eng.opts.no_clone && d.in_place_bytes() > 0;
-            let (dir, name) = split_dst(&job.dst_path);
-            let (tmp, cloned) = fsops::with_temp(dir, name, |t| {
+            let (tmp, cloned) = eng.with_temp(&job.dst_path, |t| {
                 if want_clone && fsops::clone_into_new(&basis, t)? {
                     return Ok(true);
                 }
@@ -871,7 +870,7 @@ impl RemoteState {
         }
         fsops::check_interrupt()?;
         if rename {
-            fs::rename(path, &job.dst_path)?;
+            eng.place_file(path, job)?;
         }
         Ok(())
     }
@@ -942,8 +941,7 @@ impl RemoteState {
                         continue;
                     }
                     Stats::add(&eng.stats.literal_bytes, len as u64);
-                    let (dir, name) = split_dst(&job.dst_path);
-                    let tmp = dir.join(fsops::temp_name(name));
+                    let tmp = eng.temp_path(&job.dst_path);
                     fsops::register_temp(&tmp);
                     jobs.push((job, bytes, tmp));
                 }
@@ -987,7 +985,7 @@ impl RemoteState {
         }
         let _ = uring::close_all(fds);
         for (job, tmp, r) in done {
-            let r = r.and_then(|()| fsops::check_interrupt()).and_then(|()| fs::rename(&tmp, &job.dst_path));
+            let r = r.and_then(|()| fsops::check_interrupt()).and_then(|()| eng.place_file(&tmp, &job));
             match finish_temp(&tmp, r) {
                 Ok(()) => eng.file_written(&job),
                 Err(e) => report(&job.dst_path, e),
@@ -1029,6 +1027,17 @@ impl RemoteState {
                 fsops::drop_temp(&inc.path);
             }
         }
+    }
+}
+
+/// `--munge-links` on the receiving side: a received symlink's target gets
+/// `/rsyncd-munged/` in front, so it leads nowhere (rsync's `receive_file_entry`).
+fn munge(opts: &Options, ents: &mut [DirEnt]) {
+    if !opts.munge_links {
+        return;
+    }
+    for t in ents.iter_mut().filter(|e| e.meta.kind == Kind::Symlink).filter_map(|e| e.link.as_mut()) {
+        t.splice(0..0, crate::local::flags::MUNGED.iter().copied());
     }
 }
 
@@ -1208,7 +1217,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         }
     };
     // Before anything is written: the roots decide where everything goes.
-    if let Err(e) = check::roots(&roots) {
+    if let Err(e) = check::roots(&roots).and_then(|()| check::missing(roots.iter().flat_map(|r| &r.items), opts)) {
         return fail(exit::PROTOCOL, format!("protocol error: {e}"));
     }
     let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
@@ -1218,6 +1227,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     for root in &mut roots {
         root.meta.iter_mut().for_each(|m| ids.apply(m));
         root.items.iter_mut().for_each(|e| ids.apply(&mut e.meta));
+        munge(opts, &mut root.items);
     }
     let mut engine = Engine::new(opts, filter, out);
     if io_error {
@@ -1237,6 +1247,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             return (code, StatsSnapshot::default(), false);
         }
     };
+    if let Err(code) = engine.check_temp_dir() {
+        let _ = conn.msg(Msg::Fatal { msg: "the receiver's temp-dir is not usable".into() });
+        return (code, StatsSnapshot::default(), false);
+    }
     let mut state = RemoteState::new(conn.out.clone(), opts, ids);
     // Adaptive strategy: route by the measured link unless -W / --no-whole-file decided.
     state.link = link.filter(|_| opts.strategy == Strategy::Adaptive && opts.whole_file.is_none());
@@ -1300,7 +1314,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             let r = match frame {
                 Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
                 Frame::Msg(m) => match m {
-                    Msg::DirBatch { root, dir, rel, entries, sums, mounts } => match listings.take(root, dir, &rel, &entries, &sums, &mounts) {
+                    Msg::DirBatch { root, dir, rel, entries, sums, mounts } => match listings
+                        .take(root, dir, &rel, &entries, &sums, &mounts)
+                        .and_then(|()| check::missing(entries.iter(), opts))
+                    {
                         Ok(()) => {
                             remote.on_batch(s, engine, root, dir, rel, entries, sums, mounts);
                             Ok(())
@@ -1422,6 +1439,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         engine.err(format!("attributes of {waiting} entries were never received"));
     }
     pool.install(|| {
+        engine.finish_delayed();
         engine.link_followers();
         engine.finish_deletions();
         engine.apply_fixups();

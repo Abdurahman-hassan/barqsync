@@ -43,6 +43,9 @@ pub fn collect(opts: &Options, r: &Rules, dir: &Path, ents: Vec<DirEnt>, err: &m
     }
     ents.into_iter()
         .filter_map(|mut e| {
+            if e.missing {
+                return Some(e);
+            }
             let p = dir.join(&e.name);
             match read_wire(opts, r, &p, e.meta.kind, e.meta.mode, false) {
                 Ok(x) => {

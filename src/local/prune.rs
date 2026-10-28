@@ -2,12 +2,11 @@
 //! filter rules apply, is left out of the transfer, as rsync leaves it out of its file
 //! list. With `--delete`, the destination's copy of it is then extraneous.
 
-use super::flags::adjust_listing;
+use super::flags::{adjust_listing, missing_selected};
 use crate::cli::Options;
 use crate::entry::{DirEnt, Kind};
 use crate::filter::{DirRules, Filter, Side};
 use crate::fsops;
-use crate::output::path_msg;
 use crate::paths::join_rel;
 use crate::select::{self, Descend, Sel};
 use std::collections::HashMap;
@@ -118,7 +117,14 @@ impl Prune {
             },
         };
         // Errors are reported when the transfer reads the directory.
-        let ents = adjust_listing(opts, dir, ents, &mut |_| {});
+        let mut ents = adjust_listing(opts, dir, rel, ents, &mut |_| {}, &mut |_| {});
+        // What the selection names and isn't there counts as the transfer takes it: an
+        // error (reported below if this directory has nothing), nothing (with
+        // --ignore-missing-args), or an entry asking for a deletion, which is something.
+        let mut errs = Vec::new();
+        if let Some(s) = sel {
+            missing_selected(opts, s, missing, &mut ents, &mut |m| errs.push(m), &mut |_| {});
+        }
         let passes = |e: &DirEnt| !filter.excluded(rules, &join_rel(rel, &e.name), e.meta.kind == Kind::Dir, Side::Sender);
         // Anything but a directory settles it without looking further down.
         if ents.iter().any(|e| e.meta.kind != Kind::Dir && passes(e)) {
@@ -144,9 +150,7 @@ impl Prune {
                 return true;
             }
         }
-        for (p, e) in missing {
-            err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
-        }
+        errs.into_iter().for_each(err);
         false
     }
 }

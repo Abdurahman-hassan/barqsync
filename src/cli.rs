@@ -23,7 +23,7 @@ use std::path::PathBuf;
     after_help = "Options implied by others (-a, -D, ...) or given earlier can be turned off with \
                   --no-OPTION: --no-r, --no-l, --no-p, --no-t, --no-g, --no-o, --no-D, --no-devices, \
                   --no-specials, --no-H, --no-A, --no-X, --no-O, --no-d, --no-x, --no-S, --no-c, --no-z, \
-                  --no-W, --no-v, --no-i, --no-h, --no-8, --no-m, --no-s, --no-inplace, --no-append, --no-partial, \
+                  --no-W, --no-v, --no-i, --no-h, --no-8, --no-m, --no-s, --no-inplace, --no-append, --no-partial, --no-delay-updates, --no-force, --no-ignore-errors, --no-munge-links, \
                   --no-progress, --no-numeric-ids, --no-backup, --no-mkpath, --no-timeout, --no-from0 \
                   (and their long forms, e.g. --no-owner)."
 )]
@@ -74,6 +74,15 @@ pub struct Cli {
     /// Treat symlinked directories on the receiver as directories
     #[arg(short = 'K', long = "keep-dirlinks")]
     keep_dirlinks: bool,
+    /// Only symlinks that point outside the transfer become the files they point to
+    #[arg(long = "copy-unsafe-links")]
+    copy_unsafe_links: bool,
+    /// Ignore symlinks that point outside the transfer
+    #[arg(long = "safe-links")]
+    safe_links: bool,
+    /// Munge received symlinks to make them unusable, unmunge sent ones
+    #[arg(long = "munge-links")]
+    munge_links: bool,
     /// Transfer directories without recursing
     #[arg(short = 'd', long)]
     dirs: bool,
@@ -140,6 +149,12 @@ pub struct Cli {
     /// Put a partially transferred file into DIR
     #[arg(long = "partial-dir", value_name = "DIR")]
     partial_dir: Option<OsString>,
+    /// Put all updated files into place at the transfer's end
+    #[arg(long = "delay-updates")]
+    delay_updates: bool,
+    /// Create temporary files in directory DIR
+    #[arg(short = 'T', long = "temp-dir", value_name = "DIR")]
+    temp_dir: Option<OsString>,
     /// Fine-grained output flags; `progress2` (or `progress`) shows overall progress
     #[arg(long, value_name = "FLAGS")]
     info: Vec<String>,
@@ -211,6 +226,18 @@ pub struct Cli {
     /// Also delete excluded files from destination dirs
     #[arg(long = "delete-excluded")]
     delete_excluded: bool,
+    /// Ignore missing source args without error
+    #[arg(long = "ignore-missing-args")]
+    ignore_missing_args: bool,
+    /// Delete missing source args from destination
+    #[arg(long = "delete-missing-args")]
+    delete_missing_args: bool,
+    /// Delete even if there are I/O errors
+    #[arg(long = "ignore-errors")]
+    ignore_errors: bool,
+    /// Force deletion of directories even if not empty
+    #[arg(long)]
+    force: bool,
     /// Don't delete more than NUM files (more due: warn and exit 25)
     #[arg(long = "max-delete", value_name = "NUM", allow_negative_numbers = true)]
     max_delete: Option<i64>,
@@ -387,6 +414,14 @@ pub struct Cli {
     no_append: bool,
     #[arg(long = "no-partial", hide = true)]
     no_partial: bool,
+    #[arg(long = "no-delay-updates", hide = true)]
+    no_delay_updates: bool,
+    #[arg(long = "no-ignore-errors", hide = true)]
+    no_ignore_errors: bool,
+    #[arg(long = "no-force", hide = true)]
+    no_force: bool,
+    #[arg(long = "no-munge-links", hide = true)]
+    no_munge_links: bool,
     #[arg(long = "no-progress", hide = true)]
     no_progress: bool,
     #[arg(long = "no-numeric-ids", hide = true)]
@@ -431,6 +466,13 @@ pub struct Options {
     pub copy_links: bool,
     pub copy_dirlinks: bool,
     pub keep_dirlinks: bool,
+    /// `--copy-unsafe-links`: the sender follows symlinks that point outside the transfer.
+    pub copy_unsafe_links: bool,
+    /// `--safe-links`: the receiver ignores symlinks that point outside the transfer.
+    pub safe_links: bool,
+    /// `--munge-links`: this side (only: never passed to the server) unmunges the
+    /// symlinks it sends and munges those it receives (`/rsyncd-munged/` in front).
+    pub munge_links: bool,
     pub dirs: bool,
     pub relative: bool,
     /// `--files-from`: the listed paths, read by the client (also sent to the server).
@@ -471,9 +513,24 @@ pub struct Options {
     pub partial: bool,
     #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
     pub partial_dir: Option<OsString>,
+    /// `--delay-updates`: updated files wait in `partial_dir` (`.~tmp~` by default) until
+    /// the end of the transfer, then are renamed into place one after another.
+    pub delay_updates: bool,
+    /// `-T`: temp files are made in this directory (relative to the destination) instead
+    /// of next to their files.
+    #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
+    pub temp_dir: Option<OsString>,
 
     pub delete: bool,
     pub delete_excluded: bool,
+    /// A source argument that doesn't exist is no error: 1 (`--ignore-missing-args`), or
+    /// 2 (`--delete-missing-args`), its destination is deleted too.
+    pub missing_args: u8,
+    /// `--ignore-errors`: delete even after I/O errors.
+    pub ignore_errors: bool,
+    /// `--force`: a directory in the way of a file is deleted with what it holds, even
+    /// without `--delete`.
+    pub force: bool,
     /// `--max-delete`: at most this many deletions (`None`: no limit).
     pub max_delete: Option<u64>,
     pub filter_rules: Vec<RuleSpec>,
@@ -530,6 +587,13 @@ pub struct Options {
 }
 
 impl Options {
+    /// Whether a listed file may be a symlink the listing followed (`-L`, or an unsafe
+    /// one with `--copy-unsafe-links`): opening it then follows symlinks, though it must
+    /// still reach the file that was listed.
+    pub fn follows_listed(&self) -> bool {
+        self.copy_links || self.copy_unsafe_links
+    }
+
     pub fn parse_from<I, T>(args: I) -> Result<Options>
     where
         I: IntoIterator<Item = T>,
@@ -548,7 +612,11 @@ impl Options {
         let cli = Cli::from_arg_matches(&matches)?;
         let m = &matches;
         let from0 = toggle(m, &["from0"], &["no_from0"]).unwrap_or(false);
-        let filter_rules = ordered_filter_rules(&cli, m, from0)?;
+        // rsync: --delay-updates keeps the updated files in a partial dir, `.~tmp~` unless
+        // one is given.
+        let delay_updates = toggle(m, &["delay_updates"], &["no_delay_updates"]).unwrap_or(false);
+        let partial_dir = cli.partial_dir.clone().or_else(|| delay_updates.then(|| OsString::from(".~tmp~")));
+        let filter_rules = ordered_filter_rules(&cli, m, from0, partial_dir.as_ref())?;
         let chmod = parse_chmod_args(&cli.chmod)?;
         let max_size = cli.max_size.as_deref().map(|s| parse_size(s, "--max-size")).transpose()?;
         let min_size = cli.min_size.as_deref().map(|s| parse_size(s, "--min-size")).transpose()?;
@@ -581,13 +649,17 @@ impl Options {
         o.group = toggle_with(m, &["archive", "group"], at(&groupmap), &["no_group"]).unwrap_or(false);
         o.usermap = usermap.map(|(map, _)| map);
         o.groupmap = groupmap.map(|(map, _)| map);
-        if o.append > 0 {
-            if o.whole_file == Some(true) {
-                bail!("--append cannot be used with --whole-file");
-            }
-            if o.partial_dir.is_some() {
-                bail!("--append cannot be used with --partial-dir");
-            }
+        o.delay_updates = delay_updates;
+        o.partial |= partial_dir.is_some();
+        o.partial_dir = partial_dir;
+        if o.append > 0 && o.whole_file == Some(true) {
+            bail!("--append cannot be used with --whole-file");
+        }
+        // rsync: an update made in place leaves nothing for a partial dir to hold.
+        if (o.append > 0 || o.delay_updates) && o.inplace && o.partial_dir.is_some() {
+            let what = if o.append > 0 { "append" } else { "inplace" };
+            let with = if o.delay_updates { "delay-updates" } else { "partial-dir" };
+            bail!("--{what} cannot be used with --{with}");
         }
         if files_from.is_some() {
             // rsync: --files-from implies -R and -d, and -a no longer implies -r.
@@ -629,6 +701,9 @@ impl Options {
             copy_links: c.copy_links,
             copy_dirlinks: c.copy_dirlinks,
             keep_dirlinks: c.keep_dirlinks,
+            copy_unsafe_links: c.copy_unsafe_links,
+            safe_links: c.safe_links,
+            munge_links: on(&["munge_links"], &["no_munge_links"]),
             dirs: on(&["dirs"], &["no_dirs"]),
             relative: c.relative,
             files_from: None,
@@ -665,8 +740,14 @@ impl Options {
             sparse: on(&["sparse"], &["no_sparse"]),
             partial: on(&["partial", "partial_progress"], &["no_partial"]) || c.partial_dir.is_some(),
             partial_dir: c.partial_dir,
+            delay_updates: false,
+            temp_dir: c.temp_dir,
             delete: c.delete || c.delete_before || c.delete_during || c.delete_delay || c.delete_after || c.delete_excluded,
             delete_excluded: c.delete_excluded,
+            // rsync: given both, --delete-missing-args counts.
+            missing_args: if c.delete_missing_args { 2 } else { u8::from(c.ignore_missing_args) },
+            ignore_errors: on(&["ignore_errors"], &["no_ignore_errors"]),
+            force: on(&["force"], &["no_force"]),
             // rsync: a negative limit means no deletions at all.
             max_delete: c.max_delete.map(|n| n.max(0) as u64),
             filter_rules,
@@ -913,8 +994,9 @@ fn read_files_from(file: &OsString, from0: bool) -> Result<Vec<Vec<u8>>> {
 
 /// The filter rules, in command-line order across `--filter`, `--include`, `--exclude`,
 /// their `-from` files and `-F`; `.` merge files are read now. Then, as in rsync, the
-/// rule hiding a relative `--partial-dir`, and `-C`'s rules last.
-fn ordered_filter_rules(cli: &Cli, m: &ArgMatches, from0: bool) -> Result<Vec<RuleSpec>> {
+/// rule hiding a relative `partial_dir` (`--partial-dir`, or `--delay-updates`'s), and
+/// `-C`'s rules last.
+fn ordered_filter_rules(cli: &Cli, m: &ArgMatches, from0: bool, partial_dir: Option<&OsString>) -> Result<Vec<RuleSpec>> {
     enum Opt<'a> {
         Filter(&'a OsString),
         Pattern(&'a OsString, bool),
@@ -944,7 +1026,7 @@ fn ordered_filter_rules(cli: &Cli, m: &ArgMatches, from0: bool) -> Result<Vec<Ru
     }
     // rsync protects a relative partial dir (and hides one on the sender) with a
     // trailing exclude rule.
-    if let Some(d) = &cli.partial_dir
+    if let Some(d) = partial_dir
         && !d.as_bytes().starts_with(b"/")
     {
         let d = d.as_bytes();
@@ -1182,6 +1264,37 @@ mod tests {
         assert_eq!(mode(&["--append", "-W"]).unwrap_err().to_string(), "--append cannot be used with --whole-file");
         assert!(mode(&["--append", "-W", "--no-W"]).is_ok());
         assert_eq!(mode(&["--append-verify", "--partial-dir=p"]).unwrap_err().to_string(), "--append cannot be used with --partial-dir");
+    }
+
+    #[test]
+    fn temp_dir_and_delay_updates() {
+        use std::ffi::OsStr;
+        let o = Options::parse_from(["barqsync", "-a", "--delay-updates", "-T", "tmp", "s", "d"]).unwrap();
+        assert!(o.delay_updates && o.partial);
+        assert_eq!((o.partial_dir.as_deref(), o.temp_dir.as_deref()), (Some(OsStr::new(".~tmp~")), Some(OsStr::new("tmp"))));
+        // The holding directory is hidden from the transfer and kept from --delete.
+        assert_eq!(o.filter_rules, vec![RuleSpec::exclude(b".~tmp~/".to_vec())]);
+        let o = Options::parse_from(["barqsync", "--delay-updates", "--partial-dir=.p", "s", "d"]).unwrap();
+        assert_eq!(o.partial_dir.as_deref(), Some(OsStr::new(".p")));
+        let o = Options::parse_from(["barqsync", "--delay-updates", "--no-delay-updates", "s", "d"]).unwrap();
+        assert!(!o.delay_updates && !o.partial && o.partial_dir.is_none());
+        let err = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).unwrap_err().to_string();
+        assert_eq!(err(&["--inplace", "--delay-updates"]), "--inplace cannot be used with --delay-updates");
+        assert_eq!(err(&["--delay-updates", "--append"]), "--append cannot be used with --delay-updates");
+        assert!(Options::parse_from(["barqsync", "--inplace", "--partial-dir=p", "s", "d"]).is_ok(), "unchanged");
+    }
+
+    #[test]
+    fn deletion_and_link_options() {
+        let o = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).unwrap();
+        assert_eq!(o(&["--ignore-missing-args"]).missing_args, 1);
+        assert_eq!(o(&["--delete-missing-args"]).missing_args, 2);
+        assert_eq!(o(&["--delete-missing-args", "--ignore-missing-args"]).missing_args, 2, "delete wins, as in rsync");
+        assert!(o(&["--force"]).force && !o(&["--force", "--no-force"]).force);
+        assert!(o(&["--ignore-errors"]).ignore_errors && !o(&["--ignore-errors", "--no-ignore-errors"]).ignore_errors);
+        let l = o(&["--safe-links", "--copy-unsafe-links", "--munge-links"]);
+        assert!(l.safe_links && l.copy_unsafe_links && l.munge_links && l.follows_listed());
+        assert!(!o(&["--munge-links", "--no-munge-links"]).munge_links);
     }
 
     #[test]

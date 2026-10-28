@@ -30,6 +30,8 @@ pub mod exit {
     pub const OK: i32 = 0;
     pub const SYNTAX: i32 = 1;
     pub const INCOMPATIBLE: i32 = 2;
+    /// Requested action not supported (rsync's `RERR_UNSUPPORTED`).
+    pub const UNSUPPORTED: i32 = 4;
     pub const FILE_IO: i32 = 11;
     pub const PROTOCOL: i32 = 12;
     pub const IPC: i32 = 14;
@@ -52,6 +54,11 @@ pub fn run(opts: Options) -> i32 {
         return remote::server::run();
     }
     fsops::cache::set_enabled(opts.drop_cache);
+    // rsync: a munged symlink must not lead anywhere, which it would if this existed.
+    if opts.munge_links && std::fs::metadata("/rsyncd-munged").is_ok_and(|m| m.is_dir()) {
+        eprintln!("barqsync: Symlink munging is unsafe when a /rsyncd-munged directory exists.");
+        return exit::UNSUPPORTED;
+    }
     let paths = &opts.paths;
     if paths.len() < 2 {
         eprintln!("barqsync: need at least one SRC and a DEST (listing mode is not supported)");
