@@ -14,7 +14,7 @@ use crate::entry::{DirEnt, Kind, Meta};
 use crate::ids;
 use crate::local::extra;
 use crate::local::merge::{self, SrcDir, Sources};
-use crate::local::flags::{adjust_listing, adjust_mode, remove_source};
+use crate::local::flags::{Missing, adjust_listing, adjust_mode, missing_selected, missing_source, remove_source};
 use crate::xattrs::{Rules, Xattr};
 use crate::select::{self, Descend, Sel};
 use crate::exit;
@@ -180,7 +180,8 @@ impl Sender<'_> {
     }
 
     /// Register a listing and send it. Registered first, so a quick `Need` finds it.
-    fn send_listing(&self, root: u16, rel: Vec<u8>, listing: Listing) {
+    /// `mounts`: its `-x` mount points (see `Msg::DirBatch`).
+    fn send_listing(&self, root: u16, rel: Vec<u8>, listing: Listing, mounts: Vec<u32>) {
         let sums = if self.opts.checksum { self.checksums(&listing) } else { Vec::new() };
         let size: u64 = listing.entries.iter().filter(|e| e.meta.kind == Kind::File).map(|e| e.meta.size).sum();
         self.listed_size.fetch_add(size, SeqCst);
@@ -200,12 +201,12 @@ impl Sender<'_> {
         let path = listing.sources.dirs.first().map(|d| d.path.clone()).unwrap_or_default();
         self.listings.lock().unwrap().insert(dir, listing);
         self.name_ids(entries.iter().map(|e| (&e.meta, e.extra.as_deref())));
-        self.send_for(Msg::DirBatch { root, dir, rel, entries, sums }, "the listing of \"", &path);
+        self.send_for(Msg::DirBatch { root, dir, rel, entries, sums, mounts }, "the listing of \"", &path);
     }
 
     /// `-c`: checksums of the listing's regular files, hashed in parallel.
     fn checksums(&self, l: &Listing) -> Vec<Option<Sum>> {
-        let is_file = |i: &usize| l.entries[*i].meta.kind == Kind::File;
+        let is_file = |i: &usize| l.entries[*i].meta.kind == Kind::File && !l.entries[*i].missing;
         let files: Vec<PathBuf> = (0..l.entries.len()).filter(is_file).map(|i| l.path(i)).collect();
         let mut sums = checksum::sums(files).into_iter();
         (0..l.entries.len()).map(|i| if is_file(&i) { sums.next().and_then(Result::ok) } else { None }).collect()
@@ -236,18 +237,18 @@ impl Sender<'_> {
     }
 
     /// `-L`/`-k`/`--chmod`, then (`-X`/`-A`) the entries' attributes and ACLs.
-    fn listing(&self, dir: &Path, ents: Vec<DirEnt>) -> Vec<DirEnt> {
-        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.scan_err(m));
+    fn listing(&self, dir: &Path, rel: &[u8], ents: Vec<DirEnt>) -> Vec<DirEnt> {
+        let ents = adjust_listing(self.opts, dir, rel, ents, &mut |m| self.scan_err(m), &mut |m| note(self.out, m));
         extra::collect(self.opts, &self.xrules, dir, ents, &mut |m| self.scan_err(m))
     }
 
     /// The listing of source directory `dir` (only `sel`'s entries, if given), or `None`
     /// after reporting that it could not be read.
-    fn read_dir(&self, dir: &Path, sel: Option<&Sel>) -> Option<Vec<DirEnt>> {
+    fn read_dir(&self, dir: &Path, rel: &[u8], sel: Option<&Sel>) -> Option<Vec<DirEnt>> {
         match sel {
-            Some(sel) if !sel.contents => Some(self.read_selected(dir, sel)),
+            Some(sel) if !sel.contents => Some(self.read_selected(dir, rel, sel)),
             _ => match fsops::read_dir_meta(dir) {
-                Ok(v) => Some(self.listing(dir, v)),
+                Ok(v) => Some(self.listing(dir, rel, v)),
                 Err(e) => {
                     self.scan_err(path_msg("opendir \"", dir, format!("\" failed: {e}")));
                     None
@@ -266,7 +267,7 @@ impl Sender<'_> {
         for d in &mut dirs {
             lists.push(self.enter(&d.rules, &d.path, &rel).and_then(|r| {
                 d.rules = r;
-                self.read_dir(&d.path, d.sel)
+                self.read_dir(&d.path, &rel, d.sel)
             }));
         }
         if lists.iter().all(Option::is_none) {
@@ -282,37 +283,52 @@ impl Sender<'_> {
         let lists = dirs.iter().zip(lists).map(|(d, l)| l.into_iter().filter(|e| sends(d, e)).collect()).collect();
         let (entries, sources) = merge::merge(dirs, lists);
         let (recursive, one_fs) = (self.opts.recursive, self.opts.one_file_system);
+        let mut mounts = Vec::new();
         let subdirs: Vec<(Vec<u8>, Vec<SrcDir>)> = entries
             .iter()
             .enumerate()
             .filter_map(|(i, e)| {
                 let d = sources.dir_of(i as u32);
-                let dev = d.dev.unwrap_or(e.meta.dev);
-                let sub = self.descend_into(d.sel, e, dev)?;
-                let mut srcs = vec![SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev), rules: d.rules.clone() }];
-                srcs.extend(sources.also_dirs(i as u32, &e.name, recursive, one_fs));
+                let dev = select::root_dev(d.sel, e.name.as_bytes(), e.meta.dev, d.dev);
+                // -x: a mount point isn't listed from its root. Later sources that have the
+                // directory on their own filesystem fill it alone (rsync's receiver merges
+                // their FLAG_CONTENT_DIR); with none, its contents aren't sent, and the
+                // receiver is told so, since it can't tell from merged listings which root
+                // the directory is in.
+                let mount = one_fs && e.meta.kind == Kind::Dir && e.meta.dev != dev;
+                let Some(sub) = self.descend_into(d.sel, e) else {
+                    if mount {
+                        mounts.push(i as u32);
+                    }
+                    return None;
+                };
+                let own = (!mount).then(|| SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev), rules: d.rules.clone() });
+                let srcs: Vec<SrcDir> = own.into_iter().chain(sources.also_dirs(i as u32, &e.name, recursive, one_fs)).collect();
+                if srcs.is_empty() {
+                    mounts.push(i as u32);
+                    return None;
+                }
                 Some((join_rel(&rel, &e.name), srcs))
             })
             .collect();
-        self.send_listing(root, rel, Listing { entries, sources });
+        self.send_listing(root, rel, Listing { entries, sources }, mounts);
         for (crel, srcs) in subdirs {
             s.spawn(move |s| self.walk_dir(s, root, crel, srcs));
         }
     }
 
-    /// The selected entries of `dir`, with missing names reported as errors.
-    fn read_selected(&self, dir: &Path, sel: &Sel) -> Vec<DirEnt> {
-        let (ents, errs) = select::read_selected(dir, sel);
-        for (p, e) in errs {
-            self.scan_err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
-        }
-        self.listing(dir, ents)
+    /// The selected entries of `dir`, with missing names reported as errors (unless
+    /// they were named and `--ignore-missing-args` or `--delete-missing-args` says so).
+    fn read_selected(&self, dir: &Path, rel: &[u8], sel: &Sel) -> Vec<DirEnt> {
+        let (mut ents, errs) = select::read_selected(dir, sel);
+        missing_selected(self.opts, sel, errs, &mut ents, &mut |m| self.scan_err(m), &mut |p| self.vanished(p));
+        self.listing(dir, rel, ents)
     }
 
-    /// Whether the listing of subdirectory `e` is sent (and with which selection). The
-    /// receiver makes the same decision with [`select::descend`].
-    fn descend_into(&self, sel: Option<&'static Sel>, e: &DirEnt, root_dev: u64) -> Option<Option<&'static Sel>> {
-        if e.meta.kind != Kind::Dir || (self.opts.one_file_system && e.meta.dev != root_dev) {
+    /// Whether the listing of subdirectory `e` is sent (unless `-x` stops at it), and with
+    /// which selection. The receiver makes the same decision with [`select::descend`].
+    fn descend_into(&self, sel: Option<&'static Sel>, e: &DirEnt) -> Option<Option<&'static Sel>> {
+        if e.meta.kind != Kind::Dir {
             return None;
         }
         match select::descend(sel, e.name.as_bytes(), self.opts.recursive) {
@@ -335,7 +351,7 @@ impl Sender<'_> {
                 let l = items.or_else(|| {
                     let r = self.enter(&d.rules, &d.path, b"")?;
                     d.rules = r;
-                    self.read_dir(&d.path, d.sel)
+                    self.read_dir(&d.path, b"", d.sel)
                 });
                 (d, l)
             })
@@ -514,7 +530,7 @@ impl Sender<'_> {
     /// their attribute values in full where `full`. Returns the files that are no longer
     /// small.
     fn send_small(&self, files: Vec<Source>) -> Vec<Source> {
-        let follow = self.opts.copy_links;
+        let follow = self.opts.follows_listed();
         let read = files.into_iter().map(|f| {
             fsops::test_vanish(&f.path);
             (read_small(&f.path, &f.meta, follow), f)
@@ -574,7 +590,7 @@ impl Sender<'_> {
     /// The sending functions return the size of the file as sent, all of it counted for
     /// progress by then. `xattrs`: attribute values to send in full with the data.
     fn send_whole(&self, src: &Source, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
-        let f = fsops::open_listed(&src.path, &src.meta, self.opts.copy_links)?;
+        let f = fsops::open_listed(&src.path, &src.meta, self.opts.follows_listed())?;
         self.send_whole_file(src.id, &f, xattrs)
     }
 
@@ -592,8 +608,11 @@ impl Sender<'_> {
     /// ranges it doesn't have.
     fn send_delta(&self, src: &Source, sig: Sig, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
         let (id, path) = (src.id, src.path.as_path());
-        let file = fsops::open_listed(path, &src.meta, self.opts.copy_links)?;
+        let file = fsops::open_listed(path, &src.meta, self.opts.follows_listed())?;
         let size = file.metadata()?.len();
+        if let Sig::Append { len, sum } = sig {
+            return self.send_append(src, &file, size, len, sum, xattrs);
+        }
         if let Sig::Cdc(basis) = &sig {
             return match cdc::Mapped::new(&file, size) {
                 Ok(m) => self.send_ops(id, &file, &cdc::diff(m.bytes(), basis, &Params::DEFAULT), &m, xattrs),
@@ -620,10 +639,32 @@ impl Sender<'_> {
                 let Some(p) = basis.params(Params::DEFAULT) else { return self.send_whole_file(id, &file, xattrs) };
                 (delta::diff_chunks(&delta::chunk_signature(&f, size, &p)?, &basis), basis.size, p.cdc_avg)
             }
-            Sig::Cdc(_) => unreachable!(),
+            Sig::Cdc(_) | Sig::Append { .. } => unreachable!(),
         };
         let d = self.refine(id, path, &f, size, basis_size, unit, d)?;
         self.send_ops(id, &file, &d, &f, xattrs)
+    }
+
+    /// `--append`: the receiver has the first `len` bytes of this file (`size` bytes now);
+    /// send the rest as a delta keeping them. With `--append-verify` (`sum`) only if
+    /// they match this file's start: otherwise the file goes whole, which tells the
+    /// receiver. A file now shorter than it was listed is skipped, as rsync skips a
+    /// "diminished" file.
+    fn send_append(&self, src: &Source, file: &File, size: u64, len: u64, sum: Option<Sum>, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
+        if size < src.meta.size {
+            self.out.warning(path_msg("skipped diminished file: \"", &fsops::full_path(&src.path), "\""));
+            self.send(Msg::FileEnd { id: src.id, ok: false });
+            return Ok(0);
+        }
+        if let Some(sum) = sum
+            && checksum::prefix_sum(file, len)? != sum
+        {
+            return self.send_whole_file(src.id, file, xattrs);
+        }
+        let mut d = Delta::new(size);
+        d.push(Op::Copy { off: 0, basis_off: 0, len });
+        d.push(Op::Literal { off: len, len: size - len });
+        self.send_ops(src.id, file, &d, &ReadOnce::new(file, size), xattrs)
     }
 
     /// Refine a coarse delta where it is worth it ([`refine::plan`]): ask the receiver for
@@ -677,8 +718,15 @@ fn read_small(path: &Path, listed: &Meta, follow: bool) -> io::Result<Option<Vec
     Ok((d.len() as u64 <= proto::SMALL_FILE).then_some(d))
 }
 
+/// A line shown with `-v` (rsync's `INFO` lines, such as "copying unsafe symlink").
+fn note(out: &Output, m: Vec<u8>) {
+    if out.verbose() > 0 {
+        out.info(m);
+    }
+}
+
 /// `-R`/`--files-from` roots: each base directory with its selected paths.
-fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, prune: &Prune, out: &Output, errors: &AtomicU64) -> Vec<SrcRoot> {
+fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, prune: &Prune, out: &Output, errors: &AtomicU64, vanished: &AtomicU64) -> Vec<SrcRoot> {
     let sel_roots = match &opts.files_from {
         Some(list) => select::from_list(&sources[0], list),
         None => select::from_relative_args(sources),
@@ -705,11 +753,12 @@ fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, p
                 }
             }
         } else {
-            let (ents, errs) = select::read_selected(&r.base, sel);
-            for (p, e) in errs {
-                err(path_msg("link_stat \"", &p, format!("\" failed: {e}")));
-            }
-            let items = adjust_listing(opts, &r.base, ents, &mut err)
+            let (mut ents, errs) = select::read_selected(&r.base, sel);
+            missing_selected(opts, sel, errs, &mut ents, &mut err, &mut |p| {
+                vanished.fetch_add(1, SeqCst);
+                out.warning(path_msg("file has vanished: \"", &fsops::full_path(p), "\""));
+            });
+            let items = adjust_listing(opts, &r.base, b"", ents, &mut err, &mut |m| note(out, m))
                 .into_iter()
                 .filter(|e| prune::sends(opts, filter, prune, &r.base, b"", &rules, Some(sel), None, e, &err))
                 .collect();
@@ -723,9 +772,9 @@ fn resolve_select_roots(opts: &Options, sources: &[OsString], filter: &Filter, p
 
 /// Resolve SRC arguments the way rsync does: `src/` sends the directory's contents,
 /// `src` sends the directory (or file) itself under its name.
-fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, prune: &Prune, out: &Output, errors: &AtomicU64) -> Vec<SrcRoot> {
+fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, prune: &Prune, out: &Output, errors: &AtomicU64, vanished: &AtomicU64) -> Vec<SrcRoot> {
     if opts.relative {
-        return resolve_select_roots(opts, sources, filter, prune, out, errors);
+        return resolve_select_roots(opts, sources, filter, prune, out, errors, vanished);
     }
     let xrules = extra::rules(opts);
     let mut err = |m: Vec<u8>| {
@@ -737,15 +786,21 @@ fn resolve_roots(opts: &Options, sources: &[OsString], filter: &Filter, prune: &
         let sp = PathBuf::from(s);
         match split_source(&sp) {
             (parent, Some(name)) if !wants_contents(s) => {
-                let meta = match fsops::lstat(&sp) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        err(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
-                        continue;
+                let ent = match fsops::lstat(&sp) {
+                    Ok(meta) => {
+                        let link = if meta.kind == Kind::Symlink { fsops::read_link_bytes(&sp).ok() } else { None };
+                        DirEnt::new(name.clone(), meta, link)
                     }
+                    Err(e) => match missing_source(opts, &name, &e) {
+                        Missing::Deleted(missing) => missing,
+                        Missing::Ignored => continue,
+                        Missing::Error => {
+                            err(path_msg("link_stat \"", &sp, format!("\" failed: {e}")));
+                            continue;
+                        }
+                    },
                 };
-                let link = if meta.kind == Kind::Symlink { fsops::read_link_bytes(&sp).ok() } else { None };
-                let items = adjust_listing(opts, &parent, vec![DirEnt::new(name, meta, link)], &mut err);
+                let items = adjust_listing(opts, &parent, b"", vec![ent], &mut err, &mut |m| note(out, m));
                 // A named directory is the first directory read; its parent is the root.
                 let first = if items.iter().any(|e| e.meta.kind == Kind::Dir) { sp.clone() } else { parent.clone() };
                 let rules = filter.root(&parent, &first, Side::Sender);
@@ -860,7 +915,8 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         }
     }
     let prune = Prune::default();
-    let roots = resolve_roots(opts, sources, &filter, &prune, out, &errors);
+    let vanished = AtomicU64::new(0);
+    let roots = resolve_roots(opts, sources, &filter, &prune, out, &errors, &vanished);
     let sender = Sender {
         out_frames: conn.out.clone(),
         opts,
@@ -880,7 +936,7 @@ pub fn run(conn: &Conn, opts: &Options, sources: &[OsString], out: &Output, repo
         refining: Mutex::new(HashMap::new()),
         io_error: Mutex::new(false),
         failed: SendFailure::default(),
-        vanished: AtomicU64::new(0),
+        vanished,
         listed_size: AtomicU64::new(0),
         prune,
         sources: out.uses(b'f').then(|| Mutex::new(HashMap::new())),

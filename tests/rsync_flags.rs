@@ -1042,6 +1042,340 @@ fn max_delete_matches_rsync() {
 }
 
 // ---------------------------------------------------------------------------
+// -x / --one-file-system
+// ---------------------------------------------------------------------------
+
+/// Reset `dst` for the `-x` tests: files `z` and `old/o`, and the mount point at `mnt`
+/// (`old/mnt` or deeper) holding `f` and `d/g`. Anything else goes.
+#[cfg(target_os = "macos")]
+fn mount_fixture(dst: &Path, mnt: &str) {
+    let keep: Vec<_> = Path::new(mnt).ancestors().filter(|p| !p.as_os_str().is_empty()).map(|p| dst.join(p)).collect();
+    for dir in std::iter::once(dst).chain(keep.iter().map(|p| p.as_path())) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if keep.contains(&p) {
+                continue;
+            }
+            if p.is_dir() { fs::remove_dir_all(&p).unwrap() } else { fs::remove_file(&p).unwrap() }
+        }
+    }
+    Tree::new(dst).file("z", "z").file("old/o", "o").file(&format!("{mnt}/f"), "f").file(&format!("{mnt}/d/g"), "g").same_mtimes(BASE_TIME + 700_000);
+}
+
+/// A case of [`one_file_system_keeps_destination_mount_points`]: options, sources, the
+/// destination below r/ and f/, whether `old/mnt/d/g` stays, and the modes compared.
+#[cfg(target_os = "macos")]
+type MountCase<'a> = (&'a str, &'a [&'a str], &'a str, bool, &'a [&'a str]);
+
+/// `-x` with `--delete`: a destination directory on another filesystem (a mount point, a
+/// disk image here) is neither deleted nor emptied when the source lacks it, nothing in it
+/// is deleted when the source has it, unless it is a top directory (in any of the
+/// sources), and it keeps a directory being deleted. As rsync, locally (both scanners), as
+/// a push and as a pull.
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_keeps_destination_mount_points() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let (Some(_r), Some(_f)) = (Volume::at(&t.join("r/old/mnt"), 5), Volume::at(&t.join("f/old/mnt"), 5)) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("lacks")).file("a", "a").settle_mtimes();
+    Tree::new(t.join("has")).file("mnt/new", "n").settle_mtimes();
+    Tree::new(t.join("deep")).file("old/mnt/new", "n").settle_mtimes();
+    Tree::new(t.join("partial")).file("mnt/child/c", "c").settle_mtimes();
+    Tree::new(t.join("full")).file("mnt/m", "m").settle_mtimes();
+    Tree::new(t.join("file")).file("mnt", "a file").settle_mtimes();
+    // `opts --delete`, the sources and the destination as `mode` gives them (`{host}`
+    // marks the remote side).
+    let args = |mode: &str, opts: &str, srcs: &[&str], dst: &str| -> Vec<String> {
+        let mut v = vec![opts.to_string(), "--delete".to_string()];
+        v.extend(srcs.iter().map(|s| if mode == "pull" { format!("{{host}}{s}") } else { s.to_string() }));
+        v.push(if mode == "push" { format!("{{host}}{dst}") } else { dst.to_string() });
+        v
+    };
+    let all: &[&str] = &["local", "push", "pull"];
+    // The mount point is extraneous, listed, inside the extraneous `old`, or a top
+    // directory (where a named directory or a -R path goes), whose extra entries go.
+    // With several sources it is a top directory if it is one in any of them: not when
+    // one has `mnt` on the way to a -R path and another sends it whole, but when one
+    // names it. A push or a pull gets the sources as one listing that doesn't say which
+    // directories were named, so there a named `mnt` keeps its extra entries (see the
+    // implementation notes): that case is compared locally only.
+    let cases: [MountCase; 7] = [
+        ("-aix", &["lacks/"], "old/", true, all),
+        ("-aix", &["has/"], "old/", true, all),
+        ("-aix", &["lacks/"], "", true, all),
+        ("-aix", &["has/mnt"], "old/", false, all),
+        ("-aixR", &["deep/./old/mnt"], "", false, all),
+        ("-aixR", &["partial/./mnt/child", "full/./"], "old/", true, all),
+        ("-aix", &["full/", "has/mnt"], "old/", false, &["local"]),
+    ];
+    for (opts, srcs, sub, kept, modes) in cases {
+        for &mode in modes {
+            let what = format!("{mode} {opts} {srcs:?} -> {sub}");
+            mount_fixture(&t.join("r"), "old/mnt");
+            mount_fixture(&t.join("f"), "old/mnt");
+            let a = args(mode, opts, srcs, &format!("{{dst}}/{sub}"));
+            let a: Vec<&str> = a.iter().map(String::as_str).collect();
+            let (r, f) = if mode == "local" { both(t, &a, "r", "f") } else { both_remote(t, &a, "r", "f") }.unwrap();
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
+            assert_eq!(t.join("f/old/mnt/d/g").exists(), kept, "{what}: {}", f.stdout);
+            if mode == "local" {
+                mount_fixture(&t.join("f"), "old/mnt");
+                let mut a = args(mode, opts, srcs, &format!("f/{sub}"));
+                a.insert(2, "--scanner=jwalk".into());
+                let f = barqsync(t, &a.iter().map(String::as_str).collect::<Vec<_>>());
+                same_output(&r, &f, &[], &format!("jwalk {what}"));
+                assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
+            }
+        }
+    }
+    // rsync's --info=mount, on with -vv.
+    mount_fixture(&t.join("f"), "old/mnt");
+    let f = barqsync(t, &["-axvv", "--delete", "lacks/", "f/old/"]);
+    assert!(f.stdout.lines().any(|l| l == "cannot delete mount point: mnt"), "{}", f.stdout);
+    // Not even to make way for a file: rsync deletes the files at the top of the mount
+    // point then, barqsync leaves it alone.
+    for &mode in all {
+        mount_fixture(&t.join("f"), "old/mnt");
+        let a = args(mode, "-aix", &["file/"], "f/old/");
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        let f = if mode == "local" { barqsync(t, &a) } else { barqsync_remote(t, &a) };
+        assert_eq!(f.code, 23, "{mode}: {}{}", f.stdout, f.stderr);
+        assert!(f.stderr.contains("could not make way for new regular file: mnt"), "{mode}: {}", f.stderr);
+        assert!(t.join("f/old/mnt/f").exists() && t.join("f/old/mnt/d/g").exists(), "{mode}: {}", f.stdout);
+    }
+}
+
+/// `-x` with `--delete`: a mount point two levels into a directory being deleted
+/// (`old/sub/mnt`) keeps `old/sub` and `old`, and barqsync reports that as rsync does. A
+/// dry run lists `old/sub/` as deleted, since rsync's `delete_dir_contents` still deletes
+/// a child it couldn't empty and a dry run's `rmdir` succeeds. `--max-delete=0` counts it
+/// among the skipped deletions (exit 25), since the limit is checked first. Locally, as a
+/// push and as a pull.
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_nested_mount_point_in_dry_runs_and_limits() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let (Some(_r), Some(_f)) = (Volume::at(&t.join("r/old/sub/mnt"), 5), Volume::at(&t.join("f/old/sub/mnt"), 5)) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("src")).file("a", "a").settle_mtimes();
+    for (opt, code) in [("-n", 0), ("--max-delete=0", 25)] {
+        for mode in ["local", "push", "pull"] {
+            let what = format!("{mode} {opt}");
+            mount_fixture(&t.join("r"), "old/sub/mnt");
+            mount_fixture(&t.join("f"), "old/sub/mnt");
+            let (src, dst) = match mode {
+                "push" => ("src/", "{host}{dst}"),
+                "pull" => ("{host}src/", "{dst}"),
+                _ => ("src/", "{dst}"),
+            };
+            let args = ["-aix", "--delete", opt, src, dst];
+            let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
+            assert_eq!(f.code, code, "{what}: {}", f.stderr);
+            assert_eq!(f.items().contains(&"*deleting   old/sub/".to_string()), opt == "-n", "{what}: {}", f.stdout);
+            assert!(t.join("f/old/sub/mnt/d/g").exists(), "{what}: {}", f.stdout);
+        }
+    }
+}
+
+/// `-x` with `--delete`: in a directory being deleted, a subdirectory that can't be
+/// checked for being a mount point (the directory's mode lacks `x`) stays, and the run
+/// reports it (exit 23), as rsync does.
+#[test]
+fn one_file_system_reports_directories_it_cannot_check() {
+    if skip_without_rsync() || unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    Tree::new(t.join("src")).file("a", "a").settle_mtimes();
+    for d in ["r", "f"] {
+        Tree::new(t.join(d)).dir("old/s1").dir("old/s2").chmod("old", 0o444);
+    }
+    let (r, f) = both(t, &["-aix", "--delete", "src/", "{dst}"], "r", "f").unwrap();
+    for d in ["r", "f"] {
+        Tree::new(t.join(d)).chmod("old", 0o755);
+    }
+    same_output(&r, &f, &[], "-x, old/ without x");
+    assert_eq!(f.code, 23, "{}", f.stderr);
+    assert!(f.stderr.contains("Permission denied"), "{}", f.stderr);
+    assert_same_tree(&snap_no_dir_times(&t.join("r")), &snap_no_dir_times(&t.join("f")));
+}
+
+/// `-x` with a mount point in the source (a disk image): its directory is made, but
+/// nothing on the mounted filesystem is sent, and `--delete` deletes nothing in the
+/// destination's copy of it. As rsync, locally, as a push and as a pull, into a new
+/// destination and into one with extra entries (in that copy too).
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_makes_source_mount_points_empty() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let Some(_v) = Volume::at(&t.join("src/mnt"), 5) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("src")).file("a", "a").file("sub/b", "b").file("mnt/m", "m").file("mnt/d/g", "g").settle_mtimes();
+    let paths = |mode: &str| match mode {
+        "push" => ("src/", "{host}{dst}/"),
+        "pull" => ("{host}src/", "{dst}/"),
+        _ => ("src/", "{dst}/"),
+    };
+    for mode in ["local", "push", "pull"] {
+        for existing in [false, true] {
+            let what = format!("{mode} into a {} destination", if existing { "full" } else { "new" });
+            for d in ["r", "f"] {
+                let _ = fs::remove_dir_all(t.join(d));
+                if existing {
+                    Tree::new(t.join(d))
+                        .file("z", "z")
+                        .file("sub/gone", "g")
+                        .file("mnt/x", "x")
+                        .file("mnt/old/y", "y")
+                        .same_mtimes(BASE_TIME + 700_000)
+                        .mtime("mnt/old", BASE_TIME + 700_000);
+                }
+            }
+            let (s, d) = paths(mode);
+            let args = ["-aix", "--delete", s, d];
+            let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap(&t.join("r"), true), &snap(&t.join("f"), true));
+            assert!(t.join("f/mnt").is_dir() && !t.join("f/mnt/m").exists(), "{what}: {}", f.stdout);
+            assert_eq!(t.join("f/mnt/old/y").exists(), existing, "{what}: {}", f.stdout);
+        }
+    }
+}
+
+/// `-x` with several sources merging into one destination: a mount point in the first
+/// one (`a/m`, a disk image) is filled from the later ones that have that directory on
+/// their own filesystem (`b/m`, `c/m`), and `--delete` deletes what neither has in the
+/// destination's copy. As rsync, whose receiver merges the duplicates' FLAG_CONTENT_DIR:
+/// locally (both scanners), as a push and as a pull, into a new destination and into one
+/// with extra entries.
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_fills_mount_points_from_later_sources() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let Some(_v) = Volume::at(&t.join("a/m"), 5) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("a")).file("top", "t").file("m/am", "a").file("m/d/g", "g").settle_mtimes();
+    Tree::new(t.join("b")).file("m/bm", "b").file("m/both", "from b").file("m/d/h", "h").settle_mtimes();
+    Tree::new(t.join("c")).file("m/cm", "c").file("m/both", "from c").settle_mtimes();
+    let fixture = |d: &str, existing: bool| {
+        let _ = fs::remove_dir_all(t.join(d));
+        if existing {
+            Tree::new(t.join(d)).file("m/x", "x").file("m/old/y", "y").file("m/bm", "stale").same_mtimes(BASE_TIME + 700_000);
+        }
+    };
+    for mode in ["local", "push", "pull"] {
+        for existing in [false, true] {
+            let what = format!("{mode} into a {} destination", if existing { "full" } else { "new" });
+            fixture("r", existing);
+            fixture("f", existing);
+            let host = |s: &str, side: &str| if mode == side { format!("{{host}}{s}") } else { s.to_string() };
+            let mut args = vec!["-aix".to_string(), "--delete".to_string()];
+            args.extend(["a/", "b/", "c/"].map(|s| host(s, "pull")));
+            args.push(host("{dst}/", "push"));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap(&t.join("r"), true), &snap(&t.join("f"), true));
+            assert!(t.join("f/m/cm").exists() && t.join("f/m/d/h").exists() && !t.join("f/m/am").exists(), "{what}: {}", f.stdout);
+            assert_eq!(fs::read(t.join("f/m/both")).unwrap(), b"from b", "{what}");
+            assert!(!t.join("f/m/x").exists() && !t.join("f/m/old").exists(), "{what}: {}", f.stdout);
+            if mode == "local" {
+                fixture("f", existing);
+                let f = barqsync(t, &["-aix", "--scanner=jwalk", "--delete", "a/", "b/", "c/", "f/"]);
+                same_output(&r, &f, &[], &format!("jwalk {what}"));
+                assert_same_tree(&snap(&t.join("r"), true), &snap(&t.join("f"), true));
+            }
+        }
+    }
+}
+
+/// `-x` with `-R` or `--files-from`: a path runs through a mount point (`s/mnt`, a disk
+/// image). As in rsync, which sets `-x`'s device from each named path's own and lists no
+/// implied directory's contents, the path doesn't stop there: `s/mnt/file` is sent and
+/// `--delete` leaves the rest of the destination's `s/mnt` alone, while `s/mnt/` is a
+/// top directory, sent whole, whose extra entries go. Locally, as a push and as a pull,
+/// into a new destination and into one with extra entries.
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_follows_selected_paths_through_mount_points() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let Some(_v) = Volume::at(&t.join("s/mnt"), 5) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("s")).file("top", "t").file("mnt/file", "f").file("mnt/other", "o").file("mnt/d/g", "g").settle_mtimes();
+    fs::write(t.join("list"), "s/mnt/file\ns/mnt/d/\n").unwrap();
+    // Options, sources, and whether the destination's `s/mnt/x` stays.
+    let cases: [(&[&str], &[&str], bool); 3] = [
+        (&["-aiRx"], &["s/mnt/file"], true),
+        (&["-aiRx"], &["s/mnt/", "s/top"], false),
+        (&["-aix", "--files-from=list"], &["."], true),
+    ];
+    for (opts, srcs, kept) in cases {
+        for mode in ["local", "push", "pull"] {
+            for existing in [false, true] {
+                let what = format!("{mode} {opts:?} {srcs:?} into a {} destination", if existing { "full" } else { "new" });
+                for d in ["r", "f"] {
+                    let _ = fs::remove_dir_all(t.join(d));
+                    if existing {
+                        Tree::new(t.join(d))
+                            .file("s/mnt/x", "x")
+                            .file("s/mnt/old/y", "y")
+                            .file("s/mnt/d/stale", "s")
+                            .same_mtimes(BASE_TIME + 700_000)
+                            .mtime("s/mnt/old", BASE_TIME + 700_000)
+                            .mtime("s/mnt/d", BASE_TIME + 700_000);
+                    }
+                }
+                let mut args: Vec<String> = opts.iter().map(|o| o.to_string()).collect();
+                args.push("--delete".into());
+                args.extend(srcs.iter().map(|s| if mode == "pull" { format!("{{host}}{s}") } else { s.to_string() }));
+                args.push(if mode == "push" { "{host}{dst}/".into() } else { "{dst}/".into() });
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+                same_output(&r, &f, &[], &what);
+                assert_same_tree(&snap(&t.join("r"), false), &snap(&t.join("f"), false));
+                assert!(t.join("f/s/mnt/file").exists(), "{what}: {}", f.stdout);
+                assert_eq!(t.join("f/s/mnt/x").exists(), existing && kept, "{what}: {}", f.stdout);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // -m / --prune-empty-dirs
 // ---------------------------------------------------------------------------
 
@@ -1563,5 +1897,574 @@ fn regex_lite(pat: &str) -> impl Fn(&str) -> bool + '_ {
             t.first() == p.first() && m(&p[1..], &t[1..])
         }
         m(pat.strip_prefix('^').unwrap_or(pat).as_bytes(), s.as_bytes())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --bwlimit
+// ---------------------------------------------------------------------------
+
+/// The first line of a tool's stderr without its `rsync: `/`barqsync: ` prefix (both say
+/// the same after it).
+fn message(stderr: &str) -> &str {
+    let line = stderr.lines().next().unwrap_or("");
+    line.strip_prefix("rsync: ").or_else(|| line.strip_prefix("barqsync: ")).unwrap_or(line)
+}
+
+/// rsync and barqsync with the same arguments, one after the other, each with how long
+/// it took. `{dst}` is the per-tool name, `{host}` the fake ssh's host.
+fn both_timed(cwd: &Path, args: &[&str], dst_r: &str, dst_f: &str) -> ((RunOut, std::time::Duration), (RunOut, std::time::Duration)) {
+    let rsync_bin = reference_rsync().unwrap();
+    let shim = fake_ssh(cwd);
+    let sub = |d: &str| -> Vec<String> { args.iter().map(|a| a.replace("{dst}", d).replace("{host}", "fakehost:")).collect() };
+    let mut r = std::process::Command::new(&rsync_bin);
+    r.env("LC_ALL", TEST_LOCALE).arg("-e").arg(&shim).arg(format!("--rsync-path={}", rsync_bin.display())).args(sub(dst_r));
+    let mut f = std::process::Command::new(env!("CARGO_BIN_EXE_barqsync"));
+    f.env("LC_ALL", TEST_LOCALE).arg("-e").arg(&shim).arg(format!("--remote-path={}", env!("CARGO_BIN_EXE_barqsync")));
+    f.env("BARQSYNC_TRANSPORT", "ssh").args(sub(dst_f));
+    let start = std::time::Instant::now();
+    let ro = run(&mut r, cwd);
+    let rt = start.elapsed();
+    let start = std::time::Instant::now();
+    let fo = run(&mut f, cwd);
+    ((ro, rt), (fo, start.elapsed()))
+}
+
+#[test]
+fn bwlimit_paces_transfers_like_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // Incompressible data, so -z doesn't shrink what is paced.
+    Tree::new(tmp.path().join("src")).file("big", noise(512 << 10, 7)).file("small", "s").settle_mtimes();
+    // 512 KiB at 512 KiB/s is about a second, of which both let a tenth go unpaced.
+    let least = std::time::Duration::from_millis(700);
+    for (i, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+        let (dr, df) = (format!("r{i}"), format!("f{i}"));
+        let ((r, rt), (f, ft)) = both_timed(tmp.path(), &["-aiz", "--bwlimit=512", src, dst], &dr, &df);
+        same_output(&r, &f, &[], &format!("{src} {dst}"));
+        assert!(rt >= least && ft >= least, "{src} {dst}: rsync took {rt:?}, barqsync {ft:?}");
+        assert_same_tree(&snap(&tmp.path().join(&dr), true), &snap(&tmp.path().join(&df), true));
+    }
+    // A frame that takes longer than --timeout to arrive at this rate still moves, so it
+    // is no timeout: 96 KiB at 32 KiB/s, with one second allowed between bytes. Through
+    // both I/O layers.
+    Tree::new(tmp.path().join("slow")).file("f", noise(96 << 10, 8)).settle_mtimes();
+    for io in ["threads", "tokio"] {
+        for (i, (src, dst)) in [("slow/", "{host}t1"), ("{host}slow/", "t2")].into_iter().enumerate() {
+            let args = ["-a", "--bwlimit=32", "--timeout=1", src, dst];
+            let f = barqsync_env(tmp.path(), &args, &[("BARQSYNC_NET_IO", io), ("BARQSYNC_TRANSPORT", "ssh")]);
+            assert_eq!(f.code, 0, "{io} {src} {dst}: {}", f.stderr);
+            assert_eq!(fs::read(tmp.path().join(format!("t{}/f", i + 1))).unwrap(), noise(96 << 10, 8));
+            let _ = fs::remove_dir_all(tmp.path().join(format!("t{}", i + 1)));
+        }
+    }
+    // rsync's size syntax, in KiB by default; 0 is no limit.
+    let (r, f) = both(tmp.path(), &["-ai", "--bwlimit=0", "src/", "{dst}"], "zr", "zf").unwrap();
+    same_output(&r, &f, &[], "--bwlimit=0");
+    // (A negative rate is "too large" for rsync 3.5, "invalid" for 3.2: not compared.)
+    for bad in ["--bwlimit=100b", "--bwlimit=511b", "--bwlimit=x", "--bwlimit=1q"] {
+        let (r, f) = both(tmp.path(), &["-a", bad, "src/", "{dst}"], "er", "ef").unwrap();
+        assert_eq!((r.code, f.code), (1, 1), "{bad}: {}", f.stderr);
+        assert_eq!(message(&r.stderr), message(&f.stderr), "{bad}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --chown, --usermap, --groupmap
+// ---------------------------------------------------------------------------
+
+fn group_name(gid: u32) -> Option<String> {
+    let gr = unsafe { libc::getgrgid(gid) };
+    (!gr.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr((*gr).gr_name) }.to_string_lossy().into_owned())
+}
+
+/// A group other than `not` that this user may give files (one `chown` accepts), and its
+/// name.
+fn another_group(dir: &Path, not: u32) -> Option<(u32, String)> {
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0 as libc::gid_t; n.max(0) as usize];
+    let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    groups.truncate(n.max(0) as usize);
+    let probe = dir.join("group-probe");
+    fs::write(&probe, "").unwrap();
+    let found = groups.into_iter().filter(|&g| g != not).find_map(|g| {
+        let name = group_name(g)?;
+        std::os::unix::fs::lchown(&probe, None, Some(g)).ok().map(|()| (g, name))
+    });
+    fs::remove_file(probe).unwrap();
+    found
+}
+
+#[test]
+fn id_maps_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    t.file("a", "a").file("sub/b", "b").symlink("lnk", "a").settle_mtimes();
+    let src_gid = fs::metadata(t.path("a")).unwrap().gid();
+    let (Some(src_group), Some((gid, group))) = (group_name(src_gid), another_group(tmp.path(), src_gid)) else {
+        eprintln!("SKIP: this user is in no second group to map to");
+        return;
+    };
+    let me = unsafe { std::ffi::CStr::from_ptr((*libc::getpwuid(libc::getuid())).pw_name) }.to_string_lossy().into_owned();
+    let cases: Vec<Vec<String>> = vec![
+        vec!["-ai".into(), format!("--chown=:{group}")],
+        vec!["-ai".into(), format!("--chown={me}:{group}")],
+        vec!["-ai".into(), format!("--groupmap=*:{group}")],
+        vec!["-ai".into(), format!("--groupmap={src_group}:{group}")],
+        vec!["-ai".into(), format!("--groupmap={src_gid}:{gid}")],
+        vec!["-ai".into(), format!("--groupmap=0-{}:{group}", src_gid.max(1))],
+        vec!["-ai".into(), format!("--groupmap=no-such-group-x:{src_group},*:{group}")],
+        vec!["-ai".into(), format!("--groupmap=*:{group},{src_group}:{src_gid}")],
+        // No names travel with --numeric-ids: only numbers and an empty or wildcard name match.
+        vec!["-ai".into(), "--numeric-ids".into(), format!("--groupmap={src_group}:{group}")],
+        vec!["-ai".into(), "--numeric-ids".into(), format!("--groupmap=:{group}")],
+        // A name the receiver doesn't know is reported and its pair left out.
+        vec!["-ai".into(), "--groupmap=*:no-such-group-barqsync".into()],
+        // --chown implies -g where it is given (a later --no-g turns that off again: see below).
+        vec!["-ri".into(), format!("--chown=:{group}")],
+        vec!["-ai".into(), "--no-g".into(), format!("--chown=:{group}")],
+        // Without root, owners stay as they are.
+        vec!["-ai".into(), format!("--usermap=*:{me}")],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            let mut a: Vec<&str> = flags.iter().map(String::as_str).collect();
+            a.extend([src, dst]);
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            same_output(&r, &f, &[(&dr, &df)], &format!("{flags:?} {src} {dst}"));
+            assert_eq!(r.stderr, f.stderr, "{flags:?} {src} {dst}");
+            assert_eq!(gids(&tmp.path().join(&dr)), gids(&tmp.path().join(&df)), "{flags:?} {src} {dst}");
+        }
+    }
+    // A --no-g after --chown wins. (Only locally: rsync's server turns -g back on when it
+    // is given the map, while the client sends no groups, and it fails to chgrp.)
+    let no_g = format!("--chown=:{group}");
+    let (r, f) = both(tmp.path(), &["-ai", &no_g, "--no-g", "src/", "{dst}"], "nr", "nf").unwrap();
+    same_output(&r, &f, &[("nr", "nf")], "--chown --no-g");
+    assert_eq!(gids(&tmp.path().join("nr")), gids(&tmp.path().join("nf")));
+    assert_eq!(fs::metadata(tmp.path().join("nf/a")).unwrap().gid(), src_gid);
+    // An update changes the group of what is there (`.f.....g...`).
+    for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+        let (dr, df) = (format!("ur{j}"), format!("uf{j}"));
+        seed(tmp.path(), "src/", &[&dr, &df]);
+        let chown = format!("--chown=:{group}");
+        let (r, f) = both_remote(tmp.path(), &["-ai", &chown, src, dst], &dr, &df).unwrap();
+        same_output(&r, &f, &[], &format!("update {src} {dst}"));
+        assert!(f.stdout.contains(".f.....g... a"), "{}", f.stdout);
+        assert_eq!(gids(&tmp.path().join(&dr)), gids(&tmp.path().join(&df)));
+        assert_eq!(fs::metadata(tmp.path().join(&df).join("sub/b")).unwrap().gid(), gid);
+    }
+    // rsync's errors: each map once, --chown not mixed with them, and the maps' syntax.
+    let bad: &[&[&str]] = &[
+        &["--chown=a:b", "--usermap=x:y"],
+        &["--usermap=x:y", "--chown=a:b"],
+        &["--groupmap=x:y", "--chown=:b"],
+        &["--usermap=x:y", "--usermap=z:w"],
+        &["--chown=a:b", "--chown=c:d"],
+        &["--chown=:b", "--chown=:d"],
+        &["--usermap=x"],
+        &["--usermap=x:"],
+        &["--groupmap=1a:x"],
+        &["--groupmap=1-:x"],
+    ];
+    for flags in bad {
+        let mut a = vec!["-a"];
+        a.extend(*flags);
+        a.extend(["src/", "{dst}"]);
+        let (r, f) = both(tmp.path(), &a, "er", "ef").unwrap();
+        assert_eq!((r.code, f.code), (1, 1), "{flags:?}: {}", f.stderr);
+        assert_eq!(message(&r.stderr), message(&f.stderr), "{flags:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --append, --append-verify
+// ---------------------------------------------------------------------------
+
+/// Sources and destinations for `--append`: a file that grew, one unchanged, one that is
+/// shorter and one of the same size but newer at the source, a new one, one whose start
+/// differs (only `--append-verify` notices), and a big one that grew.
+fn append_fixture(root: &Path, dsts: &[&str]) {
+    let big = noise(300_000, 9);
+    let src = Tree::new(root.join("src"));
+    src.file("grown", "0123456789abcdef")
+        .file("same", "same")
+        .file("shrunk", "shrunk")
+        .file("samesize", "SAMESIZE")
+        .file("new", "new")
+        .file("mismatch", "XXXXmore")
+        .file("sub/big", &big)
+        .chmod("grown", 0o600)
+        .settle_mtimes();
+    let same = fs::metadata(src.path("same")).unwrap().mtime() as u64;
+    for d in dsts {
+        Tree::new(root.join(d))
+            .file("grown", "0123")
+            .file("same", "same")
+            .file("shrunk", "shrunk, and longer")
+            .file("samesize", "samesiz2")
+            .file("mismatch", "YYYY")
+            .file("sub/big", &big[..100_000])
+            .same_mtimes(BASE_TIME + 100_000)
+            .mtime("same", same);
+    }
+}
+
+#[test]
+fn append_matches_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    for (i, mode) in ["--append", "--append-verify"].into_iter().enumerate() {
+        for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            append_fixture(tmp.path(), &[&dr, &df]);
+            let (r, f) = both_remote(tmp.path(), &["-ai", mode, src, dst], &dr, &df).unwrap();
+            let what = format!("{mode} {src} {dst}");
+            same_output(&r, &f, &[], &what);
+            // --append-verify: "WARNING: mismatch failed verification -- update retained (will try again)."
+            let warnings = |o: &RunOut| o.stderr.lines().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(warnings(&r), warnings(&f), "{what}");
+            assert_same_tree(&snap(&tmp.path().join(&dr), true), &snap(&tmp.path().join(&df), true));
+            // What --append keeps: shorter files are left alone, attributes too.
+            let d = tmp.path().join(&df);
+            assert_eq!(fs::read(d.join("shrunk")).unwrap(), b"shrunk, and longer", "{what}");
+            assert_eq!(fs::metadata(d.join("samesize")).unwrap().mtime() as u64, BASE_TIME + 100_000, "{what}");
+            let mismatch: &[u8] = if mode == "--append" { b"YYYYmore" } else { b"XXXXmore" };
+            assert_eq!(fs::read(d.join("mismatch")).unwrap(), mismatch, "{what}");
+        }
+    }
+    // A second run has nothing left to append.
+    let (r, f) = both(tmp.path(), &["-ai", "--append", "src/", "{dst}"], "r0-0", "f0-0").unwrap();
+    same_output(&r, &f, &[], "again");
+    // rsync's conflicts: --append is in place and delta-based.
+    for flags in [&["--append", "-W"][..], &["--append-verify", "--partial-dir=pd"], &["--append", "--no-append", "-W"]] {
+        let mut a = vec!["-a"];
+        a.extend(flags);
+        a.extend(["src/", "{dst}"]);
+        let (r, f) = both(tmp.path(), &a, "er", "ef").unwrap();
+        assert_eq!(r.code, f.code, "{flags:?}: {}", f.stderr);
+        assert_eq!(message(&r.stderr), message(&f.stderr), "{flags:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -T / --temp-dir, --delay-updates
+// ---------------------------------------------------------------------------
+
+/// Whether a tree holds any partial-dir or temp leftovers.
+fn leftovers(root: &Path) -> Vec<String> {
+    snapshot(root, false)
+        .keys()
+        .map(|k| String::from_utf8_lossy(k).into_owned())
+        .filter(|k| k.contains(".~tmp~") || k.split('/').next_back().is_some_and(|n| n.starts_with('.') && n.len() > 7 && n.as_bytes()[n.len() - 7] == b'.'))
+        .collect()
+}
+
+#[test]
+fn temp_dir_and_delay_updates_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    t.file("a", "alpha").file("same", "same").file("sub/b", noise(300_000, 4)).file("sub/c", "c").symlink("lnk", "a").settle_mtimes();
+    let cases: &[&[&str]] = &[
+        &["-ai", "-T", "scratch"],
+        &["-ai", "--temp-dir=scratch", "--partial"],
+        &["-ai", "--delay-updates"],
+        &["-ai", "--delay-updates", "-T", "scratch"],
+        &["-ai", "--delay-updates", "--partial-dir=.pd"],
+        &["-ai", "--delay-updates", "--no-delay-updates"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            // An update: a changed file, an unchanged one, a new one; and -T's directory,
+            // which is relative to the destination.
+            for d in [&dr, &df] {
+                Tree::new(tmp.path().join(d)).file("a", "old").file("same", "same").file("sub/b", noise(300_000, 5)).dir("scratch");
+                set_mtime(&tmp.path().join(d).join("same"), fs::metadata(t.path("same")).unwrap().mtime() as u64);
+            }
+            let mut a = flags.to_vec();
+            a.extend([src, dst]);
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            let what = format!("{flags:?} {src} {dst}");
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+            assert_eq!(leftovers(&tmp.path().join(&df)), Vec::<String>::new(), "{what}");
+            assert!(fs::read_dir(tmp.path().join(&df).join("scratch")).unwrap().next().is_none(), "{what}: the temp dir is left empty");
+        }
+    }
+    // rsync's checks: the temp dir must exist and be a directory, relative to the
+    // destination; in-place updates have no use for --delay-updates.
+    Tree::new(tmp.path().join("ed")).file("plainfile", "x");
+    for flags in [
+        &["-a", "-T", "nope"][..],
+        &["-a", "-T", "plainfile"],
+        &["-a", "--inplace", "--delay-updates"],
+        &["-a", "--append", "--delay-updates"],
+        &["-a", "--delay-updates", "--inplace"],
+    ] {
+        let mut a = flags.to_vec();
+        a.extend(["src/", "ed"]);
+        let r = rsync(tmp.path(), &a).unwrap();
+        let f = barqsync(tmp.path(), &a);
+        assert_eq!((r.code, f.code), (1, 1), "{flags:?}: {}", f.stderr);
+        assert_eq!(message(&r.stderr), message(&f.stderr), "{flags:?}");
+    }
+    // A pull checks it too, on the receiving (client) side.
+    let f = barqsync_remote(tmp.path(), &["-a", "-T", "nope", "{host}src/", "ed"]);
+    assert_eq!(f.code, 1, "{}", f.stderr);
+    assert!(f.stderr.contains("The temp-dir does not exist: nope"), "{}", f.stderr);
+}
+
+// ---------------------------------------------------------------------------
+// --force, --ignore-errors, --ignore-missing-args, --delete-missing-args
+// ---------------------------------------------------------------------------
+
+/// Each distinct stderr line, without the tool's name, the temp dir's path, or rsync's
+/// closing "rsync error/warning: ..." line (barqsync has none).
+fn messages(o: &RunOut, tmp: &Path) -> std::collections::BTreeSet<String> {
+    let t = tmp.to_str().unwrap();
+    o.stderr
+        .lines()
+        .filter(|l| !l.starts_with("rsync error") && !l.starts_with("rsync warning"))
+        .map(|l| l.strip_prefix("rsync: ").or_else(|| l.strip_prefix("barqsync: ")).unwrap_or(l))
+        .map(|l| l.replace("[sender] ", "").replace("[generator] ", "").replace("[receiver] ", "").replace(t, "").replace("/private", ""))
+        .collect()
+}
+
+#[test]
+fn force_and_missing_args_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    Tree::new(tmp.path().join("src")).file("a", "a").file("x", "x").dir("emptysub").settle_mtimes();
+    // A directory deleted at the source whose files are still listed (rsync: they are
+    // deleted, the directory "vanished", exit 24).
+    fs::write(tmp.path().join("list"), "a\ngone\nsub/gone2\nsub/deep\nsub/deep/gone3\n").unwrap();
+    // The missing directory named too: both it and what is named below it.
+    fs::write(tmp.path().join("list2"), "gonedir\ngonedir/k/q\n").unwrap();
+    // A missing file in a directory that has nothing else (-m).
+    fs::write(tmp.path().join("list3"), "emptysub/gone4\n").unwrap();
+    let cases: &[&[&str]] = &[
+        // A directory in the way of a file goes only with --delete or --force.
+        &["-ai", "src/", "{dst}"],
+        &["-ai", "--force", "src/", "{dst}"],
+        &["-ai", "--force", "--no-force", "src/", "{dst}"],
+        &["-ai", "--ignore-missing-args", "src/a", "src/gone", "src/x", "{dst}/"],
+        &["-ai", "--delete-missing-args", "src/a", "src/gone", "src/gonedir", "{dst}/"],
+        &["-ai", "--delete-missing-args", "--force", "src/a", "src/gonedir", "{dst}/"],
+        &["-ai", "--delete-missing-args", "--ignore-missing-args", "src/gone", "{dst}/"],
+        // A rule leaves a missing source's destination alone. (Only compared locally:
+        // over ssh rsync's sender sends the excluded name anyway, which its server then
+        // deletes in a push, and its client refuses in a pull, exit 4.)
+        &["-ai", "--delete-missing-args", "--exclude=gone", "src/a", "src/gone", "{dst}/"],
+        &["-ai", "--ignore-missing-args", "--files-from=list", "src/", "{dst}/"],
+        &["-ai", "--delete-missing-args", "--files-from=list", "src/", "{dst}/"],
+        &["-ai", "--delete-missing-args", "--files-from=list2", "src/", "{dst}/"],
+        &["-aim", "--delete-missing-args", "--files-from=list3", "src/", "{dst}/"],
+        &["-aim", "--ignore-missing-args", "--files-from=list3", "src/", "{dst}/"],
+        // A directory's own filter file protects what is in it from --force.
+        &["-ai", "--force", "-f", ": .rsync-filter", "src/", "{dst}"],
+        // A single missing file copied to a new name deletes that name.
+        &["-ai", "--delete-missing-args", "src/gone", "{dst}/target"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, remote) in ["", "push", "pull"].into_iter().enumerate() {
+            // (In a push without --delete, rsync's server has no filter rules at all.)
+            if (!remote.is_empty() && flags.contains(&"--exclude=gone")) || (remote == "push" && flags.contains(&"-f")) {
+                continue;
+            }
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            for d in [&dr, &df] {
+                Tree::new(tmp.path().join(d))
+                    .file("x/inner/f", "i")
+                    .file("x/.rsync-filter", "P keep\n")
+                    .file("x/keep", "k")
+                    .file("gone", "g")
+                    .file("target", "t")
+                    .file("gonedir/k/q", "q")
+                    .file("sub/gone2", "g2")
+                    .file("sub/deep/gone3", "g3")
+                    .file("emptysub/gone4", "g4")
+                    .same_mtimes(BASE_TIME + 100);
+            }
+            let a: Vec<String> = flags
+                .iter()
+                .map(|a| match (remote, a.starts_with("src/"), a.starts_with("{dst}")) {
+                    ("push", _, true) => format!("{{host}}{a}"),
+                    ("pull", true, _) => format!("{{host}}{a}"),
+                    _ => a.to_string(),
+                })
+                .collect();
+            let a: Vec<&str> = a.iter().map(String::as_str).collect();
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            let what = format!("{flags:?} {remote}");
+            same_output(&r, &f, &[(&dr, &df)], &what);
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+            let (rm, fm) = (messages(&r, tmp.path()), messages(&f, tmp.path()));
+            assert_eq!(rm.iter().map(|l| l.replace(&dr, "D")).collect::<Vec<_>>(), fm.iter().map(|l| l.replace(&df, "D")).collect::<Vec<_>>(), "{what}");
+        }
+    }
+}
+
+/// A file `--delete-missing-args` deletes leaves its directory's time as rsync does: the
+/// source's, when it had that time before.
+#[test]
+fn missing_args_keep_the_directory_time() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = Tree::new(tmp.path().join("src"));
+    src.file("sub/keep", "k").settle_mtimes();
+    let mtime = |p: &Path| fs::metadata(p).unwrap().mtime() as u64;
+    let (dir_time, keep_time) = (mtime(&src.path("sub")), mtime(&src.path("sub/keep")));
+    fs::write(tmp.path().join("list"), "sub/gone\n").unwrap();
+    for (j, (s, d)) in [("src/", "{dst}/"), ("src/", "{host}{dst}/"), ("{host}src/", "{dst}/")].into_iter().enumerate() {
+        let (dr, df) = (format!("r{j}"), format!("f{j}"));
+        for name in [&dr, &df] {
+            Tree::new(tmp.path().join(name)).file("sub/keep", "k").file("sub/gone", "g").mtime("sub/keep", keep_time).mtime("sub", dir_time);
+        }
+        let (r, f) = both_remote(tmp.path(), &["-ai", "--delete-missing-args", "--files-from=list", s, d], &dr, &df).unwrap();
+        let what = format!("{s} {d}");
+        same_output(&r, &f, &[(&dr, &df)], &what);
+        assert_eq!(mtime(&tmp.path().join(&dr).join("sub")), dir_time, "{what}: rsync");
+        assert_eq!(mtime(&tmp.path().join(&df).join("sub")), dir_time, "{what}");
+        assert!(!tmp.path().join(&df).join("sub/gone").exists(), "{what}");
+    }
+}
+
+#[test]
+fn ignore_errors_deletes_after_errors_like_rsync() {
+    if skip_without_rsync() || unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // An unreadable source directory is an I/O error: --delete then deletes nothing,
+    // unless --ignore-errors. (--delete-after: rsync's default --delete-during deletes
+    // in the directories it reached before the error, barqsync only after a complete
+    // read; see the known differences.)
+    Tree::new(tmp.path().join("src")).file("a", "a").file("locked/f", "f").settle_mtimes();
+    fs::set_permissions(tmp.path().join("src/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let cases: [&[&str]; 4] = [
+        &["-ai", "--delete-after"],
+        &["-ai", "--delete-after", "--ignore-errors"],
+        &["-ai", "--delete", "--ignore-errors"],
+        &["-ai", "--delete-after", "--ignore-errors", "--no-ignore-errors"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            for d in [&dr, &df] {
+                Tree::new(tmp.path().join(d)).file("a", "a").file("extra", "e").dir("old/deep");
+            }
+            let mut a = flags.to_vec();
+            a.extend([src, dst]);
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            let what = format!("{flags:?} {src} {dst}");
+            same_output(&r, &f, &[], &what);
+            // The copy of the unreadable directory is unreadable too.
+            for d in [&dr, &df] {
+                let _ = fs::set_permissions(tmp.path().join(d).join("locked"), fs::Permissions::from_mode(0o755));
+            }
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+            assert_eq!(tmp.path().join(&df).join("extra").exists(), flags.len() != 3, "{what}");
+        }
+    }
+    fs::set_permissions(tmp.path().join("src/locked"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// --safe-links, --copy-unsafe-links, --munge-links
+// ---------------------------------------------------------------------------
+
+#[test]
+fn symlink_safety_options_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let top = tmp.path().join("top");
+    Tree::new(top.join("outside")).file("file", "outside");
+    // Links inside the transfer and out of it, as `src/` (where `../` leaves it at once)
+    // and `src` (one level more) see them. (No `a/../b` targets: rsync 3.4 and later call
+    // those unsafe, 3.2 doesn't.)
+    Tree::new(top.join("src"))
+        .file("a", "a")
+        .file("sub/b", "b")
+        .symlink("rel_ok", "a")
+        .symlink("sub/up_ok", "../a")
+        .symlink("rel_out", "../outside/file")
+        .symlink("sub/up_out", "../../outside/file")
+        .symlink("abs", "/etc/hosts")
+        .symlink("dir_out", "../outside")
+        .symlink("dangling_out", "../missing")
+        .symlink("munged", "/rsyncd-munged/a")
+        .settle_mtimes();
+    let cases: &[&[&str]] = &[
+        &["-ai", "--safe-links"],
+        &["-av", "--safe-links"],
+        &["-ai", "--copy-unsafe-links"],
+        &["-av", "--copy-unsafe-links"],
+        &["-ai", "--safe-links", "--copy-unsafe-links"],
+        // Each side munges on its own: a sending client unmunges, a receiving client
+        // munges, a local copy (whose client sends) unmunges.
+        &["-ai", "--munge-links"],
+        &["-ai", "--munge-links", "--safe-links"],
+        &["-ai", "--munge-links", "--no-munge-links"],
+    ];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, spec) in ["src/", "src"].into_iter().enumerate() {
+            for (k, (src, dst)) in [("", "{dst}/"), ("", "{host}{dst}/"), ("{host}", "{dst}/")].into_iter().enumerate() {
+                let (dr, df) = (format!("r{i}-{j}-{k}"), format!("f{i}-{j}-{k}"));
+                let source = format!("{src}{spec}");
+                let mut a = flags.to_vec();
+                a.extend([source.as_str(), dst]);
+                let (r, f) = both_remote(&top, &a, &dr, &df).unwrap();
+                let what = format!("{flags:?} {source} {dst}");
+                same_output(&r, &f, &[(&dr, &df)], &what);
+                // (Without the destination itself, which each tool created a moment apart.)
+                assert_same_tree(&snap(&top.join(&dr), false), &snap(&top.join(&df), false));
+            }
+        }
+    }
+}
+
+/// A source cut short after the scan is skipped with `--append`, as rsync's sender skips
+/// a "diminished" file: the destination keeps its data and attributes, and
+/// `--remove-source-files` leaves the source. (rsync can't be raced reliably, so a test
+/// hook cuts the file to half its length just before it is opened.)
+#[test]
+fn append_skips_a_diminished_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = noise(300_000, 4);
+    for (i, (src, dst)) in [("src/", "d0"), ("src/", "{host}d1"), ("{host}src/", "d2")].into_iter().enumerate() {
+        for mode in ["--append", "--append-verify"] {
+            Tree::new(tmp.path().join("src")).file("log", &data).file("ok", "complete").settle_mtimes();
+            let name = format!("d{i}");
+            Tree::new(tmp.path().join(&name)).file("log", &data[..200_000]).file("ok", "comp").same_mtimes(BASE_TIME + 7);
+            let args = ["-a", mode, "--remove-source-files", src, dst];
+            let f = barqsync_env(tmp.path(), &args, &[("BARQSYNC_TEST_SHRINK", "log")]);
+            let what = format!("{mode} {src} {dst}");
+            assert_eq!(f.code, 0, "{what}\n{}", f.stderr);
+            assert!(f.stderr.contains("skipped diminished file: \"") && f.stderr.contains("src/log\""), "{what}: {}", f.stderr);
+            let d = tmp.path().join(&name);
+            assert_eq!(fs::read(d.join("log")).unwrap(), &data[..200_000], "{what}");
+            assert_eq!(fs::metadata(d.join("log")).unwrap().mtime() as u64, BASE_TIME + 7, "{what}");
+            assert_eq!(fs::metadata(tmp.path().join("src/log")).unwrap().len(), 150_000, "{what}: the source stays");
+            assert_eq!(fs::read(d.join("ok")).unwrap(), b"complete", "{what}");
+            assert!(!tmp.path().join("src/ok").exists(), "{what}");
+        }
     }
 }

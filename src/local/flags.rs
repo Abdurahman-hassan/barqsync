@@ -24,33 +24,128 @@ pub fn adjust_mode(opts: &Options, meta: &mut Meta) {
     }
 }
 
-/// Apply `-L`/`-k` (follow symlinks) and `--chmod` to a freshly read source listing of
-/// `dir`. A dangling symlink under `-L` is dropped and reported through `err`.
-pub fn adjust_listing(opts: &Options, dir: &Path, ents: Vec<DirEnt>, err: &mut dyn FnMut(Vec<u8>)) -> Vec<DirEnt> {
-    if !opts.copy_links && !opts.copy_dirlinks && opts.chmod.is_empty() {
+/// What `--munge-links` puts in front of a received symlink's target.
+pub const MUNGED: &[u8] = b"/rsyncd-munged/";
+
+/// Apply `-L`/`-k`/`--copy-unsafe-links` (follow symlinks), `--munge-links` (a sending
+/// side unmunges) and `--chmod` to a freshly read source listing of `dir`, at `rel` in
+/// its transfer (which decides whether a symlink is unsafe). A dangling symlink it would
+/// follow is dropped and reported through `err`; `note` gets the `-v` lines.
+pub fn adjust_listing(opts: &Options, dir: &Path, rel: &[u8], ents: Vec<DirEnt>, err: &mut dyn FnMut(Vec<u8>), note: &mut dyn FnMut(Vec<u8>)) -> Vec<DirEnt> {
+    if !opts.copy_links && !opts.copy_dirlinks && !opts.copy_unsafe_links && !opts.munge_links && opts.chmod.is_empty() {
         return ents;
     }
     ents.into_iter()
         .filter_map(|mut e| {
-            if e.meta.kind == Kind::Symlink && (opts.copy_links || opts.copy_dirlinks) {
+            if e.meta.kind == Kind::Symlink {
                 let p = dir.join(&e.name);
-                match fsops::stat(&p) {
-                    Ok(m) if opts.copy_links || m.kind == Kind::Dir => {
-                        e.meta = m;
-                        e.link = None;
+                let target = e.link.clone().unwrap_or_default();
+                // rsync's sender judges a link by the path it has in the transfer.
+                let erel = crate::paths::join_rel(rel, &e.name);
+                let unsafe_link = opts.copy_unsafe_links && !opts.copy_links && crate::paths::unsafe_symlink(&target, &erel);
+                if unsafe_link {
+                    note([&b"copying unsafe symlink \""[..], &erel, b"\" -> \"", &target, b"\""].concat());
+                }
+                let follow = opts.copy_links || unsafe_link;
+                if follow || opts.copy_dirlinks {
+                    match fsops::stat(&p) {
+                        Ok(m) if follow || m.kind == Kind::Dir => {
+                            e.meta = m;
+                            e.link = None;
+                        }
+                        Ok(_) => {}
+                        Err(_) if follow => {
+                            err(path_msg("symlink has no referent: \"", &p, "\""));
+                            return None;
+                        }
+                        Err(_) => {}
                     }
-                    Ok(_) => {}
-                    Err(_) if opts.copy_links => {
-                        err(path_msg("symlink has no referent: \"", &p, "\""));
-                        return None;
-                    }
-                    Err(_) => {}
+                }
+                if opts.munge_links
+                    && let Some(t) = e.link.as_mut()
+                    && t.len() > MUNGED.len()
+                    && t.starts_with(MUNGED)
+                {
+                    t.drain(..MUNGED.len());
                 }
             }
             adjust_mode(opts, &mut e.meta);
             Some(e)
         })
         .collect()
+}
+
+/// What a named source that couldn't be read becomes (see [`missing_source`]).
+pub enum Missing {
+    /// An error to report.
+    Error,
+    /// Missing, which `--ignore-missing-args` makes no error.
+    Ignored,
+    /// Missing, and with `--delete-missing-args` an entry asking the receiver to delete
+    /// its destination, as rsync's mode-0 file-list entries do.
+    Deleted(DirEnt),
+}
+
+/// A named source (a SRC argument, or a `-R`/`--files-from` path) that `lstat` failed on
+/// with `e`.
+pub fn missing_source(opts: &Options, name: &OsStr, e: &io::Error) -> Missing {
+    match opts.missing_args {
+        _ if e.kind() != io::ErrorKind::NotFound => Missing::Error,
+        0 => Missing::Error,
+        1 => Missing::Ignored,
+        _ => Missing::Deleted(DirEnt::missing(name.to_os_string())),
+    }
+}
+
+/// The entries of a `-R`/`--files-from` selection `select::read_selected` couldn't read
+/// (`errs`): errors to report through `err`, or (see [`missing_source`]) named ones that
+/// are missing, left out or added to `ents`. A missing directory that leads to named
+/// paths is no error with `--ignore-missing-args`; with `--delete-missing-args` it has
+/// vanished (`vanished`, exit 24), and the paths named below it are still deleted on the
+/// receiver, as rsync does: they become missing entries named by their path from here,
+/// after the directory's own when it is named too.
+pub fn missing_selected(
+    opts: &Options,
+    sel: &crate::select::Sel,
+    errs: Vec<(PathBuf, io::Error)>,
+    ents: &mut Vec<DirEnt>,
+    err: &mut dyn FnMut(Vec<u8>),
+    vanished: &mut dyn FnMut(&Path),
+) {
+    /// The paths named below missing directory `dir` (at `prefix`), each directory
+    /// leading to one vanished too.
+    fn named_below(sel: &crate::select::Sel, dir: &Path, prefix: &[u8], out: &mut Vec<DirEnt>, vanished: &mut dyn FnMut(&Path)) {
+        for (name, child) in &sel.children {
+            let path = crate::paths::join_rel(prefix, OsStr::from_bytes(name));
+            if child.named {
+                out.push(DirEnt::missing(std::ffi::OsString::from_vec(path.clone())));
+            }
+            if !child.children.is_empty() {
+                let d = dir.join(OsStr::from_bytes(name));
+                vanished(&d);
+                named_below(child, &d, &path, out, vanished);
+            }
+        }
+    }
+    use std::os::unix::ffi::OsStringExt;
+    for (p, e) in errs {
+        let name = p.file_name().unwrap_or_default();
+        let child = sel.children.get(name.as_bytes());
+        match missing_source(opts, name, &e) {
+            Missing::Error => err(path_msg("link_stat \"", &p, format!("\" failed: {e}"))),
+            Missing::Deleted(missing) => {
+                let child = child.expect("selected");
+                if child.named {
+                    ents.push(missing);
+                }
+                if !child.children.is_empty() {
+                    vanished(&p);
+                    named_below(child, &p, name.as_bytes(), ents, vanished);
+                }
+            }
+            Missing::Ignored => {}
+        }
+    }
 }
 
 /// `--remove-source-files`: delete a source entry the receiver now has. `listed` is the
@@ -110,15 +205,17 @@ pub fn write_sparse_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
 fn copy_sparse(mut s: &File, tmp: &Path, mode: u32) -> io::Result<File> {
     let out = fsops::create_new(tmp, mode)?;
     let mut buf = vec![0u8; 1 << 20];
+    let want = crate::bwlimit::pacing().map_or(buf.len(), |rate| crate::bwlimit::piece(rate).min(buf.len()));
     let mut off = 0u64;
     loop {
         fsops::check_interrupt()?;
-        let n = match s.read(&mut buf) {
+        let n = match s.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
+        crate::bwlimit::copying(n as u64);
         write_sparse_at(&out, &buf[..n], off)?;
         off += n as u64;
     }
@@ -156,6 +253,7 @@ impl Engine<'_> {
             }
         }
         self.backup_root = self.opts.backup_dir.as_deref().map(resolve);
+        self.temp_root = self.opts.temp_dir.as_deref().map(resolve);
         // rsync names the backup directory with --info=backup (-vv), "(new)" until it exists.
         if let (Some(dir), Some(root)) = (&self.opts.backup_dir, &self.backup_root)
             && self.out.levels().backup > 0
@@ -170,11 +268,117 @@ impl Engine<'_> {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // -T / --delay-updates
+    // -----------------------------------------------------------------------
+
+    /// `-T`: the temp dir must be a directory, which rsync checks before it starts: exit
+    /// 1, or 11 when it can't even be looked at.
+    pub(crate) fn check_temp_dir(&self) -> Result<(), i32> {
+        let (Some(dir), Some(given)) = (&self.temp_root, &self.opts.temp_dir) else { return Ok(()) };
+        let given = Path::new(given);
+        let (msg, code) = match fs::metadata(dir) {
+            Ok(m) if m.is_dir() => return Ok(()),
+            Ok(_) => (path_msg("The temp-dir is not a directory: ", given, ""), crate::exit::SYNTAX),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (path_msg("The temp-dir does not exist: ", given, ""), crate::exit::SYNTAX),
+            Err(e) => (path_msg("Failed to stat temp-dir ", given, format!(": {e}")), crate::exit::FILE_IO),
+        };
+        self.out.error(msg);
+        Err(code)
+    }
+
+    /// Create the temp file for writing `dst` (see [`fsops::with_temp`]): next to it, or
+    /// with `-T` in the temp dir, named without the leading `.` there, as rsync does.
+    pub(crate) fn with_temp<T>(&self, dst: &Path, create: impl FnMut(&Path) -> io::Result<T>) -> io::Result<(PathBuf, T)> {
+        let (dir, name) = split_dst(dst);
+        match &self.temp_root {
+            Some(t) => fsops::with_temp_in(t, name, false, create),
+            None => fsops::with_temp(dir, name, create),
+        }
+    }
+
+    /// A temp file name for writing `dst` (see [`Engine::with_temp`]), not created yet
+    /// (`--io-uring` creates its files itself).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn temp_path(&self, dst: &Path) -> PathBuf {
+        let (dir, name) = split_dst(dst);
+        match &self.temp_root {
+            Some(t) => t.join(fsops::temp_name_with(name, false)),
+            None => dir.join(fsops::temp_name(name)),
+        }
+    }
+
+    /// Put `job`'s finished temp file `tmp` in place of the destination. With
+    /// `--delay-updates` it waits in the partial dir instead until the transfer is done
+    /// ([`Engine::finish_delayed`]). With `-T` on another filesystem the rename can't
+    /// work: as rsync does, the data is copied instead, into a file that replaces the
+    /// destination and then gets its attributes again.
+    pub(crate) fn place_file(&self, tmp: &Path, job: &FileJob) -> io::Result<()> {
+        let held = self.partial_path(&job.dst_path).filter(|_| self.opts.delay_updates);
+        let to = held.as_deref().unwrap_or(&job.dst_path);
+        if let Some(dir) = held.as_deref().and_then(Path::parent) {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        }
+        if let Some(f) = fsops::rename_or_copy(tmp, to)? {
+            let (mode, uid, gid) = self.target_attrs(job);
+            self.finish_delta_file(&f, &job.meta, mode, uid, gid, Some((to, &job.src(self.remote.is_some()))))?;
+        }
+        if let Some(held) = held {
+            self.delayed.lock().unwrap().push((held, job.clone()));
+        }
+        Ok(())
+    }
+
+    /// `--delay-updates`: now that the transfer is done, rename the files waiting in their
+    /// partial dirs into place, one after another (rsync's `handle_delayed_updates`).
+    pub fn finish_delayed(&self) {
+        let mut delayed = std::mem::take(&mut *self.delayed.lock().unwrap());
+        delayed.sort_by(|a, b| a.1.rel.cmp(&b.1.rel));
+        for (held, job) in delayed {
+            if fsops::interrupted() {
+                return;
+            }
+            match fs::rename(&held, &job.dst_path) {
+                Ok(()) => self.file_in_place(&job),
+                Err(e) => {
+                    let from = path_msg(" (from ", &held, format!("): {e}"));
+                    self.dst_err(path_msg("rename failed for \"", &fsops::full_path(&job.dst_path), [&b"\""[..], &from].concat()));
+                }
+            }
+        }
+    }
+
     /// `-L`/`-k`/`--chmod`, then (`-X`/`-A`) the entries' attributes and ACLs, for a
     /// listing read on this machine.
-    pub(crate) fn adjust_listing(&self, dir: &Path, ents: Vec<DirEnt>) -> Vec<DirEnt> {
-        let ents = adjust_listing(self.opts, dir, ents, &mut |m| self.src_err(m));
+    pub(crate) fn adjust_listing(&self, dir: &Path, rel: &[u8], ents: Vec<DirEnt>) -> Vec<DirEnt> {
+        let note = &mut |m: Vec<u8>| {
+            if self.out.verbose() > 0 {
+                self.out.info(m);
+            }
+        };
+        let mut ents = adjust_listing(self.opts, dir, rel, ents, &mut |m| self.src_err(m), note);
+        if let Some(ids) = &self.local_ids {
+            let mut ids = ids.lock().unwrap();
+            ents.iter_mut().for_each(|e| self.map_local_ids(&mut ids, &mut e.meta));
+        }
         self.local_listing(dir, ents)
+    }
+
+    /// `--chmod` and the id maps for a local root directory's own metadata.
+    pub(crate) fn adjust_root(&self, meta: &mut Meta) {
+        adjust_mode(self.opts, meta);
+        if let Some(ids) = &self.local_ids {
+            self.map_local_ids(&mut ids.lock().unwrap(), meta);
+        }
+    }
+
+    /// Local transfers with `--usermap`/`--groupmap`: the owner and group the receiver
+    /// gives a source entry.
+    fn map_local_ids(&self, ids: &mut crate::ids::IdMap, meta: &mut Meta) {
+        let named = !self.opts.numeric_ids;
+        meta.uid = ids.map_local(true, meta.uid, named);
+        meta.gid = ids.map_local(false, meta.gid, named);
     }
 
     /// `--max-size` / `--min-size`: regular files outside the range are skipped.
@@ -421,9 +625,24 @@ impl Engine<'_> {
         finish_temp(tmp, r)
     }
 
+    /// A file's data is written: unless it waits for `--delay-updates` (which puts it in
+    /// place later), see [`Engine::file_in_place`].
+    pub(crate) fn file_written(&self, job: &FileJob) {
+        if !self.opts.delay_updates {
+            self.file_in_place(job);
+        }
+    }
+
     /// A file's data is in place: drop its `--partial-dir` leftover (and the directory,
     /// once empty) and, with `--remove-source-files`, its source.
-    pub(crate) fn file_written(&self, job: &FileJob) {
+    pub(crate) fn file_in_place(&self, job: &FileJob) {
+        // A relative partial dir goes once empty (rsync keeps an absolute one).
+        if self.opts.delay_updates
+            && self.opts.partial_dir.as_deref().is_some_and(|d| !Path::new(d).is_absolute())
+            && let Some(dir) = self.partial_path(&job.dst_path).as_deref().and_then(Path::parent)
+        {
+            let _ = fs::remove_dir(dir);
+        }
         if let Some(p) = &job.partial {
             let _ = fs::remove_file(p);
             if self.opts.partial_dir.as_deref().is_some_and(|d| !Path::new(d).is_absolute())
@@ -433,6 +652,66 @@ impl Engine<'_> {
             }
         }
         self.source_done(job.root, &job.src_path, &job.dst_path, &job.rel, &job.meta);
+    }
+
+    // -----------------------------------------------------------------------
+    // --append / --append-verify
+    // -----------------------------------------------------------------------
+
+    /// `--append`: a destination file that isn't shorter than the source is left alone,
+    /// attributes included, when its data would otherwise be rewritten (rsync).
+    pub(crate) fn append_skips(&self, src: &Meta, dst: Option<&Meta>) -> bool {
+        self.opts.append > 0 && dst.is_some_and(|d| d.kind == Kind::File && d.size >= src.size)
+    }
+
+    /// `--append`: the destination file `job`'s data goes onto (shorter, not empty).
+    pub(crate) fn append_to(&self, job: &FileJob) -> Option<Meta> {
+        let d = job.dst_meta.filter(|d| d.kind == Kind::File && 0 < d.size && d.size < job.meta.size)?;
+        (self.opts.append > 0 && job.basis.is_none()).then_some(d)
+    }
+
+    /// `--append-verify` found that the data of the destination file (`d`) isn't the
+    /// start of the source's. rsync appends anyway, finds that the file fails its
+    /// checksum and sends it again: as it does, warn (with `-v` or `-i`) and itemize the
+    /// second try, which finds the source's size and mode but not its time.
+    pub(crate) fn append_failed(&self, job: &FileJob, d: &Meta) {
+        if self.out.verbose() > 0 || self.out.itemizes() {
+            self.out.warning([&b"WARNING: "[..], &job.rel, b" failed verification -- update retained (will try again)."].concat());
+        }
+        let change = Change { transfer: true, time: !self.rules.same_mtime(&job.meta, d), ..Change::default() };
+        self.out.item(&Item::new(&job.rel, &job.meta, change).from(&job.src_path, Some((job.wire_dir, job.idx))));
+        Stats::add(&self.stats.transferred, 1);
+        Stats::add(&self.stats.transferred_bytes, job.meta.size);
+    }
+
+    /// `--append` locally: copy the source's data past the destination's end (`d.size`)
+    /// onto it. With `--append-verify` the data already there must be the source's
+    /// start, or the whole file is rewritten. A source now shorter than it was listed is
+    /// left alone, as rsync's sender skips a "diminished" file: [`Diminished`]. Returns
+    /// the literal data it took.
+    pub(crate) fn write_append(&self, job: &FileJob, d: &Meta, mode: u32, uid: Option<u32>, gid: Option<u32>) -> io::Result<u64> {
+        let src = fsops::open_listed(&job.src_path, &job.meta, self.opts.follows_listed())?;
+        if src.metadata()?.len() < job.meta.size {
+            return Err(io::Error::other(Diminished));
+        }
+        let out = fs::OpenOptions::new().read(true).write(true).open(&job.dst_path)?;
+        let from = if self.opts.append > 1 && checksum::prefix_sum(&src, d.size)? != checksum::prefix_sum(&out, d.size)? {
+            self.append_failed(job, d);
+            0
+        } else {
+            d.size
+        };
+        let end = fsops::copy_tail(&src, &out, from)?;
+        Stats::add(&self.stats.literal_bytes, end - from);
+        Stats::add(&self.stats.matched_bytes, from);
+        out.set_len(end)?;
+        self.finish_delta_file(&out, &job.meta, mode, uid, gid, Some((&job.dst_path, &job.src(false))))?;
+        Ok(end - from)
+    }
+
+    /// rsync's warning for a file [`Diminished`] since it was listed, which is not sent.
+    pub(crate) fn diminished(&self, path: &Path) {
+        self.out.warning(path_msg("skipped diminished file: \"", &fsops::full_path(path), "\""));
     }
 
     // -----------------------------------------------------------------------
@@ -606,6 +885,19 @@ impl Engine<'_> {
         fsops::copy_from(src, tmp, size, allow_fast, mode)
     }
 }
+
+/// `--append`: the source is shorter than it was listed, so the destination keeps what it
+/// has and the source stays (rsync's "skipped diminished file").
+#[derive(Debug)]
+pub(crate) struct Diminished;
+
+impl std::fmt::Display for Diminished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("diminished since it was listed")
+    }
+}
+
+impl std::error::Error for Diminished {}
 
 #[cfg(test)]
 mod tests {

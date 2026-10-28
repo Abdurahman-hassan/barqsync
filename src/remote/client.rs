@@ -39,6 +39,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     let out: &'static Output = Box::leak(Box::new(Output::new(opts, side)));
     out.open_log(opts);
     let started = Instant::now();
+    crate::bwlimit::limit_connections(opts.bwlimit);
 
     // Push (local sources, remote destination) or pull (remote sources on one host,
     // local destination). An empty remote path means the remote home directory.
@@ -140,6 +141,8 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // The log is this side's; the server only reports what goes in it.
     server_opts.log_file = None;
     server_opts.paths = server_paths;
+    // rsync: each side needs its own --munge-links; the server's is never this one.
+    server_opts.munge_links = false;
     server_opts.transport = if transport == Transport::Auto { Transport::Quic } else { transport };
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };
     // --timeout covers waiting for the remote side to start, as rsync's does.

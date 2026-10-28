@@ -170,6 +170,7 @@ pub(crate) fn make_dest_path(dir: &Path, opts: &Options, out: &Output) -> Result
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // Process-lifetime output, shared with the progress thread.
     let out: &'static Output = Box::leak(Box::new(Output::new(opts, Side::Local)));
+    crate::bwlimit::limit_copies(opts.bwlimit);
     out.open_log(opts);
     let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
@@ -199,6 +200,18 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
 
     let mut engine = Engine::new(opts, filter, out);
     engine.set_dest(&plan.dest_root);
+    if let Err(code) = engine.check_temp_dir() {
+        return code;
+    }
+    if opts.usermap.is_some() || opts.groupmap.is_some() {
+        match crate::ids::IdMap::for_receiver(opts, &mut |m| out.warning(m)) {
+            Ok(ids) => engine.local_ids = Some(std::sync::Mutex::new(ids)),
+            Err(e) => {
+                out.error(e);
+                return exit::SYNTAX;
+            }
+        }
+    }
     // A directory task waiting in `par_iter` runs other directories' tasks on its stack,
     // so nesting gets deep with many directories (5000 overflowed the 2 MiB default).
     let pool = match rayon::ThreadPoolBuilder::new()
@@ -239,6 +252,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     });
     if !fsops::interrupted() {
         pool.install(|| {
+            engine.finish_delayed();
             engine.link_followers();
             engine.finish_deletions();
             engine.apply_fixups();

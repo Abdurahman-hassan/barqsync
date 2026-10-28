@@ -41,6 +41,7 @@ pub fn run() -> i32 {
     conn.set_compression(opts.compression());
     conn.set_wire(opts.wire);
     crate::fsops::cache::set_enabled(opts.drop_cache);
+    crate::bwlimit::limit_connections(opts.bwlimit);
     mark("handshake done");
     if conn.msg(Msg::HelloAck { version: VERSION }).is_err() {
         return exit::PROTOCOL;
