@@ -47,7 +47,7 @@ echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc  # 
 ```
 
 To copy to or from another machine, install barqsync there too, from the same release line
-(0.4.x uses protocol 10 and cannot communicate with 0.3.x or earlier releases).
+(0.5.x uses protocol 11 and cannot communicate with 0.4.x or earlier releases).
 
 ## Quick start
 
@@ -147,10 +147,11 @@ Every option, and where barqsync differs from rsync:
 ## Good to know
 
 - **macOS and Linux only.**
-- **Upgrade both machines to 0.4.2.** The 0.4.x line fixes security and data-loss bugs
-  found in an audit; 0.4.1 adds the complete-scan deletion barrier and 0.4.2 improves
-  remote interruption and shutdown. See the [changelog](CHANGELOG.md). Protocol 10
-  cannot communicate with 0.3.x or earlier.
+- **Upgrade both machines to 0.5.0.** It runs most remaining everyday rsync command
+  lines (`--bwlimit`, `--chown`, `--append`, `-T`, `--delay-updates`, `--log-file`,
+  `--out-format` escapes, `--info`, `-E`/`-U`/`-N` and more), deletes nothing after a
+  file fails to be written, and hardens remote transfers against hostile peers. See
+  the [changelog](CHANGELOG.md). Protocol 11 cannot communicate with 0.4.x or earlier.
 - **Remote copies need barqsync on both machines,** like rsync, or `--remote-path` to point
   at it. Both ends must run the same release line.
 - **Remote paths:** use `host:path` or `'user@[::1]:path'` for IPv6 (quote brackets in
@@ -160,7 +161,7 @@ Every option, and where barqsync differs from rsync:
   a colon with `./`. User names and host aliases accept ASCII letters, digits and
   `._-+`, with no leading `-`; configure other login names in SSH configuration.
 - **Not supported yet:** daemon mode (`rsync://`, `host::module`) and a few rarer flags such
-  as `--fuzzy`, `--copy-dest` and `--log-file`; see the
+  as `--fuzzy` and `--copy-dest`; see the
   [implementation notes](docs/implementation.md#supported-options) for the list.
 - **`-X` and `-A` follow rsync's rules** on each system (which attribute namespaces are
   copied, POSIX ACLs on Linux, extended ACLs on macOS); ACLs aren't translated between the two.
