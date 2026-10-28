@@ -212,10 +212,13 @@ fn partial_dir_fixture(root: &Path) {
     for d in ["dr", "df", "pr", "pf"] {
         let big = fs::read(t.path("big")).unwrap();
         let big2 = fs::read(t.path("sub/big2")).unwrap();
+        // `other` is left alone and compared: its time must not depend on the second
+        // each destination was made in.
         Tree::new(root.join(d))
             .file(".rsync-partial/big", &big[..100_000])
             .file(".rsync-partial/other", "unrelated")
-            .file("sub/.rsync-partial/big2", &big2[..1000]);
+            .file("sub/.rsync-partial/big2", &big2[..1000])
+            .same_mtimes(BASE_TIME + 600_000);
     }
 }
 
