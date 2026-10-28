@@ -10,7 +10,7 @@ use barqsync::cli::Options;
 use barqsync::delta::Op;
 use barqsync::entry::{DirEnt, Kind, Meta};
 use barqsync::fsops;
-use barqsync::output::{Output, StatsSnapshot};
+use barqsync::output::{Output, Side, StatsSnapshot};
 use barqsync::proto::{Conn, Frame, Msg, NeedReq, RootInfo, Wire, file_id};
 use barqsync::remote::{receiver, sender};
 use std::ffi::{OsStr, OsString};
@@ -113,10 +113,13 @@ fn receive_logged(dest: &Path, args: &[&str], (wire, tokio): (Wire, bool), scrip
     let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let sink = log.clone();
     let handle = std::thread::spawn(move || {
-        let out = Output::forwarding(&opts, false, Box::new(move |_, _, text| {
-            let mut log = sink.lock().unwrap();
-            log.push_str(&String::from_utf8_lossy(text));
-            log.push('\n');
+        // Messages and errors, as a server forwards them (items go as records).
+        let out = Output::forwarding(&opts, Box::new(move |m| {
+            if let Msg::Log { text, .. } = m {
+                let mut log = sink.lock().unwrap();
+                log.push_str(&String::from_utf8_lossy(&text));
+                log.push('\n');
+            }
         }));
         receiver::run(&actual, &opts, &dest, &out, false).0
     });
@@ -710,7 +713,7 @@ fn a_small_file_that_grew_is_sent_whole() {
         let (actual, peer) = pair(mode.0, mode.1);
         let sources = vec![OsString::from(format!("{}/", src.display()))];
         let handle = std::thread::spawn(move || {
-            let out = Output::new(&opts);
+            let out = Output::new(&opts, Side::Push);
             sender::run(&actual, &opts, &sources, &out, false).0
         });
         let grown = vec![7u8; 300 << 10];

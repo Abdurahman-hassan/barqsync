@@ -4,7 +4,7 @@
 use super::{Stop, Transport, auto, quic, receiver, recv, relay, sender, streams};
 use crate::cli::Options;
 use crate::exit;
-use crate::output::{Output, Stats};
+use crate::output::{Output, Side, Stats};
 use crate::paths::{Location, parse_location};
 use crate::proto::{Conn, Frame, MAGIC, Msg, VERSION};
 use crate::timing::mark;
@@ -34,7 +34,9 @@ fn no_handshake_message(status: Option<i32>, remote: &str) -> String {
 }
 
 pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
-    let out: &'static Output = Box::leak(Box::new(Output::new(opts)));
+    // A local destination makes this a pull: items are shown as rsync's receiver shows them.
+    let side = if matches!(parse_location(dest), Ok(Location::Local(_))) { Side::Pull } else { Side::Push };
+    let out: &'static Output = Box::leak(Box::new(Output::new(opts, side)));
     let started = Instant::now();
     crate::bwlimit::limit_connections(opts.bwlimit);
 
@@ -193,6 +195,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
 
     mark("setup done");
+    out.flist_start(opts, server_is_sender);
     let keepalive = super::KeepAlive::start(&conn.out, opts.timeout);
     let reporter = opts.progress.then(|| crate::progress::Reporter::start(out, opts.human));
     // `confirmed`: this side has the peer's last frame, so the peer has everything this
@@ -236,17 +239,17 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     relay::reap(Duration::from_secs(if clean { 5 } else { 1 }));
     out.flush();
     if let Some(s) = stats
-        && (opts.stats || opts.verbose > 0)
         && code != exit::SIGNAL
     {
         let totals = Stats::default();
         totals.absorb(&s);
+        out.flist_end(opts, server_is_sender, totals.entries());
         let io = crate::output::Io {
             sent: crate::proto::BYTES_SENT.load(std::sync::atomic::Ordering::Relaxed),
             received: crate::proto::BYTES_RECEIVED.load(std::sync::atomic::Ordering::Relaxed),
             dry_run: opts.dry_run,
         };
-        totals.print(out, started.elapsed(), opts.human, opts.stats, io);
+        totals.print(out, started.elapsed(), opts.human, opts.info.stats, io);
     }
     out.flush();
     code

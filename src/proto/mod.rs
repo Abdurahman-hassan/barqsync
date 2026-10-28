@@ -57,11 +57,12 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 ///     `Synced` names entries only; `IoError` (source read errors stop deletions).
 /// 11: `--filter`/`-F`/`-C` rules, `--max-delete`, `-m`, `--mkpath` and `--timeout` in the
 ///     options; `KeepAlive`; vanished files and stopped deletions in the counters; `-x`
-///     mount points in `DirBatch`. Also `--bwlimit`, `--usermap`/`--groupmap` (`--chown`)
-///     and `--append(-verify)` in the options, `Sig::Append`, and id 0's name in `IdNames`;
-///     `-T`, `--delay-updates`, `--force`, `--ignore-errors`, the missing-args options and
-///     the symlink options in the options, and missing entries (`DirEnt::missing`) in
-///     listings.
+///     mount points in `DirBatch`; `--info` levels in the options; a push's items and
+///     deletions as `Item` and `Deleted` records for the client to format. Also
+///     `--bwlimit`, `--usermap`/`--groupmap` (`--chown`) and `--append(-verify)` in the
+///     options, `Sig::Append`, and id 0's name in `IdNames`; `-T`, `--delay-updates`,
+///     `--force`, `--ignore-errors`, the missing-args options and the symlink options in
+///     the options, and missing entries (`DirEnt::missing`) in listings.
 pub const VERSION: u32 = 11;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.
@@ -196,6 +197,11 @@ pub enum Msg {
     /// Output produced on the server, printed by the client. `escape`: the text may
     /// contain file names and is escaped with the client's charset before printing.
     Log { stderr: bool, escape: bool, text: Vec<u8> },
+    /// Receiver (server) → sending client: an item to show, which the client formats
+    /// as rsync's sender does (`--out-format`, `-i`, `-v`).
+    Item(Box<crate::output::ItemRec>),
+    /// Receiver (server) → sending client: an entry deleted (`dir`: a directory).
+    Deleted { rel: Vec<u8>, dir: bool },
 
     // sender → receiver
     Roots(Vec<RootInfo>),

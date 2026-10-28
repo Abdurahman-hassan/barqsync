@@ -5,10 +5,11 @@
 ### Compatibility
 
 - Remote transfers now use protocol 11: the new options travel to the other side, which
-  also reports vanished files and `--max-delete` stops. `--append` adds a request for
-  the data past a shorter file, `--delete-missing-args` entries for missing sources, and
-  the sender now names the owner and group of id 0 too.
-  Upgrade barqsync on both machines together; this release cannot communicate with 0.4.x.
+  also reports vanished files and `--max-delete` stops, and a push's items reach the
+  client as records it formats itself. `--append` adds a request for the data past a
+  shorter file, `--delete-missing-args` entries for missing sources, and the sender now
+  names the owner and group of id 0 too. Upgrade barqsync on both machines together;
+  this release cannot communicate with 0.4.x.
 
 ### Security
 
@@ -66,6 +67,18 @@
   ("file has vanished") and exit 24, as with rsync, instead of an error and exit 23.
 - `--stats` also prints rsync's "Total bytes sent/received" lines, and `-v` or `--stats`
   rsync's "sent N bytes  received M bytes" and "total size is" summary lines.
+- `--out-format` now expands rsync's escapes, locally, in pushes and in pulls: `%o`, `%f`,
+  `%n`, `%l`, `%b`, `%M`, `%t`, `%B`, `%U`, `%G`, `%p`, `%i`, `%L` and `%%`, with widths, `-`
+  and `'` (`%-20n`, `%'l`). Before, only `%n`, `%L` and `%i` were, and any other escape was
+  printed as it was while the run still ended with exit 0. `%c` and `%C` are refused
+  (exit 1); `--log-format` is accepted as rsync's old name. `%b` counts the file data sent,
+  not rsync's protocol bytes; see the implementation notes.
+- `--info` now has rsync's flags and levels: `name0`/`name1`/`name2`, `del`, `skip`/`skip2`,
+  `flist`/`flist2`, `stats0` to `stats3`, `nonreg`, `remove`, `backup` and `progress`, with
+  rsync's priorities (`-v --info=name0` lists no names, `--stats --info=stats0` prints no
+  statistics), `ALL`, `NONE` and `--info=help`. Before, every flag but `progress` was
+  ignored. Unknown flags, and `copy` and `mount` (whose messages barqsync never shows),
+  are refused (exit 1).
 
 ### Fixed
 
@@ -102,6 +115,19 @@
   `--delete-after` keeps the old file too: a write error ends rsync's run before it
   deletes. A local copy that fails to read a source file now stops deletion as well, as
   a remote sender's read error already did. All earlier releases are affected.
+- `-q` now keeps stdout empty, as rsync does: `--out-format` items, `--stats` and the
+  progress line were still printed.
+- `-v` now lists a directory whose permissions or other attributes changed, not only one
+  whose time changed, and starts with rsync's "sending incremental file list" (or
+  "building file list ... done"); `--progress` lists the files too, as rsync's does.
+- "skipping non-regular file" is shown without `-v`, as rsync shows it (`--info=nonreg0`
+  turns it off).
+- `-u` treats a source file as not newer unless it is newer by more than
+  `--modify-window`, as rsync does. A file it skips is no longer listed by `-ii`, and
+  `--remove-source-files` no longer removes it from the source.
+- `--ignore-existing` now leaves any existing destination entry alone, as rsync does: a
+  symlink or special file was updated, and a directory where a file was to go was
+  replaced. The files it leaves alone stay in the source with `--remove-source-files`.
 - `--delete` no longer removes what the filter rules protect inside a directory it deletes:
   with `--exclude='*.log'`, `old/keep.log` stays, and so does `old` ("cannot delete
   non-empty directory"), as with rsync. Before, the whole directory was removed. The same

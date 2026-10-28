@@ -56,13 +56,12 @@ pub fn run() -> i32 {
     super::set_timeout(opts.timeout);
     let keepalive = super::KeepAlive::start(&conn.out, opts.timeout);
     let fwd = conn.out.clone();
-    // In a push the items come from this (receiving) side but describe what the
-    // client sent, so they are shown as rsync's sender does (`<f...`).
+    // In a push the items come from this (receiving) side but describe what the client
+    // sent: they go as records, which the client shows as rsync's sender does.
     let out = Output::forwarding(
         &opts,
-        !server_is_sender,
-        Box::new(move |stderr, escape, text| {
-            let _ = fwd.msg(Msg::Log { stderr, escape, text: text.to_vec() });
+        Box::new(move |m| {
+            let _ = fwd.msg(m);
         }),
     );
     // A sender with the receiver's final counters knows the receiver has everything,

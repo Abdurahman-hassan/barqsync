@@ -486,6 +486,37 @@ fn without_x_attributes_are_neither_copied_nor_touched() {
     }
 }
 
+/// `--ignore-existing --info=skip2`: a file whose data and times match but whose
+/// attributes differ is named an "attr change", as rsync names it.
+#[test]
+fn skip2_names_attribute_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    if skip_x(tmp.path()) {
+        return;
+    }
+    let skipped = |o: &RunOut| -> Vec<String> {
+        let mut v: Vec<String> = o.stdout.lines().filter(|l| l.contains(" exists")).map(str::to_string).collect();
+        v.sort();
+        v
+    };
+    for (i, how) in [How::Local, How::Push("ssh"), How::Pull("ssh")].iter().enumerate() {
+        let cwd = tmp.path().join(format!("s{i}"));
+        Tree::new(cwd.join("src")).file("same", "s").file("tagged", "t").settle_mtimes();
+        set_x(&cwd.join("src/tagged"), &nm("tag"), b"v").unwrap();
+        let (dr, df) = ("d-r", "d-f");
+        for d in [dr, df] {
+            let r = barqsync(&cwd, &["-aX", "src/", d]);
+            assert_eq!(r.code, 0, "{}", r.stderr);
+            set_x(&cwd.join(d).join("tagged"), &nm("tag"), b"other").unwrap();
+        }
+        let (r, f) = sync(&cwd, *how, &["-aX", "--ignore-existing", "--info=skip2"], dr, df);
+        same_code(&r, &f, &format!("{how:?}"));
+        assert_eq!(skipped(&r), skipped(&f), "{how:?}\n--- rsync:\n{}--- barqsync:\n{}", r.stdout, f.stdout);
+        assert!(skipped(&f).contains(&"tagged exists (attr change)".to_string()), "{how:?}: {}", f.stdout);
+        assert_eq!(get_x(&cwd.join(df).join("tagged"), &nm("tag")).as_deref(), Some(&b"other"[..]), "{how:?}: left alone");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // -A
 // ---------------------------------------------------------------------------

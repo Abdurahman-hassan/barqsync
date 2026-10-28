@@ -842,6 +842,72 @@ fn remove_source_files_pull_reports_removals_like_rsync() {
     assert!(tmp.path().join("lf2-src/sub/f2").exists());
 }
 
+/// A source and a destination for `-u` and `--ignore-existing`: a destination file that
+/// is newer, one just inside a 2-second `--modify-window`, an older one, a symlink and a
+/// directory where files are to go, and a new file.
+fn skipping_fixture(root: &Path, d: &str) {
+    let t = BASE_TIME;
+    let src = Tree::new(root.join(format!("{d}-src")));
+    src.file("newer", "src").mtime("newer", t)
+        .file("window", "src").mtime("window", t + 1)
+        .file("older-dst", "src").mtime("older-dst", t + 20)
+        .file("fresh", "src").mtime("fresh", t)
+        .file("was-link", "src").mtime("was-link", t)
+        .file("was-dir", "src").mtime("was-dir", t);
+    let dst = Tree::new(root.join(d));
+    dst.file("newer", "dst!").mtime("newer", t + 10)
+        .file("window", "dst!").mtime("window", t)
+        .file("older-dst", "dst!").mtime("older-dst", t)
+        .symlink("was-link", "elsewhere")
+        .dir("was-dir")
+        .mtime("was-dir", t);
+    set_mtime(&src.root, t + 30);
+    set_mtime(&dst.root, t + 31);
+}
+
+/// What `-u` or `--ignore-existing` leaves alone stays in the source with
+/// `--remove-source-files` and as it was on the destination, as with rsync.
+#[test]
+fn skipped_files_stay_in_the_source_like_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cases: [(&str, &[&str], &[&str]); 2] = [
+        // -u skips a source not newer than the destination file by more than the window;
+        // a destination entry of another type isn't "newer".
+        ("u", &["-ai", "-u", "--modify-window=2", "--remove-source-files"], &["newer", "window"]),
+        // --ignore-existing skips whatever the destination has an entry for.
+        ("ie", &["-ai", "--ignore-existing", "--remove-source-files"], &["newer", "window", "older-dst", "was-link", "was-dir"]),
+    ];
+    let modes = [("local", "{dst}-src/", "{dst}"), ("push", "{dst}-src/", "{host}{dst}"), ("pull", "{host}{dst}-src/", "{dst}")];
+    for (tag, flags, kept) in cases {
+        for (mode, src, dst) in modes {
+            let (dr, df) = (format!("{tag}-{mode}-r"), format!("{tag}-{mode}-f"));
+            for d in [&dr, &df] {
+                skipping_fixture(tmp.path(), d);
+            }
+            let mut a = flags.to_vec();
+            a.extend([src, dst]);
+            let (r, f) = if mode == "local" { both(tmp.path(), &a, &dr, &df) } else { both_remote(tmp.path(), &a, &dr, &df) }.unwrap();
+            let what = format!("{tag} {mode}");
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap(&tmp.path().join(&dr), true), &snap(&tmp.path().join(&df), true));
+            let (sr, sf) = (tmp.path().join(format!("{dr}-src")), tmp.path().join(format!("{df}-src")));
+            assert_same_tree(&snap_no_dir_times(&sr), &snap_no_dir_times(&sf));
+            for name in kept {
+                assert!(sf.join(name).exists(), "{what}: {name} left the source");
+            }
+            assert!(!sf.join("fresh").exists(), "{what}: fresh was sent, so it is removed");
+            assert_eq!(fs::read(tmp.path().join(&df).join("newer")).unwrap(), b"dst!", "{what}");
+            if tag == "ie" {
+                assert_eq!(fs::read_link(tmp.path().join(&df).join("was-link")).unwrap(), Path::new("elsewhere"), "{what}");
+                assert!(tmp.path().join(&df).join("was-dir").is_dir(), "{what}");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // --no-OPTION
 // ---------------------------------------------------------------------------

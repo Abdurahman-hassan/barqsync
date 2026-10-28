@@ -5,7 +5,7 @@
 
 use barqsync::cli::Options;
 use barqsync::fsops;
-use barqsync::output::{Output, StatsSnapshot};
+use barqsync::output::{Output, Side, StatsSnapshot};
 use barqsync::proto::{Conn, Frame, Msg, NeedReq, Wire};
 use barqsync::remote::sender;
 use std::fs;
@@ -73,7 +73,7 @@ fn run_case(wire: Wire, case: Case) {
     let (ours, peer) = pair(wire);
     let (done_tx, done_rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let out = Output::new(&opts);
+        let out = Output::new(&opts, Side::Push);
         let code = sender::run(&ours, &opts, &sources, &out, false).0;
         let _ = ours.finish();
         done_tx.send(code).unwrap();

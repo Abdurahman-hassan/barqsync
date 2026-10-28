@@ -69,6 +69,8 @@ struct Incoming {
     prefix: Prefix,
     /// Bytes already counted for progress: copied ranges, and data as it arrives.
     counted: u64,
+    /// File data received for it (`%b`, reported once the file is done).
+    received: u64,
 }
 
 impl Incoming {
@@ -555,11 +557,11 @@ impl RemoteState {
     pub(crate) fn request(&self, eng: &Engine, wire_dir: u32, files: Vec<FileJob>) {
         let dir = files.first().map(|j| split_dst(&j.dst_path).0.to_path_buf()).unwrap_or_default();
         let mut reqs = Vec::with_capacity(files.len());
-        for job in files {
+        for mut job in files {
             if fsops::interrupted() {
                 break;
             }
-            eng.note_transfer(&job);
+            job.item = eng.note_transfer(&job);
             if eng.dry() {
                 crate::progress::done(job.meta.size);
                 continue;
@@ -657,6 +659,7 @@ impl RemoteState {
     fn file_begin(&self, eng: &Engine, id: u64, size: u64, job: FileJob) -> io::Result<()> {
         // Without a backup the file stays as it is; its data is ignored.
         if !eng.backup_existing_file(&job) {
+            eng.report_transfer(&job, job.item, 0);
             return Ok(());
         }
         // --append-verify: the sender sends the file whole when the start it has isn't
@@ -684,6 +687,7 @@ impl RemoteState {
             held: (0, Vec::new()),
             prefix: Prefix::default(),
             counted: 0,
+            received: 0,
         };
         self.incoming.lock().unwrap().insert(id, inc);
         Ok(())
@@ -695,6 +699,7 @@ impl RemoteState {
         check::copies(&copies, size, basis_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid delta: {e}")))?;
         // Without a backup the file stays as it is; its data is ignored.
         if !eng.backup_existing_file(&job) {
+            eng.report_transfer(&job, job.item, 0);
             return Ok(());
         }
         let d = Delta { size, ops: copies };
@@ -751,6 +756,7 @@ impl RemoteState {
             held: (0, Vec::new()),
             prefix: Prefix::with_copies(&d.ops),
             counted: matched,
+            received: 0,
         };
         crate::progress::bytes(matched);
         self.incoming.lock().unwrap().insert(id, inc);
@@ -790,6 +796,7 @@ impl RemoteState {
             return Ok(());
         }
         inc.counted += len;
+        inc.received += len;
         crate::progress::bytes(len);
         Ok(())
     }
@@ -810,6 +817,7 @@ impl RemoteState {
         // The sender failed to read it (and reported why), or its data is incomplete:
         // the file isn't put in place.
         if !ok || inc.prefix.done != inc.size {
+            eng.report_transfer(&inc.job, inc.job.item, inc.received);
             if ok {
                 let msg = format!("\" failed: only {} of {} bytes were sent", inc.prefix.done, inc.size);
                 eng.dst_err(path_msg("receiving \"", &inc.job.dst_path, msg));
@@ -821,8 +829,9 @@ impl RemoteState {
         }
         let dst = inc.job.dst_path.clone();
         crate::progress::done(inc.job.meta.size.saturating_sub(inc.counted));
-        let (path, registered) = (inc.path.clone(), inc.registered);
+        let (path, registered, received) = (inc.path.clone(), inc.registered, inc.received);
         let (job, r) = self.finish(eng, inc);
+        eng.report_transfer(&job, job.item, received);
         let r = if registered { finish_temp(&path, r) } else { r };
         match r {
             Ok(()) => eng.file_written(&job),
@@ -909,6 +918,7 @@ impl RemoteState {
             let dst = job.dst_path.clone();
             crate::progress::done(job.meta.size);
             Stats::add(&eng.stats.literal_bytes, len as u64);
+            eng.report_transfer(&job, job.item, len as u64);
             if let Err(e) = self.write_small(eng, job, bytes)
                 && !fsops::interrupted()
             {
@@ -937,6 +947,7 @@ impl RemoteState {
             match self.take_job_with(eng, id, xattrs.remove(&id)) {
                 Ok(job) => {
                     crate::progress::done(job.meta.size);
+                    eng.report_transfer(&job, job.item, len as u64);
                     if !eng.backup_existing_file(&job) {
                         continue;
                     }
@@ -1139,12 +1150,12 @@ fn plan_dest(eng: &mut Engine, roots: &[RootInfo], dest: &OsStr, out: &Output) -
         let shown = dest.to_string_lossy();
         let shown = if shown.len() > 1 { shown.trim_end_matches('/') } else { &shown };
         if eng.dry() {
-            out.info(format!("created directory {shown}"));
+            out.created(format!("created directory {shown}"));
         } else if let Err(e) = fs::create_dir(&dest_path) {
             out.error(path_msg("mkdir \"", &dest_path, format!("\" failed: {e}")));
             return Err(exit::FILE_IO);
         } else {
-            out.info(format!("created directory {shown}"));
+            out.created(format!("created directory {shown}"));
             dest_exists = true;
             created = true;
         }
