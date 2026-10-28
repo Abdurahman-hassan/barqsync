@@ -23,7 +23,7 @@ use std::path::PathBuf;
     after_help = "Options implied by others (-a, -D, ...) or given earlier can be turned off with \
                   --no-OPTION: --no-r, --no-l, --no-p, --no-t, --no-g, --no-o, --no-D, --no-devices, \
                   --no-specials, --no-H, --no-A, --no-X, --no-O, --no-d, --no-x, --no-S, --no-c, --no-z, \
-                  --no-W, --no-v, --no-i, --no-h, --no-8, --no-m, --no-s, --no-inplace, --no-partial, \
+                  --no-W, --no-v, --no-i, --no-h, --no-8, --no-m, --no-s, --no-inplace, --no-append, --no-partial, --no-delay-updates, --no-force, --no-ignore-errors, --no-munge-links, \
                   --no-progress, --no-numeric-ids, --no-backup, --no-mkpath, --no-timeout, --no-from0 \
                   (and their long forms, e.g. --no-owner)."
 )]
@@ -74,6 +74,15 @@ pub struct Cli {
     /// Treat symlinked directories on the receiver as directories
     #[arg(short = 'K', long = "keep-dirlinks")]
     keep_dirlinks: bool,
+    /// Only symlinks that point outside the transfer become the files they point to
+    #[arg(long = "copy-unsafe-links")]
+    copy_unsafe_links: bool,
+    /// Ignore symlinks that point outside the transfer
+    #[arg(long = "safe-links")]
+    safe_links: bool,
+    /// Munge received symlinks to make them unusable, unmunge sent ones
+    #[arg(long = "munge-links")]
+    munge_links: bool,
     /// Transfer directories without recursing
     #[arg(short = 'd', long)]
     dirs: bool,
@@ -92,6 +101,15 @@ pub struct Cli {
     /// Don't map uid/gid values by user/group name
     #[arg(long = "numeric-ids")]
     numeric_ids: bool,
+    /// Custom username mapping: FROM:TO pairs (names, ids, LOW-HIGH or wildcards), comma-separated
+    #[arg(long, value_name = "STRING")]
+    usermap: Vec<String>,
+    /// Custom groupname mapping: FROM:TO pairs, comma-separated
+    #[arg(long, value_name = "STRING")]
+    groupmap: Vec<String>,
+    /// Simple username/groupname mapping (same as --usermap=*:USER --groupmap=*:GROUP)
+    #[arg(long, value_name = "USER:GROUP")]
+    chown: Vec<String>,
     /// Same as --devices --specials
     #[arg(short = 'D')]
     devices_specials: bool,
@@ -131,6 +149,12 @@ pub struct Cli {
     /// Put a partially transferred file into DIR
     #[arg(long = "partial-dir", value_name = "DIR")]
     partial_dir: Option<OsString>,
+    /// Put all updated files into place at the transfer's end
+    #[arg(long = "delay-updates")]
+    delay_updates: bool,
+    /// Create temporary files in directory DIR
+    #[arg(short = 'T', long = "temp-dir", value_name = "DIR")]
+    temp_dir: Option<OsString>,
     /// Fine-grained informational output (`--info=help` lists the flags)
     #[arg(long, value_name = "FLAGS")]
     info: Vec<String>,
@@ -162,6 +186,12 @@ pub struct Cli {
     /// Write files directly at their final name (no temp file + rename)
     #[arg(long)]
     inplace: bool,
+    /// Append data onto shorter files (implies --inplace)
+    #[arg(long)]
+    append: bool,
+    /// Like --append, but with the old data in the file checksum
+    #[arg(long = "append-verify")]
+    append_verify: bool,
     /// fsync every written file
     #[arg(long)]
     fsync: bool,
@@ -196,6 +226,18 @@ pub struct Cli {
     /// Also delete excluded files from destination dirs
     #[arg(long = "delete-excluded")]
     delete_excluded: bool,
+    /// Ignore missing source args without error
+    #[arg(long = "ignore-missing-args")]
+    ignore_missing_args: bool,
+    /// Delete missing source args from destination
+    #[arg(long = "delete-missing-args")]
+    delete_missing_args: bool,
+    /// Delete even if there are I/O errors
+    #[arg(long = "ignore-errors")]
+    ignore_errors: bool,
+    /// Force deletion of directories even if not empty
+    #[arg(long)]
+    force: bool,
     /// Don't delete more than NUM files (more due: warn and exit 25)
     #[arg(long = "max-delete", value_name = "NUM", allow_negative_numbers = true)]
     max_delete: Option<i64>,
@@ -232,6 +274,9 @@ pub struct Cli {
     /// Exit (code 30) when no data moves over a remote connection for SECONDS
     #[arg(long, value_name = "SECONDS")]
     timeout: Option<u64>,
+    /// Limit the data rate (KiB per second unless RATE has a unit; 0: no limit)
+    #[arg(long, value_name = "RATE", allow_hyphen_values = true)]
+    bwlimit: Option<String>,
 
     /// Skip files that are newer on the receiver
     #[arg(short = 'u', long)]
@@ -365,8 +410,18 @@ pub struct Cli {
     no_secluded_args: bool,
     #[arg(long = "no-inplace", hide = true)]
     no_inplace: bool,
+    #[arg(long = "no-append", hide = true)]
+    no_append: bool,
     #[arg(long = "no-partial", hide = true)]
     no_partial: bool,
+    #[arg(long = "no-delay-updates", hide = true)]
+    no_delay_updates: bool,
+    #[arg(long = "no-ignore-errors", hide = true)]
+    no_ignore_errors: bool,
+    #[arg(long = "no-force", hide = true)]
+    no_force: bool,
+    #[arg(long = "no-munge-links", hide = true)]
+    no_munge_links: bool,
     #[arg(long = "no-progress", hide = true)]
     no_progress: bool,
     #[arg(long = "no-numeric-ids", hide = true)]
@@ -412,12 +467,23 @@ pub struct Options {
     pub copy_links: bool,
     pub copy_dirlinks: bool,
     pub keep_dirlinks: bool,
+    /// `--copy-unsafe-links`: the sender follows symlinks that point outside the transfer.
+    pub copy_unsafe_links: bool,
+    /// `--safe-links`: the receiver ignores symlinks that point outside the transfer.
+    pub safe_links: bool,
+    /// `--munge-links`: this side (only: never passed to the server) unmunges the
+    /// symlinks it sends and munges those it receives (`/rsyncd-munged/` in front).
+    pub munge_links: bool,
     pub dirs: bool,
     pub relative: bool,
     /// `--files-from`: the listed paths, read by the client (also sent to the server).
     pub files_from: Option<Vec<Vec<u8>>>,
     pub chmod: Vec<ChmodRule>,
     pub numeric_ids: bool,
+    /// `--usermap` (or `--chown`'s user, as `*:USER`): applied by the receiver.
+    pub usermap: Option<String>,
+    /// `--groupmap` (or `--chown`'s group, as `*:GROUP`): applied by the receiver.
+    pub groupmap: Option<String>,
 
     pub verbose: u8,
     pub itemize: u8,
@@ -446,6 +512,9 @@ pub struct Options {
     pub delta: DeltaMode,
     pub scanner: Scanner,
     pub inplace: bool,
+    /// `--append` (1) or `--append-verify` (2): shorter destination files only get the
+    /// rest of the data, longer ones are left alone (implies `inplace`).
+    pub append: u8,
     pub fsync: bool,
     pub no_clone: bool,
     /// Page-cache hints for big files (see `fsops::cache`).
@@ -455,9 +524,24 @@ pub struct Options {
     pub partial: bool,
     #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
     pub partial_dir: Option<OsString>,
+    /// `--delay-updates`: updated files wait in `partial_dir` (`.~tmp~` by default) until
+    /// the end of the transfer, then are renamed into place one after another.
+    pub delay_updates: bool,
+    /// `-T`: temp files are made in this directory (relative to the destination) instead
+    /// of next to their files.
+    #[rkyv(with = rkyv::with::Map<crate::proto::wire::OsBytes>)]
+    pub temp_dir: Option<OsString>,
 
     pub delete: bool,
     pub delete_excluded: bool,
+    /// A source argument that doesn't exist is no error: 1 (`--ignore-missing-args`), or
+    /// 2 (`--delete-missing-args`), its destination is deleted too.
+    pub missing_args: u8,
+    /// `--ignore-errors`: delete even after I/O errors.
+    pub ignore_errors: bool,
+    /// `--force`: a directory in the way of a file is deleted with what it holds, even
+    /// without `--delete`.
+    pub force: bool,
     /// `--max-delete`: at most this many deletions (`None`: no limit).
     pub max_delete: Option<u64>,
     pub filter_rules: Vec<RuleSpec>,
@@ -469,6 +553,8 @@ pub struct Options {
     pub mkpath: bool,
     /// `--timeout`: seconds a remote connection may go without data (0: no limit).
     pub timeout: u64,
+    /// `--bwlimit`: bytes per second, in whole KiB (0: no limit).
+    pub bwlimit: u64,
 
     pub update: bool,
     pub size_only: bool,
@@ -512,6 +598,13 @@ pub struct Options {
 }
 
 impl Options {
+    /// Whether a listed file may be a symlink the listing followed (`-L`, or an unsafe
+    /// one with `--copy-unsafe-links`): opening it then follows symlinks, though it must
+    /// still reach the file that was listed.
+    pub fn follows_listed(&self) -> bool {
+        self.copy_links || self.copy_unsafe_links
+    }
+
     pub fn parse_from<I, T>(args: I) -> Result<Options>
     where
         I: IntoIterator<Item = T>,
@@ -530,10 +623,16 @@ impl Options {
         let cli = Cli::from_arg_matches(&matches)?;
         let m = &matches;
         let from0 = toggle(m, &["from0"], &["no_from0"]).unwrap_or(false);
-        let filter_rules = ordered_filter_rules(&cli, m, from0)?;
+        // rsync: --delay-updates keeps the updated files in a partial dir, `.~tmp~` unless
+        // one is given.
+        let delay_updates = toggle(m, &["delay_updates"], &["no_delay_updates"]).unwrap_or(false);
+        let partial_dir = cli.partial_dir.clone().or_else(|| delay_updates.then(|| OsString::from(".~tmp~")));
+        let filter_rules = ordered_filter_rules(&cli, m, from0, partial_dir.as_ref())?;
         let chmod = parse_chmod_args(&cli.chmod)?;
         let max_size = cli.max_size.as_deref().map(|s| parse_size(s, "--max-size")).transpose()?;
         let min_size = cli.min_size.as_deref().map(|s| parse_size(s, "--min-size")).transpose()?;
+        let bwlimit = cli.bwlimit.as_deref().map(parse_bwlimit).transpose()?.unwrap_or(0);
+        let [usermap, groupmap] = id_maps(&cli, m)?;
         if !cli.link_dest.is_empty() && !cli.compare_dest.is_empty() {
             bail!("--link-dest cannot be combined with --compare-dest");
         }
@@ -557,6 +656,25 @@ impl Options {
         o.chmod = chmod;
         o.max_size = max_size;
         o.min_size = min_size;
+        o.bwlimit = bwlimit;
+        // rsync: --usermap implies -o and --groupmap -g, where they are given.
+        let at = |map: &Option<(String, usize)>| map.as_ref().map(|&(_, i)| i);
+        o.owner = toggle_with(m, &["archive", "owner"], at(&usermap), &["no_owner"]).unwrap_or(false);
+        o.group = toggle_with(m, &["archive", "group"], at(&groupmap), &["no_group"]).unwrap_or(false);
+        o.usermap = usermap.map(|(map, _)| map);
+        o.groupmap = groupmap.map(|(map, _)| map);
+        o.delay_updates = delay_updates;
+        o.partial |= partial_dir.is_some();
+        o.partial_dir = partial_dir;
+        if o.append > 0 && o.whole_file == Some(true) {
+            bail!("--append cannot be used with --whole-file");
+        }
+        // rsync: an update made in place leaves nothing for a partial dir to hold.
+        if (o.append > 0 || o.delay_updates) && o.inplace && o.partial_dir.is_some() {
+            let what = if o.append > 0 { "append" } else { "inplace" };
+            let with = if o.delay_updates { "delay-updates" } else { "partial-dir" };
+            bail!("--{what} cannot be used with --{with}");
+        }
         if files_from.is_some() {
             // rsync: --files-from implies -R and -d, and -a no longer implies -r.
             o.relative = true;
@@ -585,6 +703,11 @@ impl Options {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let backup = on(&["backup"], &["no_backup"]) || c.backup_dir.is_some();
         let quiet = c.quiet;
+        // The last of --append, --append-verify and --no-append counts.
+        let append = match [&["append"], &["append_verify"], &["no_append"]].map(|id| last_index(m, id)) {
+            [a, v, off] if a.max(v) > off => 1 + u8::from(v > a),
+            _ => 0,
+        };
         Options {
             recursive: on(&["archive", "recursive"], &["no_recursive"]),
             links: on(&["archive", "links"], &["no_links"]),
@@ -602,11 +725,16 @@ impl Options {
             copy_links: c.copy_links,
             copy_dirlinks: c.copy_dirlinks,
             keep_dirlinks: c.keep_dirlinks,
+            copy_unsafe_links: c.copy_unsafe_links,
+            safe_links: c.safe_links,
+            munge_links: on(&["munge_links"], &["no_munge_links"]),
             dirs: on(&["dirs"], &["no_dirs"]),
             relative: c.relative,
             files_from: None,
             chmod: Vec::new(),
             numeric_ids: on(&["numeric_ids"], &["no_numeric_ids"]),
+            usermap: None,
+            groupmap: None,
             verbose: if quiet { 0 } else { count_since(m, "verbose", "no_verbose") },
             itemize: if quiet { 0 } else { count_since(m, "itemize", "no_itemize") },
             quiet,
@@ -629,15 +757,23 @@ impl Options {
             },
             delta: c.delta,
             scanner: c.scanner,
-            inplace: on(&["inplace"], &["no_inplace"]),
+            // rsync: --append implies --inplace.
+            inplace: on(&["inplace"], &["no_inplace"]) || append > 0,
+            append,
             fsync: c.fsync,
             no_clone: c.no_clone,
             drop_cache: c.drop_cache || !c.no_drop_cache,
             sparse: on(&["sparse"], &["no_sparse"]),
             partial: on(&["partial", "partial_progress"], &["no_partial"]) || c.partial_dir.is_some(),
             partial_dir: c.partial_dir,
+            delay_updates: false,
+            temp_dir: c.temp_dir,
             delete: c.delete || c.delete_before || c.delete_during || c.delete_delay || c.delete_after || c.delete_excluded,
             delete_excluded: c.delete_excluded,
+            // rsync: given both, --delete-missing-args counts.
+            missing_args: if c.delete_missing_args { 2 } else { u8::from(c.ignore_missing_args) },
+            ignore_errors: on(&["ignore_errors"], &["no_ignore_errors"]),
+            force: on(&["force"], &["no_force"]),
             // rsync: a negative limit means no deletions at all.
             max_delete: c.max_delete.map(|n| n.max(0) as u64),
             filter_rules,
@@ -648,6 +784,7 @@ impl Options {
                 Some(true) => c.timeout.unwrap_or(0),
                 _ => 0,
             },
+            bwlimit: 0,
             update: c.update,
             size_only: c.size_only,
             ignore_times: c.ignore_times,
@@ -885,6 +1022,60 @@ fn toggle(m: &ArgMatches, on: &[&str], off: &[&str]) -> Option<bool> {
     }
 }
 
+/// [`toggle`], with one more `on` at command-line position `at` (an option implying it).
+fn toggle_with(m: &ArgMatches, on: &[&str], at: Option<usize>, off: &[&str]) -> Option<bool> {
+    match (last_index(m, on).max(at), last_index(m, off)) {
+        (None, None) => None,
+        (a, b) => Some(a > b),
+    }
+}
+
+/// `--usermap`, `--groupmap` and `--chown` (`*:USER`, `*:GROUP`) in command-line order,
+/// with rsync's errors: each map once, and `--chown` not mixed with the one it sets.
+/// Returns each map with its position on the command line (it implies `-o` or `-g`
+/// from there). The maps' syntax is checked here; their names are the receiver's to
+/// look up.
+fn id_maps(cli: &Cli, m: &ArgMatches) -> Result<[Option<(String, usize)>; 2]> {
+    let indices = |id: &str| m.indices_of(id).into_iter().flatten();
+    let mut opts: Vec<(usize, Option<usize>, &str)> = Vec::new();
+    opts.extend(indices("usermap").zip(&cli.usermap).map(|(i, s)| (i, Some(0), s.as_str())));
+    opts.extend(indices("groupmap").zip(&cli.groupmap).map(|(i, s)| (i, Some(1), s.as_str())));
+    opts.extend(indices("chown").zip(&cli.chown).map(|(i, s)| (i, None, s.as_str())));
+    opts.sort_by_key(|o| o.0);
+    const NAMES: [(&str, &str); 2] = [("usermap", "user"), ("groupmap", "group")];
+    // Each map, where it was given, and whether --chown set it.
+    let mut maps: [Option<(String, usize, bool)>; 2] = [None, None];
+    for (i, which, arg) in opts {
+        let Some(k) = which else {
+            let (user, group) = arg.split_once(':').unwrap_or((arg, ""));
+            for (k, part) in [user, group].into_iter().enumerate() {
+                if part.is_empty() {
+                    continue;
+                }
+                let (name, what) = NAMES[k];
+                match &maps[k] {
+                    Some((_, _, false)) => bail!("--chown conflicts with prior --{name}."),
+                    Some(_) => bail!("You can only specify a {what}-affecting --chown once."),
+                    None => maps[k] = Some((format!("*:{part}"), i, true)),
+                }
+            }
+            continue;
+        };
+        let name = NAMES[k].0;
+        match &maps[k] {
+            Some((_, _, true)) => bail!("--{name} conflicts with prior --chown."),
+            Some(_) => bail!("You can only specify --{name} once."),
+            None => maps[k] = Some((arg.to_string(), i, false)),
+        }
+    }
+    for (k, map) in maps.iter().enumerate() {
+        if let Some((map, ..)) = map {
+            crate::ids::NameMap::parse(map, k == 0, None, &mut |_| {}).map_err(|e| anyhow::anyhow!(e))?;
+        }
+    }
+    Ok(maps.map(|m| m.map(|(map, i, _)| (map, i))))
+}
+
 /// How many times a counted flag (`-v`) was given after its last `--no-` form.
 fn count_since(m: &ArgMatches, id: &str, off: &str) -> u8 {
     let since = last_index(m, &[off]);
@@ -901,27 +1092,45 @@ fn parse_chmod_args(specs: &[String]) -> Result<Vec<ChmodRule>> {
 /// p`; `KB` = 1000, `K`/`KiB` = 1024), and an optional `+1`/`-1` adjustment.
 pub fn parse_size(arg: &str, opt: &str) -> Result<u64> {
     let invalid = || anyhow::anyhow!("{opt} value is invalid: {arg}");
+    // A number must come first (rsync would take `K`, or nothing, as 0).
+    let b = arg.as_bytes();
+    if !b.first().is_some_and(u8::is_ascii_digit) && !(b.first() == Some(&b'.') && b.get(1).is_some_and(u8::is_ascii_digit)) {
+        return Err(invalid());
+    }
+    size_arg(arg, b'b').map_err(|_| invalid())
+}
+
+/// rsync's `parse_size_arg`: [`parse_size`]'s syntax with `unit` when none is given.
+/// Fails with what is wrong, in rsync's words: `invalid`, or `too large` (a negative
+/// number counts as that, as in rsync).
+fn size_arg(arg: &str, unit: u8) -> Result<u64, &'static str> {
     let b = arg.as_bytes();
     let mut i = b.iter().take_while(|c| c.is_ascii_digit()).count();
     if b.get(i) == Some(&b'.') {
         i += 1 + b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
     }
-    let number: f64 = if i == 0 { return Err(invalid()) } else { arg[..i].parse().map_err(|_| invalid())? };
+    // The number as `strtod` reads it from the start, sign included.
+    let signed = usize::from(matches!(b.first(), Some(b'+' | b'-')) && i == 0);
+    let mut end = signed + b[signed..].iter().take_while(|c| c.is_ascii_digit()).count();
+    if b.get(end) == Some(&b'.') {
+        end += 1 + b[end + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+    }
     let mut rest = &b[i..];
-    let reps = match rest.first() {
-        None | Some(b'+') | Some(b'-') => 0,
-        Some(&c) => {
+    let suffix = match rest.first() {
+        Some(&c) if c != b'+' && c != b'-' => {
             rest = &rest[1..];
-            match c.to_ascii_lowercase() {
-                b'b' => 0,
-                b'k' => 1,
-                b'm' => 2,
-                b'g' => 3,
-                b't' => 4,
-                b'p' => 5,
-                _ => return Err(invalid()),
-            }
+            c
         }
+        _ => unit,
+    };
+    let reps = match suffix.to_ascii_lowercase() {
+        b'b' => 0,
+        b'k' => 1,
+        b'm' => 2,
+        b'g' => 3,
+        b't' => 4,
+        b'p' => 5,
+        _ => return Err("invalid"),
     };
     let mult: u64 = match rest.first() {
         Some(b'b') | Some(b'B') => {
@@ -933,17 +1142,34 @@ pub fn parse_size(arg: &str, opt: &str) -> Result<u64> {
             rest = &rest[2..];
             1024
         }
-        _ => return Err(invalid()),
+        _ => return Err("invalid"),
     };
+    let number: f64 = arg[..end].parse().unwrap_or(0.0);
+    if number < 0.0 {
+        return Err("too large");
+    }
     let mut size = (mult.pow(reps) as f64 * number) as i128;
-    if let [sign @ (b'+' | b'-'), b'1', tail @ ..] = rest {
+    if let [sign @ (b'+' | b'-'), b'1', tail @ ..] = rest
+        && rest.len() < b.len()
+    {
         size += if *sign == b'+' { 1 } else { -1 };
         rest = tail;
     }
-    if !rest.is_empty() || size < 0 {
-        return Err(invalid());
+    if !rest.is_empty() {
+        return Err("invalid");
     }
-    Ok(size as u64)
+    u64::try_from(size).map_err(|_| "too large")
+}
+
+/// `--bwlimit=RATE`: rsync's size syntax, in KiB when no unit is given (`1.5m`,
+/// `100KB`), rounded to whole KiB per second as rsync does. 0 means no limit; anything
+/// else under 512 bytes is refused.
+fn parse_bwlimit(arg: &str) -> Result<u64> {
+    let size = size_arg(arg, b'k').map_err(|e| anyhow::anyhow!("--bwlimit={arg} is {e}"))?;
+    if size != 0 && size < 512 {
+        bail!("--bwlimit={arg} is too small (min: 512 or 0 for unlimited)");
+    }
+    Ok((size + 512) / 1024 * 1024)
 }
 
 /// Read a `--files-from` list: one path per line (or NUL-separated with `--from0`);
@@ -971,8 +1197,9 @@ fn read_files_from(file: &OsString, from0: bool) -> Result<Vec<Vec<u8>>> {
 
 /// The filter rules, in command-line order across `--filter`, `--include`, `--exclude`,
 /// their `-from` files and `-F`; `.` merge files are read now. Then, as in rsync, the
-/// rule hiding a relative `--partial-dir`, and `-C`'s rules last.
-fn ordered_filter_rules(cli: &Cli, m: &ArgMatches, from0: bool) -> Result<Vec<RuleSpec>> {
+/// rule hiding a relative `partial_dir` (`--partial-dir`, or `--delay-updates`'s), and
+/// `-C`'s rules last.
+fn ordered_filter_rules(cli: &Cli, m: &ArgMatches, from0: bool, partial_dir: Option<&OsString>) -> Result<Vec<RuleSpec>> {
     enum Opt<'a> {
         Filter(&'a OsString),
         Pattern(&'a OsString, bool),
@@ -1002,7 +1229,7 @@ fn ordered_filter_rules(cli: &Cli, m: &ArgMatches, from0: bool) -> Result<Vec<Ru
     }
     // rsync protects a relative partial dir (and hides one on the sender) with a
     // trailing exclude rule.
-    if let Some(d) = &cli.partial_dir
+    if let Some(d) = partial_dir
         && !d.as_bytes().starts_with(b"/")
     {
         let d = d.as_bytes();
@@ -1193,6 +1420,84 @@ mod tests {
         assert!(Options::parse_from(["barqsync", "--link-dest=a", "--compare-dest=b", "s", "d"]).is_err());
         assert!(Options::parse_from(["barqsync", "-b", "--suffix=", "s", "d"]).is_err());
         assert!(Options::parse_from(["barqsync", "-b", "--suffix=", "--backup-dir=bk", "s", "d"]).is_ok());
+    }
+
+    #[test]
+    fn bwlimit_parses_like_rsync() {
+        let rate = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).map(|o| o.bwlimit);
+        // KiB by default, rounded to whole KiB per second.
+        for (arg, want) in [("0", 0), ("100", 100 << 10), ("1.5", 2 << 10), ("1.5m", 1536 << 10), ("512b", 1 << 10), ("1000KB", 977 << 10), ("5-1", 5 << 10)] {
+            assert_eq!(rate(&[&format!("--bwlimit={arg}")]).unwrap(), want, "{arg}");
+        }
+        assert_eq!(rate(&[]).unwrap(), 0);
+        for (arg, why) in [("100b", "too small (min: 512 or 0 for unlimited)"), ("x", "invalid"), ("-5", "too large"), ("+5", "invalid"), ("1kq", "invalid")] {
+            let e = rate(&[&format!("--bwlimit={arg}")]).unwrap_err();
+            assert_eq!(e.to_string(), format!("--bwlimit={arg} is {why}"));
+        }
+    }
+
+    #[test]
+    fn id_maps_and_chown() {
+        let o = Options::parse_from(["barqsync", "-r", "--chown=me:staff", "s", "d"]).unwrap();
+        assert_eq!((o.usermap.as_deref(), o.groupmap.as_deref()), (Some("*:me"), Some("*:staff")));
+        assert!(o.owner && o.group, "--chown implies -o and -g");
+        let o = Options::parse_from(["barqsync", "-r", "--chown=:staff", "s", "d"]).unwrap();
+        assert!(o.usermap.is_none() && !o.owner && o.group);
+        let o = Options::parse_from(["barqsync", "-a", "--groupmap=0-9:wheel", "--no-g", "s", "d"]).unwrap();
+        assert!(!o.group && o.groupmap.is_some(), "a later --no-g wins");
+        let o = Options::parse_from(["barqsync", "--no-o", "--usermap=*:x", "--chown=:y", "s", "d"]).unwrap();
+        assert!(o.owner && o.group);
+        let err = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).unwrap_err().to_string();
+        assert_eq!(err(&["--chown=a:b", "--usermap=x:y"]), "--usermap conflicts with prior --chown.");
+        assert_eq!(err(&["--groupmap=x:y", "--chown=a:b"]), "--chown conflicts with prior --groupmap.");
+        assert_eq!(err(&["--usermap=x:y", "--usermap=x:y"]), "You can only specify --usermap once.");
+        assert_eq!(err(&["--chown=a", "--chown=b"]), "You can only specify a user-affecting --chown once.");
+        assert_eq!(err(&["--groupmap=7x:y"]), "Invalid number in --groupmap: 7x");
+        assert!(Options::parse_from(["barqsync", "--chown=a", "--chown=:b", "s", "d"]).is_ok());
+    }
+
+    #[test]
+    fn append_modes() {
+        let mode = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).map(|o| (o.append, o.inplace));
+        assert_eq!(mode(&["--append"]).unwrap(), (1, true));
+        assert_eq!(mode(&["--append", "--append-verify"]).unwrap(), (2, true));
+        assert_eq!(mode(&["--append-verify", "--append"]).unwrap(), (1, true));
+        assert_eq!(mode(&["--append", "--no-append"]).unwrap(), (0, false));
+        assert_eq!(mode(&["--append", "--no-append", "-W"]).unwrap(), (0, false));
+        assert_eq!(mode(&["--append", "-W"]).unwrap_err().to_string(), "--append cannot be used with --whole-file");
+        assert!(mode(&["--append", "-W", "--no-W"]).is_ok());
+        assert_eq!(mode(&["--append-verify", "--partial-dir=p"]).unwrap_err().to_string(), "--append cannot be used with --partial-dir");
+    }
+
+    #[test]
+    fn temp_dir_and_delay_updates() {
+        use std::ffi::OsStr;
+        let o = Options::parse_from(["barqsync", "-a", "--delay-updates", "-T", "tmp", "s", "d"]).unwrap();
+        assert!(o.delay_updates && o.partial);
+        assert_eq!((o.partial_dir.as_deref(), o.temp_dir.as_deref()), (Some(OsStr::new(".~tmp~")), Some(OsStr::new("tmp"))));
+        // The holding directory is hidden from the transfer and kept from --delete.
+        assert_eq!(o.filter_rules, vec![RuleSpec::exclude(b".~tmp~/".to_vec())]);
+        let o = Options::parse_from(["barqsync", "--delay-updates", "--partial-dir=.p", "s", "d"]).unwrap();
+        assert_eq!(o.partial_dir.as_deref(), Some(OsStr::new(".p")));
+        let o = Options::parse_from(["barqsync", "--delay-updates", "--no-delay-updates", "s", "d"]).unwrap();
+        assert!(!o.delay_updates && !o.partial && o.partial_dir.is_none());
+        let err = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).unwrap_err().to_string();
+        assert_eq!(err(&["--inplace", "--delay-updates"]), "--inplace cannot be used with --delay-updates");
+        assert_eq!(err(&["--delay-updates", "--append"]), "--append cannot be used with --delay-updates");
+        assert!(Options::parse_from(["barqsync", "--inplace", "--partial-dir=p", "s", "d"]).is_ok(), "unchanged");
+    }
+
+    #[test]
+    fn deletion_and_link_options() {
+        let o = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat()).unwrap();
+        assert_eq!(o(&["--ignore-missing-args"]).missing_args, 1);
+        assert_eq!(o(&["--delete-missing-args"]).missing_args, 2);
+        assert_eq!(o(&["--delete-missing-args", "--ignore-missing-args"]).missing_args, 2, "delete wins, as in rsync");
+        assert!(o(&["--force"]).force && !o(&["--force", "--no-force"]).force);
+        assert!(o(&["--ignore-errors"]).ignore_errors && !o(&["--ignore-errors", "--no-ignore-errors"]).ignore_errors);
+        let l = o(&["--safe-links", "--copy-unsafe-links", "--munge-links"]);
+        assert!(l.safe_links && l.copy_unsafe_links && l.munge_links && l.follows_listed());
+        assert!(!o(&["--munge-links", "--no-munge-links"]).munge_links);
     }
 
     #[test]

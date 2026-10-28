@@ -56,9 +56,13 @@ pub const MAGIC: [u8; 8] = *b"BARQSYNC";
 /// 10: `RemovalsDone` (a pull with `--remove-source-files` reports the server's removals);
 ///     `Synced` names entries only; `IoError` (source read errors stop deletions).
 /// 11: `--filter`/`-F`/`-C` rules, `--max-delete`, `-m`, `--mkpath` and `--timeout` in the
-///     options; `KeepAlive`; vanished files and stopped deletions in the counters;
-///     `--info` levels in the options; a push's items and deletions as `Item` and
-///     `Deleted` records for the client to format.
+///     options; `KeepAlive`; vanished files and stopped deletions in the counters; `-x`
+///     mount points in `DirBatch`; `--info` levels in the options; a push's items and
+///     deletions as `Item` and `Deleted` records for the client to format. Also
+///     `--bwlimit`, `--usermap`/`--groupmap` (`--chown`) and `--append(-verify)` in the
+///     options, `Sig::Append`, and id 0's name in `IdNames`; `-T`, `--delay-updates`,
+///     `--force`, `--ignore-errors`, the missing-args options and the symlink options in
+///     the options, and missing entries (`DirEnt::missing`) in listings.
 pub const VERSION: u32 = 11;
 /// Upper bound on a frame body, and on what a compressed one decompresses to; anything
 /// larger is a corrupt stream.
@@ -80,6 +84,26 @@ pub static BYTES_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 fn count(counter: &std::sync::atomic::AtomicU64, n: usize) {
     counter.fetch_add(n as u64, Ordering::Relaxed);
+}
+
+/// Milliseconds since the first call: the time base of `--timeout`'s idle checks.
+pub(crate) fn clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// When bytes last arrived on a connection (see [`clock`]).
+static LAST_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes arrived: the connection is alive even while a frame is still on its way (one
+/// can take longer than `--timeout` to arrive whole under `--bwlimit`).
+fn note_read() {
+    LAST_READ.store(clock(), Ordering::Relaxed);
+}
+
+/// When bytes last arrived on any connection (see [`clock`]).
+pub(crate) fn last_read() -> u64 {
+    LAST_READ.load(Ordering::Relaxed)
 }
 
 /// File id on the wire: directory id in the high half, index in its listing in the low half.
@@ -117,6 +141,10 @@ pub enum Sig {
     Chunks(ChunkSig),
     /// `--delta=cdc`: FastCDC chunks with xxh3 and BLAKE3 hashes.
     Cdc(CdcSig),
+    /// `--append`: the receiver's file is the first `len` bytes of this one; only the
+    /// rest is wanted. `--append-verify` sends the checksum of those bytes: if the
+    /// sender's start differs, the file comes whole.
+    Append { len: u64, sum: Option<Sum> },
 }
 
 /// Server → client: where to open parallel data streams and how to authenticate.
@@ -178,7 +206,12 @@ pub enum Msg {
     // sender → receiver
     Roots(Vec<RootInfo>),
     /// `-c`: `sums[i]` is the checksum of regular file `entries[i]` (empty otherwise).
-    DirBatch { root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt>, sums: Vec<Option<Sum>> },
+    /// `-x`: `mounts` are the directories among `entries` (indices, ascending) on another
+    /// filesystem than their transfer root (mount points) that no later source merging
+    /// into them fills. They are created, but their contents are not sent: no listing
+    /// follows for them, and nothing in them is deleted (rsync's directories without
+    /// `FLAG_CONTENT_DIR`).
+    DirBatch { root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt>, sums: Vec<Option<Sum>>, mounts: Vec<u32> },
     /// User and group names for ids in the listings that follow (no `--numeric-ids`).
     IdNames { users: Names, groups: Names },
     ScanDone { dirs: u32 },
@@ -332,13 +365,27 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
             match r.read(&mut hdr[got..]) {
                 Ok(0) if got == 0 && !pieces.pending() => return Ok(None),
                 Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(n) => got += n,
+                Ok(n) => {
+                    got += n;
+                    note_read();
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
         }
         let mut body = vec![0u8; body_len(&hdr)?];
-        r.read_exact(&mut body)?;
+        let mut got = 0;
+        while got < body.len() {
+            match r.read(&mut body[got..]) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => {
+                    got += n;
+                    note_read();
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
         count(&BYTES_RECEIVED, hdr.len() + body.len());
         if let Some(f) = pieces.add(hdr[4], body)? {
             return Ok(Some(f));
@@ -810,7 +857,19 @@ fn spawn_writer(
                     if buf.is_empty() {
                         break;
                     }
-                    w.write_all(&buf)?;
+                    match crate::bwlimit::connections() {
+                        // --bwlimit: paced pieces, each sent before the next waits.
+                        Some(rate) => {
+                            for piece in buf.chunks(crate::bwlimit::piece(rate)) {
+                                if let Some(wait) = crate::bwlimit::reserve(rate, piece.len()) {
+                                    crate::bwlimit::pause(wait);
+                                }
+                                w.write_all(piece)?;
+                                w.flush()?;
+                            }
+                        }
+                        None => w.write_all(&buf)?,
+                    }
                     count(&BYTES_SENT, buf.len());
                     if wrx.is_empty() && urgent.as_ref().is_none_or(Receiver::is_empty) {
                         w.flush()?;
@@ -1287,7 +1346,7 @@ mod tests {
         vec![
             Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender: false, opts: Box::new(opts) },
             Msg::Roots(vec![RootInfo { contents: true, meta: Some(meta), items: Vec::new(), sel: Some(sel), extra: Some(Box::new(extra)) }]),
-            Msg::DirBatch { root: 1, dir: 2, rel: b"x/y".to_vec(), entries: vec![ent, plain, mac_ent], sums: vec![Some([1; 16])] },
+            Msg::DirBatch { root: 1, dir: 2, rel: b"x/y".to_vec(), entries: vec![ent, plain, mac_ent], sums: vec![Some([1; 16])], mounts: vec![1] },
             Msg::Need { dir: 2, files: vec![NeedReq { idx: 0, sig: Some(Sig::Cdc(sig)) }], xattrs: vec![1, 5] },
             Msg::Need { dir: 3, files: vec![NeedReq { idx: 1, sig: Some(Sig::Chunks(chunks)) }], xattrs: Vec::new() },
             Msg::Refine { id: file_id(3, 1), grain: Grain::of(&p), gaps: reqs },

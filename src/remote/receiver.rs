@@ -165,6 +165,8 @@ pub struct RemoteState {
     pack_done: Condvar,
     /// `-c`: the sender's checksums, per listing.
     sums: Mutex<HashMap<u32, Vec<Option<Sum>>>>,
+    /// `-x`: the mount points the sender doesn't list, per listing (see `Msg::DirBatch`).
+    mounts: Mutex<HashMap<u32, Vec<u32>>>,
     /// Sender uid/gid -> local uid/gid, by name (see [`crate::ids`]).
     ids: Mutex<IdMap>,
     /// `--remove-source-files`: entries to report back to the sender, per root.
@@ -288,6 +290,7 @@ impl RemoteState {
             packs: Mutex::new(0),
             pack_done: Condvar::new(),
             sums: Mutex::new(HashMap::new()),
+            mounts: Mutex::new(HashMap::new()),
             ids: Mutex::new(ids),
             synced: Mutex::new(HashMap::new()),
             xattr_wait: Mutex::new(HashMap::new()),
@@ -361,6 +364,12 @@ impl RemoteState {
         self.sums.lock().unwrap().get(&dir)?.get(idx as usize).copied().flatten()
     }
 
+    /// `-x`: whether directory `idx` of listing `dir` is a mount point the sender doesn't
+    /// list: it is created, and nothing in it is synced.
+    pub(crate) fn mount(&self, dir: u32, idx: u32) -> bool {
+        self.mounts.lock().unwrap().get(&dir).is_some_and(|m| m.binary_search(&idx).is_ok())
+    }
+
     /// `--remove-source-files`: the receiver has this entry; tell the sender (in batches),
     /// or, while it waits for attribute values, once they are written.
     pub(crate) fn synced(&self, root: u16, rel: &[u8]) {
@@ -421,7 +430,8 @@ impl RemoteState {
     // Listings
     // -----------------------------------------------------------------------
 
-    /// Called by the engine for each subdirectory it created or found.
+    /// Called by the engine for each subdirectory it created or found, but a mount point
+    /// (see [`RemoteState::mount`]).
     pub(crate) fn expect_dir<'s, 'a: 's>(&self, s: &Scope<'s>, eng: &'s Engine<'a>, mut job: DirJob) {
         let key = (job.root, job.rel.clone());
         let mut slots = self.slots.lock().unwrap();
@@ -447,9 +457,13 @@ impl RemoteState {
         rel: Vec<u8>,
         mut entries: Vec<DirEnt>,
         sums: Vec<Option<Sum>>,
+        mounts: Vec<u32>,
     ) {
         if !sums.is_empty() {
             self.sums.lock().unwrap().insert(dir, sums);
+        }
+        if !mounts.is_empty() {
+            self.mounts.lock().unwrap().insert(dir, mounts);
         }
         {
             let ids = self.ids.lock().unwrap();
@@ -457,6 +471,7 @@ impl RemoteState {
                 entries.iter_mut().for_each(|e| ids.apply(&mut e.meta));
             }
         }
+        munge(eng.opts, &mut entries);
         if eng.extras_on() {
             let ids = self.ids.lock().unwrap();
             for e in &mut entries {
@@ -477,9 +492,7 @@ impl RemoteState {
                 s.spawn(move |s| {
                     let entries = entries.into_iter().enumerate().map(|(i, e)| (i as u32, e, rename.clone())).collect();
                     eng.run_items(s, Path::new(""), &dst_dir, root, dir, entries, dst_is_new, sel, None, &rules);
-                    let r = eng.remote.as_ref().unwrap();
-                    r.sums.lock().unwrap().remove(&dir);
-                    r.task_done();
+                    eng.remote.as_ref().unwrap().listing_done(dir);
                 });
             }
             _ => {
@@ -494,10 +507,15 @@ impl RemoteState {
             let dir = job.wire_dir;
             let entries = entries.into_iter().enumerate().map(|(i, e)| (i as u32, e, None)).collect();
             eng.process_listing(s, job, entries);
-            let r = eng.remote.as_ref().unwrap();
-            r.sums.lock().unwrap().remove(&dir);
-            r.task_done();
+            eng.remote.as_ref().unwrap().listing_done(dir);
         });
+    }
+
+    /// The task processing listing `dir` is done: what was kept for its entries goes.
+    fn listing_done(&self, dir: u32) {
+        self.sums.lock().unwrap().remove(&dir);
+        self.mounts.lock().unwrap().remove(&dir);
+        self.task_done();
     }
 
     fn task_done(&self) {
@@ -548,8 +566,11 @@ impl RemoteState {
                 crate::progress::done(job.meta.size);
                 continue;
             }
-            let routed = self.link.is_none_or(|l| l.wants_delta(job.meta.size));
-            let sig = if self.delta && routed { basis_signature(&job, eng.opts.delta) } else { None };
+            let sig = match eng.append_to(&job) {
+                Some(d) => append_signature(&job, &d, eng.opts.append > 1),
+                None if self.delta && self.link.is_none_or(|l| l.wants_delta(job.meta.size)) => basis_signature(&job, eng.opts.delta),
+                None => None,
+            };
             reqs.push(NeedReq { idx: job.idx, sig });
             self.needed.lock().unwrap().insert(file_id(wire_dir, job.idx), job);
         }
@@ -603,8 +624,7 @@ impl RemoteState {
                 }
             };
         }
-        let (dir, name) = split_dst(&job.dst_path);
-        let (tmp, f) = fsops::with_temp(dir, name, |t| fsops::create_new(t, mode))?;
+        let (tmp, f) = eng.with_temp(&job.dst_path, |t| fsops::create_new(t, mode))?;
         Ok((f, tmp, true, true, true))
     }
 
@@ -641,6 +661,13 @@ impl RemoteState {
         if !eng.backup_existing_file(&job) {
             eng.report_transfer(&job, job.item, 0);
             return Ok(());
+        }
+        // --append-verify: the sender sends the file whole when the start it has isn't
+        // what this side holds.
+        if eng.opts.append > 1
+            && let Some(d) = eng.append_to(&job)
+        {
+            eng.append_failed(&job, &d);
         }
         // A whole file is all literal data, as rsync counts it.
         Stats::add(&eng.stats.literal_bytes, size);
@@ -686,8 +713,7 @@ impl RemoteState {
             (f, job.dst_path.clone(), false, false, true)
         } else {
             let want_clone = !eng.opts.no_clone && d.in_place_bytes() > 0;
-            let (dir, name) = split_dst(&job.dst_path);
-            let (tmp, cloned) = fsops::with_temp(dir, name, |t| {
+            let (tmp, cloned) = eng.with_temp(&job.dst_path, |t| {
                 if want_clone && fsops::clone_into_new(&basis, t)? {
                     return Ok(true);
                 }
@@ -853,7 +879,7 @@ impl RemoteState {
         }
         fsops::check_interrupt()?;
         if rename {
-            fs::rename(path, &job.dst_path)?;
+            eng.place_file(path, job)?;
         }
         Ok(())
     }
@@ -926,8 +952,7 @@ impl RemoteState {
                         continue;
                     }
                     Stats::add(&eng.stats.literal_bytes, len as u64);
-                    let (dir, name) = split_dst(&job.dst_path);
-                    let tmp = dir.join(fsops::temp_name(name));
+                    let tmp = eng.temp_path(&job.dst_path);
                     fsops::register_temp(&tmp);
                     jobs.push((job, bytes, tmp));
                 }
@@ -971,7 +996,7 @@ impl RemoteState {
         }
         let _ = uring::close_all(fds);
         for (job, tmp, r) in done {
-            let r = r.and_then(|()| fsops::check_interrupt()).and_then(|()| fs::rename(&tmp, &job.dst_path));
+            let r = r.and_then(|()| fsops::check_interrupt()).and_then(|()| eng.place_file(&tmp, &job));
             match finish_temp(&tmp, r) {
                 Ok(()) => eng.file_written(&job),
                 Err(e) => report(&job.dst_path, e),
@@ -1016,6 +1041,17 @@ impl RemoteState {
     }
 }
 
+/// `--munge-links` on the receiving side: a received symlink's target gets
+/// `/rsyncd-munged/` in front, so it leads nowhere (rsync's `receive_file_entry`).
+fn munge(opts: &Options, ents: &mut [DirEnt]) {
+    if !opts.munge_links {
+        return;
+    }
+    for t in ents.iter_mut().filter(|e| e.meta.kind == Kind::Symlink).filter_map(|e| e.link.as_mut()) {
+        t.splice(0..0, crate::local::flags::MUNGED.iter().copied());
+    }
+}
+
 /// A sender's `-X`/`-A` data in the receiver's form: ACL ids mapped by name, then local
 /// attribute names and ACL masks (`mode`: the entry's mode as sent).
 fn local_extra(ids: &IdMap, r: &crate::xattrs::Rules, x: Option<Box<crate::entry::Extra>>, mode: u32) -> Option<Box<crate::entry::Extra>> {
@@ -1053,6 +1089,17 @@ fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<Sig> {
     } else {
         delta::chunk_signature(&f, d.size, &p).ok().map(Sig::Chunks)
     }
+}
+
+/// `--append`: ask only for the data past the destination file (`d`), with
+/// `--append-verify` sending the checksum of what it holds. `None`, so the file comes
+/// whole, if it can't be read.
+fn append_signature(job: &FileJob, d: &crate::entry::Meta, verify: bool) -> Option<Sig> {
+    let sum = match verify {
+        true => Some(crate::checksum::prefix_sum(&File::open(&job.dst_path).ok()?, d.size).ok()?),
+        false => None,
+    };
+    Some(Sig::Append { len: d.size, sum })
 }
 
 /// Decide what each root maps to on this side: rsync's destination rules (a single
@@ -1149,7 +1196,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         let _ = conn.msg(Msg::Fatal { msg });
         (code, StatsSnapshot::default(), false)
     };
-    let mut ids = IdMap::default();
+    let mut ids = match IdMap::for_receiver(opts, &mut |m| out.warning(m)) {
+        Ok(ids) => ids,
+        Err(e) => return fail(exit::SYNTAX, e),
+    };
     let mut probe = adapt::ProbeReceiver::default();
     let mut link = None;
     let mut io_error = false;
@@ -1178,7 +1228,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         }
     };
     // Before anything is written: the roots decide where everything goes.
-    if let Err(e) = check::roots(&roots) {
+    if let Err(e) = check::roots(&roots).and_then(|()| check::missing(roots.iter().flat_map(|r| &r.items), opts)) {
         return fail(exit::PROTOCOL, format!("protocol error: {e}"));
     }
     let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
@@ -1188,6 +1238,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
     for root in &mut roots {
         root.meta.iter_mut().for_each(|m| ids.apply(m));
         root.items.iter_mut().for_each(|e| ids.apply(&mut e.meta));
+        munge(opts, &mut root.items);
     }
     let mut engine = Engine::new(opts, filter, out);
     if io_error {
@@ -1207,6 +1258,10 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             return (code, StatsSnapshot::default(), false);
         }
     };
+    if let Err(code) = engine.check_temp_dir() {
+        let _ = conn.msg(Msg::Fatal { msg: "the receiver's temp-dir is not usable".into() });
+        return (code, StatsSnapshot::default(), false);
+    }
     let mut state = RemoteState::new(conn.out.clone(), opts, ids);
     // Adaptive strategy: route by the measured link unless -W / --no-whole-file decided.
     state.link = link.filter(|_| opts.strategy == Strategy::Adaptive && opts.whole_file.is_none());
@@ -1270,9 +1325,12 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
             let r = match frame {
                 Frame::Data { id, off, bytes } => remote.data(engine, id, off, &bytes),
                 Frame::Msg(m) => match m {
-                    Msg::DirBatch { root, dir, rel, entries, sums } => match listings.take(root, dir, &rel, &entries, &sums) {
+                    Msg::DirBatch { root, dir, rel, entries, sums, mounts } => match listings
+                        .take(root, dir, &rel, &entries, &sums, &mounts)
+                        .and_then(|()| check::missing(entries.iter(), opts))
+                    {
                         Ok(()) => {
-                            remote.on_batch(s, engine, root, dir, rel, entries, sums);
+                            remote.on_batch(s, engine, root, dir, rel, entries, sums, mounts);
                             Ok(())
                         }
                         Err(e) => {
@@ -1392,6 +1450,7 @@ pub fn run(conn: &Conn, opts: &Options, dest: &OsStr, out: &Output, await_remova
         engine.err(format!("attributes of {waiting} entries were never received"));
     }
     pool.install(|| {
+        engine.finish_delayed();
         engine.link_followers();
         engine.finish_deletions();
         engine.apply_fixups();

@@ -38,6 +38,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     let side = if matches!(parse_location(dest), Ok(Location::Local(_))) { Side::Pull } else { Side::Push };
     let out: &'static Output = Box::leak(Box::new(Output::new(opts, side)));
     let started = Instant::now();
+    crate::bwlimit::limit_connections(opts.bwlimit);
 
     // Push (local sources, remote destination) or pull (remote sources on one host,
     // local destination). An empty remote path means the remote home directory.
@@ -137,6 +138,8 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     }
     let mut server_opts = opts.clone();
     server_opts.paths = server_paths;
+    // rsync: each side needs its own --munge-links; the server's is never this one.
+    server_opts.munge_links = false;
     server_opts.transport = if transport == Transport::Auto { Transport::Quic } else { transport };
     let hello = Msg::Hello { magic: MAGIC, version: VERSION, server_is_sender, opts: Box::new(server_opts) };
     // --timeout covers waiting for the remote side to start, as rsync's does.

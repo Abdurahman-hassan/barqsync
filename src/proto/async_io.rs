@@ -54,8 +54,19 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Frame>
             0 => return Err(io::ErrorKind::UnexpectedEof.into()),
             _ => r.read_exact(&mut hdr[1..]).await?,
         };
+        super::note_read();
+        // Each read counts as activity for --timeout (see `note_read`).
         let mut body = vec![0u8; body_len(&hdr)?];
-        r.read_exact(&mut body).await?;
+        let mut got = 0;
+        while got < body.len() {
+            match r.read(&mut body[got..]).await? {
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                n => {
+                    got += n;
+                    super::note_read();
+                }
+            }
+        }
         super::count(&super::BYTES_RECEIVED, hdr.len() + body.len());
         if let Some(f) = pieces.add(hdr[4], body)? {
             return Ok(Some(f));
@@ -96,7 +107,19 @@ pub(crate) fn spawn_writer(
                 if buf.is_empty() {
                     break;
                 }
-                w.write_all(&buf).await?;
+                match crate::bwlimit::connections() {
+                    // --bwlimit: paced pieces, each sent before the next waits.
+                    Some(rate) => {
+                        for piece in buf.chunks(crate::bwlimit::piece(rate)) {
+                            if let Some(wait) = crate::bwlimit::reserve(rate, piece.len()) {
+                                pause(wait).await;
+                            }
+                            w.write_all(piece).await?;
+                            w.flush().await?;
+                        }
+                    }
+                    None => w.write_all(&buf).await?,
+                }
                 super::count(&super::BYTES_SENT, buf.len());
                 if rx.is_empty() && urgent.as_ref().is_none_or(|u| u.is_empty()) {
                     w.flush().await?;
@@ -112,6 +135,19 @@ pub(crate) fn spawn_writer(
         r
     });
     (tx, task)
+}
+
+/// [`crate::bwlimit::pause`] for a task: a wait cut short by Ctrl-C, so that the rest of
+/// a frame, and the `Interrupted` notice queued behind it, go out at once.
+async fn pause(wait: std::time::Duration) {
+    let end = tokio::time::Instant::now() + wait;
+    while !crate::fsops::interrupted() {
+        let left = end.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        tokio::time::sleep(left.min(crate::bwlimit::NAP)).await;
+    }
 }
 
 /// Reader task: decodes frames from `r` into `out`, then says how the stream ended (a

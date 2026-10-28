@@ -184,7 +184,7 @@ fn listing_names_cannot_leave_the_destination() {
             let entries = vec![ent(OsString::from_vec(name.to_vec()), f.file)];
             let code = receive(&f.dest, &[], mode, |p| {
                 p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries, sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries, sums: vec![], mounts: vec![] }).unwrap();
                 let msg = refused(p);
                 assert!(msg.contains("protocol error"), "{msg}");
             });
@@ -216,45 +216,45 @@ fn malformed_roots_and_listings_are_refused_before_anything_is_written() {
             let r = r.clone();
             move |p| {
                 p.msg(Msg::Roots(vec![r.clone()])).unwrap();
-                p.msg(Msg::DirBatch { root: 1, dir: 0, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 1, dir: 0, rel: vec![], entries: vec![], sums: vec![], mounts: vec![] }).unwrap();
             }
         })),
         ("a listing no directory announced", Box::new({
             let r = r.clone();
             move |p| {
                 p.msg(Msg::Roots(vec![r.clone()])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", d)], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", d)], sums: vec![], mounts: vec![] }).unwrap();
                 need(p, 0);
-                p.msg(Msg::DirBatch { root: 0, dir: 1, rel: b"other".to_vec(), entries: vec![], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 1, rel: b"other".to_vec(), entries: vec![], sums: vec![], mounts: vec![] }).unwrap();
             }
         })),
         ("a directory path with ..", Box::new({
             let r = r.clone();
             move |p| {
                 p.msg(Msg::Roots(vec![r.clone()])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", d)], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", d)], sums: vec![], mounts: vec![] }).unwrap();
                 need(p, 0);
-                p.msg(Msg::DirBatch { root: 0, dir: 1, rel: b"sub/..".to_vec(), entries: vec![], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 1, rel: b"sub/..".to_vec(), entries: vec![], sums: vec![], mounts: vec![] }).unwrap();
             }
         })),
         ("a listing sent twice", Box::new({
             let r = r.clone();
             move |p| {
                 p.msg(Msg::Roots(vec![r.clone()])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", d)], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", d)], sums: vec![], mounts: vec![] }).unwrap();
                 need(p, 0);
-                p.msg(Msg::DirBatch { root: 0, dir: 1, rel: b"sub".to_vec(), entries: vec![], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 1, rel: b"sub".to_vec(), entries: vec![], sums: vec![], mounts: vec![] }).unwrap();
                 need(p, 1);
-                p.msg(Msg::DirBatch { root: 0, dir: 2, rel: b"sub".to_vec(), entries: vec![ent("late", file)], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 2, rel: b"sub".to_vec(), entries: vec![ent("late", file)], sums: vec![], mounts: vec![] }).unwrap();
             }
         })),
         ("a reused listing id", Box::new({
             let r = r.clone();
             move |p| {
                 p.msg(Msg::Roots(vec![r.clone()])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", d)], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", d)], sums: vec![], mounts: vec![] }).unwrap();
                 need(p, 0);
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: b"sub".to_vec(), entries: vec![ent("late", file)], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: b"sub".to_vec(), entries: vec![ent("late", file)], sums: vec![], mounts: vec![] }).unwrap();
             }
         })),
         ("a name listed twice", Box::new({
@@ -262,14 +262,30 @@ fn malformed_roots_and_listings_are_refused_before_anything_is_written() {
             move |p| {
                 p.msg(Msg::Roots(vec![r.clone()])).unwrap();
                 let entries = vec![ent("x", d), ent("x", file)];
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries, sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries, sums: vec![], mounts: vec![] }).unwrap();
             }
         })),
         ("named items that differ from the roots", Box::new({
             let i = item("x");
             move |p| {
                 p.msg(Msg::Roots(vec![i.clone()])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("y", file)], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("y", file)], sums: vec![], mounts: vec![] }).unwrap();
+            }
+        })),
+        ("a listing of a mount point", Box::new({
+            let r = r.clone();
+            move |p| {
+                p.msg(Msg::Roots(vec![r.clone()])).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", d)], sums: vec![], mounts: vec![0] }).unwrap();
+                need(p, 0);
+                p.msg(Msg::DirBatch { root: 0, dir: 1, rel: b"sub".to_vec(), entries: vec![ent("late", file)], sums: vec![], mounts: vec![] }).unwrap();
+            }
+        })),
+        ("a file marked as a mount point", Box::new({
+            let r = r.clone();
+            move |p| {
+                p.msg(Msg::Roots(vec![r.clone()])).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("x", file)], sums: vec![], mounts: vec![0] }).unwrap();
             }
         })),
     ];
@@ -303,7 +319,7 @@ fn unusual_but_valid_names_are_written() {
         let code = receive(&f.dest, &[], mode, |p| {
             p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
             let entries = names.iter().map(|n| ent(OsString::from_vec(n.to_vec()), f.file)).collect();
-            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries, sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries, sums: vec![], mounts: vec![] }).unwrap();
             let files = need(p, 0);
             assert_eq!(files.len(), names.len());
             let pack = files.iter().map(|r| (file_id(0, r.idx), 4)).collect();
@@ -328,11 +344,11 @@ fn another_root_cannot_swap_a_directory_for_a_symlink() {
         l.meta.kind = Kind::Symlink;
         let code = receive(&f.dest, &[], mode, |p| {
             p.msg(Msg::Roots(vec![root(&f.dest), root(&f.dest)])).unwrap();
-            p.msg(Msg::DirBatch { root: 1, dir: 0, rel: vec![], entries: vec![ent("a", f.dir)], sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 1, dir: 0, rel: vec![], entries: vec![ent("a", f.dir)], sums: vec![], mounts: vec![] }).unwrap();
             need(p, 0);
-            p.msg(Msg::DirBatch { root: 0, dir: 1, rel: vec![], entries: vec![l.clone()], sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 0, dir: 1, rel: vec![], entries: vec![l.clone()], sums: vec![], mounts: vec![] }).unwrap();
             need(p, 1);
-            p.msg(Msg::DirBatch { root: 1, dir: 2, rel: b"a".to_vec(), entries: vec![ent("pwn", f.file)], sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 1, dir: 2, rel: b"a".to_vec(), entries: vec![ent("pwn", f.file)], sums: vec![], mounts: vec![] }).unwrap();
             let files = need(p, 2);
             assert_eq!(files.len(), 1);
             p.msg(Msg::SmallPack { files: vec![(file_id(2, 0), 4)], blob: b"PWND".to_vec(), xattrs: vec![] }).unwrap();
@@ -353,11 +369,11 @@ fn keep_dirlinks_does_not_follow_a_symlink_another_root_made() {
         l.meta.kind = Kind::Symlink;
         let code = receive(&f.dest, &["-K"], mode, |p| {
             p.msg(Msg::Roots(vec![root(&f.dest), root(&f.dest)])).unwrap();
-            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![l.clone()], sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![l.clone()], sums: vec![], mounts: vec![] }).unwrap();
             need(p, 0);
-            p.msg(Msg::DirBatch { root: 1, dir: 1, rel: vec![], entries: vec![ent("a", f.dir)], sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 1, dir: 1, rel: vec![], entries: vec![ent("a", f.dir)], sums: vec![], mounts: vec![] }).unwrap();
             need(p, 1);
-            p.msg(Msg::DirBatch { root: 1, dir: 2, rel: b"a".to_vec(), entries: vec![ent("pwn", f.file)], sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 1, dir: 2, rel: b"a".to_vec(), entries: vec![ent("pwn", f.file)], sums: vec![], mounts: vec![] }).unwrap();
             need(p, 2);
             p.msg(Msg::SmallPack { files: vec![(file_id(2, 0), 4)], blob: b"PWND".to_vec(), xattrs: vec![] }).unwrap();
             finish(p, 3);
@@ -380,7 +396,7 @@ fn deletion_waits_for_successful_scan_completion() {
             fs::write(f.dest.join("keep"), b"PRECIOUS").unwrap();
             let code = receive(&f.dest, &["--delete"], mode, |p| {
                 p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![], mounts: vec![] }).unwrap();
                 need(p, 0);
                 assert_eq!(fs::read(f.dest.join("keep")).unwrap(), b"PRECIOUS", "deleted while still scanning");
                 if outcome == "fatal" {
@@ -411,7 +427,7 @@ fn invalid_scan_completion_cannot_authorize_deletion() {
             fs::write(f.dest.join("keep"), b"PRECIOUS").unwrap();
             let code = receive(&f.dest, &["--delete"], mode, |p| {
                 p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![], mounts: vec![] }).unwrap();
                 need(p, 0);
                 match case {
                     "missing" => p.msg(Msg::SenderDone { errors: 0, vanished: 0 }).unwrap(),
@@ -422,7 +438,7 @@ fn invalid_scan_completion_cannot_authorize_deletion() {
                     }
                     _ => {
                         p.msg(Msg::ScanDone { dirs: 1 }).unwrap();
-                        p.msg(Msg::DirBatch { root: 0, dir: 1, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
+                        p.msg(Msg::DirBatch { root: 0, dir: 1, rel: vec![], entries: vec![], sums: vec![], mounts: vec![] }).unwrap();
                     }
                 }
                 assert!(refused(p).contains("protocol error"));
@@ -440,7 +456,7 @@ fn missing_selected_directory_listing_preserves_deletion_candidates() {
         fs::write(f.dest.join("keep"), b"PRECIOUS").unwrap();
         let code = receive(&f.dest, &["--delete"], mode, |p| {
             p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
-            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", f.dir)], sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("sub", f.dir)], sums: vec![], mounts: vec![] }).unwrap();
             need(p, 0);
             // The count matches, but the selected subdirectory was never listed.
             finish(p, 1);
@@ -462,7 +478,7 @@ fn a_deletion_candidate_selected_by_another_root_survives() {
                 for dir in 0..2 {
                     let selected = (dir == 0) == selected_first;
                     let entries = if selected { vec![ent("keep", meta)] } else { vec![] };
-                    p.msg(Msg::DirBatch { root: dir as u16, dir, rel: vec![], entries, sums: vec![] }).unwrap();
+                    p.msg(Msg::DirBatch { root: dir as u16, dir, rel: vec![], entries, sums: vec![], mounts: vec![] }).unwrap();
                     assert!(need(p, dir).is_empty());
                 }
                 finish(p, 2);
@@ -480,7 +496,7 @@ fn a_replaced_deletion_candidate_is_kept() {
         fs::write(f.dest.join("keep"), b"OLD").unwrap();
         let code = receive(&f.dest, &["--delete"], mode, |p| {
             p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
-            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![], sums: vec![], mounts: vec![] }).unwrap();
             need(p, 0);
             let replacement = f.outside.join("replacement");
             fs::write(&replacement, b"NEW").unwrap();
@@ -504,7 +520,7 @@ fn one_file(mode: (Wire, bool), send: impl FnOnce(&Conn, u64)) -> (i32, Vec<u8>)
     fsops::set_mtime(&f.dest.join("f"), 1_000_000_000, 0).unwrap();
     let code = receive(&f.dest, &[], mode, |p| {
         p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
-        p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("f", f.file)], sums: vec![] }).unwrap();
+        p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("f", f.file)], sums: vec![], mounts: vec![] }).unwrap();
         assert_eq!(need(p, 0).len(), 1);
         send(p, file_id(0, 0));
         finish(p, 1);
@@ -588,7 +604,7 @@ fn a_requested_file_that_never_arrives_stops_deletion() {
             fs::write(f.dest.join("stale"), b"PRECIOUS").unwrap();
             let (code, log) = receive_logged(&f.dest, &["--delete"], mode, |p| {
                 p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("f", f.file)], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("f", f.file)], sums: vec![], mounts: vec![] }).unwrap();
                 assert_eq!(need(p, 0).len(), 1);
                 if case == "never finished" {
                     let id = file_id(0, 0);
@@ -637,7 +653,7 @@ fn delta_ranges_are_checked_against_the_basis_and_the_file() {
             let src_meta = Meta { size: SIZE as u64, mtime: 1_100_000_000, ..meta_of(&path) };
             let code = receive(&f.dest, &[], mode, |p| {
                 p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
-                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("big", src_meta)], sums: vec![] }).unwrap();
+                p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries: vec![ent("big", src_meta)], sums: vec![], mounts: vec![] }).unwrap();
                 let reqs = need(p, 0);
                 assert!(reqs[0].sig.is_some(), "a basis signature is asked for");
                 let id = file_id(0, 0);
@@ -675,7 +691,7 @@ fn a_listing_larger_than_a_frame_arrives() {
         let n = entries.len();
         let code = receive(&f.dest, &["--exclude=0*"], mode, |p| {
             p.msg(Msg::Roots(vec![root(&f.dest)])).unwrap();
-            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries, sums: vec![] }).unwrap();
+            p.msg(Msg::DirBatch { root: 0, dir: 0, rel: vec![], entries, sums: vec![], mounts: vec![] }).unwrap();
             assert!(need(p, 0).is_empty(), "all {n} are excluded");
             finish(p, 1);
         });

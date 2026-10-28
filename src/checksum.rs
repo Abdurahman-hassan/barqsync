@@ -41,6 +41,31 @@ pub fn file_sum(path: &Path) -> io::Result<Sum> {
     Ok(out)
 }
 
+/// `--append-verify`: the checksum of the first `len` bytes of `f` (all of it, if it is
+/// shorter).
+pub fn prefix_sum(f: &File, len: u64) -> io::Result<Sum> {
+    use std::os::unix::fs::FileExt;
+    let mut h = blake3::Hasher::new();
+    let mut buf = vec![0u8; (1 << 20).min(len as usize)];
+    let mut off = 0u64;
+    while off < len {
+        crate::fsops::check_interrupt()?;
+        let want = (len - off).min(buf.len() as u64) as usize;
+        match f.read_at(&mut buf[..want], off) {
+            Ok(0) => break,
+            Ok(n) => {
+                h.update(&buf[..n]);
+                off += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    Ok(out)
+}
+
 /// Checksums of `paths`, in order, computed in parallel.
 pub fn sums(paths: Vec<PathBuf>) -> Vec<io::Result<Sum>> {
     if paths.len() <= 1 {

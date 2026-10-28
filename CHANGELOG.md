@@ -6,8 +6,10 @@
 
 - Remote transfers now use protocol 11: the new options travel to the other side, which
   also reports vanished files and `--max-delete` stops, and a push's items reach the
-  client as records it formats itself. Upgrade barqsync on both machines together; this
-  release cannot communicate with 0.4.x.
+  client as records it formats itself. `--append` adds a request for the data past a
+  shorter file, `--delete-missing-args` entries for missing sources, and the sender now
+  names the owner and group of id 0 too. Upgrade barqsync on both machines together;
+  this release cannot communicate with 0.4.x.
 
 ### Security
 
@@ -45,6 +47,22 @@
     (accepted; barqsync never puts paths on the remote command line).
   - `--timeout=SECONDS`: a remote transfer whose connection delivers nothing for that
     long ends with exit 30. Both sides send keepalives while busy.
+  - `--bwlimit=RATE`: each side paces what it writes to the connection, all streams
+    together, as rsync does; a local copy paces the file data it writes. rsync's size
+    syntax, in KiB per second by default.
+  - `--chown=USER:GROUP`, `--usermap` and `--groupmap`: rsync's `FROM:TO` maps (names,
+    ids, ranges and wildcards), applied by the receiver, locally too. They imply `-o`
+    and `-g`, as in rsync.
+  - `--append` and `--append-verify`: a shorter destination file gets only the rest of
+    the data, over the wire too; `--append-verify` rewrites a file whose existing data
+    isn't the source's start, warning as rsync does.
+  - `-T`/`--temp-dir` (on another filesystem the data is copied, as rsync does, into a
+    new file that replaces the destination) and `--delay-updates` (updated files wait in `.~tmp~` and
+    are renamed into place together at the end).
+  - `--force`, `--ignore-errors`, `--ignore-missing-args` and `--delete-missing-args`, the
+    last one also for `--files-from` lists that name files whose directory is gone.
+  - `--safe-links`, `--copy-unsafe-links` and `--munge-links`, with rsync 3.4's stricter
+    test for unsafe symlinks.
 - A source file that disappears between the scan and its transfer is now a warning
   ("file has vanished") and exit 24, as with rsync, instead of an error and exit 23.
 - `--stats` also prints rsync's "Total bytes sent/received" lines, and `-v` or `--stats`
@@ -64,6 +82,30 @@
 
 ### Fixed
 
+- With `-x`/`--one-file-system`, `--delete` no longer deletes on another filesystem
+  mounted inside the destination. Before, a mount point the source lacked was emptied:
+  everything on the mounted filesystem was deleted, and then removing the mount point
+  itself failed (exit 23). Now it stays, as with rsync, and `-vv` says "cannot delete
+  mount point". Nothing is deleted inside a mount point the source has either, unless
+  the transfer goes straight into it (it is the destination, or where a named source
+  directory goes), and one inside a directory being deleted keeps that directory
+  ("cannot delete non-empty directory"). This holds for local copies, pushes and pulls.
+  All earlier releases are affected.
+- With `-x`/`--one-file-system`, a push or a pull whose source holds a mount point (a
+  directory on another filesystem) no longer fails with "1 selected directories were
+  never listed" (exit 23), which also stopped `--delete`. As with rsync, and as local
+  copies already did, the destination gets the mount point's directory but nothing from
+  the mounted filesystem, and nothing in that directory is deleted. Releases 0.4.1 and
+  0.4.2 are affected; 0.4.0 didn't fail, but left that directory's time unset.
+- With `-x`/`--one-file-system`, two kinds of transfer no longer stop at a source mount
+  point where rsync goes on. When several sources merge into one destination and an
+  earlier one has a mount point where a later one has a plain directory (`a/ b/ dst/`,
+  with `a/m` a mount point and `b/m` not), `dst/m` is now filled from `b/m`, and
+  `--delete` deletes there what `b/m` lacks. Before, `dst/m` was left as it was. And a
+  `-R` or `--files-from` path through a mount point (`-R s/mnt/file`, with `s/mnt` a mount
+  point) is now sent; before, only the directory `s/mnt` was made. As with rsync, each
+  named path is checked from its own filesystem. This holds for local copies, pushes and
+  pulls. All earlier releases are affected.
 - `--delete` no longer deletes after a file could not be written to the destination (a
   full disk, a quota, an I/O error, or data that never arrived complete). Before, a file
   renamed in the source could lose its old name on the destination without getting the

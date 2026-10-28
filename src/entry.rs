@@ -94,11 +94,20 @@ pub struct DirEnt {
     pub link: Option<Vec<u8>>,
     /// `-X`/`-A`: extended attributes and ACLs (`None`: none, or not asked for).
     pub extra: Option<Box<Extra>>,
+    /// `--delete-missing-args`: a named source that doesn't exist, whose destination is
+    /// deleted (rsync's file-list entry of mode 0). Its `meta` means nothing.
+    pub missing: bool,
 }
 
 impl DirEnt {
     pub fn new(name: OsString, meta: Meta, link: Option<Vec<u8>>) -> DirEnt {
-        DirEnt { name, meta, link, extra: None }
+        DirEnt { name, meta, link, extra: None, missing: false }
+    }
+
+    /// A missing named source (see [`DirEnt::missing`]).
+    pub fn missing(name: OsString) -> DirEnt {
+        let meta = Meta { kind: Kind::File, size: 0, mtime: 0, mtime_ns: 0, mode: 0, uid: 0, gid: 0, dev: 0, ino: 0, rdev: 0, nlink: 0 };
+        DirEnt { name, meta, link: None, extra: None, missing: true }
     }
 }
 

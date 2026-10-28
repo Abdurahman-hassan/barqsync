@@ -127,6 +127,65 @@ pub fn join_rel(rel: &[u8], name: &OsStr) -> Vec<u8> {
     v
 }
 
+/// rsync's `unsafe_symlink`: whether a symlink to `dest`, at `src` (its path in the
+/// transfer, which decides how far up it may point), reaches outside the transfer. Empty
+/// and absolute targets are unsafe, and so (as from rsync 3.4) is a `/../` anywhere but
+/// in the leading `../`s, or a final `/..`; otherwise the `..`s may not climb above the
+/// transfer's top.
+pub fn unsafe_symlink(dest: &[u8], src: &[u8]) -> bool {
+    /// The components before each `/` (extra slashes skipped), and the last one.
+    fn walk(path: &[u8]) -> (Vec<&[u8]>, &[u8]) {
+        let mut comps = Vec::new();
+        let mut name = path;
+        while let Some(i) = name.iter().position(|&b| b == b'/') {
+            comps.push(&name[..i]);
+            let skip = name[i..].iter().take_while(|&&b| b == b'/').count();
+            name = &name[i + skip..];
+        }
+        (comps, name)
+    }
+    if dest.first().is_none_or(|&b| b == b'/') {
+        return true;
+    }
+    let mut rest = dest;
+    while let Some(r) = rest.strip_prefix(b"../") {
+        rest = &r[r.iter().take_while(|&&b| b == b'/').count()..];
+    }
+    if rest.windows(4).any(|w| w == b"/../") || (dest.len() > 3 && dest.ends_with(b"/..")) {
+        return true;
+    }
+    // How deep `src` is: what its target's `..`s may climb.
+    let mut depth = 0i64;
+    let (dirs, last) = walk(src);
+    for c in dirs {
+        match c {
+            b"." => {}
+            b".." => depth = 0,
+            _ => depth += 1,
+        }
+    }
+    if last == b".." {
+        depth = 0;
+    }
+    let (dirs, last) = walk(dest);
+    for c in dirs {
+        match c {
+            b"." => {}
+            b".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    if last == b".." {
+        depth -= 1;
+    }
+    depth < 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +255,44 @@ mod tests {
         assert_eq!(split_source(Path::new("b")), (PathBuf::from("."), Some("b".into())));
         assert_eq!(split_source(Path::new("/")).1, None);
         assert_eq!(split_source(Path::new("..")).1, None);
+    }
+    #[test]
+    fn unsafe_symlinks_like_rsync() {
+        // rsync's testsuite/unsafe-byname_test.py: (target, path of the link's directory).
+        let cases: &[(&str, &str, bool)] = &[
+            ("file", "from", false),
+            ("dir/file", "from", false),
+            ("dir/./file", "from", false),
+            ("dir/.", "from", false),
+            ("dir/", "from", false),
+            ("/etc/passwd", "from", true),
+            ("//../etc/passwd", "from", true),
+            ("//./etc/passwd", "from", true),
+            ("./foo", "from", false),
+            ("../foo", "from", true),
+            ("./../foo", "from", true),
+            (".//../foo", "from", true),
+            ("./../foo", "from/..", true),
+            ("../dest", "from/dir", false),
+            ("../../dest", "from//dir", true),
+            ("..//../dest", "from/dir", true),
+            ("..", "from/file", false),
+            ("../..", "from/file", true),
+            ("..//..", "from//file", true),
+            ("dir/..", "from", true),
+            ("dir/../..", "from", true),
+            ("dir/..//..", "from", true),
+            ("", "from", true),
+            ("../../unsafe/unsafefile", "from/safe", true),
+            ("..//../unsafe/unsafefile", "from/safe", true),
+            ("../files/file1", "from/safe", false),
+            ("../../unsafe/unsafefile", "safe", true),
+            ("../files/file1", "safe", true),
+            ("../../unsafe/unsafefile", "/home/me/from/safe", false),
+            ("../files/file1", "/home/me/from/safe", false),
+        ];
+        for &(dest, src, want) in cases {
+            assert_eq!(unsafe_symlink(dest.as_bytes(), src.as_bytes()), want, "{dest:?} at {src:?}");
+        }
     }
 }
