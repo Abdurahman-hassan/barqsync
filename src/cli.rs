@@ -883,9 +883,9 @@ impl Options {
 }
 
 /// rsync's `--info` levels (0: silent), as `-v`, `--stats`, `--progress` and `--info`
-/// leave them. barqsync shows what rsync shows at each level, except that `copy` and
-/// `mount` messages are never produced (naming them is refused) and `progress` is
-/// always the overall line.
+/// leave them. barqsync shows what rsync shows at each level, except that `copy`
+/// messages are never produced (naming it is refused) and `progress` is always the
+/// overall line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Info {
@@ -898,6 +898,7 @@ pub struct Info {
     pub flist: u8,
     /// Nothing barqsync does: rsync's are about daemons and busy executables.
     pub misc: u8,
+    /// "cannot delete mount point: X" (`-x` with `--delete`).
     pub mount: u8,
     /// 1: changed items; 2: also unchanged ones ("X is uptodate").
     pub name: u8,
@@ -1014,12 +1015,10 @@ impl Info {
             let n = Info::parse(arg, &mut user)?;
             named.iter_mut().zip(n).for_each(|(a, b)| *a |= b);
         }
-        // Their messages are rsync's for situations barqsync handles otherwise (a failed
-        // --link-dest copy is an error; mount points aren't kept or reported).
-        for (i, word) in [(1, "copy"), (5, "mount")] {
-            if named[i] && user[i].is_some_and(|l| l > 0) {
-                bail!("--info={word} is not supported");
-            }
+        // Its messages are rsync's for a situation barqsync handles otherwise (a failed
+        // --link-dest copy is an error).
+        if named[1] && user[1].is_some_and(|l| l > 0) {
+            bail!("--info=copy is not supported");
         }
         let mut implied = [None; 13];
         for words in INFO_VERBOSITY.iter().take(usize::from(verbose.min(2)) + 1) {
@@ -1615,10 +1614,11 @@ mod tests {
         }
         assert_eq!(info(&["--info=nam2"]).unwrap_err().to_string(), "Unknown --info item: \"nam\"");
         // Messages barqsync never produces are refused when asked for.
-        for bad in ["--info=copy", "--info=MOUNT2"] {
+        for bad in ["--info=copy", "--info=COPY2"] {
             assert!(info(&[bad]).unwrap_err().to_string().ends_with("is not supported"), "{bad}");
         }
-        assert!(info(&["--info=copy0,mount0"]).is_ok());
+        assert!(info(&["--info=copy0"]).is_ok());
+        assert_eq!(info(&["--info=MOUNT2"]).unwrap().0.mount, 2);
         let help = info(&["--info=help"]).unwrap_err();
         assert!(help.is::<InfoHelp>() && help.to_string().contains("\nSKIP       Mention files skipped"));
     }

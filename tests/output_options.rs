@@ -311,7 +311,7 @@ fn unsupported_requests_are_refused() {
         assert_eq!(msg(&r.stderr), msg(&f.stderr), "{bad}\nrsync: {}\nbarqsync: {}", r.stderr, f.stderr);
     }
     // What barqsync can't show is refused rather than ignored.
-    for bad in ["--info=copy", "--info=mount2", "--out-format=%n %C", "--out-format=%-4c"] {
+    for bad in ["--info=copy", "--out-format=%n %C", "--out-format=%-4c"] {
         let f = barqsync(tmp.path(), &["-a", bad, "src/", "f"]);
         assert_eq!(f.code, 1, "{bad}: {}", f.stderr);
         assert!(f.stderr.contains("not supported"), "{bad}: {}", f.stderr);

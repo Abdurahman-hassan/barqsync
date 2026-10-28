@@ -1136,10 +1136,29 @@ fn one_file_system_keeps_destination_mount_points() {
             }
         }
     }
-    // rsync's --info=mount, on with -vv.
-    mount_fixture(&t.join("f"), "old/mnt");
-    let f = barqsync(t, &["-axvv", "--delete", "lacks/", "f/old/"]);
-    assert!(f.stdout.lines().any(|l| l == "cannot delete mount point: mnt"), "{}", f.stdout);
+    // --info=mount names each mount point, whether the source lacks it or has it.
+    let line = "cannot delete mount point: mnt".to_string();
+    for src in ["lacks/", "has/"] {
+        for &mode in all {
+            let what = format!("{mode} --info=mount {src}");
+            mount_fixture(&t.join("r"), "old/mnt");
+            mount_fixture(&t.join("f"), "old/mnt");
+            let a = args(mode, "-aix", &[src], "{dst}/old/");
+            let mut a: Vec<&str> = a.iter().map(String::as_str).collect();
+            a.insert(2, "--info=mount");
+            let (r, f) = if mode == "local" { both(t, &a, "r", "f") } else { both_remote(t, &a, "r", "f") }.unwrap();
+            same_output(&r, &f, &[], &what);
+            assert!(f.items().contains(&line), "{what}: {}", f.stdout);
+        }
+    }
+    // -vv turns it on, as in rsync, and --info=mount0 off again.
+    for (extra, shown) in [(None, true), (Some("--info=mount0"), false)] {
+        mount_fixture(&t.join("f"), "old/mnt");
+        let mut a = vec!["-axvv", "--delete", "lacks/", "f/old/"];
+        a.extend(extra);
+        let f = barqsync(t, &a);
+        assert_eq!(f.items().contains(&line), shown, "{a:?}: {}", f.stdout);
+    }
     // Not even to make way for a file: rsync deletes the files at the top of the mount
     // point then, barqsync leaves it alone.
     for &mode in all {
