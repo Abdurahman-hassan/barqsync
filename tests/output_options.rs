@@ -344,3 +344,82 @@ fn progress_names_items_like_rsync() {
     assert_eq!(named(&r), named(&f), "--- rsync:\n{}--- barqsync:\n{}", r.stdout, f.stdout);
     assert!(named(&f).contains(&"new.txt".to_string()), "{}", f.stdout);
 }
+
+/// A `--log-file`'s lines, sorted, each checked for and stripped of rsync's stamp (`YYYY/MM/DD
+/// HH:MM:SS [PID] `), with the byte counts that differ reduced to which lines they are
+/// and barqsync's own "transferred ..." line left out.
+fn log_lines(path: &Path, dst: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut v: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let b = l.as_bytes();
+            let digits = |r: std::ops::Range<usize>| b.get(r).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
+            assert!(
+                l.len() > 22 && digits(0..4) && b[4] == b'/' && digits(5..7) && b[7] == b'/' && digits(8..10) && b[10] == b' ' && digits(11..13) && b[13] == b':' && b[19] == b' ' && b[20] == b'[',
+                "{}: no time stamp: {l:?}",
+                path.display()
+            );
+            let end = l[21..].find("] ").unwrap_or_else(|| panic!("no pid: {l:?}")) + 21;
+            assert!(digits(21..end), "{l:?}");
+            l[end + 2..].to_string()
+        })
+        .filter(|l| !l.starts_with("transferred "))
+        .map(|l| match ["sent ", "total size is "].iter().find(|p| l.starts_with(*p)) {
+            Some(p) => format!("<{}>", p.trim()),
+            None => l.replace(dst, "<dst>"),
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn log_file_matches_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["-a", "--delete", "--log-file={dst}.log"],
+        &["-a", "--delete", "--log-file={dst}.log", "--log-file-format=%o %n%L"],
+        // No items, but deletions as "deleting NAME".
+        &["-a", "--delete", "--log-file={dst}.log", "--log-file-format="],
+        // A dry run logs no transfers or deletions, the rest it would do.
+        &["-an", "--delete", "--log-file={dst}.log"],
+        // -q keeps stdout empty, not the log.
+        &["-aq", "--delete", "--log-file={dst}.log"],
+        &["-a", "-ii", "--log-file={dst}.log"],
+        &["-av", "--log-file={dst}.log", "--log-file-format=%i %f"],
+        // %l, %B and %M of what changed (not %b: its bytes are barqsync's, not rsync's).
+        &["-a", "--delete", "--log-file={dst}.log", "--log-file-format=%o %n %l %B %M"],
+        // "X is uptodate": logged when another process says it (a local copy's, a push's
+        // server), not by a pull's client, which says it itself.
+        &["-a", "--info=name2", "--log-file={dst}.log"],
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let names = dst_names(cases.len());
+    fixture(tmp.path(), &names);
+    for (i, args) in cases.iter().enumerate() {
+        for mode in MODES {
+            let dsts = (format!("r{i}{mode:?}"), format!("f{i}{mode:?}"));
+            let (r, f) = run_both(tmp.path(), mode, args, (&dsts.0, &dsts.1));
+            let what = format!("{mode:?} {args:?}");
+            same(&r, &f, (&dsts.0, &dsts.1), &what);
+            let (rl, fl) = (log_lines(&tmp.path().join(format!("{}.log", dsts.0)), &dsts.0), log_lines(&tmp.path().join(format!("{}.log", dsts.1)), &dsts.1));
+            assert_eq!(rl, fl, "{what}");
+            assert!(fl.iter().any(|l| l.ends_with("file list")), "{what}: {fl:?}");
+        }
+    }
+    // A failed push still logs its byte counts: rsync's sending side always does.
+    let (r, f) = both_remote(tmp.path(), &["-a", "--log-file={dst}.log", "src/", "{host}{dst}/missing/x"], "rfail", "ffail").unwrap();
+    assert!(r.code != 0 && f.code != 0, "{}", f.stderr);
+    for (log, dst) in [("rfail.log", "rfail"), ("ffail.log", "ffail")] {
+        let lines = log_lines(&tmp.path().join(log), dst);
+        assert!(lines.contains(&"<sent>".to_string()), "{log}: {lines:?}");
+    }
+    // A log that can't be opened is reported, and the run goes on (rsync: exit 0).
+    let (r, f) = run_both(tmp.path(), Mode::Local, &["-a", "--log-file=nowhere/{dst}.log"], ("r0Local", "f0Local"));
+    assert_eq!((r.code, f.code), (0, 0), "{}", f.stderr);
+    assert!(f.stderr.contains("failed to open log-file nowhere/f0Local.log"), "{}", f.stderr);
+    assert!(f.stdout.contains("Ignoring \"log file\" setting."), "{}", f.stdout);
+}

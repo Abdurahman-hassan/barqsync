@@ -83,6 +83,25 @@ pub struct Output {
     groups: OnceLock<(bool, Vec<u32>)>,
     charset: Charset,
     forward: Option<Forward>,
+    /// `--log-file`: what the client's log reports (a server whose client logs reports
+    /// it to the client too).
+    log: Option<LogSpec>,
+    /// The client's log file, once opened (see [`Output::open_log`]).
+    log_file: OnceLock<Mutex<std::fs::File>>,
+}
+
+/// What `--log-file` logs (rsync's client with a log file open): every message it shows,
+/// even with `-q`; items and deletions in `--log-file-format`; and as the transfer starts
+/// and ends, the file-list line and the byte counts. Each line starts with the local time
+/// and the process id, and is escaped as rsync's log is.
+struct LogSpec {
+    /// `--log-file-format` (`%i %n%L` by default); `None` when given empty: no items.
+    format: Option<Format>,
+    has_i: bool,
+    /// Deletions are logged in the format (it has `%o` or `%i`), else as `deleting NAME`.
+    del_format: bool,
+    /// A dry run: no transfers or deletions are logged (they don't happen).
+    dry_run: bool,
 }
 
 /// What changed about one item, rendered by `%i` as rsync's `YXcstpoguax`.
@@ -219,7 +238,9 @@ impl Output {
             itemize: opts.itemize,
             info: opts.info,
             del_format: has_i > 0 || format.as_ref().is_some_and(|f| f.has(b'o')),
-            after: format.as_ref().is_some_and(|f| f.has(b'b')),
+            // %b in either format: transfers are reported once their data is known.
+            after: format.as_ref().is_some_and(|f| f.has(b'b'))
+                || opts.log_file_format.as_deref().is_some_and(|f| Format::parse(f).is_ok_and(|f| f.has(b'b'))),
             format,
             has_i,
             times: opts.times,
@@ -229,7 +250,71 @@ impl Output {
             groups: OnceLock::new(),
             charset: Charset::for_output(opts.eight_bit_output),
             forward: None,
+            log: opts.log_file_format.as_deref().map(|f| {
+                let format = Some(f).filter(|f| !f.is_empty()).and_then(|f| Format::parse(f).ok());
+                let has_i = format.as_ref().is_some_and(|f| f.has(b'i'));
+                LogSpec { del_format: has_i || format.as_ref().is_some_and(|f| f.has(b'o')), format, has_i, dry_run: opts.dry_run }
+            }),
+            log_file: OnceLock::new(),
         }
+    }
+
+    /// `--log-file`: open it to append to (created with mode 0644, as rsync does). One that
+    /// can't be opened is reported, and the run goes on without it.
+    pub fn open_log(&self, opts: &Options) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(path) = &opts.log_file else { return };
+        match std::fs::OpenOptions::new().append(true).create(true).mode(0o644).open(path) {
+            Ok(f) => {
+                let _ = self.log_file.set(Mutex::new(f));
+            }
+            Err(e) => {
+                self.error(path_msg("failed to open log-file ", Path::new(path), format!(": {e}")));
+                self.notice("Ignoring \"log file\" setting.");
+            }
+        }
+    }
+
+    /// Write one message to the log, after the time and process id. As in rsync's log,
+    /// the control characters in it are escaped (`\#012` for a newline), so a name can't
+    /// make a record of its own.
+    fn log(&self, text: &[u8]) {
+        let Some(file) = self.log_file.get() else { return };
+        let text = text.strip_suffix(b"\n").unwrap_or(text);
+        if text.is_empty() {
+            return;
+        }
+        let mut buf = format!("{} [{}] ", timestamp(), std::process::id()).into_bytes();
+        escape(text, Charset::Any, &mut buf);
+        buf.push(b'\n');
+        let _ = file.lock().unwrap_or_else(|e| e.into_inner()).write_all(&buf);
+    }
+
+    /// [`Output::log`] for text of barqsync's own, which holds no names but may hold
+    /// several lines (the summary): a record for each, as rsync logs its lines.
+    fn log_lines(&self, text: &[u8]) {
+        text.split(|&b| b == b'\n').for_each(|line| self.log(line));
+    }
+
+    /// The log's first line: rsync's sending side builds the file list, a receiving client
+    /// receives it.
+    pub fn log_start(&self, receiving: bool) {
+        self.log(if receiving { b"receiving file list" } else { b"building file list" });
+    }
+
+    /// The log's last line: the bytes moved and the size of the source files.
+    pub fn log_end(&self, io: Io, total_size: u64) {
+        let (sent, received, size) = (rsync_num(io.sent, false), rsync_num(io.received, false), rsync_num(total_size, false));
+        self.log(format!("sent {sent} bytes  received {received} bytes  total size {size}").as_bytes());
+    }
+
+    /// Whether the log takes item `it` (rsync's `maybe_log_item`): what stdout's rule
+    /// would list (see [`Output::shows`]; without `-i`, so not a file whose attributes
+    /// alone changed), if it changed or the log's format has `%i`; never a dry run's
+    /// transfers, which don't happen.
+    fn logs_item(&self, it: &Item) -> bool {
+        let Some(log) = &self.log else { return false };
+        log.format.is_some() && !(log.dry_run && it.change.transfer) && self.listed(it) && (it.change.significant() || log.has_i)
     }
 
     /// Output for a server process: nothing is written locally. Lines go to `forward`
@@ -244,8 +329,13 @@ impl Output {
     /// compromised server must not be able to put control characters or terminal escape
     /// sequences on the user's screen through a `Log` frame. `_escape_it` (the peer's own
     /// mark) is ignored for that reason; the server's forwarded lines are single lines of
-    /// item text, errors or notices, which escaping leaves intact.
+    /// item text, errors or notices, which escaping leaves intact. The log takes what goes
+    /// to stdout: rsync's server writes its errors and warnings to its own stderr, which
+    /// never reaches the client's log.
     pub fn print_forwarded(&self, stderr: bool, _escape_it: bool, text: &[u8]) {
+        if !stderr {
+            self.log(text);
+        }
         if self.quiet && !stderr {
             return;
         }
@@ -290,9 +380,10 @@ impl Output {
         &self.info
     }
 
-    /// Item lines show `%i` change summaries (so attribute differences are worth finding).
+    /// Item lines, on stdout or in the log, show `%i` change summaries (so attribute
+    /// differences are worth finding).
     pub fn itemizes(&self) -> bool {
-        self.has_i > 0
+        self.has_i > 0 || self.log.as_ref().is_some_and(|l| l.has_i)
     }
 
     /// Unchanged items are reported too: listed (`-ii`, `--info=name2` with `%i`), or
@@ -307,9 +398,10 @@ impl Output {
         self.after
     }
 
-    /// Item lines use the escape `letter`.
+    /// Item lines, on stdout or in the log, use the escape `letter`.
     pub fn uses(&self, letter: u8) -> bool {
-        self.format.as_ref().is_some_and(|f| f.has(letter))
+        let log = self.log.as_ref().and_then(|l| l.format.as_ref());
+        self.format.iter().chain(log).any(|f| f.has(letter))
     }
 
     fn line(&self, bytes: &[u8]) {
@@ -378,34 +470,34 @@ impl Output {
     /// names the other entries that aren't directories: "X is uptodate", or just "X"
     /// when only their attributes were updated.
     pub fn item(&self, it: &Item) {
-        if self.quiet || self.format.is_none() {
+        let logged = self.logs_item(it);
+        if (self.quiet || self.format.is_none()) && !logged {
             return;
         }
-        let c = it.change;
-        let significant = c.significant();
-        let named = matches!(it.link, Link::Hard(_));
-        let kind = it.meta.kind;
-        let shown = c.transfer
-            || (self.has_i > 0 && (significant || named || self.has_i > 1 || self.info.name > 1))
-            || ((c.local || c.hardlink) && significant)
-            || named
-            || (kind == Kind::Dir && significant);
-        if shown {
+        // A server reports what the client may show or log: the client decides.
+        if self.shows(it) || logged {
             return match &self.forward {
                 Some(f) => f(Msg::Item(Box::new(ItemRec::of(it)))),
-                None => self.show(it, self.long_name(it.rel, it.src)),
+                None => self.report(it, self.long_name(it.rel, it.src)),
             };
         }
-        if self.has_i == 0 && self.info.name > 1 && kind != Kind::Dir {
-            let state: &[u8] = if c.any_attr() { b"" } else { b" is uptodate" };
-            self.escaped_line(&[it.rel, state].concat());
+        if !self.quiet && self.format.is_some() && self.has_i == 0 && self.info.name > 1 && it.meta.kind != Kind::Dir {
+            let state: &[u8] = if it.change.any_attr() { b"" } else { b" is uptodate" };
+            let line = [it.rel, state].concat();
+            // rsync's local copy says it from a process of its own, so its client logs it,
+            // as it logs what the server says in a push; in a pull it is the client's own
+            // line, which its log doesn't take.
+            if self.side == Side::Local {
+                self.log(&line);
+            }
+            self.escaped_line(&line);
         }
     }
 
     /// An item a remote receiver reported (see [`ItemRec`]); `src` is where its source
     /// is on this side.
     pub fn peer_item(&self, rec: &ItemRec, src: &Path) {
-        if self.quiet || self.format.is_none() {
+        if (self.quiet || self.format.is_none()) && self.log.is_none() {
             return;
         }
         let link = match &rec.link {
@@ -414,7 +506,39 @@ impl Output {
             Some((true, n)) => Link::Hard(n),
         };
         let it = Item { rel: &rec.rel, meta: &rec.meta, change: rec.change, link, src, at: rec.at, bytes: rec.bytes };
-        self.show(&it, self.long_name(&rec.rel, src));
+        self.report(&it, self.long_name(&rec.rel, src));
+    }
+
+    /// Whether stdout lists item `it` (its format given), as rsync's client does: a
+    /// transfer always; with `%i`, any change (`-ii`, `--info=name2`: any item);
+    /// otherwise what was created or changed in place, a hard link, or a directory that
+    /// changed.
+    fn shows(&self, it: &Item) -> bool {
+        self.format.is_some() && self.listed(it)
+    }
+
+    /// [`Output::shows`]' rule, whatever the format.
+    fn listed(&self, it: &Item) -> bool {
+        let c = it.change;
+        let significant = c.significant();
+        let named = matches!(it.link, Link::Hard(_));
+        c.transfer
+            || (self.has_i > 0 && (significant || named || self.has_i > 1 || self.info.name > 1))
+            || ((c.local || c.hardlink) && significant)
+            || named
+            || (it.meta.kind == Kind::Dir && significant)
+    }
+
+    /// Show item `it` on stdout and in the log, as each wants it; `fname` is its `%f`.
+    fn report(&self, it: &Item, fname: Vec<u8>) {
+        if !self.quiet && self.shows(it) {
+            self.show(it, &fname);
+        }
+        if self.logs_item(it)
+            && let Some(format) = self.log.as_ref().and_then(|l| l.format.as_ref())
+        {
+            self.log(&self.render(format, it, &fname));
+        }
     }
 
     /// `%f`: the source path for a sender (a transfer root's directory ends in `/.`, a
@@ -434,8 +558,13 @@ impl Output {
         name
     }
 
-    fn show(&self, it: &Item, fname: Vec<u8>) {
+    fn show(&self, it: &Item, fname: &[u8]) {
         let Some(format) = &self.format else { return };
+        self.escaped_line(&self.render(format, it, fname));
+    }
+
+    /// Item `it` in `format`; `fname` is its `%f`.
+    fn render(&self, format: &Format, it: &Item, fname: &[u8]) -> Vec<u8> {
         let kind = it.meta.kind;
         let mut name = if it.rel.is_empty() { b".".to_vec() } else { it.rel.to_vec() };
         if kind == Kind::Dir {
@@ -450,7 +579,7 @@ impl Output {
         let fields = Fields {
             op: if self.side == Side::Pull { b"recv" } else { b"send" },
             name: &name,
-            fname: &fname,
+            fname,
             link,
             changes: &changes,
             size: it.meta.size,
@@ -460,7 +589,7 @@ impl Output {
             uid: if self.owner { it.meta.uid } else { 0 },
             gid: self.shown_gid(it.meta.gid),
         };
-        self.escaped_line(&format.render(&fields));
+        format.render(&fields)
     }
 
     /// `%G`: rsync's receiver shows `DEFAULT` for a group it can't give a file.
@@ -479,18 +608,32 @@ impl Output {
     /// `deleting NAME`; shown with `--info=del` (`-v`) or any item format. `mode`: the
     /// deleted entry's permissions, which a receiving client's `%B` shows.
     pub fn deleting(&self, rel: &[u8], is_dir: bool, mode: u32) {
-        if self.quiet || (self.info.del == 0 && self.format.is_none()) {
+        let shown = !self.quiet && (self.info.del > 0 || self.format.is_some());
+        let logged = self.log.as_ref().is_some_and(|l| !l.dry_run);
+        if !shown && !logged {
             return;
         }
         if let Some(f) = &self.forward {
             return f(Msg::Deleted { rel: rel.to_vec(), dir: is_dir });
         }
+        if logged && let Some(log) = &self.log {
+            let format = log.format.as_ref().filter(|_| log.del_format);
+            self.log(&self.deletion_line(format, rel, is_dir, mode));
+        }
+        if shown {
+            let format = self.format.as_ref().filter(|_| self.del_format);
+            self.escaped_line(&self.deletion_line(format, rel, is_dir, mode));
+        }
+    }
+
+    /// A deletion in `format`, or as `deleting NAME`.
+    fn deletion_line(&self, format: Option<&Format>, rel: &[u8], is_dir: bool, mode: u32) -> Vec<u8> {
         let mut name = rel.to_vec();
         if is_dir {
             name.push(b'/');
         }
-        let line = match &self.format {
-            Some(format) if self.del_format => {
+        match format {
+            Some(format) => {
                 let fields = Fields {
                     op: b"del.",
                     name: &name,
@@ -503,21 +646,26 @@ impl Output {
                 };
                 format.render(&fields)
             }
-            _ => [&b"deleting "[..], &name].concat(),
-        };
-        self.escaped_line(&line);
+            None => [&b"deleting "[..], &name].concat(),
+        }
     }
 
-    /// Deletions show their permissions (`%B` in a receiving client's deletion format).
+    /// Deletions show their permissions (`%B` in a receiving client's deletion format, on
+    /// stdout or in the log).
     pub fn deletion_modes(&self) -> bool {
-        self.side == Side::Pull && self.del_format && self.format.as_ref().is_some_and(|f| f.has(b'B'))
+        let shown = self.del_format && self.format.as_ref().is_some_and(|f| f.has(b'B'));
+        let logged = self.log.as_ref().is_some_and(|l| l.del_format && l.format.as_ref().is_some_and(|f| f.has(b'B')));
+        self.side == Side::Pull && (shown || logged)
     }
 
     /// "created directory DEST" and `--mkpath`'s "created N directories for DEST": with
     /// `--info=name` (`-v`) or `%i`, as in rsync.
     pub fn created(&self, msg: impl AsRef<[u8]>) {
-        if !self.quiet && (self.info.name > 0 || self.has_i > 0) {
-            self.escaped_line(msg.as_ref());
+        if self.info.name > 0 || self.has_i > 0 {
+            self.log(msg.as_ref());
+            if !self.quiet {
+                self.escaped_line(msg.as_ref());
+            }
         }
     }
 
@@ -559,13 +707,15 @@ impl Output {
     /// name bytes.
     pub fn info(&self, msg: impl AsRef<[u8]>) {
         if self.verbose > 0 || self.itemize > 0 {
+            self.log(msg.as_ref());
             self.escaped_line(msg.as_ref());
         }
     }
 
-    /// A notice shown without `-v` but not with `-q` (rsync's `FINFO` messages). Not
-    /// escaped: it must not contain names.
+    /// A notice shown without `-v` but not with `-q` (rsync's `FINFO` messages, which its
+    /// log gets either way). Not escaped: it must not contain names.
     pub fn notice(&self, msg: impl AsRef<[u8]>) {
+        self.log_lines(msg.as_ref());
         if !self.quiet {
             self.line(msg.as_ref());
         }
@@ -575,6 +725,7 @@ impl Output {
     /// `FINFO` lines, such as "cannot delete non-empty directory", or those an `--info`
     /// level asks for).
     pub fn note(&self, msg: impl AsRef<[u8]>) {
+        self.log(msg.as_ref());
         if !self.quiet {
             self.escaped_line(msg.as_ref());
         }
@@ -583,6 +734,7 @@ impl Output {
     /// Summary lines (not with `-q`). Not escaped, so the message may contain newlines
     /// but must not contain names.
     pub fn always(&self, msg: impl AsRef<[u8]>) {
+        self.log_lines(msg.as_ref());
         if !self.quiet {
             self.line(msg.as_ref());
         }
@@ -594,6 +746,7 @@ impl Output {
         if let Some(f) = &self.forward {
             return f(Msg::Log { stderr: true, escape: true, text: msg.as_ref().to_vec() });
         }
+        self.log(msg.as_ref());
         self.flush();
         let mut line = Vec::new();
         escape(msg.as_ref(), self.charset, &mut line);
@@ -607,6 +760,7 @@ impl Output {
         if let Some(f) = &self.forward {
             return f(Msg::Log { stderr: true, escape: true, text: [b"barqsync: ", msg.as_ref()].concat() });
         }
+        self.log(&[b"barqsync: ", msg.as_ref()].concat());
         self.flush();
         let mut line = b"barqsync: ".to_vec();
         escape(msg.as_ref(), self.charset, &mut line);
@@ -617,6 +771,17 @@ impl Output {
     pub fn flush(&self) {
         let _ = self.out.lock().unwrap().w.flush();
     }
+}
+
+/// The local time as rsync's log shows it (its `timestring`).
+fn timestamp() -> String {
+    let t = unsafe { libc::time(std::ptr::null_mut()) };
+    // SAFETY: `tm` is filled by `localtime_r` before it is read.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return "(time out of range)".into();
+    }
+    format!("{:4}/{:02}/{:02} {:02}:{:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 /// rsync's `clean_fname` without options: no doubled `/`, no `.` components but a last
@@ -1036,6 +1201,22 @@ mod tests {
         let mut out = Vec::new();
         escape(text, charset, &mut out);
         out
+    }
+
+    /// Each message is one log record, its control characters escaped, so a name with a
+    /// newline can't forge a record; barqsync's own summary lines are a record each.
+    #[test]
+    fn log_records_are_one_line_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("run.log");
+        let opts = Options::parse_from(["barqsync", format!("--log-file={}", path.display()).as_str(), "s", "d"]).unwrap();
+        let out = Output::new(&opts, Side::Local);
+        out.open_log(&opts);
+        out.note(b"payload\n*deleting  important");
+        out.always(b"\nsent 1 bytes  received 2 bytes\ntotal size is 3");
+        let log = std::fs::read_to_string(&path).unwrap();
+        let records: Vec<&str> = log.lines().map(|l| l.split_once("] ").unwrap().1).collect();
+        assert_eq!(records, ["payload\\#012*deleting  important", "sent 1 bytes  received 2 bytes", "total size is 3"]);
     }
 
     /// Expected output measured with glibc rsync 3.2.7 (LC_ALL=C, C.UTF-8, and `-8`) and

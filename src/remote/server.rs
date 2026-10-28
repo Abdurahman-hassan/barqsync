@@ -68,7 +68,7 @@ pub fn run() -> i32 {
     // unless it reports removals after them: then the client still has to read those.
     let (code, confirmed) = if server_is_sender {
         let removals = super::reports_removals(&opts, server_is_sender);
-        let (code, stats) = sender::run(&conn, &opts, &opts.paths, &out, removals);
+        let (code, stats, _) = sender::run(&conn, &opts, &opts.paths, &out, removals);
         (code, stats.is_some() && !removals)
     } else {
         match opts.paths.first() {

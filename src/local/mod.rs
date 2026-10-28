@@ -171,6 +171,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // Process-lifetime output, shared with the progress thread.
     let out: &'static Output = Box::leak(Box::new(Output::new(opts, Side::Local)));
     crate::bwlimit::limit_copies(opts.bwlimit);
+    out.open_log(opts);
     let filter = match Filter::new(&opts.filter_rules, opts.delete_excluded, opts.from0) {
         Ok(f) => f,
         Err(e) => {
@@ -181,6 +182,7 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     let started = Instant::now();
     // As rsync's sending side does, before the receiving side creates the destination.
     out.flist_start(opts, false);
+    out.log_start(false);
     let plan = match plan(opts, sources, dest, out) {
         Ok(p) => p,
         Err(code) => return code,
@@ -269,7 +271,11 @@ pub fn run(opts: &Options, sources: &[OsString], dest: &OsString) -> i32 {
     // No connection: what is "sent" is the file data written.
     let io = crate::output::Io { sent: Stats::get(&engine.stats.literal_bytes), received: 0, dry_run: opts.dry_run };
     engine.stats.print(out, started.elapsed(), opts.human, opts.info.stats, io);
+    let code = if fsops::interrupted() { exit::SIGNAL } else { engine.stats.exit_code() };
+    // rsync logs its byte counts unless the summary showed them (and after an error).
+    if code != exit::OK || opts.info.stats == 0 {
+        out.log_end(io, Stats::get(&engine.stats.total_size));
+    }
     out.flush();
-
-    if fsops::interrupted() { exit::SIGNAL } else { engine.stats.exit_code() }
+    code
 }

@@ -79,6 +79,10 @@
   statistics), `ALL`, `NONE` and `--info=help`. Before, every flag but `progress` was
   ignored. Unknown flags, and `copy` and `mount` (whose messages barqsync never shows),
   are refused (exit 1).
+- `--log-file=FILE` and `--log-file-format=FORMAT`, locally, in pushes and in pulls: the
+  client appends what rsync's client logs, each line stamped with the time and process
+  id: the file-list line, items in the log format (`%i %n%L` by default), deletions,
+  every message it shows (also with `-q`), and the closing byte counts.
 
 ### Fixed
 

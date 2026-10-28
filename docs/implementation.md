@@ -90,7 +90,7 @@ With Homebrew's keg-only rustup, add `/opt/homebrew/opt/rustup/bin` to `PATH`.
 
 `-a` (= `-rlptgoD`), `-r -l -p -t -g -o -D --devices --specials`, `-H`, `-X`/`-XX`, `-A`,
 `-v -q -n` (`-q`: nothing on stdout, as in rsync),
-`-i`/`-ii`, `--progress`/`-P`, `--out-format` and `--info` (see the table),
+`-i`/`-ii`, `--progress`/`-P`, `--out-format`, `--log-file` and `--info` (see the table),
 `--delete`, `--delete-excluded`,
 `--exclude/--include/--exclude-from/--include-from` (rsync wildcard rules, first match wins,
 `/` anchoring, trailing `/` for directories, `**`, `dir/***`, `+ `/`- ` prefixes, `!` to clear),
@@ -135,6 +135,7 @@ Also, with rsync's semantics locally and over ssh (each has a differential test 
 | `-s/--secluded-args`, `--protect-args` | Accepted: barqsync's remote paths and options always travel in the protocol, never on the remote command line. |
 | `--timeout=SECONDS` | A remote transfer whose connection delivers nothing for that long ends with 30 ("io timeout after N seconds -- exiting"), the server too. Each side sends a keepalive when it has nothing else to send, so a side that is busy (scanning, hashing, deleting) doesn't trip it; only a connection that stopped moving data does. |
 | `--out-format=FORMAT` (`--log-format`) | rsync's escapes: `%o` (`send`, `recv`, `del.`), `%n`, `%f` (the source path for a sending client, a root directory as `src/.`; the name in the destination for a receiving one), `%l`, `%b` (see the differences below), `%M`, `%t`, `%B`, `%U` and `%G` (0 and `DEFAULT` without `-o`/`-g`, or for a group the receiving client can't give), `%p`, `%i`, `%L`, `%%`, with the modifiers `-`, a width (a leading `0` pads numbers with zeros, and strings too on macOS, as its libc does) and `'` (`%'l`: digit grouping, `%''l`: units of 1000, `%'''l`: units of 1024). As in rsync, `%a`, `%h`, `%P`, `%u`, unknown escapes and a trailing `%` stay as they are outside a daemon, and `%m` is empty. A format decides which items are listed: every transfer, entries created or changed in place, hard links, changed directories; with `%i` any change. Deletions use the format when it has `%o` or `%i`, otherwise they show as `deleting NAME`. `%c` and `%C` (rsync's checksum data) are refused, exit 1. |
+| `--log-file=FILE`, `--log-file-format=FORMAT` | The client appends to FILE (created with mode 0644) what rsync's client logs, each line after the local time and its process id (`2026/10/27 09:41:07 [4321] `): "building file list" as the run starts ("receiving file list" in a pull); in FORMAT (`--out-format`'s escapes; `%i %n%L` by default, empty: no items), the items `--out-format`'s rule picks for stdout's own format (`-i`, `-v` or none, also with `-q`) when they changed, or all of them when FORMAT has `%i`; deletions in FORMAT when it has `%o` or `%i`, otherwise as `deleting NAME`; every message the client shows, also with `-q` (warnings, errors, `-v`'s lines and summary), but not a server's errors and warnings, which rsync's server writes to its own stderr ("X is uptodate" is logged for a local copy and a push, where another process says it, not for a pull); and at the end "sent N bytes  received M bytes  total size T", unless `-v` or `--stats` logged the summary (a pull logs it only after a run without errors). A dry run logs no transfers or deletions. A FILE that can't be opened is reported ("failed to open log-file FILE", then "Ignoring \"log file\" setting.") and the run goes on. The server writes no log: what it reports reaches the client's. |
 | `--info=FLAGS` | rsync's words, levels and priorities: what `--info` sets wins over what `-v`, `--stats` and `--progress` imply, in any order; `ALL[N]`, `NONE` and `help` work; an unknown word is refused (exit 1). `name` (`-v`; 2: unchanged entries too, "X is uptodate"), `del` (deletions without an item format), `skip` (`-u`, `--existing`, `--ignore-existing`, `--max-size`/`--min-size`; 2: what an existing file differs in), `flist` (rsync's file-list messages, "sending incremental file list" or, without incremental recursion, "building file list ... done"; 2: the number of files), `stats` (1: the closing lines of `-v`, 2: `--stats`), `nonreg` ("skipping non-regular file", on by default as in rsync), `remove`, `backup` (also "backup_dir is DIR"), `progress`. `misc` and `symsafe` are accepted: their rsync messages concern daemons, busy executables and options barqsync doesn't have. `copy` and `mount` are refused when named: barqsync doesn't produce rsync's messages for failed `--link-dest` copies or mount points. |
 | `--stats` | Also rsync's "Total bytes sent/received" lines, and with `-v` or `--stats` its "sent N bytes  received M bytes  R bytes/sec" and "total size is T  speedup is S" lines (thousands separators; `-h`: units of 1000). They count the bytes on the connection, all streams included; a local copy, which has none, counts the file data written as sent. |
 | `--bwlimit=RATE` | rsync's size syntax, in KiB per second unless a unit is given (`1.5m`, `100KB`), rounded to whole KiB as rsync does; `0` is no limit and anything else under 512 bytes is refused with rsync's message (exit 1). Each side paces what it writes to its connections, as rsync's `sleep_for_bwlimit` does: pieces of an eighth of a second's worth, a writer waiting once it is more than a tenth of a second ahead. All streams of a transfer (`--streams`, QUIC) share the one limit. A local copy paces the file data it writes, as rsync's local copies go through a pipe the limit applies to; it then makes no clones or in-kernel copies, which can't be paced. Backup and `--link-dest`/`--compare-dest` copies aren't paced (rsync makes those without the connection). |
@@ -155,9 +156,9 @@ Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 12 protocol, 20 interrupte
 transfer, 24 source files vanished, 25 `--max-delete` limit, 30 `--timeout`).
 
 Still missing: daemon mode (`rsync://`, `host::module`), as well as `--copy-dest`, `--fuzzy`,
-`--contimeout`, `--log-file`, `-N`, `-E`, `-U`, `--no-implied-dirs`, `--no-R`, filter rules for
-xattr names (the `x` modifier), merge and `-C` rules inside per-directory filter files, and a
-remote (`host:`) `--files-from` list.
+`--contimeout`, `-N`, `-E`, `-U`, `--no-implied-dirs`, `--no-R`, filter rules for xattr names
+(the `x` modifier), merge and `-C` rules inside per-directory filter files, and a remote
+(`host:`) `--files-from` list.
 
 Known differences:
 
@@ -168,9 +169,15 @@ Known differences:
   Files are copied in parallel, so per-file progress lines would interleave
   meaninglessly. Item lines (`-v`, `-i`, `--out-format`) come in the order the parallel
   transfer produces them, not in rsync's file-list order.
-- `%b` in `--out-format` is the file data sent for the item (its literal data, before
-  `-z`): 3 for a new 3-byte file, where rsync, which counts the protocol bytes its
-  transfer of the file took, shows 46. Both show 0 for an item that wasn't transferred.
+- `%b` in `--out-format` and `--log-file-format` is the file data sent for the item (its
+  literal data, before `-z`): 3 for a new 3-byte file, where rsync, which counts the
+  protocol bytes its transfer of the file took, shows 46. Both show 0 for an item that
+  wasn't transferred.
+- `--log-file` gets the messages barqsync shows, so with `-v` or `--stats` also its own
+  "transferred N files, ..." line; and a failed run's log, like its stderr, has no "rsync
+  error: ... (code N)" line. With `-q`, a local copy's log also gets the receiving side's
+  notices ("cannot delete non-empty directory", "skipping non-regular file"), which
+  rsync's receiving process, quiet as well, drops before they reach the log.
 - In a push, `%U` and `%G` show the owner and group as the receiving side mapped them by
   name, where rsync's sender shows its own numbers. They differ only when the two
   machines number the user or group differently.
@@ -996,12 +1003,12 @@ src/remote/         client (spawns the server over ssh), server, sender and rece
                     relay.rs: streams through ssh (--stream-relay), auto.rs: --transport auto,
                     check.rs: checks on what the sending side announces
 src/output.rs       what is shown at rsync's --info levels: item lines, deletions, stats
-src/logformat.rs    --out-format: rsync's %-escapes, parsed and expanded
+src/logformat.rs    --out-format, --log-file-format: rsync's %-escapes, parsed and expanded
 tests/local_sync.rs end-to-end tests, most of them differential against rsync 3.x
 tests/delta_sync.rs --no-whole-file end to end (clone+patch, --inplace, rebuild) vs rsync
 tests/remote_sync.rs push/pull through a fake ssh, differential against rsync over the same shim
 tests/rsync_flags.rs the options above, locally and over the fake ssh (and one that cuts it)
-tests/output_options.rs --out-format and --info vs rsync, locally, pushed and pulled
+tests/output_options.rs --out-format, --log-file and --info vs rsync, locally, pushed and pulled
 tests/xattrs_acls.rs -X / -A vs rsync, locally and pushed/pulled on each transport
 tests/mutation_safety.rs, source_ack_safety.rs, peer_input.rs, deletion.rs,
 tests/remote_lifecycle.rs, remote_shutdown.rs, remote_paths.rs
