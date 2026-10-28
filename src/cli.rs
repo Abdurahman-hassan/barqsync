@@ -22,7 +22,7 @@ use std::path::PathBuf;
     disable_help_flag = true,
     after_help = "Options implied by others (-a, -D, ...) or given earlier can be turned off with \
                   --no-OPTION: --no-r, --no-l, --no-p, --no-t, --no-g, --no-o, --no-D, --no-devices, \
-                  --no-specials, --no-H, --no-A, --no-X, --no-O, --no-d, --no-x, --no-S, --no-c, --no-z, \
+                  --no-specials, --no-H, --no-A, --no-X, --no-O, --no-U, --no-N, --no-open-noatime, --no-d, --no-x, --no-S, --no-c, --no-z, \
                   --no-W, --no-v, --no-i, --no-h, --no-8, --no-m, --no-s, --no-inplace, --no-append, --no-partial, --no-delay-updates, --no-force, --no-ignore-errors, --no-munge-links, \
                   --no-progress, --no-numeric-ids, --no-backup, --no-mkpath, --no-timeout, --no-from0 \
                   (and their long forms, e.g. --no-owner)."
@@ -47,12 +47,24 @@ pub struct Cli {
     /// Preserve permissions
     #[arg(short = 'p', long)]
     perms: bool,
+    /// Preserve executability (without -p)
+    #[arg(short = 'E', long)]
+    executability: bool,
     /// Preserve modification times
     #[arg(short = 't', long)]
     times: bool,
     /// Omit directories from --times
     #[arg(short = 'O', long = "omit-dir-times")]
     omit_dir_times: bool,
+    /// Preserve access (use) times (twice: also --open-noatime)
+    #[arg(short = 'U', long = "atimes", action = ArgAction::Append, num_args = 0, default_missing_value = "1")]
+    atimes: Vec<u8>,
+    /// Avoid changing the atime on opened files
+    #[arg(long = "open-noatime")]
+    open_noatime: bool,
+    /// Preserve create times (newness; macOS)
+    #[arg(short = 'N', long = "crtimes")]
+    crtimes: bool,
     /// Preserve group
     #[arg(short = 'g', long)]
     group: bool,
@@ -392,6 +404,12 @@ pub struct Cli {
     no_xattrs: bool,
     #[arg(long = "no-omit-dir-times", alias = "no-O", hide = true)]
     no_omit_dir_times: bool,
+    #[arg(long = "no-atimes", alias = "no-U", hide = true)]
+    no_atimes: bool,
+    #[arg(long = "no-open-noatime", hide = true)]
+    no_open_noatime: bool,
+    #[arg(long = "no-crtimes", alias = "no-N", hide = true)]
+    no_crtimes: bool,
     #[arg(long = "no-dirs", alias = "no-d", hide = true)]
     no_dirs: bool,
     #[arg(long = "no-one-file-system", alias = "no-x", hide = true)]
@@ -459,9 +477,17 @@ pub struct Options {
     pub links: bool,
     pub hard_links: bool,
     pub perms: bool,
+    /// `-E`: without `-p`, a regular file's executability is kept.
+    pub executability: bool,
     pub times: bool,
     /// `-O`, also forced by `--backup` without `--backup-dir` (rsync).
     pub omit_dir_times: bool,
+    /// `-U`: access times are kept, except directories' (2: `-UU`).
+    pub atimes: u8,
+    /// `--open-noatime` (`-UU`): files are read without changing their access times.
+    pub open_noatime: bool,
+    /// `-N`: creation times are kept (macOS).
+    pub crtimes: bool,
     pub group: bool,
     pub owner: bool,
     /// `-A`
@@ -687,6 +713,10 @@ impl Options {
         if o.append > 0 && o.whole_file == Some(true) {
             bail!("--append cannot be used with --whole-file");
         }
+        // rsync can only set creation times on macOS (and Cygwin).
+        if o.crtimes && !cfg!(target_os = "macos") {
+            bail!("This barqsync does not support --crtimes (-N)");
+        }
         // rsync: an update made in place leaves nothing for a partial dir to hold.
         if (o.append > 0 || o.delay_updates) && o.inplace && o.partial_dir.is_some() {
             let what = if o.append > 0 { "append" } else { "inplace" };
@@ -732,8 +762,12 @@ impl Options {
             hard_links: on(&["hard_links"], &["no_hard_links"]),
             // rsync: -A implies -p.
             perms: on(&["archive", "perms", "acls"], &["no_perms"]),
+            executability: c.executability,
             times: on(&["archive", "times"], &["no_times"]),
             omit_dir_times: on(&["omit_dir_times"], &["no_omit_dir_times"]) || (backup && c.backup_dir.is_none()),
+            atimes: count_since(m, "atimes", "no_atimes").min(2),
+            open_noatime: toggle_with(m, &["open_noatime"], second_atimes(m), &["no_open_noatime"]).unwrap_or(false),
+            crtimes: on(&["crtimes"], &["no_crtimes"]),
             group: on(&["archive", "group"], &["no_group"]),
             owner: on(&["archive", "owner"], &["no_owner"]),
             acls: on(&["acls"], &["no_acls"]),
@@ -1094,6 +1128,28 @@ fn id_maps(cli: &Cli, m: &ArgMatches) -> Result<[Option<(String, usize)>; 2]> {
         }
     }
     Ok(maps.map(|m| m.map(|(map, i, _)| (map, i))))
+}
+
+/// Where a `-U` turned `--open-noatime` on, as in rsync: the last one that was at least
+/// the second since a `--no-U`.
+fn second_atimes(m: &ArgMatches) -> Option<usize> {
+    let given = |id: &str| m.value_source(id) == Some(ValueSource::CommandLine);
+    let mut at: Vec<(usize, bool)> = Vec::new();
+    for (id, reset) in [("atimes", false), ("no_atimes", true)] {
+        if given(id) {
+            at.extend(m.indices_of(id).into_iter().flatten().map(|i| (i, reset)));
+        }
+    }
+    at.sort_unstable();
+    let mut n = 0;
+    let mut second = None;
+    for (i, reset) in at {
+        n = if reset { 0 } else { n + 1 };
+        if n > 1 {
+            second = Some(i);
+        }
+    }
+    second
 }
 
 /// How many times a counted flag (`-v`) was given after its last `--no-` form.
@@ -1586,6 +1642,26 @@ mod tests {
         assert_eq!(parse(&["--log-file-format=%n"]).unwrap().log_file_format, None);
         let e = parse(&["--log-file=x", "--log-file-format=%n %C"]).unwrap_err().to_string();
         assert!(e.contains("--log-file-format escape %C"), "{e}");
+    }
+
+    #[test]
+    fn time_options() {
+        let parse = |args: &[&str]| Options::parse_from([&["barqsync"], args, &["s", "d"]].concat());
+        assert!(parse(&["-E"]).unwrap().executability);
+        let at = |args: &[&str]| parse(args).map(|o| (o.atimes, o.open_noatime)).unwrap();
+        assert_eq!(at(&["-U"]), (1, false));
+        assert_eq!(at(&["-UU"]), (2, true));
+        assert_eq!(at(&["--open-noatime"]), (0, true));
+        // In command-line order, as rsync: the second -U turns --open-noatime on where it is.
+        assert_eq!(at(&["-UU", "--no-open-noatime"]), (2, false));
+        assert_eq!(at(&["--no-open-noatime", "-UU"]), (2, true));
+        assert_eq!(at(&["-U", "--no-U", "-U"]), (1, false));
+        assert_eq!(at(&["-UU", "--no-atimes"]), (0, true));
+        match parse(&["-N"]) {
+            Ok(o) => assert!(cfg!(target_os = "macos") && o.crtimes),
+            Err(e) => assert_eq!(e.to_string(), "This barqsync does not support --crtimes (-N)"),
+        }
+        assert!(!parse(&["-N", "--no-N"]).unwrap().crtimes);
     }
 
     #[test]

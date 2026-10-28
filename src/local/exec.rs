@@ -240,6 +240,8 @@ struct DirFixup {
     link: bool,
     mode: Option<u32>,
     mtime: Option<(i64, u32)>,
+    /// `-N`: the creation time to set.
+    crtime: Option<i64>,
     uid: Option<u32>,
     gid: Option<u32>,
 }
@@ -333,7 +335,10 @@ impl<'a> Engine<'a> {
         let am_root = fsops::am_root();
         let rules = DiffRules {
             perms: opts.perms,
+            executability: opts.executability && !opts.perms,
             times: opts.times,
+            atimes: opts.atimes > 0,
+            crtimes: opts.crtimes,
             owner: opts.owner,
             group: opts.group,
             am_root,
@@ -434,11 +439,27 @@ impl<'a> Engine<'a> {
     pub(crate) fn attr_change(&self, src: &Meta, dst: &Meta, transferring: bool) -> Change {
         Change {
             time: (self.opts.times || transferring) && !self.rules.same_mtime(src, dst),
-            perms: self.opts.perms && src.mode != dst.mode,
+            perms: self.rules.perms_differ(src, dst),
             owner: self.rules.wanted_uid(src).is_some_and(|u| u != dst.uid),
             group: self.rules.wanted_gid(src).is_some_and(|g| g != dst.gid),
+            // rsync sets a symlink's access time but never itemizes it.
+            atime: src.kind != Kind::Symlink && self.rules.atime_differs(src, dst),
+            crtime: self.rules.crtimes && src.crtime != dst.crtime,
             ..Change::default()
         }
+    }
+
+    /// `-N`: give `path` (a symlink itself) the creation time of `src`. As in rsync, it
+    /// comes before the other times, and a filesystem that can't set it is no error.
+    pub(crate) fn put_crtime(&self, path: &Path, src: &Meta) {
+        if self.opts.crtimes {
+            let _ = fsops::set_crtime(path, src.crtime);
+        }
+    }
+
+    /// `-U`: the access time a copy of `src` gets (a directory's isn't kept).
+    pub(crate) fn kept_atime(&self, src: &Meta) -> Option<i64> {
+        (self.opts.atimes > 0 && src.kind != Kind::Dir).then_some(src.atime)
     }
 
     /// Report a directory: new (`cd+++++++++`), or what differs, which plain `-v` shows
@@ -1254,13 +1275,17 @@ impl<'a> Engine<'a> {
         .then_some((src.mtime, src.mtime_ns));
         let uid = self.rules.wanted_uid(src).filter(|&u| job.pre.is_none_or(|p| p.uid != u));
         let gid = self.rules.wanted_gid(src).filter(|&g| job.pre.is_none_or(|p| p.gid != g));
-        if mode.is_some() || mtime.is_some() || uid.is_some() || gid.is_some() {
+        // -N: rsync leaves a volume's root directory (inode 2) alone, which HFS+ refuses.
+        let crtime = (self.opts.crtimes && !link && job.pre.is_none_or(|p| p.crtime != src.crtime && p.ino != 2))
+            .then_some(src.crtime);
+        if mode.is_some() || mtime.is_some() || crtime.is_some() || uid.is_some() || gid.is_some() {
             self.fixups.lock().unwrap().push(DirFixup {
                 depth: job.depth,
                 path: job.dst.clone(),
                 link,
                 mode,
                 mtime,
+                crtime,
                 uid,
                 gid,
             });
@@ -1401,6 +1426,9 @@ impl<'a> Engine<'a> {
                     && let Err(e) = fsops::chmod(&f.path, m)
                 {
                     self.err(path_msg("chmod \"", &f.path, format!("\" failed: {e}")));
+                }
+                if let Some(c) = f.crtime {
+                    let _ = fsops::set_crtime(&f.path, c);
                 }
                 let set = if f.link { fsops::set_symlink_mtime } else { fsops::set_mtime };
                 if let Some((s, ns)) = f.mtime
@@ -1921,8 +1949,14 @@ impl<'a> Engine<'a> {
                         if xattr && let Err(e) = self.apply_extra(dst_path, &x, have, d.mode) {
                             self.err(path_msg("set_xattr \"", dst_path, format!("\" failed: {e}")));
                         }
+                        if a.crtime {
+                            self.put_crtime(dst_path, meta);
+                        }
                         if a.mtime {
                             let _ = fsops::set_symlink_mtime(dst_path, meta.mtime, meta.mtime_ns);
+                        }
+                        if a.atime {
+                            let _ = fsops::set_atime(dst_path, meta.atime, true);
                         }
                     }
                     self.source_done(root, src_path, dst_path, rel, meta);
@@ -1961,8 +1995,12 @@ impl<'a> Engine<'a> {
         let res = fsops::with_temp(dir, name, |tmp| std::os::unix::fs::symlink(&target, tmp)).and_then(|(tmp, ())| {
             let r = (|| {
                 fsops::lchown(&tmp, self.rules.wanted_uid(meta), self.rules.wanted_gid(meta))?;
+                self.put_crtime(&tmp, meta);
                 if self.opts.times {
                     fsops::set_symlink_mtime(&tmp, meta.mtime, meta.mtime_ns)?;
+                }
+                if let Some(a) = self.kept_atime(meta) {
+                    fsops::set_atime(&tmp, a, true)?;
                 }
                 self.place_link(&tmp, dst_path)
             })();
@@ -2020,8 +2058,12 @@ impl<'a> Engine<'a> {
                 let r = (|| {
                     fsops::chmod(&tmp, self.new_mode(meta))?;
                     fsops::lchown(&tmp, self.rules.wanted_uid(meta), self.rules.wanted_gid(meta))?;
+                    self.put_crtime(&tmp, meta);
                     if self.opts.times {
                         fsops::set_mtime(&tmp, meta.mtime, meta.mtime_ns)?;
+                    }
+                    if let Some(a) = self.kept_atime(meta) {
+                        fsops::set_atime(&tmp, a, false)?;
                     }
                     fs::rename(&tmp, dst_path)
                 })();
@@ -2062,10 +2104,18 @@ impl<'a> Engine<'a> {
                 self.fix_extra(path, x, have)?;
             }
             if a.mode {
-                fsops::chmod(path, src.mode)?;
+                // -E: the file's own permissions, executable or not like the source's.
+                let mode = if self.opts.perms { src.mode } else { self.rules.kept_mode(src, fsops::lstat(path)?.mode) };
+                fsops::chmod(path, mode)?;
+            }
+            if a.crtime {
+                self.put_crtime(path, src);
             }
             if a.mtime {
                 fsops::set_mtime(path, src.mtime, src.mtime_ns)?;
+            }
+            if a.atime {
+                fsops::set_atime(path, src.atime, false)?;
             }
             Ok::<(), io::Error>(())
         })();
@@ -2131,7 +2181,7 @@ impl<'a> Engine<'a> {
     pub(crate) fn target_attrs(&self, job: &FileJob) -> (u32, Option<u32>, Option<u32>) {
         let src = &job.meta;
         let mode = match (&job.dst_meta, self.opts.perms) {
-            (Some(d), false) if d.kind == Kind::File => d.mode,
+            (Some(d), false) if d.kind == Kind::File => self.rules.kept_mode(src, d.mode),
             _ => self.new_mode(src),
         };
         (mode, self.rules.wanted_uid(src), self.rules.wanted_gid(src))
@@ -2208,8 +2258,12 @@ impl<'a> Engine<'a> {
             fsops::lchown(&job.dst_path, uid, gid)?;
             self.written_extra(&job.dst_path, job, mode)?;
             fsops::chmod(&job.dst_path, mode)?;
+            self.put_crtime(&job.dst_path, src);
             if self.opts.times {
                 fsops::set_mtime(&job.dst_path, src.mtime, src.mtime_ns)?;
+            }
+            if let Some(a) = self.kept_atime(src) {
+                fsops::set_atime(&job.dst_path, a, false)?;
             }
             if self.opts.fsync {
                 fsops::fsync_path(&job.dst_path)?;
@@ -2336,10 +2390,16 @@ impl<'a> Engine<'a> {
             self.apply_extra(path, x, None, mode)?;
         }
         fsops::fchmod(f, mode)?;
+        if let Some((path, _)) = ext {
+            self.put_crtime(path, src);
+        }
         if self.opts.times {
             fsops::set_fd_mtime(f, src.mtime, src.mtime_ns)?;
         } else {
             fsops::set_fd_mtime_now(f)?;
+        }
+        if let Some(a) = self.kept_atime(src) {
+            fsops::set_fd_atime(f, a)?;
         }
         if self.opts.fsync {
             f.sync_all()?;
@@ -2372,8 +2432,14 @@ impl<'a> Engine<'a> {
         if mode & !self.umask & 0o777 != mode || self.opts.acls {
             fsops::fchmod(f, mode)?;
         }
+        if let Some((path, x)) = ext {
+            self.put_crtime(path, x.meta);
+        }
         if let Some((s, ns)) = mtime {
             fsops::set_fd_mtime(f, s, ns)?;
+        }
+        if let Some(a) = ext.and_then(|(_, x)| self.kept_atime(x.meta)) {
+            fsops::set_fd_atime(f, a)?;
         }
         if self.opts.fsync {
             f.sync_all()?;
@@ -2403,10 +2469,16 @@ impl<'a> Engine<'a> {
                     self.apply_extra(path, x, None, mode)?;
                 }
                 fsops::chmod(path, mode)?;
+                if let Some(x) = src {
+                    self.put_crtime(path, x.meta);
+                }
                 match mtime {
                     Some((s, ns)) => fsops::set_mtime(path, s, ns)?,
                     // Clones inherit the source mtime; without -t rsync leaves "now".
                     None => fsops::touch_now(path)?,
+                }
+                if let Some(a) = src.and_then(|x| self.kept_atime(x.meta)) {
+                    fsops::set_atime(path, a, false)?;
                 }
                 if self.opts.fsync {
                     fsops::fsync_path(path)?;

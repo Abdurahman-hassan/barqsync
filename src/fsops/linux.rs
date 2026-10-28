@@ -81,7 +81,7 @@ pub fn copy_new(src: &File, tmp: &Path, size: u64, mode: u32) -> io::Result<Copi
 pub fn statx_at(dirfd: std::os::fd::RawFd, name: &std::ffi::CStr) -> io::Result<crate::entry::Meta> {
     use crate::entry::{Kind, Meta};
     let mut sx: libc::statx = unsafe { std::mem::zeroed() };
-    let mask = libc::STATX_TYPE
+    let mut mask = libc::STATX_TYPE
         | libc::STATX_MODE
         | libc::STATX_NLINK
         | libc::STATX_UID
@@ -89,6 +89,9 @@ pub fn statx_at(dirfd: std::os::fd::RawFd, name: &std::ffi::CStr) -> io::Result<
         | libc::STATX_MTIME
         | libc::STATX_INO
         | libc::STATX_SIZE;
+    if crate::entry::reads_atime() {
+        mask |= libc::STATX_ATIME;
+    }
     let flags = libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_DONT_SYNC;
     if unsafe { libc::statx(dirfd, name.as_ptr(), flags, mask, &mut sx) } != 0 {
         return Err(io::Error::last_os_error());
@@ -103,6 +106,8 @@ pub fn statx_at(dirfd: std::os::fd::RawFd, name: &std::ffi::CStr) -> io::Result<
         libc::S_IFBLK => Kind::BlockDev,
         _ => Kind::Socket,
     };
+    // No creation times here: rsync supports -N on macOS only.
+    let (atime, crtime) = Meta::extra_times(kind, sx.stx_atime.tv_sec, 0);
     Ok(Meta {
         kind,
         size: sx.stx_size,
@@ -115,5 +120,7 @@ pub fn statx_at(dirfd: std::os::fd::RawFd, name: &std::ffi::CStr) -> io::Result<
         ino: sx.stx_ino,
         rdev: libc::makedev(sx.stx_rdev_major, sx.stx_rdev_minor),
         nlink: sx.stx_nlink as u64,
+        atime,
+        crtime,
     })
 }

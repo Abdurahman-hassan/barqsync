@@ -29,6 +29,12 @@ pub fn run() -> i32 {
                 let _ = conn.finish();
                 return exit::INCOMPATIBLE;
             }
+            // As rsync's server, which can set creation times on macOS only.
+            if opts.crtimes && !cfg!(target_os = "macos") {
+                let _ = conn.msg(Msg::Fatal { msg: "The server does not support --crtimes (-N)".into() });
+                let _ = conn.finish();
+                return exit::SYNTAX;
+            }
             let mut opts = opts;
             opts.paths = opts.paths.into_iter().map(expand_tilde).collect();
             (server_is_sender, opts)
@@ -41,6 +47,8 @@ pub fn run() -> i32 {
     conn.set_compression(opts.compression());
     conn.set_wire(opts.wire);
     crate::fsops::cache::set_enabled(opts.drop_cache);
+    crate::entry::read_times(opts.atimes > 0, opts.crtimes);
+    crate::fsops::set_open_noatime(opts.open_noatime);
     crate::bwlimit::limit_connections(opts.bwlimit);
     mark("handshake done");
     if conn.msg(Msg::HelloAck { version: VERSION }).is_err() {

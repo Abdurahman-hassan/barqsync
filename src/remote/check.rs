@@ -215,7 +215,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     fn ent(name: &[u8], kind: Kind) -> DirEnt {
-        let meta = Meta { kind, size: 0, mtime: 0, mtime_ns: 0, mode: 0o755, uid: 0, gid: 0, dev: 0, ino: 0, rdev: 0, nlink: 1 };
+        let meta = Meta { kind, size: 0, mtime: 0, mtime_ns: 0, mode: 0o755, uid: 0, gid: 0, dev: 0, ino: 0, rdev: 0, nlink: 1, atime: 0, crtime: 0 };
         DirEnt::new(OsString::from_vec(name.to_vec()), meta, None)
     }
 

@@ -6,7 +6,13 @@ use crate::entry::{Kind, Meta};
 #[derive(Debug, Clone)]
 pub struct DiffRules {
     pub perms: bool,
+    /// `-E` without `-p`: whether a regular file is executable (any `x` bit) is kept.
+    pub executability: bool,
     pub times: bool,
+    /// `-U`: access times (not directories').
+    pub atimes: bool,
+    /// `-N`: creation times.
+    pub crtimes: bool,
     /// Owner is only applied when running as root (rsync semantics).
     pub owner: bool,
     /// Group is applied when root, or when the user belongs to the source group.
@@ -39,15 +45,48 @@ impl DiffRules {
         }
     }
 
+    /// Whether the permissions differ as far as `-p` (all bits) or `-E` (whether any `x`
+    /// bit is on) care, as rsync's `perms_differ`.
+    pub fn perms_differ(&self, src: &Meta, dst: &Meta) -> bool {
+        if self.perms {
+            src.mode != dst.mode
+        } else {
+            self.executability && (src.mode & 0o111 != 0) != (dst.mode & 0o111 != 0)
+        }
+    }
+
+    /// The permissions an existing file keeps when they aren't copied (`-p` off): its own,
+    /// with `-E` made executable, or not, like `src` (rsync's `dest_mode`): no `x` bit at
+    /// all, or one for each `r`.
+    pub fn kept_mode(&self, src: &Meta, dst_mode: u32) -> u32 {
+        let mut mode = dst_mode & 0o7777;
+        if self.executability && src.kind == Kind::File {
+            if src.mode & 0o111 == 0 {
+                mode &= !0o111;
+            } else if dst_mode & 0o111 == 0 {
+                mode |= (mode & 0o444) >> 2;
+            }
+        }
+        mode
+    }
+
     /// Does `dst` already carry the attributes we would apply from `src`?
     pub fn attrs_differ(&self, src: &Meta, dst: &Meta) -> AttrDiff {
         AttrDiff {
-            mode: self.perms && src.mode != dst.mode,
+            mode: self.perms_differ(src, dst),
             mtime: self.times && !self.same_mtime(src, dst),
             owner: self.wanted_uid(src).is_some_and(|u| u != dst.uid)
                 || self.wanted_gid(src).is_some_and(|g| g != dst.gid),
+            atime: self.atime_differs(src, dst),
+            crtime: self.crtimes && src.crtime != dst.crtime,
             ..AttrDiff::default()
         }
+    }
+
+    /// `-U`: the access times differ (in seconds, as rsync compares them); directories'
+    /// aren't kept.
+    pub fn atime_differs(&self, src: &Meta, dst: &Meta) -> bool {
+        self.atimes && src.kind != Kind::Dir && src.atime != dst.atime
     }
 }
 
@@ -60,11 +99,15 @@ pub struct AttrDiff {
     pub xattr: bool,
     /// `-A`: the ACLs differ.
     pub acl: bool,
+    /// `-U`: the access time differs.
+    pub atime: bool,
+    /// `-N`: the creation time differs.
+    pub crtime: bool,
 }
 
 impl AttrDiff {
     pub fn any(&self) -> bool {
-        self.mode || self.mtime || self.owner || self.xattr || self.acl
+        self.mode || self.mtime || self.owner || self.xattr || self.acl || self.atime || self.crtime
     }
 }
 
@@ -142,7 +185,10 @@ mod tests {
     fn rules() -> DiffRules {
         DiffRules {
             perms: true,
+            executability: false,
             times: true,
+            atimes: false,
+            crtimes: false,
             owner: true,
             group: true,
             am_root: false,
@@ -169,6 +215,8 @@ mod tests {
             ino: 1,
             rdev: 0,
             nlink: 1,
+            atime: 0,
+            crtime: 0,
         }
     }
 

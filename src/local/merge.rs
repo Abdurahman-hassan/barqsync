@@ -134,7 +134,7 @@ mod tests {
     use std::ffi::OsString;
 
     fn ent(name: &str, kind: Kind, size: u64) -> DirEnt {
-        let meta = Meta { kind, size, mtime: 0, mtime_ns: 0, mode: 0o755, uid: 0, gid: 0, dev: 1, ino: size, rdev: 0, nlink: 1 };
+        let meta = Meta { kind, size, mtime: 0, mtime_ns: 0, mode: 0o755, uid: 0, gid: 0, dev: 1, ino: size, rdev: 0, nlink: 1, atime: 0, crtime: 0 };
         DirEnt::new(OsString::from(name), meta, None)
     }
 

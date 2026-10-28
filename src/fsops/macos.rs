@@ -41,6 +41,32 @@ pub fn clone_into_new(src: &File, tmp: &Path) -> io::Result<bool> {
     }
 }
 
+/// `-N`: a creation time, set as rsync sets it: `setattrlist`, not following a symlink
+/// at the end of `path`.
+pub fn set_crtime(path: &Path, sec: i64) -> io::Result<()> {
+    let c = cstr(path)?;
+    let mut al = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_CRTIME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut t = libc::timespec { tv_sec: sec as libc::time_t, tv_nsec: 0 };
+    let r = unsafe {
+        libc::setattrlist(
+            c.as_ptr(),
+            (&mut al as *mut libc::attrlist).cast(),
+            (&mut t as *mut libc::timespec).cast(),
+            std::mem::size_of::<libc::timespec>(),
+            libc::FSOPT_NOFOLLOW,
+        )
+    };
+    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
 // ---------------------------------------------------------------------------
 // getattrlistbulk: a directory's names and attributes, many entries per syscall
 // ---------------------------------------------------------------------------
@@ -102,6 +128,8 @@ fn kind_of(objtype: u32) -> Kind {
 /// at mount points) and entries the kernel flags with an error get a regular `fstatat`;
 /// symlink targets are read with `readlinkat`.
 pub fn read_dir_bulk(dir: &DirHandle) -> io::Result<Option<Vec<DirEnt>>> {
+    // -U, -N: the access and creation times too.
+    let times = Times { atime: crate::entry::reads_atime(), crtime: crate::entry::reads_crtime() };
     let mut al = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -109,7 +137,9 @@ pub fn read_dir_bulk(dir: &DirHandle) -> io::Result<Option<Vec<DirEnt>>> {
             | libc::ATTR_CMN_NAME
             | libc::ATTR_CMN_DEVID
             | libc::ATTR_CMN_OBJTYPE
+            | if times.crtime { libc::ATTR_CMN_CRTIME } else { 0 }
             | libc::ATTR_CMN_MODTIME
+            | if times.atime { libc::ATTR_CMN_ACCTIME } else { 0 }
             | libc::ATTR_CMN_OWNERID
             | libc::ATTR_CMN_GRPID
             | libc::ATTR_CMN_ACCESSMASK
@@ -149,7 +179,7 @@ pub fn read_dir_bulk(dir: &DirHandle) -> io::Result<Option<Vec<DirEnt>>> {
             let mut off = 0usize;
             for _ in 0..n {
                 let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-                raw.push(parse_record(&buf[off..off + len])?);
+                raw.push(parse_record(&buf[off..off + len], times)?);
                 off += len;
             }
         }
@@ -184,7 +214,14 @@ pub fn read_dir_bulk(dir: &DirHandle) -> io::Result<Option<Vec<DirEnt>>> {
 /// set; `ATTR_CMN_ERROR` (placed right after that set, not in bit order); the other
 /// common attributes in bit order; then the file attributes, which are present only
 /// for non-directories even with `FSOPT_PACK_INVAL_ATTRS`. Values are 4-byte aligned.
-fn parse_record(rec: &[u8]) -> io::Result<(OsString, Option<Meta>)> {
+/// Which optional times a record holds.
+#[derive(Clone, Copy)]
+struct Times {
+    atime: bool,
+    crtime: bool,
+}
+
+fn parse_record(rec: &[u8], times: Times) -> io::Result<(OsString, Option<Meta>)> {
     let mut r = Rec { buf: rec, pos: 4 };
     let _common_returned = r.u32()?;
     let _vol = r.u32()?;
@@ -201,8 +238,19 @@ fn parse_record(rec: &[u8]) -> io::Result<(OsString, Option<Meta>)> {
     // Sign-extended like `st_dev as u64`, so it compares equal to what `lstat` gives.
     let dev = r.i32()? as u64;
     let objtype = r.u32()?;
+    // Each time is a `timespec`; -U and -N keep whole seconds.
+    let mut crtime = 0;
+    if times.crtime {
+        crtime = r.i64()?;
+        r.i64()?;
+    }
     let mtime = r.i64()?;
     let mtime_ns = r.i64()? as u32;
+    let mut atime = 0;
+    if times.atime {
+        atime = r.i64()?;
+        r.i64()?;
+    }
     let uid = r.u32()?;
     let gid = r.u32()?;
     let mode = r.u32()? & 0o7777;
@@ -215,5 +263,6 @@ fn parse_record(rec: &[u8]) -> io::Result<(OsString, Option<Meta>)> {
     let rdev = r.u32()? as u64;
     let size = r.i64()? as u64;
     let kind = kind_of(objtype);
-    Ok((name, Some(Meta { kind, size, mtime, mtime_ns, mode, uid, gid, dev, ino, rdev, nlink })))
+    let (atime, crtime) = Meta::extra_times(kind, atime, crtime);
+    Ok((name, Some(Meta { kind, size, mtime, mtime_ns, mode, uid, gid, dev, ino, rdev, nlink, atime, crtime })))
 }

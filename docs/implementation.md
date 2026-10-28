@@ -125,6 +125,9 @@ Also, with rsync's semantics locally and over ssh (each has a differential test 
 | `--chmod=CHMOD` | rsync's syntax (`D`/`F`, `ugoa`, `+-=`, `rwxXst`, octal), applied to the source modes as sent. |
 | `--remove-source-files` | Non-directories the receiver has (transferred or already up to date) are removed from the source, unless their size or mtime changed meanwhile. |
 | `-O/--omit-dir-times` | |
+| `-E/--executability` | Without `-p`, an existing file keeps its permissions but becomes executable, or not, like its source: an `x` for each `r` it has, or none (rsync's `dest_mode`); a new file gets the source's mode, less the umask, as usual. A difference in executability alone is itemized `p`. |
+| `-U/--atimes` | Access times are kept, except directories', in whole seconds as rsync keeps them: set on what is written (a symlink's too) and on what is up to date, itemized `u` (not for a symlink, as in rsync). `-UU` also sets `--open-noatime`: files are read with `O_NOATIME` on Linux (on macOS, as with rsync, nothing changes), so that reading the source doesn't change what was copied. `--no-U`/`--no-atimes`, `--no-open-noatime`. |
+| `-N/--crtimes` | macOS: creation times are kept, of files, symlinks and directories (not a volume's root), set with `setattrlist` before the other times as rsync does, and itemized `n` (`b` with `-U`'s `u`). Elsewhere, like rsync, it is refused: "This barqsync does not support --crtimes (-N)", exit 1; a server that isn't on macOS refuses it as rsync's does ("The server does not support --crtimes (-N)"). `--no-N`/`--no-crtimes`. |
 | `--no-OPTION` | `--no-r`, `--no-l`, `--no-p`, `--no-t`, `--no-g`, `--no-o`, `--no-D`, `--no-devices`, `--no-specials`, `--no-H`, `--no-A`, `--no-X`, `--no-O`, `--no-d`, `--no-x`, `--no-S`, `--no-c`, `--no-z`, `--no-W`, `--no-v`, `--no-i`, `--no-h`, `--no-8`, `--no-m`, `--no-s`, `--no-inplace`, `--no-append`, `--no-partial`, `--no-delay-updates`, `--no-force`, `--no-ignore-errors`, `--no-munge-links`, `--no-progress`, `--no-numeric-ids`, `--no-backup`, `--no-mkpath`, `--no-timeout`, `--no-from0`, and their long forms (`--no-owner`, ...). Options apply in order, as in rsync: `-a --no-o` drops `-o`, `--no-o -a` keeps it, and `--no-v` resets the `-v` count. Any option may be given more than once. |
 | `--delete-before`, `--delete-during`/`--del`, `--delete-delay`, `--delete-after` | Each implies `--delete`. Two different times are refused, and so is a `--delete` without `-r` or `-d` (also after `--no-r`). barqsync always deletes once the transfer is done, the whole source was read and everything changed was written without errors, which is rsync's `--delete-delay`/`--delete-after`; see the differences below. |
 | `--max-delete=N` | At most N deletions (a negative N: none), in rsync's order (directory by directory as rsync's file list visits them; in each, subdirectories first, then files, by descending name). What the limit stops is counted: "Deletions stopped due to --max-delete limit (K skipped)", exit 25 unless an error (23) or a vanished file (24) says otherwise. A directory that keeps an entry stays ("cannot delete non-empty directory"). |
@@ -156,9 +159,9 @@ Exit codes follow rsync (0 ok, 1 syntax, 11 file I/O, 12 protocol, 20 interrupte
 transfer, 24 source files vanished, 25 `--max-delete` limit, 30 `--timeout`).
 
 Still missing: daemon mode (`rsync://`, `host::module`), as well as `--copy-dest`, `--fuzzy`,
-`--contimeout`, `-N`, `-E`, `-U`, `--no-implied-dirs`, `--no-R`, filter rules for xattr names
-(the `x` modifier), merge and `-C` rules inside per-directory filter files, and a remote
-(`host:`) `--files-from` list.
+`--contimeout`, `--no-implied-dirs`, `--no-R`, filter rules for xattr names (the `x`
+modifier), merge and `-C` rules inside per-directory filter files, and a remote (`host:`)
+`--files-from` list.
 
 Known differences:
 

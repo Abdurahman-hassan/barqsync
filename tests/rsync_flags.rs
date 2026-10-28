@@ -1831,8 +1831,8 @@ fn timeout_ends_a_stalled_transfer_with_30() {
     assert!(ferr.contains("io timeout after"), "{ferr}");
     assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
     // A healthy transfer is not cut short. (A longer timeout than above: under load, the
-    // remote side alone can take a second to start.)
-    let f = barqsync_remote(tmp.path(), &["-a", "--timeout=5", "src/", "{host}ok"]);
+    // remote side alone can take seconds to start, as a full test run showed.)
+    let f = barqsync_remote(tmp.path(), &["-a", "--timeout=15", "src/", "{host}ok"]);
     assert_eq!(f.code, 0, "{}", f.stderr);
 }
 
@@ -2465,6 +2465,244 @@ fn append_skips_a_diminished_source() {
             assert_eq!(fs::metadata(tmp.path().join("src/log")).unwrap().len(), 150_000, "{what}: the source stays");
             assert_eq!(fs::read(d.join("ok")).unwrap(), b"complete", "{what}");
             assert!(!tmp.path().join("src/ok").exists(), "{what}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -E / --executability
+// ---------------------------------------------------------------------------
+
+#[test]
+fn executability_matches_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Tree::new(tmp.path().join("src"));
+    t.file("run.sh", "run")
+        .file("data", "data")
+        .file("owner_x", "o")
+        .file("changed.sh", "new content")
+        .file("new.sh", "new")
+        .chmod("run.sh", 0o755)
+        .chmod("data", 0o644)
+        .chmod("owner_x", 0o700)
+        .chmod("changed.sh", 0o751)
+        .chmod("new.sh", 0o751)
+        .settle_mtimes();
+    let mtime = |n: &str| fs::metadata(t.path(n)).unwrap().mtime() as u64;
+    // Without -p a destination file keeps its permissions; -E only makes it executable
+    // (an x for each r) or not, like the source.
+    let cases: &[&[&str]] = &[&["-rtiE"], &["-rti"], &["-rtiE", "-p"], &["-rtiE", "--chmod=Fu-x"]];
+    for (i, flags) in cases.iter().enumerate() {
+        for (j, (src, dst)) in [("src/", "{dst}"), ("src/", "{host}{dst}"), ("{host}src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            for d in [&dr, &df] {
+                let dt = Tree::new(tmp.path().join(d));
+                dt.file("run.sh", "run").file("data", "data").file("owner_x", "o").file("changed.sh", "old");
+                dt.chmod("run.sh", 0o644).chmod("data", 0o755).chmod("owner_x", 0o640).chmod("changed.sh", 0o600);
+                for n in ["run.sh", "data", "owner_x", "changed.sh"] {
+                    dt.mtime(n, mtime(n));
+                }
+            }
+            let mut a = flags.to_vec();
+            a.extend([src, dst]);
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            let what = format!("{flags:?} {src} {dst}");
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap_no_dir_times(&tmp.path().join(&dr)), &snap_no_dir_times(&tmp.path().join(&df)));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -U / --atimes, -N / --crtimes
+// ---------------------------------------------------------------------------
+
+/// Set `p`'s access time (seconds; a symlink's own), leaving its other times alone.
+fn set_atime(p: &Path, secs: i64) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ };
+    let times = [libc::timespec { tv_sec: secs as libc::time_t, tv_nsec: 0 }, omit];
+    assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) }, 0);
+}
+
+/// The access times of what is below `root`, but directories' (which -U doesn't keep).
+fn atimes(root: &Path) -> BTreeMap<String, i64> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            let m = fs::symlink_metadata(&p).unwrap();
+            if m.is_dir() {
+                stack.push(p);
+            } else {
+                out.insert(p.strip_prefix(root).unwrap().to_string_lossy().into_owned(), m.atime());
+            }
+        }
+    }
+    out
+}
+
+/// What -U is tried on: a file to create, one up to date but for its access time, one
+/// with other data, one in a new directory, and a symlink. Each tool reads a copy of its
+/// own (`{dst}.src`), since reading a file may change its access time; theirs are later
+/// than the modification times, which keeps reading from changing them where it can.
+fn atimes_fixture(root: &Path, dst: &str) {
+    let src = Tree::new(root.join(format!("{dst}.src")));
+    src.file("a", "a").file("same", "same").file("newer", "new").file("sub/b", "b").symlink("lnk", "a").settle_mtimes();
+    for (i, f) in ["a", "same", "newer", "sub/b", "lnk"].into_iter().enumerate() {
+        set_atime(&src.path(f), BASE_TIME as i64 + 500_000 + i as i64 * 1000);
+    }
+    let d = Tree::new(root.join(dst));
+    d.file("same", "same").file("newer", "old").mtime("same", fs::metadata(src.path("same")).unwrap().mtime() as u64);
+    set_atime(&d.path("same"), BASE_TIME as i64);
+    set_atime(&d.path("newer"), BASE_TIME as i64);
+}
+
+#[test]
+fn atimes_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // (flags, whether the access times are kept)
+    let cases: [(&[&str], bool); 3] = [(&["-ai", "-U"], true), (&["-ai", "-U", "--no-U"], false), (&["-ai", "--atimes", "-n"], false)];
+    for (i, (flags, kept)) in cases.into_iter().enumerate() {
+        for (j, (s, d)) in [("{dst}.src/", "{dst}"), ("{dst}.src/", "{host}{dst}"), ("{host}{dst}.src/", "{dst}")].into_iter().enumerate() {
+            let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+            for name in [&dr, &df] {
+                atimes_fixture(tmp.path(), name);
+            }
+            let mut a = flags.to_vec();
+            a.extend([s, d]);
+            let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+            let what = format!("{flags:?} {s} {d}");
+            same_output(&r, &f, &[], &what);
+            if kept {
+                let (src, dst) = (atimes(&tmp.path().join(format!("{df}.src"))), atimes(&tmp.path().join(&df)));
+                assert_eq!(atimes(&tmp.path().join(&dr)), dst, "{what}");
+                // What is kept is what the scan found, before the source was read.
+                assert_eq!(dst.keys().collect::<Vec<_>>(), src.keys().collect::<Vec<_>>(), "{what}");
+                assert_eq!(dst["same"], BASE_TIME as i64 + 501_000, "{what}");
+            }
+        }
+    }
+}
+
+/// `-UU` (`--open-noatime`): reading the source leaves its files' access times alone
+/// where the system can (Linux's `O_NOATIME`; macOS has none, for rsync either). Not a
+/// symlink's: reading one may change it whatever the options.
+#[cfg(target_os = "linux")]
+#[test]
+fn open_noatime_leaves_the_source_alone() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let files = |dir: &Path| {
+        let mut a = atimes(dir);
+        a.remove("lnk");
+        a
+    };
+    for (j, (s, d)) in [("{dst}.src/", "{dst}"), ("{dst}.src/", "{host}{dst}"), ("{host}{dst}.src/", "{dst}")].into_iter().enumerate() {
+        let (dr, df) = (format!("r{j}"), format!("f{j}"));
+        for name in [&dr, &df] {
+            atimes_fixture(tmp.path(), name);
+        }
+        let before = files(&tmp.path().join(format!("{df}.src")));
+        let (r, f) = both_remote(tmp.path(), &["-aiUU", s, d], &dr, &df).unwrap();
+        same_output(&r, &f, &[], &format!("{s} {d}"));
+        assert_eq!(files(&tmp.path().join(format!("{dr}.src"))), before, "rsync {s} {d}");
+        assert_eq!(files(&tmp.path().join(format!("{df}.src"))), before, "{s} {d}");
+    }
+}
+
+/// Set `p`'s creation time (a symlink's own), as rsync does on macOS.
+#[cfg(target_os = "macos")]
+fn set_crtime(p: &Path, secs: i64) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    let mut al = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_CRTIME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut t = libc::timespec { tv_sec: secs as libc::time_t, tv_nsec: 0 };
+    let size = std::mem::size_of::<libc::timespec>();
+    let r = unsafe { libc::setattrlist(c.as_ptr(), (&mut al as *mut libc::attrlist).cast(), (&mut t as *mut libc::timespec).cast(), size, libc::FSOPT_NOFOLLOW) };
+    assert_eq!(r, 0, "{}", std::io::Error::last_os_error());
+}
+
+/// The creation times of `root` and what is below it.
+#[cfg(target_os = "macos")]
+fn crtimes(root: &Path) -> BTreeMap<String, i64> {
+    use std::os::macos::fs::MetadataExt as _;
+    let mut out = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let m = fs::symlink_metadata(&p).unwrap();
+        out.insert(p.strip_prefix(root).unwrap().to_string_lossy().into_owned(), m.st_birthtime());
+        if m.is_dir() {
+            stack.extend(fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+        }
+    }
+    out
+}
+
+/// -N keeps creation times on macOS (files, symlinks, directories); elsewhere rsync
+/// refuses it, and so does barqsync.
+#[test]
+fn crtimes_match_rsync() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    #[cfg(not(target_os = "macos"))]
+    {
+        Tree::new(tmp.path().join("src")).file("a", "a").settle_mtimes();
+        let (r, f) = both(tmp.path(), &["-aN", "src/", "{dst}"], "r", "f").unwrap();
+        assert_eq!((r.code, f.code), (1, 1), "{}", f.stderr);
+        assert!(r.stderr.contains("does not support --crtimes (-N)") && f.stderr.contains("does not support --crtimes (-N)"), "{}", f.stderr);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Earlier than the modification times, as for files changed since they were made.
+        let fixture = |name: &str| {
+            let src = Tree::new(tmp.path().join(format!("{name}.src")));
+            src.file("a", "a").file("same", "same").file("sub/b", "b").symlink("lnk", "a").settle_mtimes();
+            for (i, f) in ["", "a", "same", "sub", "sub/b", "lnk"].into_iter().enumerate() {
+                set_crtime(&src.path(f), BASE_TIME as i64 - 100_000 - i as i64 * 1000);
+            }
+            let d = Tree::new(tmp.path().join(name));
+            d.file("same", "same").mtime("same", fs::metadata(src.path("same")).unwrap().mtime() as u64);
+        };
+        // (flags, whether the creation times are kept)
+        let cases: [(&[&str], bool); 3] = [(&["-ai", "-N"], true), (&["-ai", "-NU"], true), (&["-ai", "--crtimes", "--no-crtimes"], false)];
+        for (i, (flags, kept)) in cases.into_iter().enumerate() {
+            for (j, (s, d)) in [("{dst}.src/", "{dst}"), ("{dst}.src/", "{host}{dst}"), ("{host}{dst}.src/", "{dst}")].into_iter().enumerate() {
+                let (dr, df) = (format!("r{i}-{j}"), format!("f{i}-{j}"));
+                for name in [&dr, &df] {
+                    fixture(name);
+                }
+                let mut a = flags.to_vec();
+                a.extend([s, d]);
+                let (r, f) = both_remote(tmp.path(), &a, &dr, &df).unwrap();
+                let what = format!("{flags:?} {s} {d}");
+                same_output(&r, &f, &[], &what);
+                if kept {
+                    let got = crtimes(&tmp.path().join(&df));
+                    assert_eq!(crtimes(&tmp.path().join(&dr)), got, "{what}");
+                    assert_eq!(got, crtimes(&tmp.path().join(format!("{df}.src"))), "{what}");
+                }
+            }
         }
     }
 }
