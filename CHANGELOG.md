@@ -5,8 +5,9 @@
 ### Compatibility
 
 - Remote transfers now use protocol 11: the new options travel to the other side, which
-  also reports vanished files and `--max-delete` stops. Upgrade barqsync on both machines
-  together; this release cannot communicate with 0.4.x.
+  also reports vanished files and `--max-delete` stops. `--append` adds a request for
+  the data past a shorter file, and the sender now names the owner and group of id 0 too.
+  Upgrade barqsync on both machines together; this release cannot communicate with 0.4.x.
 
 ### Security
 
@@ -44,6 +45,15 @@
     (accepted; barqsync never puts paths on the remote command line).
   - `--timeout=SECONDS`: a remote transfer whose connection delivers nothing for that
     long ends with exit 30. Both sides send keepalives while busy.
+  - `--bwlimit=RATE`: each side paces what it writes to the connection, all streams
+    together, as rsync does; a local copy paces the file data it writes. rsync's size
+    syntax, in KiB per second by default.
+  - `--chown=USER:GROUP`, `--usermap` and `--groupmap`: rsync's `FROM:TO` maps (names,
+    ids, ranges and wildcards), applied by the receiver, locally too. They imply `-o`
+    and `-g`, as in rsync.
+  - `--append` and `--append-verify`: a shorter destination file gets only the rest of
+    the data, over the wire too; `--append-verify` rewrites a file whose existing data
+    isn't the source's start, warning as rsync does.
 - A source file that disappears between the scan and its transfer is now a warning
   ("file has vanished") and exit 24, as with rsync, instead of an error and exit 23.
 - `--stats` also prints rsync's "Total bytes sent/received" lines, and `-v` or `--stats`

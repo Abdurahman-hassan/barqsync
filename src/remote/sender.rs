@@ -577,6 +577,9 @@ impl Sender<'_> {
         let (id, path) = (src.id, src.path.as_path());
         let file = fsops::open_listed(path, &src.meta, self.opts.copy_links)?;
         let size = file.metadata()?.len();
+        if let Sig::Append { len, sum } = sig {
+            return self.send_append(src, &file, size, len, sum, xattrs);
+        }
         if let Sig::Cdc(basis) = &sig {
             return match cdc::Mapped::new(&file, size) {
                 Ok(m) => self.send_ops(id, &file, &cdc::diff(m.bytes(), basis, &Params::DEFAULT), &m, xattrs),
@@ -603,10 +606,32 @@ impl Sender<'_> {
                 let Some(p) = basis.params(Params::DEFAULT) else { return self.send_whole_file(id, &file, xattrs) };
                 (delta::diff_chunks(&delta::chunk_signature(&f, size, &p)?, &basis), basis.size, p.cdc_avg)
             }
-            Sig::Cdc(_) => unreachable!(),
+            Sig::Cdc(_) | Sig::Append { .. } => unreachable!(),
         };
         let d = self.refine(id, path, &f, size, basis_size, unit, d)?;
         self.send_ops(id, &file, &d, &f, xattrs)
+    }
+
+    /// `--append`: the receiver has the first `len` bytes of this file (`size` bytes now);
+    /// send the rest as a delta keeping them. With `--append-verify` (`sum`) only if
+    /// they match this file's start: otherwise the file goes whole, which tells the
+    /// receiver. A file now shorter than it was listed is skipped, as rsync skips a
+    /// "diminished" file.
+    fn send_append(&self, src: &Source, file: &File, size: u64, len: u64, sum: Option<Sum>, xattrs: Option<Vec<Xattr>>) -> io::Result<u64> {
+        if size < src.meta.size {
+            self.out.warning(path_msg("skipped diminished file: \"", &fsops::full_path(&src.path), "\""));
+            self.send(Msg::FileEnd { id: src.id, ok: false });
+            return Ok(0);
+        }
+        if let Some(sum) = sum
+            && checksum::prefix_sum(file, len)? != sum
+        {
+            return self.send_whole_file(src.id, file, xattrs);
+        }
+        let mut d = Delta::new(size);
+        d.push(Op::Copy { off: 0, basis_off: 0, len });
+        d.push(Op::Literal { off: len, len: size - len });
+        self.send_ops(src.id, file, &d, &ReadOnce::new(file, size), xattrs)
     }
 
     /// Refine a coarse delta where it is worth it ([`refine::plan`]): ask the receiver for

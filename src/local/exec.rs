@@ -75,6 +75,9 @@ pub struct Engine<'a> {
     io_warned: AtomicBool,
     /// `-m`: which source directories have content (local transfers).
     pub(crate) prune: super::prune::Prune,
+    /// Local transfers with `--usermap`/`--groupmap`/`--chown`: how source ids map (a
+    /// remote receiver maps them as listings arrive).
+    pub(crate) local_ids: Option<Mutex<crate::ids::IdMap>>,
 }
 
 /// Per-directory filter state (see [`DirRules`]): the source side's decides what is sent
@@ -344,6 +347,7 @@ impl<'a> Engine<'a> {
             io_error: AtomicBool::new(false),
             io_warned: AtomicBool::new(false),
             prune: Default::default(),
+            local_ids: None,
         }
     }
 
@@ -482,7 +486,7 @@ impl<'a> Engine<'a> {
             Root::Contents { src, dst } => {
                 let src_meta = match fsops::stat(src) {
                     Ok(mut m) => {
-                        super::flags::adjust_mode(self.opts, &mut m);
+                        self.adjust_root(&mut m);
                         m
                     }
                     Err(e) => return self.src_err(path_msg("link_stat \"", src, format!("\" failed: {e}"))),
@@ -528,7 +532,7 @@ impl<'a> Engine<'a> {
                 if *with_root {
                     let src_meta = match fsops::stat(base) {
                         Ok(mut m) => {
-                            super::flags::adjust_mode(self.opts, &mut m);
+                            self.adjust_root(&mut m);
                             m
                         }
                         Err(e) => return self.src_err(path_msg("link_stat \"", base, format!("\" failed: {e}"))),
@@ -579,7 +583,7 @@ impl<'a> Engine<'a> {
             if with_root {
                 match fsops::stat(path) {
                     Ok(mut m) => {
-                        super::flags::adjust_mode(self.opts, &mut m);
+                        self.adjust_root(&mut m);
                         top.get_or_insert((path.clone(), m));
                         dev = Some(m.dev);
                     }
@@ -1409,6 +1413,9 @@ impl<'a> Engine<'a> {
                         have = h;
                         diff
                     });
+                    if action == FileAction::Transfer && self.append_skips(&e.meta, dst_meta.as_ref()) {
+                        continue;
+                    }
                     let mut alt = None;
                     if !self.alt_dirs.is_empty()
                         && action == FileAction::Transfer
@@ -1954,11 +1961,12 @@ impl<'a> Engine<'a> {
         }
         fsops::test_vanish(&job.src_path);
         // A big copy moves the progress line as it goes, not only once it is done.
-        let (r, counted) = crate::progress::tracking(|| self.write_file(job));
+        let (r, counted) = crate::progress::tracking(|| crate::bwlimit::paced(|| self.write_file(job)));
         crate::progress::done(job.meta.size.saturating_sub(counted));
         match r {
             Ok(()) => self.file_written(job),
             Err(e) if fsops::interrupted() => drop(e),
+            Err(e) if e.get_ref().is_some_and(|e| e.is::<super::flags::Diminished>()) => self.diminished(&job.src_path),
             Err(e) if e.kind() == io::ErrorKind::NotFound && fsops::lstat(&job.src_path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) => {
                 self.vanished(&job.src_path)
             }
@@ -1980,6 +1988,9 @@ impl<'a> Engine<'a> {
         let src = &job.meta;
         let (mode, uid, gid) = self.target_attrs(job);
 
+        if let Some(d) = self.append_to(job) {
+            return self.write_append(job, &d, mode, uid, gid);
+        }
         if self.delta_candidate(job) {
             match self.write_delta(job, mode, uid, gid) {
                 Ok(true) => return Ok(()),
@@ -2008,7 +2019,8 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
 
-        let allow_fast = !self.opts.no_clone;
+        // A clone or an in-kernel copy can't be paced to --bwlimit.
+        let allow_fast = !self.opts.no_clone && crate::bwlimit::pacing().is_none();
         let mtime = self.opts.times.then_some((src.mtime, src.mtime_ns));
         if self.opts.inplace && job.dst_meta.is_none() {
             // Like rsync --inplace, new files are written at their final name: no temp
@@ -2076,6 +2088,8 @@ impl<'a> Engine<'a> {
         Stats::add(&self.stats.delta_files, 1);
         Stats::add(&self.stats.literal_bytes, d.literal_bytes());
         Stats::add(&self.stats.matched_bytes, d.matched_bytes());
+        // --bwlimit: only the literal data is "sent", as with rsync's delta transfer.
+        crate::bwlimit::copying(d.literal_bytes());
 
         if self.opts.inplace && d.is_in_place() && job.basis.is_none() {
             let out = fs::OpenOptions::new().write(true).open(&job.dst_path)?;

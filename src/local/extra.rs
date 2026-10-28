@@ -120,9 +120,19 @@ impl Engine<'_> {
         }
         let mut ents = collect(self.opts, &self.xrules, dir, ents, &mut |m| self.src_err(m));
         for e in &mut ents {
+            self.map_acl_ids(e.extra.as_deref_mut());
             e.extra = to_local(&self.xrules, e.extra.take(), e.meta.mode);
         }
         ents
+    }
+
+    /// Local transfers with `--usermap`/`--groupmap`: the ids in an ACL, as the receiver
+    /// maps them (rsync's `match_acl_ids`).
+    fn map_acl_ids(&self, x: Option<&mut Extra>) {
+        if let (Some(ids), Some(acl)) = (&self.local_ids, x.and_then(|x| x.acl.as_mut())) {
+            let mut ids = ids.lock().unwrap();
+            acl.map_ids(|user, id| ids.map_local(user, id, !self.opts.numeric_ids));
+        }
     }
 
     /// Local transfers: a root directory's attributes in the receiver's form.
@@ -131,7 +141,10 @@ impl Engine<'_> {
             return None;
         }
         match read_wire(self.opts, &self.xrules, path, meta.kind, meta.mode, true) {
-            Ok(x) => to_local(&self.xrules, x, meta.mode),
+            Ok(mut x) => {
+                self.map_acl_ids(x.as_deref_mut());
+                to_local(&self.xrules, x, meta.mode)
+            }
             Err(e) => {
                 self.src_err(path_msg("get_xattr/get_acl \"", path, format!("\" failed: {e}")));
                 None

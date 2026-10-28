@@ -128,10 +128,18 @@ impl Acls {
         }
     }
 
-    /// Map the named entries' ids (remote transfers map them by name, like owners).
-    pub fn map_ids(&mut self, f: impl Fn(bool, u32) -> u32) {
+    /// Map the named entries' ids (remote transfers map them by name, like owners). A
+    /// POSIX ACL's entries go back in the order one is read in (users, then groups, each
+    /// by id), so it compares equal to what was written; a macOS ACL's order is part of
+    /// what it says.
+    pub fn map_ids(&mut self, mut f: impl FnMut(bool, u32) -> u32) {
         for n in self.access.names.iter_mut().chain(self.default.names.iter_mut()) {
             n.id = f(n.user, n.id);
+        }
+        if self.flavor == Flavor::Posix {
+            for names in [&mut self.access.names, &mut self.default.names] {
+                names.sort_by_key(|n| (!n.user, n.id));
+            }
         }
     }
 
@@ -512,6 +520,29 @@ mod tests {
 
     fn name(id: u32, user: bool, access: u32) -> AclName {
         AclName { id, user, access }
+    }
+
+    /// Mapped ids put a POSIX ACL's entries back in order (users, then groups, by id), so
+    /// an ACL written once compares equal next time; a macOS ACL keeps its order.
+    #[test]
+    fn mapped_ids_keep_posix_order() {
+        let names = vec![name(1001, true, 6), name(1002, true, 4), name(7, false, 4), name(9, false, 6)];
+        let access = RsyncAcl { names, ..RsyncAcl::default() };
+        let swap = |user: bool, id: u32| match (user, id) {
+            (true, 1001) => 1002,
+            (true, 1002) => 1001,
+            (false, 7) => 9,
+            (false, 9) => 7,
+            _ => id,
+        };
+        let mut posix = Acls { flavor: Flavor::Posix, access: access.clone(), default: access.clone() };
+        posix.map_ids(swap);
+        let want = vec![name(1001, true, 4), name(1002, true, 6), name(7, false, 6), name(9, false, 4)];
+        assert_eq!((&posix.access.names, &posix.default.names), (&want, &want));
+        let mut darwin = Acls { flavor: Flavor::Darwin, access, default: RsyncAcl::default() };
+        darwin.map_ids(swap);
+        let kept: Vec<(u32, bool)> = darwin.access.names.iter().map(|n| (n.id, n.user)).collect();
+        assert_eq!(kept, [(1002, true), (1001, true), (9, false), (7, false)]);
     }
 
     /// A POSIX file with named entries: what the mode says is dropped, the mask comes

@@ -1,6 +1,7 @@
 //! barqsync: a parallel, rsync-compatible file synchronizer.
 
 pub mod acls;
+pub mod bwlimit;
 pub mod checksum;
 pub mod chmod;
 pub mod cli;

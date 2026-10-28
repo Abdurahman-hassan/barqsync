@@ -15,11 +15,10 @@ pub mod relay;
 pub mod streams;
 
 use crate::fsops;
-use crate::proto::{Conn, Frame, FrameSender, Msg};
+use crate::proto::{Conn, Frame, FrameSender, Msg, clock};
 use std::io;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How file data travels in a remote transfer (`--transport`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
@@ -139,10 +138,6 @@ static LAST_IN: AtomicU64 = AtomicU64::new(0);
 /// The transfer ended because nothing arrived for `--timeout` seconds.
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
 
-fn clock() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u64
-}
 
 /// `--timeout`: from now on, a connection that delivers nothing for `secs` seconds ends
 /// the transfer (exit 30). Each side sends [`KeepAlive`]s meanwhile, so only a
@@ -160,7 +155,8 @@ pub fn timed_out() -> bool {
 /// The error ending a connection that has been silent for longer than `--timeout`.
 fn check_timeout() -> Option<io::Error> {
     let secs = TIMEOUT.load(SeqCst);
-    let idle = clock().saturating_sub(LAST_IN.load(SeqCst));
+    // A frame still arriving is activity too.
+    let idle = clock().saturating_sub(LAST_IN.load(SeqCst).max(crate::proto::last_read()));
     if secs == 0 || idle < secs * 1000 {
         return None;
     }
