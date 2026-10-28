@@ -113,6 +113,19 @@ pub(crate) struct DirJob {
     pub(crate) rules: Rules,
 }
 
+impl DirJob {
+    /// Drop the first source: the next merged one takes its place (false if there is
+    /// none). The directory keeps the first one's attributes.
+    fn next_source(&mut self) -> bool {
+        if self.more.is_empty() {
+            return false;
+        }
+        let d = self.more.remove(0);
+        (self.src, self.sel, self.root_dev, self.rules.src) = (d.path, d.sel, d.dev, d.rules);
+        true
+    }
+}
+
 pub(crate) struct Ctx<'p> {
     src: &'p Path,
     dst: &'p Path,
@@ -1633,8 +1646,8 @@ impl<'a> Engine<'a> {
                 self.err(path_msg("set_xattr/set_acl \"", &dst_path, format!("\" failed: {e}")));
             }
         }
-        let root_dev = src_dev.unwrap_or(meta.dev);
         let name = src_path.file_name().unwrap_or_default();
+        let root_dev = select::root_dev(sel, name.as_bytes(), meta.dev, src_dev);
         let more = match ctx.sources {
             Some(src) if descend != Descend::No => src.also_dirs(idx, name, self.opts.recursive, self.opts.one_file_system),
             _ => Vec::new(),
@@ -1645,7 +1658,7 @@ impl<'a> Engine<'a> {
             Some(src) => src.top(idx, name, self.opts.recursive),
             None => select::top_dir(sel, name.as_bytes(), self.opts.recursive),
         };
-        let job = DirJob {
+        let mut job = DirJob {
             src: src_path,
             dst: dst_path,
             rel,
@@ -1665,11 +1678,12 @@ impl<'a> Engine<'a> {
             rules: Rules { src: ctx.src_rules(idx).clone(), dst: ctx.rules.dst.clone() },
         };
         // -x: a directory on another filesystem than its transfer root (a mount point) is
-        // created, but nothing in it is synced. A remote sender decides, and marks the ones
-        // it doesn't list.
+        // created, but nothing in it is synced, unless later sources have it on their own
+        // filesystem: then they alone fill it, as rsync's receiver merges their
+        // FLAG_CONTENT_DIR. A remote sender decides, and marks the ones it doesn't list.
         let mount = match &self.remote {
             Some(r) => r.mount(ctx.wire_dir, idx),
-            None => self.opts.one_file_system && meta.dev != root_dev,
+            None => self.opts.one_file_system && meta.dev != root_dev && !job.next_source(),
         };
         if descend == Descend::No || mount {
             // -d, or a mount point: the directory itself, without its contents.

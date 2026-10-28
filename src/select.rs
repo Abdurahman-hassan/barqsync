@@ -102,6 +102,19 @@ pub fn descend<'a>(parent: Option<&'a Sel>, name: &[u8], recursive: bool) -> Des
     }
 }
 
+/// `-x`: the device that child directory `name` (on device `dev`) of a directory with
+/// selection `parent` is compared with (on another one, it is a mount point), and so are
+/// the directories below it. That is the transfer root's, `root_dev` (`None`: each entry
+/// is a root of its own, as named items are), but a path of the selection starts from its
+/// own device: rsync lists no implied directory's contents, and sets `filesystem_dev`
+/// from each named path.
+pub fn root_dev(parent: Option<&Sel>, name: &[u8], dev: u64, root_dev: Option<u64>) -> u64 {
+    match root_dev {
+        Some(d) if !parent.is_some_and(|p| p.children.contains_key(name)) => d,
+        _ => dev,
+    }
+}
+
 /// `--delete` only prunes directories whose full contents are being sent.
 pub fn may_delete(sel: Option<&Sel>) -> bool {
     sel.is_none_or(|s| s.contents)
@@ -280,5 +293,20 @@ mod tests {
         assert!(top_dir(Some(b), b"c", true));
         // Nothing below a directory sent whole is one.
         assert!(!top_dir(None, b"x", true));
+    }
+
+    #[test]
+    fn selected_paths_start_from_their_own_device() {
+        let roots = from_relative_args(&["s/mnt/file".into(), "s/named".into(), "s/all/".into()]);
+        let s = &roots[0].sel.children[&b"s".to_vec()];
+        // Implied (`mnt`) or named (`named`, `all`): never a mount point, whatever its device.
+        for name in [&b"mnt"[..], b"named", b"all"] {
+            assert_eq!(root_dev(Some(s), name, 9, Some(1)), 9);
+        }
+        // Listed only because `all/`'s contents are sent: its root's device counts.
+        let all = &s.children[&b"all".to_vec()];
+        assert_eq!(root_dev(Some(all), b"sub", 9, Some(1)), 1);
+        assert_eq!(root_dev(None, b"sub", 9, Some(1)), 1);
+        assert_eq!(root_dev(None, b"item", 9, None), 9);
     }
 }

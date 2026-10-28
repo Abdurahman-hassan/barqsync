@@ -173,9 +173,10 @@ pub enum Msg {
     Roots(Vec<RootInfo>),
     /// `-c`: `sums[i]` is the checksum of regular file `entries[i]` (empty otherwise).
     /// `-x`: `mounts` are the directories among `entries` (indices, ascending) on another
-    /// filesystem than their transfer root. They are created, but their contents are not
-    /// sent: no listing follows for them, and nothing in them is deleted (rsync's
-    /// directories without `FLAG_CONTENT_DIR`).
+    /// filesystem than their transfer root (mount points) that no later source merging
+    /// into them fills. They are created, but their contents are not sent: no listing
+    /// follows for them, and nothing in them is deleted (rsync's directories without
+    /// `FLAG_CONTENT_DIR`).
     DirBatch { root: u16, dir: u32, rel: Vec<u8>, entries: Vec<DirEnt>, sums: Vec<Option<Sum>>, mounts: Vec<u32> },
     /// User and group names for ids in the listings that follow (no `--numeric-ids`).
     IdNames { users: Names, groups: Names },

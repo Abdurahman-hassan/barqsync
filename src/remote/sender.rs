@@ -272,16 +272,25 @@ impl Sender<'_> {
             .enumerate()
             .filter_map(|(i, e)| {
                 let d = sources.dir_of(i as u32);
-                let dev = d.dev.unwrap_or(e.meta.dev);
-                if one_fs && e.meta.kind == Kind::Dir && e.meta.dev != dev {
-                    // -x: a mount point. Its contents aren't sent, and the receiver is told
-                    // so, since it can't tell from merged listings which root it is in.
+                let dev = select::root_dev(d.sel, e.name.as_bytes(), e.meta.dev, d.dev);
+                // -x: a mount point isn't listed from its root. Later sources that have the
+                // directory on their own filesystem fill it alone (rsync's receiver merges
+                // their FLAG_CONTENT_DIR); with none, its contents aren't sent, and the
+                // receiver is told so, since it can't tell from merged listings which root
+                // the directory is in.
+                let mount = one_fs && e.meta.kind == Kind::Dir && e.meta.dev != dev;
+                let Some(sub) = self.descend_into(d.sel, e) else {
+                    if mount {
+                        mounts.push(i as u32);
+                    }
+                    return None;
+                };
+                let own = (!mount).then(|| SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev), rules: d.rules.clone() });
+                let srcs: Vec<SrcDir> = own.into_iter().chain(sources.also_dirs(i as u32, &e.name, recursive, one_fs)).collect();
+                if srcs.is_empty() {
                     mounts.push(i as u32);
                     return None;
                 }
-                let sub = self.descend_into(d.sel, e)?;
-                let mut srcs = vec![SrcDir { path: d.path.join(&e.name), sel: sub, dev: Some(dev), rules: d.rules.clone() }];
-                srcs.extend(sources.also_dirs(i as u32, &e.name, recursive, one_fs));
                 Some((join_rel(&rel, &e.name), srcs))
             })
             .collect();
@@ -300,7 +309,7 @@ impl Sender<'_> {
         self.listing(dir, ents)
     }
 
-    /// Whether the listing of subdirectory `e` (not a `-x` mount point) is sent, and with
+    /// Whether the listing of subdirectory `e` is sent (unless `-x` stops at it), and with
     /// which selection. The receiver makes the same decision with [`select::descend`].
     fn descend_into(&self, sel: Option<&'static Sel>, e: &DirEnt) -> Option<Option<&'static Sel>> {
         if e.meta.kind != Kind::Dir {
