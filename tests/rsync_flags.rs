@@ -1199,6 +1199,116 @@ fn one_file_system_makes_source_mount_points_empty() {
     }
 }
 
+/// `-x` with several sources merging into one destination: a mount point in the first
+/// one (`a/m`, a disk image) is filled from the later ones that have that directory on
+/// their own filesystem (`b/m`, `c/m`), and `--delete` deletes what neither has in the
+/// destination's copy. As rsync, whose receiver merges the duplicates' FLAG_CONTENT_DIR:
+/// locally (both scanners), as a push and as a pull, into a new destination and into one
+/// with extra entries.
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_fills_mount_points_from_later_sources() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let Some(_v) = Volume::at(&t.join("a/m"), 5) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("a")).file("top", "t").file("m/am", "a").file("m/d/g", "g").settle_mtimes();
+    Tree::new(t.join("b")).file("m/bm", "b").file("m/both", "from b").file("m/d/h", "h").settle_mtimes();
+    Tree::new(t.join("c")).file("m/cm", "c").file("m/both", "from c").settle_mtimes();
+    let fixture = |d: &str, existing: bool| {
+        let _ = fs::remove_dir_all(t.join(d));
+        if existing {
+            Tree::new(t.join(d)).file("m/x", "x").file("m/old/y", "y").file("m/bm", "stale").same_mtimes(BASE_TIME + 700_000);
+        }
+    };
+    for mode in ["local", "push", "pull"] {
+        for existing in [false, true] {
+            let what = format!("{mode} into a {} destination", if existing { "full" } else { "new" });
+            fixture("r", existing);
+            fixture("f", existing);
+            let host = |s: &str, side: &str| if mode == side { format!("{{host}}{s}") } else { s.to_string() };
+            let mut args = vec!["-aix".to_string(), "--delete".to_string()];
+            args.extend(["a/", "b/", "c/"].map(|s| host(s, "pull")));
+            args.push(host("{dst}/", "push"));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+            same_output(&r, &f, &[], &what);
+            assert_same_tree(&snap(&t.join("r"), true), &snap(&t.join("f"), true));
+            assert!(t.join("f/m/cm").exists() && t.join("f/m/d/h").exists() && !t.join("f/m/am").exists(), "{what}: {}", f.stdout);
+            assert_eq!(fs::read(t.join("f/m/both")).unwrap(), b"from b", "{what}");
+            assert!(!t.join("f/m/x").exists() && !t.join("f/m/old").exists(), "{what}: {}", f.stdout);
+            if mode == "local" {
+                fixture("f", existing);
+                let f = barqsync(t, &["-aix", "--scanner=jwalk", "--delete", "a/", "b/", "c/", "f/"]);
+                same_output(&r, &f, &[], &format!("jwalk {what}"));
+                assert_same_tree(&snap(&t.join("r"), true), &snap(&t.join("f"), true));
+            }
+        }
+    }
+}
+
+/// `-x` with `-R` or `--files-from`: a path runs through a mount point (`s/mnt`, a disk
+/// image). As in rsync, which sets `-x`'s device from each named path's own and lists no
+/// implied directory's contents, the path doesn't stop there: `s/mnt/file` is sent and
+/// `--delete` leaves the rest of the destination's `s/mnt` alone, while `s/mnt/` is a
+/// top directory, sent whole, whose extra entries go. Locally, as a push and as a pull,
+/// into a new destination and into one with extra entries.
+#[cfg(target_os = "macos")]
+#[test]
+fn one_file_system_follows_selected_paths_through_mount_points() {
+    if skip_without_rsync() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let Some(_v) = Volume::at(&t.join("s/mnt"), 5) else {
+        eprintln!("SKIP: no disk image could be attached");
+        return;
+    };
+    Tree::new(t.join("s")).file("top", "t").file("mnt/file", "f").file("mnt/other", "o").file("mnt/d/g", "g").settle_mtimes();
+    fs::write(t.join("list"), "s/mnt/file\ns/mnt/d/\n").unwrap();
+    // Options, sources, and whether the destination's `s/mnt/x` stays.
+    let cases: [(&[&str], &[&str], bool); 3] = [
+        (&["-aiRx"], &["s/mnt/file"], true),
+        (&["-aiRx"], &["s/mnt/", "s/top"], false),
+        (&["-aix", "--files-from=list"], &["."], true),
+    ];
+    for (opts, srcs, kept) in cases {
+        for mode in ["local", "push", "pull"] {
+            for existing in [false, true] {
+                let what = format!("{mode} {opts:?} {srcs:?} into a {} destination", if existing { "full" } else { "new" });
+                for d in ["r", "f"] {
+                    let _ = fs::remove_dir_all(t.join(d));
+                    if existing {
+                        Tree::new(t.join(d))
+                            .file("s/mnt/x", "x")
+                            .file("s/mnt/old/y", "y")
+                            .file("s/mnt/d/stale", "s")
+                            .same_mtimes(BASE_TIME + 700_000)
+                            .mtime("s/mnt/old", BASE_TIME + 700_000)
+                            .mtime("s/mnt/d", BASE_TIME + 700_000);
+                    }
+                }
+                let mut args: Vec<String> = opts.iter().map(|o| o.to_string()).collect();
+                args.push("--delete".into());
+                args.extend(srcs.iter().map(|s| if mode == "pull" { format!("{{host}}{s}") } else { s.to_string() }));
+                args.push(if mode == "push" { "{host}{dst}/".into() } else { "{dst}/".into() });
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let (r, f) = if mode == "local" { both(t, &args, "r", "f") } else { both_remote(t, &args, "r", "f") }.unwrap();
+                same_output(&r, &f, &[], &what);
+                assert_same_tree(&snap(&t.join("r"), false), &snap(&t.join("f"), false));
+                assert!(t.join("f/s/mnt/file").exists(), "{what}: {}", f.stdout);
+                assert_eq!(t.join("f/s/mnt/x").exists(), existing && kept, "{what}: {}", f.stdout);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // -m / --prune-empty-dirs
 // ---------------------------------------------------------------------------

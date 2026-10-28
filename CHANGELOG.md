@@ -66,6 +66,15 @@
   copies already did, the destination gets the mount point's directory but nothing from
   the mounted filesystem, and nothing in that directory is deleted. Releases 0.4.1 and
   0.4.2 are affected; 0.4.0 didn't fail, but left that directory's time unset.
+- With `-x`/`--one-file-system`, two kinds of transfer no longer stop at a source mount
+  point where rsync goes on. When several sources merge into one destination and an
+  earlier one has a mount point where a later one has a plain directory (`a/ b/ dst/`,
+  with `a/m` a mount point and `b/m` not), `dst/m` is now filled from `b/m`, and
+  `--delete` deletes there what `b/m` lacks. Before, `dst/m` was left as it was. And a
+  `-R` or `--files-from` path through a mount point (`-R s/mnt/file`, with `s/mnt` a mount
+  point) is now sent; before, only the directory `s/mnt` was made. As with rsync, each
+  named path is checked from its own filesystem. This holds for local copies, pushes and
+  pulls. All earlier releases are affected.
 - `--delete` no longer deletes after a file could not be written to the destination (a
   full disk, a quota, an I/O error, or data that never arrived complete). Before, a file
   renamed in the source could lose its old name on the destination without getting the
