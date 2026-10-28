@@ -504,3 +504,44 @@ pub fn barqsync_remote(cwd: &Path, args: &[&str]) -> RunOut {
     fa.extend(args.iter().map(|a| a.replace("{host}", "fakehost:")));
     barqsync(cwd, &fa.iter().map(String::as_str).collect::<Vec<_>>())
 }
+
+/// A small APFS volume of its own (a disk image), detached when dropped.
+#[cfg(target_os = "macos")]
+pub struct Volume {
+    pub mount: PathBuf,
+    _image: tempfile::TempDir,
+}
+
+#[cfg(target_os = "macos")]
+impl Volume {
+    /// A volume of `mib` MiB, mounted in a directory of its own.
+    pub fn new(mib: u32) -> Option<Volume> {
+        let image = tempfile::tempdir().unwrap();
+        let mount = image.path().join("mnt");
+        Volume::attach(image, mount, mib)
+    }
+
+    /// A volume of `mib` MiB mounted at `mount`, a mount point inside a tree (made if
+    /// missing).
+    pub fn at(mount: &Path, mib: u32) -> Option<Volume> {
+        fs::create_dir_all(mount).unwrap();
+        Volume::attach(tempfile::tempdir().unwrap(), mount.to_path_buf(), mib)
+    }
+
+    fn attach(image: tempfile::TempDir, mount: PathBuf, mib: u32) -> Option<Volume> {
+        use std::process::Stdio;
+        let dmg = image.path().join("vol.dmg");
+        let ok = |c: &mut Command| c.stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        let size = format!("{mib}m");
+        let created = ok(Command::new("hdiutil").args(["create", "-size", &size, "-fs", "APFS", "-volname", "barqsync-test"]).arg(&dmg));
+        let attached = created && ok(Command::new("hdiutil").args(["attach", "-nobrowse", "-mountpoint"]).arg(&mount).arg(&dmg));
+        attached.then_some(Volume { mount, _image: image })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Volume {
+    fn drop(&mut self) {
+        let _ = Command::new("hdiutil").args(["detach", "-force"]).arg(&self.mount).stdout(std::process::Stdio::null()).status();
+    }
+}

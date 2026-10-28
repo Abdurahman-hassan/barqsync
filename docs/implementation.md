@@ -127,6 +127,7 @@ Also, with rsync's semantics locally and over ssh (each has a differential test 
 | `--no-OPTION` | `--no-r`, `--no-l`, `--no-p`, `--no-t`, `--no-g`, `--no-o`, `--no-D`, `--no-devices`, `--no-specials`, `--no-H`, `--no-A`, `--no-X`, `--no-O`, `--no-d`, `--no-x`, `--no-S`, `--no-c`, `--no-z`, `--no-W`, `--no-v`, `--no-i`, `--no-h`, `--no-8`, `--no-m`, `--no-s`, `--no-inplace`, `--no-append`, `--no-partial`, `--no-progress`, `--no-numeric-ids`, `--no-backup`, `--no-mkpath`, `--no-timeout`, `--no-from0`, and their long forms (`--no-owner`, ...). Options apply in order, as in rsync: `-a --no-o` drops `-o`, `--no-o -a` keeps it, and `--no-v` resets the `-v` count. Any option may be given more than once. |
 | `--delete-before`, `--delete-during`/`--del`, `--delete-delay`, `--delete-after` | Each implies `--delete`. Two different times are refused, and so is a `--delete` without `-r` or `-d` (also after `--no-r`). barqsync always deletes once the transfer is done, the whole source was read and everything changed was written without errors, which is rsync's `--delete-delay`/`--delete-after`; see the differences below. |
 | `--max-delete=N` | At most N deletions (a negative N: none), in rsync's order (directory by directory as rsync's file list visits them; in each, subdirectories first, then files, by descending name). What the limit stops is counted: "Deletions stopped due to --max-delete limit (K skipped)", exit 25 unless an error (23) or a vanished file (24) says otherwise. A directory that keeps an entry stays ("cannot delete non-empty directory"). |
+| `-x` with `--delete` | A mount point in the source (a directory on another filesystem than its transfer root) is made in the destination without its contents, and nothing in the destination's copy of it is deleted. The sender decides, and marks these directories in its listings (protocol 11). When several sources merge into one destination, later ones that have that directory on their own filesystem fill it instead (`a/ b/ dst/`, with `a/m` a mount point and `b/m` not: `dst/m` gets `b/m`'s contents and `a/m`'s attributes), as rsync's receiver merges the duplicates' content flag. A `-R` or `--files-from` path doesn't stop at a mount point: its implied directories are never taken for mount points, and each named path is checked from its own filesystem, as rsync sets `-x`'s device from each argument (`-R s/mnt/file` sends the file). A mount point in the destination (a directory on another filesystem than the one it is in) is left alone. If the source lacks it, it isn't deleted, and `-vv` says "cannot delete mount point: X" (rsync's `--info=mount`). If the source has it, its extra entries stay, unless it is one of rsync's top directories: the destination itself, where a named source directory goes, or the end of a `-R` path. A directory being deleted that holds one stays ("cannot delete non-empty directory"). |
 | `--filter`/`-f`, `-F`, `-C` | rsync's filter rules: `-`/`+` (`exclude`/`include`), `H`/`S` (sender only), `P`/`R` (receiver only), `!` (`clear`), the modifiers `!`, `/`, `p`, `s`, `r` and `C`, a space or `_` before the pattern. `. FILE` merges FILE's rules (read on the client, `-` for stdin); `: FILE` reads FILE in each directory, its rules applying there and below, deeper ones first (`n`: not inherited; `-`/`+`: bare patterns; `w`: words; `e`: exclude FILE too; `C`: `.cvsignore` style). A name with a leading `/` or other path (`-F` is `: /.rsync-filter`) is also read in the directories above the first one transferred. A leading `/` in a per-directory file anchors at its directory. `-FF` adds `- .rsync-filter`; `-C` appends `:C` and `-C` (rsync's default CVS list, perishable, then `~/.cvsignore` and `$CVSIGNORE`). With `-0`/`--from0`, rules files, merge and per-directory ones included, have NUL-separated rules. With `--delete`, receiver-side rules protect destination entries, read from the destination's own per-directory files, also inside a directory being deleted (which then stays), perishable rules aside; `--delete-excluded` makes plain rules sender-only. A remote receiver re-checks what the sender lists unless the rules need the sender's files (per-directory or `/` rules), as rsync trusts the sender then. |
 | `-m/--prune-empty-dirs` | Directories with nothing but directories below them, once the rules apply, are left out (with `--delete`, the destination's copies are then extraneous). A directory a receiver-side rule (`P`) protects stays, with the ones leading to it, and a `--files-from` entry missing from a pruned directory is still reported (23). The sender decides, so a pull needs the server to know `-m` (protocol 11). |
 | `--mkpath` | The destination's missing directories are created ("created N directories for DIR" with `-v`/`-i`, also counted in a dry run); for a single file, its parent's. |
@@ -183,6 +184,20 @@ Known differences:
   reads the old ones.
 - A per-directory filter file that can't be read or has an invalid rule is reported, and
   what its directory holds is left out (exit 23, and nothing is deleted); rsync stops (exit 1).
+- With `-x` and `--delete`, a mount point that a file must replace stays whole ("could not
+  make way for new regular file", exit 23). rsync gives up too, but first deletes the
+  files at the top of the mount point.
+- With `-x`, a push or a pull of several sources into one destination (`a/ b dst/`) leaves
+  the extra entries of a mount point where a named directory goes (`dst/b`). rsync deletes
+  them, as barqsync does in a local copy, or for `b dst/` alone: the sources reach the
+  receiver as one merged listing, which doesn't say which directories were named.
+- With `-x`, a `-R` or `--files-from` path inside another named directory that is sent
+  whole stops at a mount point on its way, as the rest of that directory does
+  (`-R s s/mnt/file`, with `s/mnt` a mount point: barqsync sends nothing in `s/mnt`).
+  rsync still sends the path, and with `-R s s/mnt` all of `s/mnt`.
+- With `-x` and `-m`, a mount point that a later source fills (`a/ b/ dst/`, with `a/m` a
+  mount point and `b/m` not) gets `b/m`'s attributes; rsync gives `dst/m` `a/m`'s, as
+  barqsync does without `-m`.
 - `--from0` applies to per-directory filter files on both sides. rsync tells its server
   about it only along with `--files-from`, so in a pull its sender reads them line by line.
 - `--timeout` applies to remote transfers, where both sides send keepalives while they are
@@ -984,7 +999,9 @@ The integration tests run each scenario through the reference rsync 3.x as well 
 `/opt/homebrew/bin/rsync`, `/usr/local/bin/rsync` or `/usr/bin/rsync`, or set
 `RSYNC=/path`) and assert that both the printed items and the resulting trees are identical:
 content, mode, mtime and symlink targets. When no rsync 3.x is installed they are skipped.
-macOS's `/usr/bin/rsync` is openrsync and is ignored.
+macOS's `/usr/bin/rsync` is openrsync and is ignored. On macOS, a few tests also attach
+small disk images (`hdiutil`, no root needed) for a full disk or a mount point; they don't
+run on Linux.
 
 CI (`.github/workflows/ci.yml`) runs `cargo build`, `cargo test` and
 `cargo clippy --all-targets -- -D warnings` on macOS (arm64) and Linux (x86_64) on every push

@@ -53,12 +53,13 @@ pub(crate) fn sends(
         Descend::All => None,
         Descend::Some(s) => Some(s),
     };
-    if opts.one_file_system && root_dev.is_some_and(|d| d != e.meta.dev) {
+    let dev = select::root_dev(sel, e.name.as_bytes(), e.meta.dev, root_dev);
+    if opts.one_file_system && dev != e.meta.dev {
         return false;
     }
     let child = dir.join(&e.name);
     match filter.enter(rules, &child, &erel) {
-        Ok(crules) => prune.keeps(opts, filter, &child, &erel, &crules, sub, root_dev.or(Some(e.meta.dev)), err),
+        Ok(crules) => prune.keeps(opts, filter, &child, &erel, &crules, sub, Some(dev), err),
         // Reported when the directory itself is read.
         Err(_) => true,
     }
@@ -133,12 +134,13 @@ impl Prune {
                 Descend::All => None,
                 Descend::Some(s) => Some(s),
             };
-            if opts.one_file_system && root_dev.is_some_and(|d| d != e.meta.dev) {
+            let dev = select::root_dev(sel, e.name.as_bytes(), e.meta.dev, root_dev);
+            if opts.one_file_system && dev != e.meta.dev {
                 continue;
             }
             let child = dir.join(&e.name);
             let Ok(crules) = filter.enter(rules, &child, &erel) else { return true };
-            if self.keeps(opts, filter, &child, &erel, &crules, sub, root_dev.or(Some(e.meta.dev)), err) {
+            if self.keeps(opts, filter, &child, &erel, &crules, sub, Some(dev), err) {
                 return true;
             }
         }
