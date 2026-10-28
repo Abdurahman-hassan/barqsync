@@ -55,8 +55,8 @@
   - `--append` and `--append-verify`: a shorter destination file gets only the rest of
     the data, over the wire too; `--append-verify` rewrites a file whose existing data
     isn't the source's start, warning as rsync does.
-  - `-T`/`--temp-dir` (copying over the destination when the directory is on another
-    filesystem, as rsync does) and `--delay-updates` (updated files wait in `.~tmp~` and
+  - `-T`/`--temp-dir` (on another filesystem the data is copied, as rsync does, into a
+    new file that replaces the destination) and `--delay-updates` (updated files wait in `.~tmp~` and
     are renamed into place together at the end).
   - `--force`, `--ignore-errors`, `--ignore-missing-args` and `--delete-missing-args`, the
     last one also for `--files-from` lists that name files whose directory is gone.
