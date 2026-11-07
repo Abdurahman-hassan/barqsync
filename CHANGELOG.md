@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.5.2 - 2026-11-07
+
+### Compatibility
+
+- Protocol 11, as 0.5.0 and 0.5.1, which 0.5.2 works with. The fixes are on the side
+  that does the work: the receiver's (a pull's client, a push's server) for the partial
+  dir, spellings, delta and temp file fixes, the sender's for the test hooks. Upgrade
+  both machines.
+
+### Security
+
+- A symlink named like a relative partial dir (`.~tmp~` with `--delay-updates`, or NAME
+  with `--partial-dir=NAME`) can no longer lead the receiver out of the destination.
+  Such a symlink in the source tree, or listed by a malicious server, made the receiver
+  take a file outside the destination for a leftover of an interrupted transfer, and
+  delete it, with exit 0 (AU-SEC-01). A non-directory where a relative partial dir goes
+  is now left out of the transfer, and the partial dir is used only if every part of it
+  is a real directory: one in the way is replaced first, as rsync's `handle_partial_dir`
+  does, never followed.
+- The `BARQSYNC_TEST_*` environment hooks are gone from release builds (AU-SEC-07). Two
+  of them deleted or cut source files, on the server side of a pull too, so a variable
+  left in a shell profile could destroy data. Debug builds keep them for the tests; a
+  release build that needs them is `cargo test --release --features test-hooks`.
+
+### Fixed
+
+- `--inplace`, `--append` and `--append-verify` no longer delete a destination file whose
+  name differs from the source's only in case or Unicode normalization, on a file system
+  that ignores those (APFS by default), and exit 23 (AU-COR-02). The file is now found as
+  rsync finds it, so `-u`, the quick check and an `--append` resume apply to it. The same
+  lookup makes a case-only rename converge (AU-COR-03): a renamed file was copied again
+  on every run, and a renamed directory failed with "File exists" and stopped every
+  deletion. barqsync keeps the destination's spelling; rsync with `--delete` deletes the
+  old name and copies the source again, even a newer file `-u` should have kept.
+- A remote delta whose basis (the destination file) is written by another program after
+  its signature was made is no longer committed (AU-COR-01). The matched stretches came
+  from the changed file, so the result was neither the source nor the old file, passed
+  the next quick check, and the exit was 0. The file is now left as it is, with an error
+  and exit 23, and the next run updates it.
+- A local copy of a source file that is cut short while it is read is an error (exit 23),
+  as rsync's read errors are, and the destination keeps its old version (AU-COR-05).
+  Before, the destination got the part read so far, and the exit was 0.
+- Runs into the same destination at the same time no longer fail each other (AU-TST-03).
+  A directory another run created first was an error ("mkdir ... failed: File exists",
+  exit 23, and no deletions); as rsync's mkdir, barqsync now goes on into it. And
+  `--delete` removed another run's temp files while it was still writing them, so its
+  rename failed ("No such file or directory"). A temp file changed since this run began
+  is now left to its run, and a run whose temp file is deleted anyway copies the file
+  again. One left by a run killed earlier is still deleted.
+- SIGXFSZ is ignored, as rsync ignores it (AU-TST-07). Under a file size limit (`ulimit
+  -f`) the write of a bigger file failed by killing barqsync, leaving its temp files and
+  the rest of the transfer undone; it is now an error for that file ("File too large").
+
 ## 0.5.1 - 2026-10-29
 
 ### Added

@@ -157,7 +157,7 @@ pub fn listen(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
         })?
     };
     // A test hook: advertise a different (e.g. unreachable) address to exercise fallback.
-    let advertised = std::env::var("BARQSYNC_TEST_STREAM_ADDR").unwrap_or_else(|_| addr.to_string());
+    let advertised = crate::test_hooks::var("BARQSYNC_TEST_STREAM_ADDR").unwrap_or_else(|| addr.to_string());
     Ok((StreamOffer { addr: advertised, fingerprint, token }, Acceptor { accepted, stop, thread: Some(thread) }))
 }
 
@@ -274,7 +274,7 @@ pub(crate) fn client_config(offer: &StreamOffer) -> io::Result<Arc<ClientConfig>
 /// dropped; if none opens, the error says why (the caller then tries relays, then uses
 /// the ssh pipe).
 pub fn connect(offer: &StreamOffer, n: usize) -> io::Result<Vec<DataStream>> {
-    if std::env::var_os("BARQSYNC_TEST_DIRECT_BLOCKED").is_some() {
+    if crate::test_hooks::var_os("BARQSYNC_TEST_DIRECT_BLOCKED").is_some() {
         return Err(io::Error::new(io::ErrorKind::ConnectionReset, "Connection reset by peer (test)"));
     }
     let addr = offer.addr.parse::<SocketAddr>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -351,7 +351,7 @@ fn listen_async(max: usize) -> io::Result<(StreamOffer, Acceptor)> {
             }
         });
     }
-    let advertised = std::env::var("BARQSYNC_TEST_STREAM_ADDR").unwrap_or_else(|_| addr.to_string());
+    let advertised = crate::test_hooks::var("BARQSYNC_TEST_STREAM_ADDR").unwrap_or_else(|| addr.to_string());
     Ok((StreamOffer { addr: advertised, fingerprint, token }, Acceptor { accepted, stop, thread: None }))
 }
 

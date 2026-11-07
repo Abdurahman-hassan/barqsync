@@ -20,6 +20,7 @@ pub mod proto;
 pub mod remote;
 pub mod scan;
 pub mod select;
+pub mod test_hooks;
 pub mod timing;
 pub mod xattrs;
 

@@ -1,6 +1,6 @@
 [package]
 name = "barqsync"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.92"
 description = "A parallel, rsync-compatible file synchronizer: local, over ssh, TLS-over-TCP streams or QUIC (macOS and Linux)"
@@ -18,6 +18,11 @@ exclude = ["bench/results/*", "docs/*", ".gitignore", ".github/", "dist-workspac
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
 bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
+
+[features]
+# The BARQSYNC_TEST_* environment hooks in a release build (debug builds always have
+# them): `cargo test --release --features test-hooks`.
+test-hooks = []
 
 [dependencies]
 anyhow = "1.0.104"

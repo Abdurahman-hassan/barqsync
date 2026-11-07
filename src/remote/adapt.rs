@@ -73,7 +73,7 @@ impl LinkInfo {
 /// Sender side: measure the link and tell the receiver. Output the receiver forwards
 /// meanwhile is printed.
 pub(crate) fn probe(conn: &Conn, out: &Output) -> Result<LinkInfo, Stop> {
-    let forced = std::env::var("BARQSYNC_TEST_LINK_BPS").ok().and_then(|v| v.parse().ok());
+    let forced = crate::test_hooks::var("BARQSYNC_TEST_LINK_BPS").and_then(|v| v.parse().ok());
     let link = match forced {
         Some(bps) => LinkInfo { bps, rtt_us: 0 },
         None => {

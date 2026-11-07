@@ -276,6 +276,10 @@ fn stop_midway(act: Act, transport: &str, pull: bool, net_io: &str, extra: &[&st
 
 fn each_transport(act: Act, net_io: &str) {
     for transport in ["ssh", "tcp", "relay", "quic"] {
+        // A relay is forced with a test hook, which a release build doesn't have.
+        if transport == "relay" && !barqsync::test_hooks::ENABLED {
+            continue;
+        }
         for pull in [false, true] {
             stop_midway(act, transport, pull, net_io, &[]);
         }
@@ -323,6 +327,9 @@ fn an_interrupted_server_stops_pacing() {
 
 #[test]
 fn a_server_interrupt_noticed_after_the_data_streams_end_exits_20() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     each_transport(Act::LateNotice, "threads");
     each_transport(Act::LateNotice, "tokio");
 }

@@ -105,7 +105,7 @@ pub fn listen() -> io::Result<(StreamOffer, Listener)> {
     };
     let addr = endpoint.local_addr()?;
     // The same test hook as `--streams`: advertise an unreachable address.
-    let advertised = std::env::var("BARQSYNC_TEST_STREAM_ADDR").unwrap_or_else(|_| addr.to_string());
+    let advertised = crate::test_hooks::var("BARQSYNC_TEST_STREAM_ADDR").unwrap_or_else(|| addr.to_string());
     Ok((StreamOffer { addr: advertised, fingerprint, token }, Listener { endpoint, token }))
 }
 
