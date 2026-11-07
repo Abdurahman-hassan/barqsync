@@ -1,6 +1,6 @@
 # What's left in barqsync
 
-Status on 29 October 2026.
+Status on 7 November 2026.
 
 - **0.5.0** releases everything merged since 0.4.2: the hardening against hostile
   peers and swapped source files (PR 27), no deletion after a failed write (PR 30),
@@ -10,6 +10,11 @@ Status on 29 October 2026.
   0.5.x can't talk to 0.4.x: upgrade both ends together.
 - **0.5.1** accepts `--info=mount` (PR 40), which 0.5.0 refused; see its
   [release record](releases/0.5.1.md). Protocol 11, as 0.5.0.
+- **0.5.2** fixes what the audit of 30 October 2026 found open before a release (PR 43):
+  a partial-dir symlink that led the receiver to delete a file outside the destination,
+  test hooks that could delete source files in release builds, `--inplace` deleting a
+  differently spelled file on APFS, and a remote delta committed wrong when its basis
+  changed. See its [release record](releases/0.5.2.md). Protocol 11, as 0.5.0.
 
 How the P1 work was organized, and where each finding landed:
 [audit/p1-coordination.md](audit/p1-coordination.md). The
@@ -24,7 +29,7 @@ entries before a later scan failure. Pending deletions now wait for a successful
 1. **Yanking 0.1 to 0.3** on crates.io because of the data-loss bugs is your call. The
    GitHub advisories for SEC-01 and SEC-02 (versions up to 0.3.0 affected, fixed in 0.4.0)
    are published: GHSA-44h8-452c-567g and GHSA-vw2w-g2g6-46ww.
-2. **Install 0.5.1 on both Macs.** Then delete the old copies on the second Mac:
+2. **Install 0.5.2 on both Macs.** Then delete the old copies on the second Mac:
    `~/bin/barqsync-pr11` and `~/bin/barqsync-0.4.0-rc` (test builds), and `~/bin/barqsync`
    (0.1.0). Its firewall exceptions for those are no longer needed for `--streams`.
 3. **Tidy up:**
@@ -36,7 +41,20 @@ entries before a later scan failure. Pending deletions now wait for a successful
    before its release PR merged, so the published crate's changelog says 2026-10-20 and the
    crate includes `IMPLEMENTATION_PLAN.md` and `REMAINING.md` (since moved into `docs/`).
 
-## Still open after 0.5.1
+## Still open after 0.5.2
+
+### From the audit of 30 October 2026
+
+Each finding still open has an `#[ignore]`d test in `tests/audit_*.rs` that asserts the
+right behavior and names it (AU-XXX-NN). Among them:
+
+- **A nesting limit for peer messages:** a deeply nested selection tree in one message
+  overflows the decoding thread's stack (AU-SEC-03).
+- **`--timeout` with QUIC:** a stopped remote shell outlasts it (found on 7 November 2026).
+- **Read-only destination directories** are not made writable for an update, as rsync
+  does (AU-TST-01).
+- **0.5.2 detects** a delta basis changed during the transfer (AU-COR-01), with exit 23;
+  the end-to-end hash below would resend the file instead.
 
 ### From the audit (P2, or what the P1 fixes left out)
 

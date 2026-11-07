@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 - 2026-11-07
+
+### Compatibility
+
+- Protocol 11, as 0.5.0 and 0.5.1, which 0.5.2 works with. The fixes are on the side
+  that does the work: the receiver's (a pull's client, a push's server) for the partial
+  dir, spellings, delta and temp file fixes, the sender's for the test hooks. Upgrade
+  both machines.
 
 ### Security
 
