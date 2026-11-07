@@ -218,6 +218,17 @@ pub fn test_vanish(path: &Path) {
     }
 }
 
+/// Tests: with `BARQSYNC_TEST_LOSE_TEMP=NAME`, the temp file written for the destination
+/// file named NAME is deleted once, just before it is renamed into place, as another
+/// run's `--delete` can. Release builds ignore it ([`crate::test_hooks`]).
+pub fn test_lose_temp(dst: &Path, tmp: &Path) {
+    static NAME: std::sync::LazyLock<Option<std::ffi::OsString>> = std::sync::LazyLock::new(|| crate::test_hooks::var_os("BARQSYNC_TEST_LOSE_TEMP"));
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if NAME.as_deref().is_some_and(|n| dst.file_name() == Some(n)) && !DONE.swap(true, Ordering::Relaxed) {
+        let _ = fs::remove_file(tmp);
+    }
+}
+
 /// `--mkpath`: create the directories of `path` that don't exist yet, `path` included
 /// (rsync's `make_path`). A dry run only counts them. Returns how many there were.
 pub fn make_path(path: &Path, dry_run: bool) -> io::Result<usize> {

@@ -2395,19 +2395,38 @@ impl<'a> Engine<'a> {
                 .and_then(|()| fsops::check_interrupt());
             return self.finish_or_keep(&job.dst_path, job, r).map(|()| src.size);
         }
-        let (tmp, copied) = self.with_temp(&job.dst_path, |tmp| {
-            // An interrupted copy is kept with --partial before the temp is discarded.
-            self.copy_from(&src_file, tmp, src.size, allow_fast, mode).inspect_err(|_| {
-                if fsops::interrupted() {
-                    self.keep_partial(tmp, &job.dst_path);
-                }
-            })
-        })?;
-        let r = self
-            .apply_new_file_attrs(&tmp, copied, mode, uid, gid, mtime, Some(&job.src(false)))
-            .and_then(|()| fsops::check_interrupt())
-            .and_then(|()| self.place_file(&tmp, job));
-        self.finish_or_keep(&tmp, job, r).map(|()| src.size)
+        let mut tries = 1;
+        loop {
+            let (tmp, copied) = self.with_temp(&job.dst_path, |tmp| {
+                // An interrupted copy is kept with --partial before the temp is discarded.
+                self.copy_from(&src_file, tmp, src.size, allow_fast, mode).inspect_err(|_| {
+                    if fsops::interrupted() {
+                        self.keep_partial(tmp, &job.dst_path);
+                    }
+                })
+            })?;
+            let r = self
+                .apply_new_file_attrs(&tmp, copied, mode, uid, gid, mtime, Some(&job.src(false)))
+                .and_then(|()| fsops::check_interrupt())
+                .and_then(|()| {
+                    fsops::test_lose_temp(&job.dst_path, &tmp);
+                    self.place_file(&tmp, job)
+                });
+            // Another run into the same destination can take this temp file for a leftover
+            // and delete it before it is renamed (its `--delete`, AU-TST-03): then the
+            // file is copied again, as long as the source is still there to read.
+            let lost = matches!(&r, Err(e) if e.kind() == io::ErrorKind::NotFound)
+                && !fsops::interrupted()
+                && fsops::lstat(&tmp).is_err_and(|e| e.kind() == io::ErrorKind::NotFound);
+            if lost && tries < TEMP_LOST_TRIES {
+                tries += 1;
+                fsops::unregister_temp(&tmp);
+                use std::io::Seek;
+                (&src_file).rewind()?;
+                continue;
+            }
+            return self.finish_or_keep(&tmp, job, r).map(|()| src.size);
+        }
     }
 
     /// Delta transfer is opt-in locally (`--no-whole-file`), like rsync, and needs an
@@ -2627,6 +2646,10 @@ impl Ctx<'_> {
         }
     }
 }
+
+/// How many times at most a whole-file copy is made when its temp file is deleted by
+/// someone else before it is renamed (see [`Engine::write_file`]).
+const TEMP_LOST_TRIES: usize = 3;
 
 pub(crate) fn split_dst(path: &Path) -> (&Path, &OsStr) {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));

@@ -1743,6 +1743,27 @@ fn barqsync_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> RunOut {
     run(&mut cmd, cwd)
 }
 
+/// A temp file deleted before it is renamed into place, as another run into the same
+/// destination can delete it (its `--delete` takes it for a leftover), is written again:
+/// the copy lands and the exit is 0. A test hook deletes it once, for a file copied
+/// through a buffer and for one big enough to be cloned on APFS.
+#[test]
+fn a_temp_file_deleted_before_its_rename_is_written_again() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
+    for (name, len) in [("mid", 300_000), ("big", 1 << 20)] {
+        let tmp = tempfile::tempdir().unwrap();
+        Tree::new(tmp.path().join("src")).file("a", "a").file(name, noise(len, 3)).settle_mtimes();
+        let f = barqsync_env(tmp.path(), &["-a", "src/", "d"], &[("BARQSYNC_TEST_LOSE_TEMP", name)]);
+        assert_eq!(f.code, 0, "{name}: {}", f.stderr);
+        assert_eq!(fs::read(tmp.path().join("d").join(name)).unwrap(), noise(len, 3), "{name}");
+        let mut left: Vec<_> = fs::read_dir(tmp.path().join("d")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left, ["a", name], "{name}: temp files left");
+    }
+}
+
 /// A file that disappears between the scan and its transfer is a warning and exit 24,
 /// as rsync's "file has vanished"; an error still makes it 23. (rsync can't be raced
 /// reliably, so a test hook removes the file just before it is opened.)

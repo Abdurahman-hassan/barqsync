@@ -46,8 +46,9 @@
   A directory another run created first was an error ("mkdir ... failed: File exists",
   exit 23, and no deletions); as rsync's mkdir, barqsync now goes on into it. And
   `--delete` removed another run's temp files while it was still writing them, so its
-  rename failed ("No such file or directory"); a temp file changed since this run began
-  is now left to its run. One left by a run killed earlier is still deleted.
+  rename failed ("No such file or directory"). A temp file changed since this run began
+  is now left to its run, and a run whose temp file is deleted anyway copies the file
+  again. One left by a run killed earlier is still deleted.
 - SIGXFSZ is ignored, as rsync ignores it (AU-TST-07). Under a file size limit (`ulimit
   -f`) the write of a bigger file failed by killing barqsync, leaving its temp files and
   the rest of the transfer undone; it is now an error for that file ("File too large").
