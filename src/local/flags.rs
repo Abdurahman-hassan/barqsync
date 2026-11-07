@@ -314,12 +314,8 @@ impl Engine<'_> {
     /// work: as rsync does, the data is copied instead, into a file that replaces the
     /// destination and then gets its attributes again.
     pub(crate) fn place_file(&self, tmp: &Path, job: &FileJob) -> io::Result<()> {
-        let held = self.partial_path(&job.dst_path).filter(|_| self.opts.delay_updates);
+        let held = if self.opts.delay_updates { Some(self.make_partial_path(&job.dst_path)?) } else { None };
         let to = held.as_deref().unwrap_or(&job.dst_path);
-        if let Some(dir) = held.as_deref().and_then(Path::parent) {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        }
         if let Some(f) = fsops::rename_or_copy(tmp, to)? {
             let (mode, uid, gid) = self.target_attrs(job);
             self.finish_delta_file(&f, &job.meta, mode, uid, gid, Some((to, &job.src(self.remote.is_some()))))?;
@@ -339,7 +335,12 @@ impl Engine<'_> {
             if fsops::interrupted() {
                 return;
             }
-            match fs::rename(&held, &job.dst_path) {
+            // The partial dir must still be the one the file went into.
+            let r = match self.partial_path(&job.dst_path) {
+                Some(p) if p == held => fs::rename(&held, &job.dst_path),
+                _ => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+            };
+            match r {
                 Ok(()) => self.file_in_place(&job),
                 Err(e) => {
                     let from = path_msg(" (from ", &held, format!("): {e}"));
@@ -581,10 +582,64 @@ impl Engine<'_> {
     // --partial / --partial-dir
     // -----------------------------------------------------------------------
 
+    /// The `--partial-dir` file for `dst_path`, if its partial dir is there. A relative
+    /// partial dir must be a real directory, every part of it: a symlink in its place
+    /// (which the source can send) is not followed, as it could lead out of the
+    /// destination (AU-SEC-01).
     fn partial_path(&self, dst_path: &Path) -> Option<PathBuf> {
-        let pd = Path::new(self.opts.partial_dir.as_deref()?);
+        self.walk_partial_dir(dst_path, false).ok()
+    }
+
+    /// [`Engine::partial_path`], creating the partial dir if needed, private to the user.
+    /// As rsync's `handle_partial_dir` does, anything but a directory in the way of a
+    /// relative one is removed first: a symlink goes, not what it points to.
+    fn make_partial_path(&self, dst_path: &Path) -> io::Result<PathBuf> {
+        self.walk_partial_dir(dst_path, true)
+    }
+
+    fn walk_partial_dir(&self, dst_path: &Path, create: bool) -> io::Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
+        let mkdir = |p: &Path, recursive: bool| fs::DirBuilder::new().recursive(recursive).mode(0o700).create(p);
+        let Some(pd) = self.opts.partial_dir.as_deref().map(Path::new) else { return Err(io::ErrorKind::NotFound.into()) };
         let (dir, name) = split_dst(dst_path);
-        Some(if pd.is_absolute() { pd.join(name) } else { dir.join(pd).join(name) })
+        // An absolute partial dir is the user's own choice, used as it is.
+        if pd.is_absolute() {
+            if create {
+                mkdir(pd, true)?;
+            }
+            return Ok(pd.join(name));
+        }
+        let mut p = dir.to_path_buf();
+        for part in pd.components() {
+            p.push(part);
+            // Files of one directory are written side by side: another worker may make
+            // the same partial dir at the same time, which is just as good.
+            let is_dir = |p: &Path| fsops::lstat(p).is_ok_and(|m| m.kind == Kind::Dir);
+            match fsops::lstat(&p) {
+                Ok(m) if m.kind == Kind::Dir => continue,
+                Ok(_) if create => match fs::remove_file(&p) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound && !is_dir(&p) => return Err(e),
+                    _ => {}
+                },
+                Ok(_) => return Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+                Err(e) if create && e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            match mkdir(&p, false) {
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && is_dir(&p) => {}
+                r => r?,
+            }
+        }
+        Ok(p.join(name))
+    }
+
+    /// Whether `name`, listed in the source directory `rel`, would stand where a relative
+    /// `--partial-dir` goes (or a directory in its path): then it isn't anything but a
+    /// directory. rsync's trailing exclude rule only hides a partial dir that is a
+    /// directory; a symlink there, from the source or a peer, is dropped here so that
+    /// nothing is ever written or deleted through it (AU-SEC-01).
+    pub(crate) fn in_partial_dirs_way(&self, rel: &[u8], name: &[u8], kind: Kind) -> bool {
+        kind != Kind::Dir && self.opts.partial_dir.as_deref().is_some_and(|pd| in_partial_dir_path(pd.as_bytes(), rel, name))
     }
 
     /// A file left in `--partial-dir` by an interrupted transfer becomes the basis.
@@ -603,17 +658,11 @@ impl Engine<'_> {
         if !self.opts.partial || fs::metadata(tmp).map_or(true, |m| m.len() == 0) {
             return false;
         }
-        let target = match self.partial_path(dst_path) {
-            Some(p) => {
-                // rsync creates the partial dir private to the user.
-                use std::os::unix::fs::DirBuilderExt;
-                if let Some(dir) = p.parent()
-                    && fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).is_err()
-                {
-                    return false;
-                }
-                p
-            }
+        let target = match self.opts.partial_dir {
+            Some(_) => match self.make_partial_path(dst_path) {
+                Ok(p) => p,
+                Err(_) => return false,
+            },
             None => dst_path.to_path_buf(),
         };
         if tmp != target && fs::rename(tmp, &target).is_err() {
@@ -652,7 +701,9 @@ impl Engine<'_> {
         {
             let _ = fs::remove_dir(dir);
         }
-        if let Some(p) = &job.partial {
+        // The leftover goes only from where it was found: not through a partial dir that
+        // has turned into a symlink since.
+        if let Some(p) = job.partial.as_ref().filter(|p| self.partial_path(&job.dst_path).as_ref() == Some(*p)) {
             let _ = fs::remove_file(p);
             if self.opts.partial_dir.as_deref().is_some_and(|d| !Path::new(d).is_absolute())
                 && let Some(dir) = p.parent()
@@ -887,11 +938,20 @@ impl Engine<'_> {
     /// Copy a new file's data from `src`, a source opened with [`fsops::open_listed`];
     /// with `-S` runs of zeros become holes (no clone or kernel copy, which would keep
     /// them as data).
+    ///
+    /// A source cut short while it was read (`size` is its listed size) gives a copy
+    /// that is neither its old data nor its new: an error, as rsync's read errors are
+    /// (AU-COR-05). A file that grew is copied whole, and the next run sees its new time.
     pub(crate) fn copy_from(&self, src: &File, tmp: &Path, size: u64, allow_fast: bool, mode: u32) -> io::Result<Copied> {
-        if self.opts.sparse {
-            return copy_sparse(src, tmp, mode).map(Copied::Written);
+        let copied = if self.opts.sparse { Copied::Written(copy_sparse(src, tmp, mode)?) } else { fsops::copy_from(src, tmp, size, allow_fast, mode)? };
+        let len = match &copied {
+            Copied::Written(f) => f.metadata()?.len(),
+            Copied::Clone => fs::symlink_metadata(tmp)?.len(),
+        };
+        if len < size {
+            return Err(io::Error::other(format!("the source shrank while it was copied ({len} of {size} bytes)")));
         }
-        fsops::copy_from(src, tmp, size, allow_fast, mode)
+        Ok(copied)
     }
 }
 
@@ -908,9 +968,30 @@ impl std::fmt::Display for Diminished {
 
 impl std::error::Error for Diminished {}
 
+/// Whether `name` in the directory `rel` is the relative partial dir `pd` of some
+/// directory, or a directory on its way there: part k of `pd` of the directory k levels up.
+fn in_partial_dir_path(pd: &[u8], rel: &[u8], name: &[u8]) -> bool {
+    if pd.starts_with(b"/") {
+        return false;
+    }
+    let parts: Vec<&[u8]> = pd.split(|&c| c == b'/').filter(|c| !c.is_empty() && *c != b".").collect();
+    let up: Vec<&[u8]> = rel.split(|&c| c == b'/').filter(|c| !c.is_empty()).collect();
+    parts.iter().enumerate().any(|(k, part)| *part == name && k <= up.len() && up[up.len() - k..] == parts[..k])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_in_a_relative_partial_dirs_path_are_found_at_every_level() {
+        let at = |pd: &str, rel: &str, name: &str| in_partial_dir_path(pd.as_bytes(), rel.as_bytes(), name.as_bytes());
+        assert!(at(".~tmp~", "", ".~tmp~") && at(".~tmp~", "a/b", ".~tmp~"));
+        assert!(!at(".~tmp~", "", "victim") && !at("/abs/.p", "", ".p") && !at("/abs/.p", "", "abs"));
+        // `a/b`: `a` anywhere, and `b` in a directory named `a`.
+        assert!(at("a/b", "", "a") && at("a/b", "x/y", "a") && at("a/b", "a", "b") && at("./a//b/", "x/a", "b"));
+        assert!(!at("a/b", "", "b") && !at("a/b", "x", "b"));
+    }
 
     #[test]
     fn sparse_writes_skip_zero_blocks_but_keep_content() {

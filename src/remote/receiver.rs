@@ -568,7 +568,12 @@ impl RemoteState {
             }
             let sig = match eng.append_to(&job) {
                 Some(d) => append_signature(&job, &d, eng.opts.append > 1),
-                None if self.delta && self.link.is_none_or(|l| l.wants_delta(job.meta.size)) => basis_signature(&job, eng.opts.delta),
+                None if self.delta && self.link.is_none_or(|l| l.wants_delta(job.meta.size)) => {
+                    basis_signature(&job, eng.opts.delta).map(|(sig, version)| {
+                        job.basis_version = Some(version);
+                        sig
+                    })
+                }
                 None => None,
             };
             reqs.push(NeedReq { idx: job.idx, sig });
@@ -615,14 +620,11 @@ impl RemoteState {
             return Ok((f, job.dst_path.clone(), false, false, false));
         }
         if eng.opts.inplace && job.dst_meta.is_none() {
+            // Registered for cleanup once it is this transfer's own: a file that stands
+            // at the name already (created since it was listed) is never removed.
+            let f = fsops::create_new(&job.dst_path, mode)?;
             fsops::register_temp(&job.dst_path);
-            return match fsops::create_new(&job.dst_path, mode) {
-                Ok(f) => Ok((f, job.dst_path.clone(), false, true, true)),
-                Err(e) => {
-                    fsops::unregister_temp(&job.dst_path);
-                    Err(e)
-                }
-            };
+            return Ok((f, job.dst_path.clone(), false, true, true));
         }
         let (tmp, f) = eng.with_temp(&job.dst_path, |t| fsops::create_new(t, mode))?;
         Ok((f, tmp, true, true, true))
@@ -695,6 +697,12 @@ impl RemoteState {
 
     fn delta_begin(&self, eng: &Engine, id: u64, size: u64, copies: Vec<Op>, job: FileJob) -> io::Result<()> {
         let basis = File::open(job.basis_path())?;
+        // The delta copies the stretches of the basis that matched its signature: a basis
+        // written to since (by another program) would give a file that is neither the
+        // source nor the old one, and passes the next quick check (AU-COR-01).
+        if job.basis_version.is_some_and(|v| fsops::Version::of(&basis).ok() != Some(v)) {
+            return Err(basis_changed());
+        }
         let basis_size = basis.metadata()?.len();
         check::copies(&copies, size, basis_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid delta: {e}")))?;
         // Without a backup the file stays as it is; its data is ignored.
@@ -702,6 +710,8 @@ impl RemoteState {
             eng.report_transfer(&job, job.item, 0);
             return Ok(());
         }
+        // A backup (a hard link) changes the basis's change time: it counts from here.
+        let version = job.basis_version.and_then(|_| fsops::Version::of(&basis).ok());
         let d = Delta { size, ops: copies };
         let matched: u64 = d.ops.iter().map(Op::len).sum();
         Stats::add(&eng.stats.delta_files, 1);
@@ -736,6 +746,12 @@ impl RemoteState {
         } else {
             apply(&d, &ReadOnce::new(&basis, basis_size), &NoLiteral, &file, has_basis)
         };
+        // Nothing more is read from the basis: it must not have changed while it was.
+        // (Updated in place, it is the file being written.)
+        let r = r.and_then(|()| match version {
+            Some(v) if rename && fsops::Version::of(&basis).ok() != Some(v) => Err(basis_changed()),
+            _ => Ok(()),
+        });
         if let Err(e) = r {
             if registered {
                 fsops::drop_temp(&path);
@@ -1064,12 +1080,20 @@ fn local_extra(ids: &IdMap, r: &crate::xattrs::Rules, x: Option<Box<crate::entry
     extra::to_local(r, Some(x), mode)
 }
 
+/// A delta's basis changed after its signature was made: the file is left as it is.
+fn basis_changed() -> io::Error {
+    io::Error::other("its old version changed during the transfer, so the update was discarded")
+}
+
 /// Coarse signature of the destination file to send along with a request, so the sender
 /// can reply with a delta: aligned blocks when the size is unchanged (in-place edits),
 /// content-defined chunks when it changed (inserts, deletes, appends). The sender may then
 /// ask for finer signatures of the parts that didn't match ([`RemoteState::refine`]).
 /// `--delta=cdc` always sends its own chunks.
-fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<Sig> {
+///
+/// Also the basis's version the signature is of, taken before it is read, so that a change
+/// while it is read shows too.
+fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<(Sig, fsops::Version)> {
     let d = match &job.basis {
         Some(p) => fsops::lstat(p).ok()?,
         None => job.dst_meta?,
@@ -1078,17 +1102,19 @@ fn basis_signature(job: &FileJob, mode: DeltaMode) -> Option<Sig> {
         return None;
     }
     let f = File::open(job.basis_path()).ok()?;
+    let version = fsops::Version::of(&f).ok()?;
     if mode == DeltaMode::Cdc {
         let m = cdc::Mapped::new(&f, d.size).ok()?;
-        return Some(Sig::Cdc(cdc::signature(m.bytes(), &delta::Params::DEFAULT)));
+        return Some((Sig::Cdc(cdc::signature(m.bytes(), &delta::Params::DEFAULT)), version));
     }
     let f = ReadOnce::new(&f, d.size);
     let p = delta::Params::DEFAULT;
-    if job.meta.size == d.size {
+    let sig = if job.meta.size == d.size {
         delta::block_signature(&f, d.size, &p).ok().map(Sig::Blocks)
     } else {
         delta::chunk_signature(&f, d.size, &p).ok().map(Sig::Chunks)
-    }
+    };
+    sig.map(|s| (s, version))
 }
 
 /// `--append`: ask only for the data past the destination file (`d`), with

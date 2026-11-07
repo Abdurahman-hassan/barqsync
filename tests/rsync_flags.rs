@@ -1748,6 +1748,9 @@ fn barqsync_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> RunOut {
 /// reliably, so a test hook removes the file just before it is opened.)
 #[test]
 fn vanished_files_exit_24() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     let tmp = tempfile::tempdir().unwrap();
     for (i, (src, dst)) in [("src/", "d0"), ("src/", "{host}d1"), ("{host}src/", "d2")].iter().enumerate() {
         Tree::new(tmp.path().join("src")).file("a", "a").file("gone", "g").file("big", vec![1u8; 300_000]).settle_mtimes();
@@ -2469,6 +2472,9 @@ fn symlink_safety_options_match_rsync() {
 /// hook cuts the file to half its length just before it is opened.)
 #[test]
 fn append_skips_a_diminished_source() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let data = noise(300_000, 4);
     for (i, (src, dst)) in [("src/", "d0"), ("src/", "{host}d1"), ("{host}src/", "d2")].into_iter().enumerate() {

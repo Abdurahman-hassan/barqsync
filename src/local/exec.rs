@@ -154,6 +154,18 @@ pub(crate) struct Ctx<'p> {
     sources: Option<&'p Sources>,
     /// This directory's own filter state (the source side's: when not merged).
     rules: &'p Rules,
+    /// Source names the destination lists under another spelling (see
+    /// [`Engine::spelling_aliases`]), with that spelling.
+    aliases: &'p Aliases,
+}
+
+/// See [`Engine::spelling_aliases`].
+#[derive(Default)]
+pub(crate) struct Aliases {
+    /// A source name to the destination's spelling of it.
+    spelling: HashMap<OsString, OsString>,
+    /// Every destination name that is a source entry's file: not extraneous.
+    kept: HashSet<OsString>,
 }
 
 #[derive(Clone)]
@@ -182,6 +194,9 @@ pub(crate) struct FileJob {
     /// Remote: the attribute values in full, sent with the data when the listing only
     /// had checksums of some.
     pub(crate) full_xattrs: Option<Vec<crate::xattrs::Xattr>>,
+    /// Remote: the basis file as it was when its signature was made, which a delta
+    /// against it needs it still to be.
+    pub(crate) basis_version: Option<fsops::Version>,
 }
 
 impl FileJob {
@@ -707,6 +722,9 @@ impl<'a> Engine<'a> {
     /// applied the rules already; the ones only it can check (per-directory files,
     /// absolute paths) are trusted, as rsync trusts them.
     fn sends(&self, dir: &Path, rel: &[u8], rules: &DirRules, sel: Option<&'static Sel>, root_dev: Option<u64>, e: &DirEnt) -> bool {
+        if self.in_partial_dirs_way(rel, e.name.as_bytes(), e.meta.kind) {
+            return false;
+        }
         if self.remote.is_some() {
             let erel = join_rel(rel, &e.name);
             return !self.filter.is_static() || !self.filter.excluded(&DirRules::default(), &erel, e.meta.kind == Kind::Dir, Side::Sender);
@@ -812,6 +830,8 @@ impl<'a> Engine<'a> {
             wire_dir,
             sources,
             rules,
+            // Each named item was looked up by its own name.
+            aliases: &Aliases::default(),
         };
         let (_, files) = self.process_entries(s, &ctx, entries, &dst_map);
         self.transfer(wire_dir, files);
@@ -911,7 +931,8 @@ impl<'a> Engine<'a> {
     /// `src_rules`: the directory's own source-side filter state, which a listing from a
     /// single source is filtered with here (merged ones were filtered source by source).
     fn diff_listing<'s>(&'s self, s: &Scope<'s>, job: &DirJob, entries: Entries, sources: Option<&Sources>, src_rules: &DirRules) -> Vec<FileJob> {
-        let entries: Entries = if sources.is_some() || (self.filter.is_empty() && !self.opts.prune_empty_dirs) {
+        let unfiltered = self.filter.is_empty() && !self.opts.prune_empty_dirs && self.opts.partial_dir.is_none();
+        let entries: Entries = if sources.is_some() || unfiltered {
             entries
         } else {
             entries.into_iter().filter(|(_, e, _)| self.sends(&job.src, &job.rel, src_rules, job.sel, job.root_dev, e)).collect()
@@ -940,6 +961,7 @@ impl<'a> Engine<'a> {
             Some(job.rules.dst.clone())
         };
 
+        let aliases = if job.dst_is_new { Aliases::default() } else { self.spelling_aliases(&job.dst, &entries, &dst_map, dst_metas.as_ref()) };
         let mut changed = false;
         // A merged directory is pruned when any of its sources sends its full contents.
         let full = match sources {
@@ -956,7 +978,7 @@ impl<'a> Engine<'a> {
             && (dev.is_none() || dev == job.dst_dev)
             && self.may_delete()
         {
-            changed |= self.defer_extraneous(job, &entries, &dst_map, dst_rules, dev);
+            changed |= self.defer_extraneous(job, &entries, &dst_map, &aliases, dst_rules, dev);
         }
         let dst_handle = if job.dst_is_new || dst_metas.is_some() { None } else { fsops::DirHandle::open(&job.dst).ok() };
         let rules = Rules { src: src_rules.clone(), dst: dst_rules.unwrap_or_else(|| job.rules.dst.clone()) };
@@ -975,17 +997,67 @@ impl<'a> Engine<'a> {
             wire_dir: job.wire_dir,
             sources,
             rules: &rules,
+            aliases: &aliases,
         };
         let (c, files) = self.process_entries(s, &ctx, entries, &dst_map);
         self.push_fixup(job, changed || c);
         files
     }
 
+    /// Source names that the destination directory `dst` lists under another spelling: on
+    /// a file system that ignores case or Unicode normalization (APFS by default), the
+    /// source's `README.md` is the destination's `readme.md`, which a lookup by the
+    /// source's spelling finds as rsync's does. Without this the file would look new: it
+    /// was deleted as extraneous, or with `--inplace` replaced (AU-COR-02, AU-COR-03).
+    ///
+    /// Only a name the source has and the destination's listing doesn't can be another
+    /// spelling of one the destination has and the source doesn't, so nothing is looked
+    /// up unless there are both; then each is looked up once, and a pair is the same
+    /// file (device and inode).
+    fn spelling_aliases(&self, dst: &Path, entries: &Entries, dst_map: &HashMap<OsString, Kind>, dst_metas: Option<&HashMap<OsString, Meta>>) -> Aliases {
+        let mut aliases = Aliases::default();
+        let src_names: HashSet<&OsStr> = entries.iter().filter(|(_, e, _)| !e.missing).map(|(_, e, d)| d.as_deref().unwrap_or(&e.name)).collect();
+        let dst_only: Vec<&OsString> = dst_map.keys().filter(|n| !src_names.contains(n.as_os_str())).collect();
+        if dst_only.is_empty() || src_names.iter().all(|n| dst_map.contains_key(*n)) {
+            return aliases;
+        }
+        let handle = fsops::DirHandle::open(dst).ok();
+        let lstat = |n: &OsStr| match &handle {
+            Some(h) => h.lstat(n),
+            None => fsops::lstat(&dst.join(n)),
+        };
+        // Hard links share an inode, so it can stand for several names: each is kept.
+        let mut by_id: HashMap<(u64, u64), Vec<&OsString>> = HashMap::new();
+        for n in dst_only {
+            if let Some(m) = dst_metas.and_then(|m| m.get(n)).copied().or_else(|| lstat(n).ok()) {
+                by_id.entry((m.dev, m.ino)).or_default().push(n);
+            }
+        }
+        for n in src_names.into_iter().filter(|n| !dst_map.contains_key(*n)) {
+            if let Ok(m) = lstat(n)
+                && let Some(names) = by_id.get(&(m.dev, m.ino))
+            {
+                aliases.kept.extend(names.iter().map(|d| (*d).clone()));
+                aliases.spelling.insert(n.to_os_string(), names[0].clone());
+            }
+        }
+        aliases
+    }
+
     /// Queue what `dst_map` has and the listing doesn't for deletion, unless a
     /// destination-side rule (`dst_rules`) protects it. `dev` (`-x`): the directory's
     /// device; a directory on another one (a mount point) stays.
-    fn defer_extraneous(&self, job: &DirJob, entries: &Entries, dst_map: &HashMap<OsString, Kind>, dst_rules: &DirRules, dev: Option<u64>) -> bool {
-        let src_names: HashSet<&OsStr> = entries.iter().map(|(_, e, _)| e.name.as_os_str()).collect();
+    fn defer_extraneous(
+        &self,
+        job: &DirJob,
+        entries: &Entries,
+        dst_map: &HashMap<OsString, Kind>,
+        aliases: &Aliases,
+        dst_rules: &DirRules,
+        dev: Option<u64>,
+    ) -> bool {
+        // A name the source has under another spelling is that source entry's file.
+        let src_names: HashSet<&OsStr> = entries.iter().map(|(_, e, _)| e.name.as_os_str()).chain(aliases.kept.iter().map(OsString::as_os_str)).collect();
         // rsync's --info=mount (on with -vv) names each mount point here, listed or not.
         let mounts = dev.is_some() && self.out.levels().mount > 0;
         let extra: Vec<&OsString> = dst_map
@@ -1373,6 +1445,7 @@ impl<'a> Engine<'a> {
                             partial: None,
                             extra: None,
                             full_xattrs: None,
+                            basis_version: None,
                         };
                         self.transfer_file(&job);
                     } else {
@@ -1481,7 +1554,10 @@ impl<'a> Engine<'a> {
                 changed |= self.delete_missing(ctx.dst, dname, &join_rel(ctx.rel, dname), &ctx.rules.dst, &mut absent);
                 continue;
             }
-            let dst_kind = if ctx.dst_is_new { None } else { dst_map.get(dname).copied() };
+            // The destination's own spelling of the name, when it differs (see
+            // `spelling_aliases`); the file is still written as `dst_path`.
+            let dkey: &OsStr = ctx.aliases.spelling.get(dname).map_or(dname, OsString::as_os_str);
+            let dst_kind = if ctx.dst_is_new { None } else { dst_map.get(dkey).copied() };
             // Each entry listed counts ("Number of files", --info=flist2), whatever is done
             // with it; a directory counts where it is handled.
             match e.meta.kind {
@@ -1508,7 +1584,7 @@ impl<'a> Engine<'a> {
             match e.meta.kind {
                 Kind::Dir => changed |= self.handle_dir(s, ctx, e.meta, e.extra.as_deref(), idx, rel, src_path, dst_path, dst_kind),
                 Kind::File => {
-                    if self.ignored_existing(ctx, &rel, &e, dname, &dst_path, dst_kind, same_sums.contains(&idx)) || self.size_filtered(&e.meta, &rel) {
+                    if self.ignored_existing(ctx, &rel, &e, dkey, &dst_path, dst_kind, same_sums.contains(&idx)) || self.size_filtered(&e.meta, &rel) {
                         continue;
                     }
                     let leads = || {
@@ -1528,7 +1604,7 @@ impl<'a> Engine<'a> {
                             }
                             changed = true;
                         }
-                        Some(_) => match ctx.lstat_dst(dname, &dst_path) {
+                        Some(_) => match ctx.lstat_dst(dkey, &dst_path) {
                             Ok(m) => dst_meta = Some(m),
                             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                             Err(e) => {
@@ -1626,6 +1702,7 @@ impl<'a> Engine<'a> {
                                 partial: None,
                                 extra: e.extra,
                                 full_xattrs: None,
+                                basis_version: None,
                             };
                             self.find_partial(&mut job);
                             files.push(job);
@@ -1633,7 +1710,7 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Kind::Symlink => {
-                    if self.ignored_existing(ctx, &rel, &e, dname, &dst_path, dst_kind, false) {
+                    if self.ignored_existing(ctx, &rel, &e, dkey, &dst_path, dst_kind, false) {
                         continue;
                     }
                     if !self.opts.links {
@@ -1653,7 +1730,7 @@ impl<'a> Engine<'a> {
                     changed |= self.handle_symlink(ctx.root, at, &e, from, &rel, &src_path, &dst_path, dst_kind, &ctx.rules.dst);
                 }
                 kind => {
-                    if self.ignored_existing(ctx, &rel, &e, dname, &dst_path, dst_kind, false) {
+                    if self.ignored_existing(ctx, &rel, &e, dkey, &dst_path, dst_kind, false) {
                         continue;
                     }
                     let allowed = match kind {
@@ -1737,6 +1814,7 @@ impl<'a> Engine<'a> {
         let mut cands = Vec::new();
         for (idx, e, dname) in entries {
             let dname = dname.as_deref().unwrap_or(&e.name);
+            let dname: &OsStr = ctx.aliases.spelling.get(dname).map_or(dname, OsString::as_os_str);
             if e.meta.kind != Kind::File || dst_map.get(dname) != Some(&Kind::File) {
                 continue;
             }
@@ -1832,7 +1910,12 @@ impl<'a> Engine<'a> {
         if is_new {
             Stats::add(&self.stats.created, 1);
             if !self.dry() {
-                let r = fs::DirBuilder::new().mode(0o700 | self.new_mode(&meta)).create(&dst_path);
+                let r = match fs::DirBuilder::new().mode(0o700 | self.new_mode(&meta)).create(&dst_path) {
+                    // As rsync's mkdir: a directory made meanwhile (by another run into the
+                    // same destination) does as well (AU-TST-03).
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists && fsops::lstat(&dst_path).is_ok_and(|m| m.kind == Kind::Dir) => Ok(()),
+                    r => r,
+                };
                 if let Err(e) = r {
                     self.dst_err(path_msg("mkdir \"", &dst_path, format!("\" failed: {e}")));
                     return changed;
@@ -2280,8 +2363,16 @@ impl<'a> Engine<'a> {
             // The mtime is set last, so an interrupted copy never passes the quick check;
             // on Ctrl-C the partial file is removed like a temp file.
             fsops::register_temp(&job.dst_path);
-            let r = self
-                .copy_from(&src_file, &job.dst_path, src.size, allow_fast, mode)
+            let copied = match self.copy_from(&src_file, &job.dst_path, src.size, allow_fast, mode) {
+                // The file is created exclusively: what stands at its name now (created
+                // since it was listed) isn't this copy's, and is left alone (AU-COR-02).
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    fsops::unregister_temp(&job.dst_path);
+                    return Err(e);
+                }
+                r => r,
+            };
+            let r = copied
                 .and_then(|copied| self.apply_new_file_attrs(&job.dst_path, copied, mode, uid, gid, mtime, Some(&job.src(false))))
                 .and_then(|()| fsops::check_interrupt());
             return self.finish_or_keep(&job.dst_path, job, r).map(|()| src.size);

@@ -318,7 +318,7 @@ pub fn encode(frame: &Frame, level: Option<i32>, wire: Wire) -> io::Result<Vec<u
 /// bytes (tests: small messages then cross as several frames too).
 fn piece_size() -> usize {
     static PIECE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        let n = std::env::var("BARQSYNC_TEST_FRAME_PIECE").ok().and_then(|v| v.parse().ok());
+        let n = crate::test_hooks::var("BARQSYNC_TEST_FRAME_PIECE").and_then(|v| v.parse().ok());
         n.map_or(MAX_FRAME, |n: usize| n.clamp(1, MAX_FRAME))
     });
     *PIECE
@@ -329,7 +329,7 @@ fn piece_size() -> usize {
 /// whose end then arrives first), else not at all.
 fn notice_lag(f: &Frame) -> Option<Duration> {
     static LAG: std::sync::LazyLock<Option<Duration>> = std::sync::LazyLock::new(|| {
-        std::env::var("BARQSYNC_TEST_NOTICE_LAG_MS").ok().and_then(|v| v.parse().ok()).map(Duration::from_millis)
+        crate::test_hooks::var("BARQSYNC_TEST_NOTICE_LAG_MS").and_then(|v| v.parse().ok()).map(Duration::from_millis)
     });
     if matches!(f, Frame::Msg(Msg::Interrupted)) { *LAG } else { None }
 }

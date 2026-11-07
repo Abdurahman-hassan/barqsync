@@ -382,6 +382,9 @@ fn parallel_tls_streams_push_and_pull() {
 
 #[test]
 fn parallel_streams_fall_back_to_ssh() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     let tmp = tempfile::tempdir().unwrap();
     rich_tree(&tmp.path().join("src"));
     let f = remote_with_env(
@@ -398,6 +401,9 @@ fn parallel_streams_fall_back_to_ssh() {
 /// each over its own remote-shell connection and a relay on the far side, both ways.
 #[test]
 fn parallel_streams_go_through_ssh_when_blocked() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     for pull in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
         delta_fixture(tmp.path());
@@ -427,6 +433,9 @@ fn parallel_streams_go_through_ssh_when_blocked() {
 /// transfer stays on the ssh pipe and says why.
 #[test]
 fn parallel_streams_fall_back_to_ssh_when_relays_fail_too() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     let tmp = tempfile::tempdir().unwrap();
     rich_tree(&tmp.path().join("src"));
     let f = remote_with_env(
@@ -470,6 +479,9 @@ fn quic_push_and_pull_in_both_wire_formats() {
 
 #[test]
 fn quic_falls_back_to_ssh() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     let tmp = tempfile::tempdir().unwrap();
     rich_tree(&tmp.path().join("src"));
     let started = std::time::Instant::now();
@@ -539,6 +551,9 @@ fn auto_transport_stays_on_ssh_on_short_links() {
 
 #[test]
 fn auto_transport_falls_back_fast_and_remembers_the_host() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     let tmp = tempfile::tempdir().unwrap();
     rich_tree(&tmp.path().join("src"));
     let blocked = [("BARQSYNC_TEST_STREAM_ADDR", "127.0.0.1:1")];
@@ -611,6 +626,9 @@ fn auto_transport_remembers_a_clean_link() {
 
 #[test]
 fn adaptive_strategy_routes_by_link_speed() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     // delta_fixture: two files of ~8 MiB with old copies on the receiver.
     for (bps, whole) in [("10000000000", true), ("20000000", false)] {
         for pull in [false, true] {
@@ -656,6 +674,9 @@ fn adaptive_strategy_probes_the_link() {
 
 #[test]
 fn whole_file_flags_override_the_adaptive_strategy() {
+    if !barqsync::test_hooks::ENABLED {
+        return eprintln!("SKIP: needs the BARQSYNC_TEST_* hooks (a debug build, or --features test-hooks)");
+    }
     for (flag, delta) in [("-W", false), ("--no-whole-file", true)] {
         let tmp = tempfile::tempdir().unwrap();
         delta_fixture(tmp.path());

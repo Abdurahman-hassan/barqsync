@@ -153,6 +153,25 @@ pub fn same_file(a: &Meta, b: &Meta) -> bool {
     (a.dev, a.ino) == (b.dev, b.ino)
 }
 
+/// What tells whether an open file's data has changed: a write changes its change time,
+/// which can't be set back, and a file put in its place has another inode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Version {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Version {
+    pub fn of(f: &File) -> io::Result<Version> {
+        use std::os::unix::fs::MetadataExt;
+        let m = f.metadata()?;
+        Ok(Version { dev: m.dev(), ino: m.ino(), size: m.size(), mtime: (m.mtime(), m.mtime_nsec()), ctime: (m.ctime(), m.ctime_nsec()) })
+    }
+}
+
 /// [`same_file`] for two open files.
 pub fn same_open_file(a: &File, b: &File) -> io::Result<bool> {
     Ok(same_file(&Meta::from_metadata(&a.metadata()?), &Meta::from_metadata(&b.metadata()?)))
@@ -160,10 +179,11 @@ pub fn same_open_file(a: &File, b: &File) -> io::Result<bool> {
 
 /// Tests: with `BARQSYNC_TEST_VANISH=NAME`, a source file named NAME is removed just before
 /// it is opened to be sent, as if it was deleted after the scan; with
-/// `BARQSYNC_TEST_SHRINK=NAME`, it is cut to half its length instead.
+/// `BARQSYNC_TEST_SHRINK=NAME`, it is cut to half its length instead. Release builds
+/// ignore both ([`crate::test_hooks`]).
 pub fn test_vanish(path: &Path) {
     static NAMES: std::sync::LazyLock<[Option<std::ffi::OsString>; 2]> = std::sync::LazyLock::new(|| {
-        [std::env::var_os("BARQSYNC_TEST_VANISH"), std::env::var_os("BARQSYNC_TEST_SHRINK")]
+        [crate::test_hooks::var_os("BARQSYNC_TEST_VANISH"), crate::test_hooks::var_os("BARQSYNC_TEST_SHRINK")]
     });
     let named = |i: usize| NAMES[i].as_deref().is_some_and(|n| path.file_name() == Some(n));
     if named(0) {
@@ -386,7 +406,12 @@ pub fn interrupt_token() -> &'static tokio_util::sync::CancellationToken {
 /// A SIGTERM or SIGHUP ignored when barqsync started (under `nohup`, or by a parent that
 /// ignores it) stays ignored, as Unix tools leave it: whoever started us asked for the
 /// transfer to survive it.
+///
+/// SIGXFSZ is ignored, as rsync ignores it: a write past the file size limit
+/// (`ulimit -f`) then fails with EFBIG, an error for that file, instead of killing the
+/// process and leaving its temp files (AU-TST-07).
 pub fn handle_interrupts(code: i32) {
+    unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
     let ignored: Vec<i32> = [libc::SIGTERM, libc::SIGHUP]
         .into_iter()
         .filter(|&sig| unsafe {
