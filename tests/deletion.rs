@@ -97,6 +97,26 @@ fn names(dir: &Path) -> Vec<String> {
 
 const SKIPPING: &str = "IO error encountered -- skipping file deletion";
 
+/// A file named like a temp file (`.NAME.XXXXXX`) that a run killed earlier left behind
+/// is extraneous like any other, locally and remotely. (One another run is still
+/// writing has changed since this run began, and is left to that run.)
+#[test]
+fn a_temp_file_left_by_an_earlier_run_is_deleted() {
+    for mode in MODES {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        fake_ssh(t);
+        fs::create_dir_all(t.join("src")).unwrap();
+        fs::create_dir_all(t.join("dst")).unwrap();
+        fs::write(t.join("src/alpha"), "a").unwrap();
+        fs::write(t.join("dst/.alpha.Xy12Zq"), "left behind").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let r = run_mode(t, mode, &["-a", "--delete"], &["src/"], "dst/");
+        assert_eq!(r.code, 0, "{mode}: {}{}", r.stdout, r.stderr);
+        assert_eq!(names(&t.join("dst")), ["alpha"], "{mode}: {}{}", r.stdout, r.stderr);
+    }
+}
+
 #[test]
 fn a_dangling_symlink_under_copy_links_stops_deletion() {
     for mode in MODES {

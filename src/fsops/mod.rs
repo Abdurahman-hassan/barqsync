@@ -153,8 +153,7 @@ pub fn same_file(a: &Meta, b: &Meta) -> bool {
     (a.dev, a.ino) == (b.dev, b.ino)
 }
 
-/// What tells whether an open file's data has changed: a write changes its change time,
-/// which can't be set back, and a file put in its place has another inode.
+/// What tells whether an open file's data has changed (see [`Version::same_data`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Version {
     dev: u64,
@@ -162,13 +161,35 @@ pub struct Version {
     size: u64,
     mtime: (i64, i64),
     ctime: (i64, i64),
+    nlink: u64,
 }
 
 impl Version {
     pub fn of(f: &File) -> io::Result<Version> {
         use std::os::unix::fs::MetadataExt;
         let m = f.metadata()?;
-        Ok(Version { dev: m.dev(), ino: m.ino(), size: m.size(), mtime: (m.mtime(), m.mtime_nsec()), ctime: (m.ctime(), m.ctime_nsec()) })
+        Ok(Version {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+            nlink: m.nlink(),
+        })
+    }
+
+    /// Whether `now` (the same file later) can still hold the data it held. A file put
+    /// in its place has another inode; a write changes the size or the modification
+    /// time, and also the change time, which can't be set back, so a write whose
+    /// modification time was put back shows too.
+    ///
+    /// The change time also moves when a link to the file is made or removed, which a
+    /// run does without touching the data: a backup of the file is a hard link, and a
+    /// hard-linked file's other names are replaced or backed up. So for a file with
+    /// more than one name (then or now) only the size and modification time count.
+    pub fn same_data(&self, now: &Version) -> bool {
+        let linked = self.nlink > 1 || now.nlink > 1;
+        (self.dev, self.ino, self.size, self.mtime) == (now.dev, now.ino, now.size, now.mtime) && (linked || self.ctime == now.ctime)
     }
 }
 
@@ -491,6 +512,13 @@ const TEMP_SUFFIX_LEN: usize = 7; // ".XXXXXX"
 /// bytes so non-UTF-8 names never collapse onto a shared temp name.
 pub fn temp_name(final_name: &OsStr) -> OsString {
     temp_name_with(final_name, true)
+}
+
+/// Whether `name` has the form of a temp file next to a destination file (see
+/// [`temp_name`]): `.NAME.XXXXXX`, as rsync names them too.
+pub fn is_temp_name(name: &OsStr) -> bool {
+    let n = name.as_bytes();
+    n.len() > 1 + TEMP_SUFFIX_LEN && n[0] == b'.' && n[n.len() - TEMP_SUFFIX_LEN] == b'.' && n[n.len() - 6..].iter().all(u8::is_ascii_alphanumeric)
 }
 
 /// [`temp_name`], without the leading `.` when `dot` is false (a `-T` directory's temp
@@ -898,6 +926,57 @@ pub fn am_root() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_names_are_told_apart() {
+        for n in [".a.Xy12Zq", ".file.txt.000000", "..x.abcdef"] {
+            assert!(is_temp_name(OsStr::new(n)), "{n}");
+        }
+        for n in ["a.Xy12Zq", ".a.Xy12Z", ".a.Xy-2Zq", ".Xy12Zq", ".a_Xy12Zq"] {
+            assert!(!is_temp_name(OsStr::new(n)), "{n}");
+        }
+        assert!(is_temp_name(&temp_name(OsStr::new("report.pdf"))));
+    }
+
+    #[test]
+    fn a_version_tells_data_changes_from_link_changes() {
+        use std::os::unix::fs::FileExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = |n: &str| tmp.path().join(n);
+        let write = |n: &str| fs::OpenOptions::new().write(true).open(p(n)).unwrap().write_all_at(b"SOME", 0).unwrap();
+        let put_back = |n: &str, m: &fs::Metadata| {
+            let times = std::fs::FileTimes::new().set_modified(m.modified().unwrap());
+            fs::OpenOptions::new().write(true).open(p(n)).unwrap().set_times(times).unwrap();
+        };
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // One name: a backup link is no change; a write is, even with its time put back.
+        fs::write(p("a"), b"some data").unwrap();
+        let f = File::open(p("a")).unwrap();
+        let v = Version::of(&f).unwrap();
+        fs::hard_link(p("a"), p("a~")).unwrap();
+        assert!(v.same_data(&Version::of(&f).unwrap()));
+        fs::remove_file(p("a~")).unwrap();
+        let m = fs::metadata(p("a")).unwrap();
+        pause();
+        write("a");
+        assert!(!v.same_data(&Version::of(&f).unwrap()));
+        put_back("a", &m);
+        assert!(!v.same_data(&Version::of(&f).unwrap()), "the change time shows the write");
+
+        // Two names: the other one backed up and replaced is no change; a write is.
+        fs::write(p("b"), b"some data").unwrap();
+        fs::hard_link(p("b"), p("c")).unwrap();
+        let f = File::open(p("b")).unwrap();
+        let v = Version::of(&f).unwrap();
+        fs::hard_link(p("c"), p("c~")).unwrap();
+        fs::write(p("new"), b"other").unwrap();
+        fs::rename(p("new"), p("c")).unwrap();
+        assert!(v.same_data(&Version::of(&f).unwrap()));
+        pause();
+        write("b");
+        assert!(!v.same_data(&Version::of(&f).unwrap()));
+    }
 
     /// The bulk / statx scanner must agree field-for-field with plain `fstatat`.
     #[test]

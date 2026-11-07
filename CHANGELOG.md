@@ -35,9 +35,12 @@
 - A local copy of a source file that is cut short while it is read is an error (exit 23),
   as rsync's read errors are, and the destination keeps its old version (AU-COR-05).
   Before, the destination got the part read so far, and the exit was 0.
-- A directory that another run into the same destination creates first is no longer an
-  error ("mkdir ... failed: File exists", exit 23, and no deletions): as rsync's mkdir,
-  barqsync goes on into it (AU-TST-03).
+- Runs into the same destination at the same time no longer fail each other (AU-TST-03).
+  A directory another run created first was an error ("mkdir ... failed: File exists",
+  exit 23, and no deletions); as rsync's mkdir, barqsync now goes on into it. And
+  `--delete` removed another run's temp files while it was still writing them, so its
+  rename failed ("No such file or directory"); a temp file changed since this run began
+  is now left to its run. One left by a run killed earlier is still deleted.
 - SIGXFSZ is ignored, as rsync ignores it (AU-TST-07). Under a file size limit (`ulimit
   -f`) the write of a bigger file failed by killing barqsync, leaving its temp files and
   the rest of the transfer undone; it is now an error for that file ("File too large").

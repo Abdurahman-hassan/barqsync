@@ -700,7 +700,7 @@ impl RemoteState {
         // The delta copies the stretches of the basis that matched its signature: a basis
         // written to since (by another program) would give a file that is neither the
         // source nor the old one, and passes the next quick check (AU-COR-01).
-        if job.basis_version.is_some_and(|v| fsops::Version::of(&basis).ok() != Some(v)) {
+        if job.basis_version.is_some_and(|v| !fsops::Version::of(&basis).is_ok_and(|now| v.same_data(&now))) {
             return Err(basis_changed());
         }
         let basis_size = basis.metadata()?.len();
@@ -710,8 +710,6 @@ impl RemoteState {
             eng.report_transfer(&job, job.item, 0);
             return Ok(());
         }
-        // A backup (a hard link) changes the basis's change time: it counts from here.
-        let version = job.basis_version.and_then(|_| fsops::Version::of(&basis).ok());
         let d = Delta { size, ops: copies };
         let matched: u64 = d.ops.iter().map(Op::len).sum();
         Stats::add(&eng.stats.delta_files, 1);
@@ -748,8 +746,8 @@ impl RemoteState {
         };
         // Nothing more is read from the basis: it must not have changed while it was.
         // (Updated in place, it is the file being written.)
-        let r = r.and_then(|()| match version {
-            Some(v) if rename && fsops::Version::of(&basis).ok() != Some(v) => Err(basis_changed()),
+        let r = r.and_then(|()| match job.basis_version {
+            Some(v) if rename && !fsops::Version::of(&basis).is_ok_and(|now| v.same_data(&now)) => Err(basis_changed()),
             _ => Ok(()),
         });
         if let Err(e) = r {

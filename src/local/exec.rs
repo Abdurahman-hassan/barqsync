@@ -49,6 +49,8 @@ pub struct Engine<'a> {
     fixups: Mutex<Vec<DirFixup>>,
     /// Entries absent from a listing; removal waits for the complete source scan.
     deletions: Mutex<HashMap<PathBuf, Deletion>>,
+    /// When the run began: a temp file changed since belongs to a run in progress.
+    started: std::time::SystemTime,
     /// `-H`: hard-link groups keyed by the source `(dev, ino)`.
     hardlinks: Mutex<HashMap<(u64, u64), HardGroup>>,
     pub(crate) umask: u32,
@@ -366,6 +368,7 @@ impl<'a> Engine<'a> {
             checksum: opts.checksum,
         };
         Engine {
+            started: std::time::SystemTime::now(),
             opts,
             rules,
             filter,
@@ -1102,6 +1105,20 @@ impl<'a> Engine<'a> {
         self.filter.excluded(rules, rel, is_dir, side) || (!self.opts.delete_excluded && self.is_protected_backup(name))
     }
 
+    /// Whether `path` is another run's temp file, still being written: named like one,
+    /// and changed since this run began (its change time moves with each write, and
+    /// when its time is set before its rename). Deleting it would fail that run's
+    /// rename, so it is left to that run (AU-TST-03); one left by a run that was killed
+    /// before this one began is extraneous like any file.
+    fn in_flight_temp(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        path.file_name().is_some_and(fsops::is_temp_name)
+            && fs::symlink_metadata(path).is_ok_and(|m| {
+                let changed = std::time::UNIX_EPOCH + std::time::Duration::new(m.ctime().max(0) as u64, m.ctime_nsec().clamp(0, 999_999_999) as u32);
+                changed >= self.started
+            })
+    }
+
     /// Called only after all scanning/transfer tasks have joined, and for a remote
     /// transfer after the sender's completion was checked. A later source error
     /// invalidates every earlier absence decision, and so does an entry that failed to
@@ -1124,6 +1141,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
             match fsops::lstat(&path) {
+                Ok(now) if now.kind == Kind::File && self.in_flight_temp(&path) => {}
                 Ok(now) if now.kind == deletion.meta.kind && fsops::same_file(&now, &deletion.meta) => {
                     self.delete_item(&path, &deletion.rel, now.kind, &deletion.rules, false, false);
                 }
